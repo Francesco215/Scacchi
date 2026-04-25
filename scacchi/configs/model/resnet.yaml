@@ -1,0 +1,6 @@
+name: resnet
+channels: 64
+blocks: 4
+policy_channels: 2
+value_channels: 1
+value_hidden: 64

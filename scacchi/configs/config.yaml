@@ -1,0 +1,12 @@
+defaults:
+  - env: chess
+  - model: resnet
+  - optimizer: adamw
+  - search: gumbel
+  - runtime: single_mesh
+  - train: default
+  - _self_
+
+hydra:
+  job:
+    chdir: true

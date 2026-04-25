@@ -51,6 +51,10 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Local training outputs
+outputs/
+checkpoints/
+
 # Translations
 *.mo
 *.pot
@@ -152,6 +156,8 @@ activemq-data/
 .envrc
 .venv
 env/
+!scacchi/configs/env/
+!scacchi/configs/env/*.yaml
 venv/
 ENV/
 env.bak/
