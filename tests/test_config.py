@@ -28,8 +28,19 @@ def test_default_yaml_config_becomes_validated_dataclass():
 def test_post_init_coerces_bool_and_numeric_values():
     eval_cfg = EvalConfig(
         enabled=cast(Any, "false"),
-        batch_size=cast(Any, "3"),
         interval=cast(Any, "5"),
+        batch_size=cast(Any, "3"),
+        max_num_steps=cast(Any, "64"),
+        search={
+            "name": "gumbel",
+            "num_simulations": "4",
+            "max_num_considered_actions": "8",
+            "max_depth": "16",
+            "gumbel_scale": "0.0",
+        },
+        anchor_interval=cast(Any, "50"),
+        max_anchors=cast(Any, "4"),
+        initial_anchor_elo=cast(Any, "0.0"),
     )
 
     assert eval_cfg.enabled is False
@@ -38,11 +49,14 @@ def test_post_init_coerces_bool_and_numeric_values():
 
 
 def test_train_and_eval_search_configs_are_independent():
-    raw_cfg = OmegaConf.create(
-        {
-            "train": {"search": {"num_simulations": 9, "gumbel_scale": 1.5}},
-            "eval": {"search": {"num_simulations": 3, "gumbel_scale": 0.0}},
-        }
+    raw_cfg = OmegaConf.merge(
+        OmegaConf.load("scacchi/configs/config.yaml"),
+        OmegaConf.create(
+            {
+                "train": {"search": {"num_simulations": 9, "gumbel_scale": 1.5}},
+                "eval": {"search": {"num_simulations": 3, "gumbel_scale": 0.0}},
+            }
+        ),
     )
 
     cfg = config_from_dict_config(raw_cfg)
@@ -55,7 +69,22 @@ def test_train_and_eval_search_configs_are_independent():
 
 def test_enabled_eval_requires_even_batch_size():
     with pytest.raises(ValueError, match="eval.batch_size must be even"):
-        EvalConfig(enabled=True, batch_size=3)
+        EvalConfig(
+            enabled=True,
+            interval=10,
+            batch_size=3,
+            max_num_steps=64,
+            search={
+                "name": "gumbel",
+                "num_simulations": 4,
+                "max_num_considered_actions": 8,
+                "max_depth": 16,
+                "gumbel_scale": 0.0,
+            },
+            anchor_interval=50,
+            max_anchors=4,
+            initial_anchor_elo=0.0,
+        )
 
 
 def test_unknown_top_level_config_section_is_rejected():

@@ -8,7 +8,7 @@ import pgx
 from flax import nnx
 from omegaconf import OmegaConf
 
-from scacchi.config import EvalConfig, EvalSearchConfig
+from scacchi.config import EvalConfig, SearchConfig
 from scacchi.evaluation import (
     Anchor,
     add_anchor,
@@ -62,14 +62,20 @@ def test_score_to_elo_is_finite_and_ordered():
 def test_tiny_match_batch_and_anchor_report(tmp_path: Path):
     env, model = _small_state()
     cfg = EvalConfig(
+        enabled=True,
+        interval=1,
         batch_size=2,
         max_num_steps=2,
-        search=EvalSearchConfig(
+        search=SearchConfig(
+            name="gumbel",
             num_simulations=2,
             max_num_considered_actions=4,
             max_depth=2,
             gumbel_scale=0.0,
         ),
+        anchor_interval=1,
+        max_anchors=1,
+        initial_anchor_elo=0.0,
     )
     eval_fn = nnx.jit(
         lambda candidate_model, anchor_model, key: play_match_batch(

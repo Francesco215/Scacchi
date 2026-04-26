@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Any, Mapping, TypeVar, cast
 
 from omegaconf import DictConfig, OmegaConf
-from omegaconf.errors import OmegaConfBaseException
 
 T = TypeVar("T")
 
@@ -95,7 +94,7 @@ def _as_section(value: Any, cls: type[T], name: str) -> T:
 
 @dataclass
 class EnvConfig:
-    id: str = "chess"
+    id: str
 
     def __post_init__(self) -> None:
         self.id = _as_str(self.id, "env.id")
@@ -103,12 +102,12 @@ class EnvConfig:
 
 @dataclass
 class ModelConfig:
-    name: str = "resnet"
-    channels: int = 64
-    blocks: int = 4
-    policy_channels: int = 2
-    value_channels: int = 1
-    value_hidden: int = 64
+    name: str
+    channels: int
+    blocks: int
+    policy_channels: int
+    value_channels: int
+    value_hidden: int
 
     def __post_init__(self) -> None:
         self.name = _as_str(self.name, "model.name").lower()
@@ -123,10 +122,10 @@ class ModelConfig:
 
 @dataclass
 class OptimizerConfig:
-    name: str = "adamw"
-    learning_rate: float = 1.0e-3
-    weight_decay: float = 1.0e-4
-    adam_weight_decay: float = 0.0
+    name: str
+    learning_rate: float
+    weight_decay: float
+    adam_weight_decay: float
 
     def __post_init__(self) -> None:
         self.name = _as_str(self.name, "optimizer.name").lower()
@@ -139,7 +138,7 @@ class OptimizerConfig:
         )
 
 
-def _validate_search_config(config: Any, prefix: str) -> None:
+def _validate_search_config(config: Any, prefix: str = "search") -> None:
     config.name = _as_str(config.name, f"{prefix}.name").lower()
     config.num_simulations = _as_int(
         config.num_simulations, f"{prefix}.num_simulations", min_value=1
@@ -154,39 +153,27 @@ def _validate_search_config(config: Any, prefix: str) -> None:
 
 
 @dataclass
-class TrainSearchConfig:
-    name: str = "gumbel"
-    num_simulations: int = 16
-    max_num_considered_actions: int = 16
-    max_depth: int | None = None
-    gumbel_scale: float = 1.0
+class SearchConfig:
+    name: str
+    num_simulations: int
+    max_num_considered_actions: int
+    max_depth: int | None
+    gumbel_scale: float
 
     def __post_init__(self) -> None:
-        _validate_search_config(self, "train.search")
-
-
-@dataclass
-class EvalSearchConfig:
-    name: str = "gumbel"
-    num_simulations: int = 4
-    max_num_considered_actions: int = 8
-    max_depth: int | None = 16
-    gumbel_scale: float = 0.0
-
-    def __post_init__(self) -> None:
-        _validate_search_config(self, "eval.search")
+        _validate_search_config(self)
 
 
 @dataclass
 class EvalConfig:
-    enabled: bool = True
-    interval: int = 10
-    batch_size: int = 4
-    max_num_steps: int = 64
-    search: EvalSearchConfig = field(default_factory=EvalSearchConfig)
-    anchor_interval: int = 50
-    max_anchors: int = 4
-    initial_anchor_elo: float = 0.0
+    enabled: bool
+    interval: int
+    batch_size: int
+    max_num_steps: int
+    search: SearchConfig
+    anchor_interval: int
+    max_anchors: int
+    initial_anchor_elo: float
 
     def __post_init__(self) -> None:
         self.enabled = _as_bool(self.enabled, "eval.enabled")
@@ -196,7 +183,8 @@ class EvalConfig:
             msg = "eval.batch_size must be even for color-balanced matches."
             raise ValueError(msg)
         self.max_num_steps = _as_int(self.max_num_steps, "eval.max_num_steps", min_value=1)
-        self.search = _as_section(self.search, EvalSearchConfig, "eval.search")
+        self.search = _as_section(self.search, SearchConfig, "eval.search")
+        _validate_search_config(self.search, "eval.search")
         self.anchor_interval = _as_int(
             self.anchor_interval, "eval.anchor_interval", min_value=1
         )
@@ -206,10 +194,10 @@ class EvalConfig:
 
 @dataclass
 class CheckpointConfig:
-    dir: str = "checkpoints"
-    max_to_keep: int = 5
-    save_interval_steps: int = 1000
-    resume: bool = True
+    dir: str
+    max_to_keep: int
+    save_interval_steps: int
+    resume: bool
 
     def __post_init__(self) -> None:
         self.dir = _as_str(self.dir, "checkpoint.dir")
@@ -222,9 +210,9 @@ class CheckpointConfig:
 
 @dataclass
 class RuntimeConfig:
-    name: str = "single_mesh"
-    axis_name: str = "data"
-    num_devices: int = 1
+    name: str
+    axis_name: str
+    num_devices: int
 
     def __post_init__(self) -> None:
         self.name = _as_str(self.name, "runtime.name").lower()
@@ -234,13 +222,13 @@ class RuntimeConfig:
 
 @dataclass
 class TrainConfig:
-    seed: int = 0
-    num_iters: int = 10_000
-    selfplay_batch_size: int = 32
-    max_num_steps: int = 16
-    search: TrainSearchConfig = field(default_factory=TrainSearchConfig)
-    batch_size: int = 128
-    log_interval: int = 10
+    seed: int
+    num_iters: int
+    selfplay_batch_size: int
+    max_num_steps: int
+    search: SearchConfig
+    batch_size: int
+    log_interval: int
 
     def __post_init__(self) -> None:
         self.seed = _as_int(self.seed, "train.seed", min_value=0)
@@ -249,20 +237,21 @@ class TrainConfig:
             self.selfplay_batch_size, "train.selfplay_batch_size", min_value=1
         )
         self.max_num_steps = _as_int(self.max_num_steps, "train.max_num_steps", min_value=1)
-        self.search = _as_section(self.search, TrainSearchConfig, "train.search")
+        self.search = _as_section(self.search, SearchConfig, "train.search")
+        _validate_search_config(self.search, "train.search")
         self.batch_size = _as_int(self.batch_size, "train.batch_size", min_value=1)
         self.log_interval = _as_int(self.log_interval, "train.log_interval", min_value=1)
 
 
 @dataclass
 class ScacchiConfig:
-    env: EnvConfig = field(default_factory=EnvConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-    eval: EvalConfig = field(default_factory=EvalConfig)
-    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
-    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    train: TrainConfig = field(default_factory=TrainConfig)
+    env: EnvConfig
+    model: ModelConfig
+    optimizer: OptimizerConfig
+    eval: EvalConfig
+    checkpoint: CheckpointConfig
+    runtime: RuntimeConfig
+    train: TrainConfig
 
     def __post_init__(self) -> None:
         self.env = _as_section(self.env, EnvConfig, "env")
@@ -298,9 +287,7 @@ def config_from_dict_config(cfg: DictConfig | Mapping[str, Any] | ScacchiConfig)
         raise ValueError(msg)
 
     try:
-        schema = OmegaConf.structured(ScacchiConfig)
-        merged = OmegaConf.merge(schema, clean_data)
-        return cast(ScacchiConfig, OmegaConf.to_object(merged))
-    except OmegaConfBaseException as exc:
+        return ScacchiConfig(**clean_data)
+    except TypeError as exc:
         msg = f"Invalid training config: {exc}"
         raise ValueError(msg) from exc

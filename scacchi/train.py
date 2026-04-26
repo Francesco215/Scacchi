@@ -41,8 +41,11 @@ def main(raw_cfg: DictConfig) -> None:
     cfg_dict = asdict(cfg)
     absl_logging.set_verbosity(absl_logging.WARNING)
     env = pgx.make(cast(pgx.EnvId, cfg.env.id))
-    if tuple(env.observation_shape) != (8, 8, 119) or env.num_actions != 4672:
-        raise ValueError("This entrypoint is configured for PGX full chess.")
+    observation_shape = tuple(env.observation_shape)
+    if len(observation_shape) != 3:
+        raise ValueError(
+            f"Expected a spatial PGX observation with rank 3, got {observation_shape}."
+        )
 
     mesh = create_mesh(cfg.runtime)
     validate_batch_size(cfg.train.selfplay_batch_size, mesh)
@@ -53,7 +56,7 @@ def main(raw_cfg: DictConfig) -> None:
 
     model = AlphaZeroResNet(
         cfg.model,
-        observation_shape=tuple(env.observation_shape),
+        observation_shape=observation_shape,
         num_actions=env.num_actions,
         seed=cfg.train.seed,
     )
@@ -109,14 +112,32 @@ def main(raw_cfg: DictConfig) -> None:
             batch = compute_training_batch(data)
             batch = take_batch(shuffle_batch(batch, shuffle_key), cfg.train.batch_size)
             metrics = train_step(model, optimizer, batch)
-            
-            
+
             metrics_host = jax.device_get(metrics)
-            log: dict[str, float | int] = {"iteration": iteration, "loss": float(metrics_host.loss), "policy_loss": float(metrics_host.policy_loss), "value_loss": float(metrics_host.value_loss), "samples": int(batch.observation.shape[0]), "mean_value_target": float(jnp.mean(batch.value_target))}
+            value_mask = batch.value_mask.astype(jnp.float32)
+            log: dict[str, float | int] = {
+                "iteration": iteration,
+                "loss": float(metrics_host.loss),
+                "policy_loss": float(metrics_host.policy_loss),
+                "value_loss": float(metrics_host.value_loss),
+                "samples": int(batch.observation.shape[0]),
+                "value_mask_frac": float(jnp.mean(value_mask)),
+                "mean_value_target": float(jnp.mean(batch.value_target)),
+                "mean_abs_value_target": float(
+                    jnp.sum(jnp.abs(batch.value_target) * value_mask)
+                    / jnp.maximum(jnp.sum(value_mask), 1.0)
+                ),
+            }
             eval_ran = eval_enabled and iteration % cfg.eval.interval == 0
             if eval_ran:
                 rng_key, eval_key = jax.random.split(rng_key)
-                report = evaluate_vs_anchors(eval_fn=eval_fn, candidate_model=model, anchors=anchors, rng_key=eval_key, iteration=iteration)
+                report = evaluate_vs_anchors(
+                    eval_fn=eval_fn,
+                    candidate_model=model,
+                    anchors=anchors,
+                    rng_key=eval_key,
+                    iteration=iteration,
+                )
                 current_elo = report.elo
                 log.update(report_to_log_dict(report))
                 append_eval_history("eval_history.jsonl", report)

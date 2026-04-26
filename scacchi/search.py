@@ -12,9 +12,7 @@ import pgx
 from flax import nnx
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
-from scacchi.config import EvalSearchConfig, TrainSearchConfig
-
-SearchConfig = TrainSearchConfig | EvalSearchConfig
+from scacchi.config import SearchConfig
 
 
 def mask_illegal_logits(
