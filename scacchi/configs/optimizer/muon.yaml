@@ -1,4 +1,0 @@
-name: muon
-learning_rate: 1.0e-3
-weight_decay: 0.0
-adam_weight_decay: 0.0

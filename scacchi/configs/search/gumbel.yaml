@@ -1,6 +1,0 @@
-name: gumbel
-num_simulations: 16
-max_num_considered_actions: 16
-max_depth: null
-train_gumbel_scale: 1.0
-eval_gumbel_scale: 0.0
