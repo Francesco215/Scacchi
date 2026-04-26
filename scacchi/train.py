@@ -42,24 +42,12 @@ def main(raw_cfg: DictConfig) -> None:
     absl_logging.set_verbosity(absl_logging.WARNING)
     env = pgx.make(cast(pgx.EnvId, cfg.env.id))
     observation_shape = tuple(env.observation_shape)
-    if len(observation_shape) != 3:
-        raise ValueError(
-            f"Expected a spatial PGX observation with rank 3, got {observation_shape}."
-        )
+    assert len(observation_shape) == 3, f"Expected a spatial PGX observation with rank 3, got {observation_shape}."
 
+    #TODO: make the parallelism real!
     mesh = create_mesh(cfg.runtime)
-    validate_batch_size(cfg.train.selfplay_batch_size, mesh)
-    validate_batch_size(cfg.train.batch_size, mesh)
-    eval_enabled = cfg.eval.enabled
-    if eval_enabled:
-        validate_batch_size(cfg.eval.batch_size, mesh)
 
-    model = AlphaZeroResNet(
-        cfg.model,
-        observation_shape=observation_shape,
-        num_actions=env.num_actions,
-        seed=cfg.train.seed,
-    )
+    model = AlphaZeroResNet(cfg.model, observation_shape=observation_shape, num_actions=env.num_actions, seed=cfg.train.seed)
     tx = make_optimizer(cfg.optimizer)
     optimizer = init_optimizer(model, tx)
     train_step = make_train_step()
@@ -67,36 +55,21 @@ def main(raw_cfg: DictConfig) -> None:
         lambda model, key: run_selfplay(env=env, model=model, rng_key=key, cfg=cfg.train)
     )
     eval_fn = nnx.jit(
-        lambda candidate_model, anchor_model, key: play_match_batch(
-            env=env,
-            candidate_model=candidate_model,
-            anchor_model=anchor_model,
-            rng_key=key,
-            cfg=cfg.eval,
-        )
+        lambda candidate_model, anchor_model, key: play_match_batch(env=env, candidate_model=candidate_model, anchor_model=anchor_model, rng_key=key, cfg=cfg.eval)
     )
     rng_key = jax.random.key(cfg.train.seed)
     print(OmegaConf.to_yaml(OmegaConf.create(cfg_dict)))
-    with build_checkpoint_manager(
-        cfg.checkpoint,
-        cfg.checkpoint.dir,
-        max_steps=cfg.train.num_iters,
-    ) as checkpoint_manager:
+    with build_checkpoint_manager(cfg.checkpoint, cfg.checkpoint.dir, max_steps=cfg.train.num_iters) as checkpoint_manager:
         start_iteration = 0
         current_elo = cfg.eval.initial_anchor_elo
         if cfg.checkpoint.resume:
-            restored = restore_checkpoint(
-                checkpoint_manager,
-                model=model,
-                optimizer=optimizer,
-                rng_key=rng_key,
-            )
+            restored = restore_checkpoint(checkpoint_manager, model=model, optimizer=optimizer, rng_key=rng_key)
             start_iteration = restored.start_step
             rng_key = restored.rng_key
             current_elo = float(restored.meta.get("metadata", {}).get("elo", current_elo))
 
         anchors: tuple[Anchor, ...] = ()
-        if eval_enabled:
+        if cfg.eval.enabled:
             anchors = (
                 Anchor(
                     name="initial" if start_iteration == 0 else "resume",
@@ -128,7 +101,7 @@ def main(raw_cfg: DictConfig) -> None:
                     / jnp.maximum(jnp.sum(value_mask), 1.0)
                 ),
             }
-            eval_ran = eval_enabled and iteration % cfg.eval.interval == 0
+            eval_ran = cfg.eval.enabled and iteration % cfg.eval.interval == 0
             if eval_ran:
                 rng_key, eval_key = jax.random.split(rng_key)
                 report = evaluate_vs_anchors(
