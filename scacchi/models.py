@@ -10,6 +10,8 @@ from flax import nnx
 from jaxtyping import Array, Float
 from omegaconf import DictConfig
 
+from scacchi.config import ModelConfig
+
 
 class ResidualBlock(nnx.Module):
     def __init__(self, channels: int, *, rngs: nnx.Rngs):
@@ -30,7 +32,7 @@ class AlphaZeroResNet(nnx.Module):
 
     def __init__(
         self,
-        cfg: DictConfig,
+        cfg: DictConfig | ModelConfig,
         *,
         observation_shape: tuple[int, int, int],
         num_actions: int,

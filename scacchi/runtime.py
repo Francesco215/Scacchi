@@ -7,8 +7,10 @@ import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from omegaconf import DictConfig
 
+from scacchi.config import RuntimeConfig
 
-def create_mesh(cfg: DictConfig) -> Mesh:
+
+def create_mesh(cfg: DictConfig | RuntimeConfig) -> Mesh:
     """Create the runtime mesh.
 
     The default config creates a one-device mesh. Future data parallelism can

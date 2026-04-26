@@ -15,23 +15,17 @@ optimizer:
   weight_decay: 1.0e-4
   adam_weight_decay: 0.0
 
-search:
-  name: gumbel
-  num_simulations: 16
-  max_num_considered_actions: 16
-  max_depth: null
-  train_gumbel_scale: 1.0
-  eval_gumbel_scale: 0.0
-
 eval:
   enabled: true
   interval: 10
   batch_size: 4
   max_num_steps: 64
-  num_simulations: 4
-  max_num_considered_actions: 8
-  max_depth: 16
-  gumbel_scale: 0.0
+  search:
+    name: gumbel
+    num_simulations: 4
+    max_num_considered_actions: 8
+    max_depth: 16
+    gumbel_scale: 0.0
   anchor_interval: 50
   max_anchors: 4
   initial_anchor_elo: 0.0
@@ -52,6 +46,12 @@ train:
   num_iters: 10_000
   selfplay_batch_size: 32
   max_num_steps: 16
+  search:
+    name: gumbel
+    num_simulations: 16
+    max_num_considered_actions: 16
+    max_depth: null
+    gumbel_scale: 1.0
   batch_size: 128
   log_interval: 10
 

@@ -12,6 +12,10 @@ import pgx
 from flax import nnx
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
+from scacchi.config import EvalSearchConfig, TrainSearchConfig
+
+SearchConfig = TrainSearchConfig | EvalSearchConfig
+
 
 def mask_illegal_logits(
     logits: Float[Array, "batch action"], legal_action_mask: Bool[Array, "batch action"]
@@ -63,10 +67,7 @@ def run_search(
     model: nnx.Module,
     rng_key: PRNGKeyArray,
     state: pgx.State,
-    num_simulations: int,
-    max_num_considered_actions: int,
-    max_depth: int | None,
-    gumbel_scale: float,
+    cfg: SearchConfig,
 ) -> mctx.PolicyOutput[Any]:
     """Run Gumbel AlphaZero search from a batched PGX state."""
 
@@ -79,10 +80,10 @@ def run_search(
         rng_key=rng_key,
         root=root,
         recurrent_fn=recurrent_fn,
-        num_simulations=num_simulations,
+        num_simulations=cfg.num_simulations,
         invalid_actions=~state.legal_action_mask,
-        max_depth=max_depth,
+        max_depth=cfg.max_depth,
         qtransform=partial(mctx.qtransform_completed_by_mix_value, use_mixed_value=True),
-        max_num_considered_actions=max_num_considered_actions,
-        gumbel_scale=gumbel_scale,
+        max_num_considered_actions=cfg.max_num_considered_actions,
+        gumbel_scale=cfg.gumbel_scale,
     )

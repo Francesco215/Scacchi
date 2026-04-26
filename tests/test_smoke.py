@@ -6,6 +6,7 @@ import pgx
 from flax import nnx
 from omegaconf import OmegaConf
 
+from scacchi.config import TrainConfig, TrainSearchConfig
 from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
 from scacchi.runtime import batch_sharding, create_mesh, replicated_sharding, validate_batch_size
@@ -90,10 +91,12 @@ def test_mctx_search_returns_legal_actions():
         model=model,
         rng_key=jax.random.key(1),
         state=state,
-        num_simulations=2,
-        max_num_considered_actions=4,
-        max_depth=2,
-        gumbel_scale=1.0,
+        cfg=TrainSearchConfig(
+            num_simulations=2,
+            max_num_considered_actions=4,
+            max_depth=2,
+            gumbel_scale=1.0,
+        ),
     )
     assert policy_output.action.shape == (2,)
     legal = state.legal_action_mask[jnp.arange(2), policy_output.action]
@@ -102,18 +105,18 @@ def test_mctx_search_returns_legal_actions():
 
 def test_tiny_selfplay_and_train_step():
     env, model, optimizer, _ = make_small_state()
-    selfplay_fn = nnx.jit(
-        lambda model, key: run_selfplay(
-            env=env,
-            model=model,
-            rng_key=key,
-            batch_size=2,
-            max_num_steps=2,
+    cfg = TrainConfig(
+        selfplay_batch_size=2,
+        max_num_steps=2,
+        search=TrainSearchConfig(
             num_simulations=2,
             max_num_considered_actions=4,
             max_depth=2,
             gumbel_scale=1.0,
-        )
+        ),
+    )
+    selfplay_fn = nnx.jit(
+        lambda model, key: run_selfplay(env=env, model=model, rng_key=key, cfg=cfg)
     )
     data = selfplay_fn(model, jax.random.key(2))
     assert data.observation.shape == (2, 2, *env.observation_shape)

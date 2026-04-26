@@ -15,15 +15,15 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false uv run python -m scacchi.train \
   train.selfplay_batch_size=2 \
   train.max_num_steps=2 \
   train.batch_size=4 \
-  search.num_simulations=2 \
-  search.max_num_considered_actions=4 \
-  search.max_depth=2 \
+  train.search.num_simulations=2 \
+  train.search.max_num_considered_actions=4 \
+  train.search.max_depth=2 \
   eval.interval=1 \
   eval.batch_size=2 \
   eval.max_num_steps=2 \
-  eval.num_simulations=2 \
-  eval.max_num_considered_actions=4 \
-  eval.max_depth=2
+  eval.search.num_simulations=2 \
+  eval.search.max_num_considered_actions=4 \
+  eval.search.max_depth=2
 ```
 
 Evaluation writes relative Elo progress against frozen anchors to `eval_history.jsonl`

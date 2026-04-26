@@ -10,6 +10,8 @@ import orbax.checkpoint as ocp
 from flax import nnx
 from omegaconf import DictConfig, OmegaConf
 
+from scacchi.config import CheckpointConfig
+
 ITEM_NAMES = ("model_state", "optimizer_state", "rngs", "meta")
 
 
@@ -28,7 +30,7 @@ class RestoreResult(NamedTuple):
 
 
 def build_checkpoint_manager(
-    cfg: DictConfig,
+    cfg: DictConfig | CheckpointConfig,
     ckpt_dir: str | Path,
     *,
     max_steps: int,

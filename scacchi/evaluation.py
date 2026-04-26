@@ -14,6 +14,7 @@ import pgx
 from flax import nnx
 from jaxtyping import Array, Float, PRNGKeyArray
 
+from scacchi.config import EvalConfig
 from scacchi.search import run_search
 
 
@@ -77,15 +78,11 @@ def play_match_batch(
     candidate_model: nnx.Module,
     anchor_model: nnx.Module,
     rng_key: PRNGKeyArray,
-    batch_size: int,
-    max_num_steps: int,
-    num_simulations: int,
-    max_num_considered_actions: int,
-    max_depth: int | None,
-    gumbel_scale: float,
+    cfg: EvalConfig,
 ) -> MatchStats:
     """Play a batched candidate-vs-anchor match set with alternating colors."""
 
+    batch_size = cfg.batch_size
     if batch_size % 2 != 0:
         msg = "Evaluation batch_size must be even for color balancing."
         raise ValueError(msg)
@@ -114,20 +111,14 @@ def play_match_batch(
             model=candidate_model,
             rng_key=candidate_key,
             state=search_state,
-            num_simulations=num_simulations,
-            max_num_considered_actions=max_num_considered_actions,
-            max_depth=max_depth,
-            gumbel_scale=gumbel_scale,
+            cfg=cfg.search,
         )
         anchor_policy = run_search(
             env=env,
             model=anchor_model,
             rng_key=anchor_key,
             state=search_state,
-            num_simulations=num_simulations,
-            max_num_considered_actions=max_num_considered_actions,
-            max_depth=max_depth,
-            gumbel_scale=gumbel_scale,
+            cfg=cfg.search,
         )
 
         candidate_to_move = search_state.current_player == candidate_player
@@ -141,7 +132,7 @@ def play_match_batch(
         )
         return (state, candidate_return, done | next_done), None
 
-    keys = jax.random.split(scan_key, max_num_steps)
+    keys = jax.random.split(scan_key, cfg.max_num_steps)
     init_carry = (
         state,
         jnp.zeros(batch_size, dtype=jnp.float32),
