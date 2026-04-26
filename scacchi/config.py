@@ -138,18 +138,6 @@ class OptimizerConfig:
         )
 
 
-def _validate_search_config(config: Any, prefix: str = "search") -> None:
-    config.name = _as_str(config.name, f"{prefix}.name").lower()
-    config.num_simulations = _as_int(
-        config.num_simulations, f"{prefix}.num_simulations", min_value=1
-    )
-    config.max_num_considered_actions = _as_int(
-        config.max_num_considered_actions,
-        f"{prefix}.max_num_considered_actions",
-        min_value=1,
-    )
-    config.max_depth = _as_optional_int(config.max_depth, f"{prefix}.max_depth", min_value=1)
-    config.gumbel_scale = _as_float(config.gumbel_scale, f"{prefix}.gumbel_scale", min_value=0.0)
 
 
 @dataclass
@@ -160,8 +148,18 @@ class SearchConfig:
     max_depth: int | None
     gumbel_scale: float
 
-    def __post_init__(self) -> None:
-        _validate_search_config(self)
+    def __post_init__(self, prefix: str="search") -> None:
+        self.name = _as_str(self.name, f"{prefix}.name").lower()
+        self.num_simulations = _as_int(
+            self.num_simulations, f"{prefix}.num_simulations", min_value=1
+        )
+        self.max_num_considered_actions = _as_int(
+            self.max_num_considered_actions,
+            f"{prefix}.max_num_considered_actions",
+            min_value=1,
+        )
+        self.max_depth = _as_optional_int(self.max_depth, f"{prefix}.max_depth", min_value=1)
+        self.gumbel_scale = _as_float(self.gumbel_scale, f"{prefix}.gumbel_scale", min_value=0.0)
 
 
 @dataclass
@@ -184,7 +182,6 @@ class EvalConfig:
             raise ValueError(msg)
         self.max_num_steps = _as_int(self.max_num_steps, "eval.max_num_steps", min_value=1)
         self.search = _as_section(self.search, SearchConfig, "eval.search")
-        _validate_search_config(self.search, "eval.search")
         self.anchor_interval = _as_int(
             self.anchor_interval, "eval.anchor_interval", min_value=1
         )
@@ -238,7 +235,6 @@ class TrainConfig:
         )
         self.max_num_steps = _as_int(self.max_num_steps, "train.max_num_steps", min_value=1)
         self.search = _as_section(self.search, SearchConfig, "train.search")
-        _validate_search_config(self.search, "train.search")
         self.batch_size = _as_int(self.batch_size, "train.batch_size", min_value=1)
         self.log_interval = _as_int(self.log_interval, "train.log_interval", min_value=1)
 
