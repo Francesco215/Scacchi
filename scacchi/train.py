@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import pgx
 from absl import logging as absl_logging
+from flax import nnx
 from omegaconf import DictConfig, OmegaConf
 
 from scacchi.checkpoint import (
@@ -29,7 +30,7 @@ from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
 from scacchi.runtime import create_mesh, validate_batch_size
 from scacchi.selfplay import compute_training_batch, run_selfplay
-from scacchi.training import init_train_state, make_train_step, shuffle_batch, take_batch
+from scacchi.training import init_optimizer, make_train_step, shuffle_batch, take_batch
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -62,13 +63,12 @@ def main(cfg: DictConfig) -> None:
         seed=int(cfg.train.seed),
     )
     tx = make_optimizer(cfg.optimizer)
-    graphdef, train_state = init_train_state(model, tx)
-    train_step = make_train_step(graphdef, tx)
-    selfplay_fn = jax.jit(
-        lambda params, key: run_selfplay(
+    optimizer = init_optimizer(model, tx)
+    train_step = make_train_step()
+    selfplay_fn = nnx.jit(
+        lambda model, key: run_selfplay(
             env=env,
-            graphdef=graphdef,
-            params=params,
+            model=model,
             rng_key=key,
             batch_size=int(cfg.train.selfplay_batch_size),
             max_num_steps=int(cfg.train.max_num_steps),
@@ -78,12 +78,11 @@ def main(cfg: DictConfig) -> None:
             gumbel_scale=float(cfg.search.train_gumbel_scale),
         )
     )
-    eval_fn = jax.jit(
-        lambda candidate_params, anchor_params, key: play_match_batch(
+    eval_fn = nnx.jit(
+        lambda candidate_model, anchor_model, key: play_match_batch(
             env=env,
-            graphdef=graphdef,
-            candidate_params=candidate_params,
-            anchor_params=anchor_params,
+            candidate_model=candidate_model,
+            anchor_model=anchor_model,
             rng_key=key,
             batch_size=int(cfg.eval.batch_size),
             max_num_steps=int(cfg.eval.max_num_steps),
@@ -105,11 +104,11 @@ def main(cfg: DictConfig) -> None:
         if bool(cfg.checkpoint.resume):
             restored = restore_checkpoint(
                 checkpoint_manager,
-                train_state=train_state,
+                model=model,
+                optimizer=optimizer,
                 rng_key=rng_key,
             )
             start_iteration = restored.start_step
-            train_state = restored.train_state
             rng_key = restored.rng_key
             current_elo = float(restored.meta.get("metadata", {}).get("elo", current_elo))
 
@@ -118,7 +117,7 @@ def main(cfg: DictConfig) -> None:
             anchors = (
                 Anchor(
                     name="initial" if start_iteration == 0 else "resume",
-                    params=train_state.params,
+                    model=nnx.clone(model),
                     elo=current_elo,
                     iteration=max(start_iteration - 1, 0),
                 ),
@@ -126,10 +125,10 @@ def main(cfg: DictConfig) -> None:
 
         for iteration in range(start_iteration, int(cfg.train.num_iters)):
             rng_key, selfplay_key, shuffle_key = jax.random.split(rng_key, 3)
-            data = selfplay_fn(train_state.params, selfplay_key)
+            data = selfplay_fn(model, selfplay_key)
             batch = compute_training_batch(data)
             batch = take_batch(shuffle_batch(batch, shuffle_key), int(cfg.train.batch_size))
-            train_state, metrics = train_step(train_state, batch)
+            metrics = train_step(model, optimizer, batch)
             metrics_host = jax.device_get(metrics)
             log: dict[str, float | int] = {
                 "iteration": iteration,
@@ -144,7 +143,7 @@ def main(cfg: DictConfig) -> None:
                 rng_key, eval_key = jax.random.split(rng_key)
                 report = evaluate_vs_anchors(
                     eval_fn=eval_fn,
-                    candidate_params=train_state.params,
+                    candidate_model=model,
                     anchors=anchors,
                     rng_key=eval_key,
                     iteration=iteration,
@@ -155,7 +154,7 @@ def main(cfg: DictConfig) -> None:
                 if iteration > 0 and iteration % int(cfg.eval.anchor_interval) == 0:
                     anchors = add_anchor(
                         anchors,
-                        params=train_state.params,
+                        model=model,
                         elo=current_elo,
                         iteration=iteration,
                         max_anchors=int(cfg.eval.max_anchors),
@@ -166,7 +165,8 @@ def main(cfg: DictConfig) -> None:
                 checkpoint_manager,
                 iteration,
                 cfg=OmegaConf.to_container(cfg, resolve=True),
-                train_state=train_state,
+                model=model,
+                optimizer=optimizer,
                 rng_key=rng_key,
                 metadata={
                     "elo": current_elo,

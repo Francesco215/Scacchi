@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
-import optax
-from flax import nnx
 from jaxtyping import Array, Bool, Float
 
 
@@ -22,11 +20,3 @@ class TrainingBatch(NamedTuple):
     policy_target: Float[Array, "batch action"]
     value_target: Float[Array, "batch"]
     value_mask: Bool[Array, "batch"]
-
-
-class TrainState(NamedTuple):
-    params: nnx.State
-    opt_state: optax.OptState
-
-
-ModelGraphDef = Any

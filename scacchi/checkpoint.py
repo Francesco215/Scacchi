@@ -1,4 +1,4 @@
-"""Orbax checkpoints for training state, RNG, and metadata."""
+"""Orbax checkpoints for NNX model state, optimizer state, RNG, and metadata."""
 
 from __future__ import annotations
 
@@ -7,9 +7,8 @@ from typing import Any, NamedTuple
 
 import jax
 import orbax.checkpoint as ocp
+from flax import nnx
 from omegaconf import DictConfig, OmegaConf
-
-from scacchi.types import TrainState
 
 ITEM_NAMES = ("model_state", "optimizer_state", "rngs", "meta")
 
@@ -24,7 +23,6 @@ class NoOpCheckpointManager(ocp.CheckpointManager):
 
 class RestoreResult(NamedTuple):
     start_step: int
-    train_state: TrainState
     rng_key: jax.Array
     meta: dict[str, Any]
 
@@ -71,7 +69,8 @@ def maybe_save_checkpoint(
     step: int,
     *,
     cfg: Any,
-    train_state: TrainState,
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
     rng_key: jax.Array,
     metadata: dict[str, Any] | None = None,
 ) -> bool:
@@ -81,8 +80,8 @@ def maybe_save_checkpoint(
         return False
 
     save_args = ocp.args.Composite(
-        model_state=ocp.args.StandardSave(train_state.params),
-        optimizer_state=ocp.args.StandardSave(train_state.opt_state),
+        model_state=ocp.args.StandardSave(nnx.state(model)),
+        optimizer_state=ocp.args.StandardSave(nnx.state(optimizer)),
         rngs=ocp.args.StandardSave({"key": rng_key}),
         meta=ocp.args.JsonSave(_json_meta(cfg=cfg, step=step, metadata=metadata)),
     )
@@ -92,29 +91,27 @@ def maybe_save_checkpoint(
 def restore_checkpoint(
     manager: ocp.CheckpointManager,
     *,
-    train_state: TrainState,
+    model: nnx.Module,
+    optimizer: nnx.Optimizer,
     rng_key: jax.Array,
 ) -> RestoreResult:
     """Restore latest checkpoint, or return provided state if none exists."""
 
     step = manager.latest_step()
     if step is None:
-        return RestoreResult(start_step=0, train_state=train_state, rng_key=rng_key, meta={})
+        return RestoreResult(start_step=0, rng_key=rng_key, meta={})
 
     restore_args = ocp.args.Composite(
-        model_state=ocp.args.StandardRestore(train_state.params),
-        optimizer_state=ocp.args.StandardRestore(train_state.opt_state),
+        model_state=ocp.args.StandardRestore(nnx.state(model)),
+        optimizer_state=ocp.args.StandardRestore(nnx.state(optimizer)),
         rngs=ocp.args.StandardRestore({"key": rng_key}),
         meta=ocp.args.JsonRestore(),
     )
     restored = manager.restore(step, args=restore_args)
-    restored_state = TrainState(
-        params=restored["model_state"],
-        opt_state=restored["optimizer_state"],
-    )
+    nnx.update(model, restored["model_state"])
+    nnx.update(optimizer, restored["optimizer_state"])
     return RestoreResult(
         start_step=int(step) + 1,
-        train_state=restored_state,
         rng_key=restored["rngs"]["key"],
         meta=restored["meta"],
     )

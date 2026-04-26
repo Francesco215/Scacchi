@@ -10,14 +10,13 @@ from jaxtyping import PRNGKeyArray
 from pgx.experimental import auto_reset
 
 from scacchi.search import run_search
-from scacchi.types import ModelGraphDef, SelfplayBatch, TrainingBatch
+from scacchi.types import SelfplayBatch, TrainingBatch
 
 
 def run_selfplay(
     *,
     env: pgx.Env,
-    graphdef: ModelGraphDef,
-    params: nnx.State,
+    model: nnx.Module,
     rng_key: PRNGKeyArray,
     batch_size: int,
     max_num_steps: int,
@@ -39,8 +38,7 @@ def run_selfplay(
         actor = state.current_player
         policy_output = run_search(
             env=env,
-            graphdef=graphdef,
-            params=params,
+            model=model,
             rng_key=search_key,
             state=state,
             num_simulations=num_simulations,

@@ -12,8 +12,6 @@ import pgx
 from flax import nnx
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
-from scacchi.types import ModelGraphDef
-
 
 def mask_illegal_logits(
     logits: Float[Array, "batch action"], legal_action_mask: Bool[Array, "batch action"]
@@ -25,34 +23,25 @@ def mask_illegal_logits(
     return jnp.where(legal_action_mask, logits, min_logit)
 
 
-def predict(
-    graphdef: ModelGraphDef,
-    params: nnx.State,
-    observation: Float[Array, "... height width channels"],
-    *,
-    train: bool,
-) -> tuple[Float[Array, "... action"], Float[Array, "..."]]:
-    """Functional NNX model call used inside JAX transforms."""
-
-    model = nnx.merge(graphdef, params)
-    return model(observation, train=train)
 
 
-def make_recurrent_fn(env: pgx.Env, graphdef: ModelGraphDef):
+
+def make_recurrent_fn(env: pgx.Env, model: nnx.Module):
     """Create an MCTX recurrent function backed by PGX dynamics."""
 
     step = jax.vmap(env.step)
 
     def recurrent_fn(
-        params: nnx.State,
+        unused_params: Any,
         rng_key: PRNGKeyArray,
         action: Int[Array, "batch"],
         state: pgx.State,
     ) -> tuple[mctx.RecurrentFnOutput, pgx.State]:
+        del unused_params
         del rng_key
         actor = state.current_player
         next_state = step(state, action)
-        logits, value = predict(graphdef, params, next_state.observation, train=False)
+        logits, value = model(next_state.observation, train=False)
         logits = mask_illegal_logits(logits, next_state.legal_action_mask)
         reward = next_state.rewards[jnp.arange(action.shape[0]), actor]
         value = jnp.where(next_state.terminated, 0.0, value)
@@ -71,8 +60,7 @@ def make_recurrent_fn(env: pgx.Env, graphdef: ModelGraphDef):
 def run_search(
     *,
     env: pgx.Env,
-    graphdef: ModelGraphDef,
-    params: nnx.State,
+    model: nnx.Module,
     rng_key: PRNGKeyArray,
     state: pgx.State,
     num_simulations: int,
@@ -82,12 +70,12 @@ def run_search(
 ) -> mctx.PolicyOutput[Any]:
     """Run Gumbel AlphaZero search from a batched PGX state."""
 
-    logits, value = predict(graphdef, params, state.observation, train=False)
+    logits, value = model(state.observation, train=False)
     logits = mask_illegal_logits(logits, state.legal_action_mask)
     root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
-    recurrent_fn = make_recurrent_fn(env, graphdef)
+    recurrent_fn = make_recurrent_fn(env, model)
     return mctx.gumbel_muzero_policy(
-        params=params,
+        params=(),
         rng_key=rng_key,
         root=root,
         recurrent_fn=recurrent_fn,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pgx
+from flax import nnx
 from omegaconf import OmegaConf
 
 from scacchi.checkpoint import (
@@ -12,10 +13,10 @@ from scacchi.checkpoint import (
 )
 from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
-from scacchi.training import init_train_state
+from scacchi.training import init_optimizer
 
 
-def _small_train_state():
+def _small_model_and_optimizer(seed: int = 0):
     env = pgx.make("chess")
     model = AlphaZeroResNet(
         OmegaConf.create(
@@ -30,16 +31,16 @@ def _small_train_state():
         ),
         observation_shape=tuple(env.observation_shape),
         num_actions=env.num_actions,
-        seed=0,
+        seed=seed,
     )
     tx = make_optimizer(
         OmegaConf.create({"name": "adamw", "learning_rate": 1.0e-3, "weight_decay": 0.0})
     )
-    return init_train_state(model, tx)[1]
+    return model, init_optimizer(model, tx)
 
 
 def test_orbax_checkpoint_round_trip(tmp_path):
-    train_state = _small_train_state()
+    model, optimizer = _small_model_and_optimizer(seed=0)
     rng_key = jax.random.key(3)
     cfg = OmegaConf.create(
         {
@@ -54,7 +55,8 @@ def test_orbax_checkpoint_round_trip(tmp_path):
             manager,
             0,
             cfg={"example": True},
-            train_state=train_state,
+            model=model,
+            optimizer=optimizer,
             rng_key=rng_key,
             metadata={"elo": 12.5},
         )
@@ -62,17 +64,20 @@ def test_orbax_checkpoint_round_trip(tmp_path):
         assert saved
         assert manager.latest_step() == 0
 
+        restored_model, restored_optimizer = _small_model_and_optimizer(seed=1)
         restored = restore_checkpoint(
             manager,
-            train_state=train_state,
+            model=restored_model,
+            optimizer=restored_optimizer,
             rng_key=jax.random.key(0),
         )
         assert restored.start_step == 1
         assert restored.meta["metadata"]["elo"] == 12.5
         assert jnp.array_equal(restored.rng_key, rng_key)
 
-        original_leaves = jax.tree_util.tree_leaves(train_state.params)
-        restored_leaves = jax.tree_util.tree_leaves(restored.train_state.params)
+        original_leaves = jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))
+        restored_leaves = jax.tree_util.tree_leaves(nnx.state(restored_model, nnx.Param))
         assert len(original_leaves) == len(restored_leaves)
         for original, restored_leaf in zip(original_leaves, restored_leaves, strict=True):
             assert jnp.array_equal(original, restored_leaf)
+        assert int(restored_optimizer.step[...]) == int(optimizer.step[...])

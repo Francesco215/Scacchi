@@ -5,6 +5,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import pgx
+from flax import nnx
 from omegaconf import OmegaConf
 
 from scacchi.evaluation import (
@@ -18,7 +19,7 @@ from scacchi.evaluation import (
 )
 from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
-from scacchi.training import init_train_state
+from scacchi.training import init_optimizer
 
 
 def _small_model_cfg():
@@ -45,8 +46,8 @@ def _small_state():
     tx = make_optimizer(
         OmegaConf.create({"name": "adamw", "learning_rate": 1.0e-3, "weight_decay": 0.0})
     )
-    graphdef, train_state = init_train_state(model, tx)
-    return env, graphdef, train_state
+    init_optimizer(model, tx)
+    return env, model
 
 
 def test_score_to_elo_is_finite_and_ordered():
@@ -58,13 +59,12 @@ def test_score_to_elo_is_finite_and_ordered():
 
 
 def test_tiny_match_batch_and_anchor_report(tmp_path: Path):
-    env, graphdef, train_state = _small_state()
-    eval_fn = jax.jit(
-        lambda candidate_params, anchor_params, key: play_match_batch(
+    env, model = _small_state()
+    eval_fn = nnx.jit(
+        lambda candidate_model, anchor_model, key: play_match_batch(
             env=env,
-            graphdef=graphdef,
-            candidate_params=candidate_params,
-            anchor_params=anchor_params,
+            candidate_model=candidate_model,
+            anchor_model=anchor_model,
             rng_key=key,
             batch_size=2,
             max_num_steps=2,
@@ -75,9 +75,9 @@ def test_tiny_match_batch_and_anchor_report(tmp_path: Path):
         )
     )
     anchors = (
-        Anchor(name="initial", params=train_state.params, elo=0.0, iteration=0),
+        Anchor(name="initial", model=nnx.clone(model), elo=0.0, iteration=0),
     )
-    stats = eval_fn(train_state.params, train_state.params, jax.random.key(1))
+    stats = eval_fn(model, anchors[0].model, jax.random.key(1))
     assert int(stats.games) == 2
     assert int(stats.white_games) == 1
     assert int(stats.black_games) == 1
@@ -86,7 +86,7 @@ def test_tiny_match_batch_and_anchor_report(tmp_path: Path):
 
     report = evaluate_vs_anchors(
         eval_fn=eval_fn,
-        candidate_params=train_state.params,
+        candidate_model=model,
         anchors=anchors,
         rng_key=jax.random.key(2),
         iteration=3,
@@ -103,7 +103,7 @@ def test_tiny_match_batch_and_anchor_report(tmp_path: Path):
 
     updated = add_anchor(
         anchors,
-        params=train_state.params,
+        model=model,
         elo=report.elo,
         iteration=4,
         max_anchors=1,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pgx
+from flax import nnx
 from omegaconf import OmegaConf
 
 from scacchi.models import AlphaZeroResNet
@@ -10,7 +11,7 @@ from scacchi.optim import make_optimizer
 from scacchi.runtime import batch_sharding, create_mesh, replicated_sharding, validate_batch_size
 from scacchi.search import run_search
 from scacchi.selfplay import compute_training_batch, run_selfplay
-from scacchi.training import init_train_state, make_train_step, take_batch
+from scacchi.training import init_optimizer, make_train_step, take_batch
 
 
 def small_model_cfg():
@@ -37,8 +38,8 @@ def make_small_state():
     tx = make_optimizer(
         OmegaConf.create({"name": "adamw", "learning_rate": 1.0e-3, "weight_decay": 0.0})
     )
-    graphdef, train_state = init_train_state(model, tx)
-    return env, graphdef, train_state, tx
+    optimizer = init_optimizer(model, tx)
+    return env, model, optimizer, tx
 
 
 def test_pgx_chess_and_mesh_contracts():
@@ -53,8 +54,7 @@ def test_pgx_chess_and_mesh_contracts():
 
 
 def test_model_and_optimizer_factories():
-    env, graphdef, train_state, _ = make_small_state()
-    del graphdef
+    env, _, optimizer, _ = make_small_state()
     state = jax.vmap(env.init)(jax.random.split(jax.random.key(0), 3))
     model = AlphaZeroResNet(
         small_model_cfg(),
@@ -67,7 +67,7 @@ def test_model_and_optimizer_factories():
     assert value.shape == (3,)
     assert jnp.isfinite(logits).all()
     assert jnp.isfinite(value).all()
-    assert train_state.opt_state is not None
+    assert optimizer.opt_state is not None
 
     muon = make_optimizer(
         OmegaConf.create(
@@ -83,12 +83,11 @@ def test_model_and_optimizer_factories():
 
 
 def test_mctx_search_returns_legal_actions():
-    env, graphdef, train_state, _ = make_small_state()
+    env, model, _, _ = make_small_state()
     state = jax.vmap(env.init)(jax.random.split(jax.random.key(0), 2))
     policy_output = run_search(
         env=env,
-        graphdef=graphdef,
-        params=train_state.params,
+        model=model,
         rng_key=jax.random.key(1),
         state=state,
         num_simulations=2,
@@ -102,12 +101,11 @@ def test_mctx_search_returns_legal_actions():
 
 
 def test_tiny_selfplay_and_train_step():
-    env, graphdef, train_state, tx = make_small_state()
-    selfplay_fn = jax.jit(
-        lambda params, key: run_selfplay(
+    env, model, optimizer, _ = make_small_state()
+    selfplay_fn = nnx.jit(
+        lambda model, key: run_selfplay(
             env=env,
-            graphdef=graphdef,
-            params=params,
+            model=model,
             rng_key=key,
             batch_size=2,
             max_num_steps=2,
@@ -117,15 +115,15 @@ def test_tiny_selfplay_and_train_step():
             gumbel_scale=1.0,
         )
     )
-    data = selfplay_fn(train_state.params, jax.random.key(2))
+    data = selfplay_fn(model, jax.random.key(2))
     assert data.observation.shape == (2, 2, *env.observation_shape)
     assert data.action_weights.shape == (2, 2, env.num_actions)
     assert jnp.isfinite(data.action_weights).all()
 
     batch = take_batch(compute_training_batch(data), 4)
-    before = jax.tree_util.tree_leaves(train_state.params)
-    train_state, metrics = make_train_step(graphdef, tx)(train_state, batch)
-    after = jax.tree_util.tree_leaves(train_state.params)
+    before = jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))
+    metrics = make_train_step()(model, optimizer, batch)
+    after = jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))
     assert jnp.isfinite(metrics.loss)
     assert jnp.isfinite(metrics.policy_loss)
     assert jnp.isfinite(metrics.value_loss)

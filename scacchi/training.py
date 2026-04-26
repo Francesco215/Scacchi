@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -10,8 +10,7 @@ import optax
 from flax import nnx
 from jaxtyping import Array, Float, PRNGKeyArray
 
-from scacchi.search import predict
-from scacchi.types import ModelGraphDef, TrainState, TrainingBatch
+from scacchi.types import TrainingBatch
 
 
 class LossMetrics(NamedTuple):
@@ -20,23 +19,19 @@ class LossMetrics(NamedTuple):
     value_loss: Float[Array, ""]
 
 
-def init_train_state(model: nnx.Module, tx: optax.GradientTransformation) -> tuple[
-    ModelGraphDef, TrainState
-]:
-    """Split an NNX model into a pure graph/state pair and initialize Optax."""
+def init_optimizer(model: nnx.Module, tx: optax.GradientTransformation) -> nnx.Optimizer:
+    """Initialize an NNX optimizer for model parameters."""
 
-    graphdef, params = nnx.split(model)
-    return graphdef, TrainState(params=params, opt_state=tx.init(params))
+    return nnx.Optimizer(model, tx, wrt=nnx.Param)
 
 
 def loss_fn(
-    graphdef: ModelGraphDef,
-    params: nnx.State,
+    model: nnx.Module,
     batch: TrainingBatch,
 ) -> tuple[Float[Array, ""], LossMetrics]:
     """Policy cross-entropy plus masked value MSE."""
 
-    logits, value = predict(graphdef, params, batch.observation, train=True)
+    logits, value = model(batch.observation, train=True)
     policy_loss = optax.softmax_cross_entropy(logits, batch.policy_target).mean()
     value_loss = optax.l2_loss(value, batch.value_target)
     mask = batch.value_mask.astype(value_loss.dtype)
@@ -45,18 +40,21 @@ def loss_fn(
     return loss, LossMetrics(loss=loss, policy_loss=policy_loss, value_loss=value_loss)
 
 
-def make_train_step(graphdef: ModelGraphDef, tx: optax.GradientTransformation):
-    """Create a jitted train step closing over static model graph and optimizer."""
+def make_train_step():
+    """Create a jitted train step for an NNX model and optimizer."""
 
-    @jax.jit
-    def train_step(state: TrainState, batch: TrainingBatch) -> tuple[TrainState, LossMetrics]:
-        (loss, metrics), grads = jax.value_and_grad(loss_fn, argnums=1, has_aux=True)(
-            graphdef, state.params, batch
-        )
+    @nnx.jit
+    def train_step(
+        model: nnx.Module, optimizer: nnx.Optimizer, batch: TrainingBatch
+    ) -> LossMetrics:
+        (loss, metrics), grads = nnx.value_and_grad(
+            loss_fn,
+            argnums=nnx.DiffState(0, nnx.Param),
+            has_aux=True,
+        )(model, batch)
         del loss
-        updates, opt_state = tx.update(grads, state.opt_state, state.params)
-        params = cast(nnx.State, optax.apply_updates(state.params, updates))
-        return TrainState(params=params, opt_state=opt_state), metrics
+        optimizer.update(model, grads)
+        return metrics
 
     return train_step
 

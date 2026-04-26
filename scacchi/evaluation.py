@@ -15,7 +15,6 @@ from flax import nnx
 from jaxtyping import Array, Float, PRNGKeyArray
 
 from scacchi.search import run_search
-from scacchi.types import ModelGraphDef
 
 
 class MatchStats(NamedTuple):
@@ -31,7 +30,7 @@ class MatchStats(NamedTuple):
 @dataclass(frozen=True)
 class Anchor:
     name: str
-    params: nnx.State
+    model: nnx.Module
     elo: float
     iteration: int
 
@@ -64,7 +63,7 @@ class EloReport:
     anchors: tuple[AnchorResult, ...]
 
 
-EvalFn = Callable[[nnx.State, nnx.State, PRNGKeyArray], MatchStats]
+EvalFn = Callable[[nnx.Module, nnx.Module, PRNGKeyArray], MatchStats]
 
 
 def _where_done(done: Array, done_value: Any, active_value: Any) -> Any:
@@ -75,9 +74,8 @@ def _where_done(done: Array, done_value: Any, active_value: Any) -> Any:
 def play_match_batch(
     *,
     env: pgx.Env,
-    graphdef: ModelGraphDef,
-    candidate_params: nnx.State,
-    anchor_params: nnx.State,
+    candidate_model: nnx.Module,
+    anchor_model: nnx.Module,
     rng_key: PRNGKeyArray,
     batch_size: int,
     max_num_steps: int,
@@ -112,8 +110,7 @@ def play_match_batch(
 
         candidate_policy = run_search(
             env=env,
-            graphdef=graphdef,
-            params=candidate_params,
+            model=candidate_model,
             rng_key=candidate_key,
             state=search_state,
             num_simulations=num_simulations,
@@ -123,8 +120,7 @@ def play_match_batch(
         )
         anchor_policy = run_search(
             env=env,
-            graphdef=graphdef,
-            params=anchor_params,
+            model=anchor_model,
             rng_key=anchor_key,
             state=search_state,
             num_simulations=num_simulations,
@@ -184,12 +180,12 @@ def score_to_elo(score: float, anchor_elo: float, games: int) -> float:
 def evaluate_vs_anchors(
     *,
     eval_fn: EvalFn,
-    candidate_params: nnx.State,
+    candidate_model: nnx.Module,
     anchors: tuple[Anchor, ...],
     rng_key: PRNGKeyArray,
     iteration: int,
 ) -> EloReport:
-    """Evaluate candidate parameters against all frozen anchors."""
+    """Evaluate a candidate model against all frozen anchors."""
 
     if not anchors:
         msg = "At least one anchor is required for Elo evaluation."
@@ -203,7 +199,7 @@ def evaluate_vs_anchors(
     total_losses = 0
     weighted_elo = 0.0
     for anchor, key in zip(anchors, keys, strict=True):
-        stats = jax.device_get(eval_fn(candidate_params, anchor.params, key))
+        stats = jax.device_get(eval_fn(candidate_model, anchor.model, key))
         games = int(stats.games)
         wins = int(stats.wins)
         draws = int(stats.draws)
@@ -248,7 +244,7 @@ def evaluate_vs_anchors(
 def add_anchor(
     anchors: tuple[Anchor, ...],
     *,
-    params: nnx.State,
+    model: nnx.Module,
     elo: float,
     iteration: int,
     max_anchors: int,
@@ -257,7 +253,7 @@ def add_anchor(
 
     new_anchor = Anchor(
         name=f"iter_{iteration:06d}",
-        params=params,
+        model=nnx.clone(model),
         elo=float(elo),
         iteration=int(iteration),
     )
