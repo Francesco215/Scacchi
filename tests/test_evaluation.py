@@ -16,7 +16,7 @@ from scacchi.evaluation import (
     report_to_json,
     score_to_elo,
 )
-from scacchi.models import make_model
+from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
 from scacchi.training import init_train_state
 
@@ -36,7 +36,7 @@ def _small_model_cfg():
 
 def _small_state():
     env = pgx.make("chess")
-    model = make_model(
+    model = AlphaZeroResNet(
         _small_model_cfg(),
         observation_shape=tuple(env.observation_shape),
         num_actions=env.num_actions,

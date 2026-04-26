@@ -39,17 +39,24 @@ class AlphaZeroResNet(nnx.Module):
 
     def __init__(
         self,
+        cfg: DictConfig,
         *,
         observation_shape: tuple[int, int, int],
         num_actions: int,
-        channels: int,
-        blocks: int,
-        policy_channels: int,
-        value_channels: int,
-        value_hidden: int,
-        rngs: nnx.Rngs,
+        seed: int,
     ):
+        if str(cfg.name) != "resnet":
+            msg = f"Unknown model '{cfg.name}'."
+            raise ValueError(msg)
+
         height, width, in_channels = observation_shape
+        rngs = nnx.Rngs(seed)
+        channels = int(cfg.channels)
+        blocks = int(cfg.blocks)
+        policy_channels = int(cfg.policy_channels)
+        value_channels = int(cfg.value_channels)
+        value_hidden = int(cfg.value_hidden)
+
         self.observation_shape = observation_shape
         self.num_actions = int(num_actions)
         self.policy_flat_dim = int(height * width * policy_channels)
@@ -92,27 +99,3 @@ class AlphaZeroResNet(nnx.Module):
         policy_logits = jnp.reshape(policy_logits, (*leading_shape, self.num_actions))
         value = jnp.reshape(value, leading_shape)
         return policy_logits, value
-
-
-def make_model(
-    cfg: DictConfig,
-    *,
-    observation_shape: tuple[int, int, int],
-    num_actions: int,
-    seed: int,
-) -> AlphaZeroResNet:
-    """Build the configured NNX model."""
-
-    if str(cfg.name) != "resnet":
-        msg = f"Unknown model '{cfg.name}'."
-        raise ValueError(msg)
-    return AlphaZeroResNet(
-        observation_shape=observation_shape,
-        num_actions=num_actions,
-        channels=int(cfg.channels),
-        blocks=int(cfg.blocks),
-        policy_channels=int(cfg.policy_channels),
-        value_channels=int(cfg.value_channels),
-        value_hidden=int(cfg.value_hidden),
-        rngs=nnx.Rngs(seed),
-    )

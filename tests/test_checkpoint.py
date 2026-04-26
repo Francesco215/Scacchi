@@ -10,14 +10,14 @@ from scacchi.checkpoint import (
     maybe_save_checkpoint,
     restore_checkpoint,
 )
-from scacchi.models import make_model
+from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
 from scacchi.training import init_train_state
 
 
 def _small_train_state():
     env = pgx.make("chess")
-    model = make_model(
+    model = AlphaZeroResNet(
         OmegaConf.create(
             {
                 "name": "resnet",

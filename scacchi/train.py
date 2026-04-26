@@ -25,7 +25,7 @@ from scacchi.evaluation import (
     play_match_batch,
     report_to_log_dict,
 )
-from scacchi.models import make_model
+from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
 from scacchi.runtime import create_mesh, validate_batch_size
 from scacchi.selfplay import compute_training_batch, run_selfplay
@@ -55,7 +55,7 @@ def main(cfg: DictConfig) -> None:
         if int(cfg.eval.max_anchors) < 1:
             raise ValueError("eval.max_anchors must be at least one.")
 
-    model = make_model(
+    model = AlphaZeroResNet(
         cfg.model,
         observation_shape=tuple(env.observation_shape),
         num_actions=env.num_actions,

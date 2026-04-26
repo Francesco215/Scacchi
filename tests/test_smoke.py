@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import pgx
 from omegaconf import OmegaConf
 
-from scacchi.models import make_model
+from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
 from scacchi.runtime import batch_sharding, create_mesh, replicated_sharding, validate_batch_size
 from scacchi.search import run_search
@@ -28,7 +28,7 @@ def small_model_cfg():
 
 def make_small_state():
     env = pgx.make("chess")
-    model = make_model(
+    model = AlphaZeroResNet(
         small_model_cfg(),
         observation_shape=tuple(env.observation_shape),
         num_actions=env.num_actions,
@@ -56,7 +56,7 @@ def test_model_and_optimizer_factories():
     env, graphdef, train_state, _ = make_small_state()
     del graphdef
     state = jax.vmap(env.init)(jax.random.split(jax.random.key(0), 3))
-    model = make_model(
+    model = AlphaZeroResNet(
         small_model_cfg(),
         observation_shape=tuple(env.observation_shape),
         num_actions=env.num_actions,
