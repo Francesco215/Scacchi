@@ -108,6 +108,7 @@ def play_match_batch(
             lambda dummy, active: _where_done(done, dummy, active), dummy_state, state
         )
 
+        #TODO: this is wasteful as it uses 2x compute. fix that.
         candidate_policy = run_search(
             env=env,
             model=candidate_model,

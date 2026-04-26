@@ -129,50 +129,22 @@ def main(cfg: DictConfig) -> None:
             batch = compute_training_batch(data)
             batch = take_batch(shuffle_batch(batch, shuffle_key), int(cfg.train.batch_size))
             metrics = train_step(model, optimizer, batch)
+            
+            
             metrics_host = jax.device_get(metrics)
-            log: dict[str, float | int] = {
-                "iteration": iteration,
-                "loss": float(metrics_host.loss),
-                "policy_loss": float(metrics_host.policy_loss),
-                "value_loss": float(metrics_host.value_loss),
-                "samples": int(batch.observation.shape[0]),
-                "mean_value_target": float(jnp.mean(batch.value_target)),
-            }
+            log: dict[str, float | int] = {"iteration": iteration, "loss": float(metrics_host.loss), "policy_loss": float(metrics_host.policy_loss), "value_loss": float(metrics_host.value_loss), "samples": int(batch.observation.shape[0]), "mean_value_target": float(jnp.mean(batch.value_target))}
             eval_ran = eval_enabled and iteration % int(cfg.eval.interval) == 0
             if eval_ran:
                 rng_key, eval_key = jax.random.split(rng_key)
-                report = evaluate_vs_anchors(
-                    eval_fn=eval_fn,
-                    candidate_model=model,
-                    anchors=anchors,
-                    rng_key=eval_key,
-                    iteration=iteration,
-                )
+                report = evaluate_vs_anchors(eval_fn=eval_fn, candidate_model=model, anchors=anchors, rng_key=eval_key, iteration=iteration)
                 current_elo = report.elo
                 log.update(report_to_log_dict(report))
                 append_eval_history("eval_history.jsonl", report)
                 if iteration > 0 and iteration % int(cfg.eval.anchor_interval) == 0:
-                    anchors = add_anchor(
-                        anchors,
-                        model=model,
-                        elo=current_elo,
-                        iteration=iteration,
-                        max_anchors=int(cfg.eval.max_anchors),
-                    )
+                    anchors = add_anchor(anchors, model=model, elo=current_elo, iteration=iteration, max_anchors=int(cfg.eval.max_anchors))
             if iteration % int(cfg.train.log_interval) == 0 or eval_ran:
                 print(log)
-            maybe_save_checkpoint(
-                checkpoint_manager,
-                iteration,
-                cfg=OmegaConf.to_container(cfg, resolve=True),
-                model=model,
-                optimizer=optimizer,
-                rng_key=rng_key,
-                metadata={
-                    "elo": current_elo,
-                    "anchors": anchor_summaries(anchors),
-                },
-            )
+            maybe_save_checkpoint(checkpoint_manager, iteration, cfg=OmegaConf.to_container(cfg, resolve=True), model=model, optimizer=optimizer, rng_key=rng_key, metadata={"elo": current_elo, "anchors": anchor_summaries(anchors)})
         checkpoint_manager.wait_until_finished()
 
 

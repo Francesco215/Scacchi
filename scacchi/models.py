@@ -11,15 +11,6 @@ from jaxtyping import Array, Float
 from omegaconf import DictConfig
 
 
-class PolicyValueModel(Protocol):
-    num_actions: int
-
-    def __call__(
-        self, observation: Float[Array, "... height width channels"], *, train: bool
-    ) -> tuple[Float[Array, "... action"], Float[Array, "..."]]:
-        ...
-
-
 class ResidualBlock(nnx.Module):
     def __init__(self, channels: int, *, rngs: nnx.Rngs):
         self.conv1 = nnx.Conv(channels, channels, kernel_size=(3, 3), padding="SAME", rngs=rngs)
