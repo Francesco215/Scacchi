@@ -49,7 +49,6 @@ def test_pgx_chess_and_mesh_contracts():
     assert env.num_actions == 4672
 
     mesh = create_mesh(OmegaConf.create({"name": "single_mesh", "axis_name": "data", "num_devices": 1}))
-    validate_batch_size(4, mesh)
     assert batch_sharding(mesh, 2).spec == jax.sharding.PartitionSpec("data", None)
     assert replicated_sharding(mesh).spec == jax.sharding.PartitionSpec()
 
