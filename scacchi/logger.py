@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Literal, Protocol, Self, TypeGuard
+
+from tqdm import tqdm
 
 from scacchi.config import LoggingConfig
+
+Scalar = float | int
+
+
+class _HasAsDict(Protocol):
+    def _asdict(self) -> dict[str, Any]: ...
+
+
+def _has_asdict(obj: Any) -> TypeGuard[_HasAsDict]:
+    return hasattr(obj, "_asdict")
 
 
 class Logger:
@@ -16,7 +28,7 @@ class Logger:
     Subclass or use WandbLogger for a real logging backend.
     """
 
-    def __init__(self, log_every: int = 1, max_steps: Optional[int] = None):
+    def __init__(self, log_every: int = 1, max_steps: int | None = None) -> None:
         self.log_every = log_every
         self.max_steps = max_steps
         self._initialized = False
@@ -28,37 +40,37 @@ class Logger:
         is_last = self.max_steps is not None and step == self.max_steps - 1
         return is_periodic or is_last
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         self._initialized = True
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> Literal[False]:
         self._initialized = False
         return False
 
-    def log_metrics(self, *args, **kwargs):
+    def log_metrics(self, step: int, metrics: dict[str, Scalar], prefix: str) -> None:
         pass
 
-    def log_image(self, *args, **kwargs):
+    def log_image(self, *args: Any, **kwargs: Any) -> None:
         pass
 
-    def log_video(self, *args, **kwargs):
+    def log_video(self, *args: Any, **kwargs: Any) -> None:
         pass
 
     def log(
         self,
         step: int,
         metrics: Any,
-        pbar: Any = None,
+        pbar: tqdm[Any] | None = None,
         prefix: str = "train/",
         float_fmt: str = ".4f",
-        pbar_filter: Optional[str] = None,
-        **extra: Any,
-    ):
+        pbar_filter: str | None = None,
+        **extra: Scalar,
+    ) -> None:
         if not self.should_log(step):
             return
 
-        raw = dict(metrics._asdict()) if hasattr(metrics, "_asdict") else dict(metrics)
+        raw: dict[str, Any] = dict(metrics._asdict()) if _has_asdict(metrics) else dict(metrics)
         raw.update(extra)
         clean = self._convert_metrics(raw)
 
@@ -67,8 +79,8 @@ class Logger:
 
         self.log_metrics(step, clean, prefix)
 
-    def _convert_metrics(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
-        clean: Dict[str, Any] = {}
+    def _convert_metrics(self, metrics: dict[str, Any]) -> dict[str, Scalar]:
+        clean: dict[str, Scalar] = {}
         for k, v in metrics.items():
             if hasattr(v, "item"):
                 v = v.item()
@@ -83,20 +95,20 @@ class Logger:
 
     def _update_pbar(
         self,
-        pbar: Any,
-        metrics: Dict[str, Any],
+        pbar: tqdm[Any],
+        metrics: dict[str, Scalar],
         float_fmt: str,
-        pbar_filter: Optional[str],
-    ):
+        pbar_filter: str | None,
+    ) -> None:
         filtered = metrics
         if pbar_filter is not None:
             pattern = re.compile(pbar_filter)
             filtered = {k: v for k, v in metrics.items() if pattern.search(k)}
 
-        postfix = {}
-        for k, v in filtered.items():
-            postfix[k] = f"{v:{float_fmt}}" if isinstance(v, float) else str(v)
-
+        postfix: dict[str, str] = {
+            k: f"{v:{float_fmt}}" if isinstance(v, float) else str(v)
+            for k, v in filtered.items()
+        }
         pbar.set_postfix(**postfix)
 
 
@@ -105,17 +117,17 @@ class WandbLogger(Logger):
         self,
         logging_cfg: LoggingConfig,
         log_every: int = 1,
-        max_steps: Optional[int] = None,
+        max_steps: int | None = None,
         config: Any = None,
-        dir: Optional[str] = None,
-    ):
+        dir: str | None = None,
+    ) -> None:
         super().__init__(log_every=log_every, max_steps=max_steps)
         self.project = logging_cfg.wandb_project
         self.config = config
         self.dir = dir
-        self._run = None
+        self._run: Any = None
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         import wandb
 
         self._run = wandb.init(
@@ -127,7 +139,7 @@ class WandbLogger(Logger):
         self._initialized = True
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> Literal[False]:
         if self._run is not None:
             import wandb
 
@@ -135,7 +147,7 @@ class WandbLogger(Logger):
         self._initialized = False
         return False
 
-    def log_metrics(self, step: int, metrics: Dict[str, Any], prefix: str = "train/"):
+    def log_metrics(self, step: int, metrics: dict[str, Scalar], prefix: str = "train/") -> None:
         import wandb
 
         wandb.log({f"{prefix}{k}": v for k, v in metrics.items()}, step=step)
@@ -145,8 +157,8 @@ class WandbLogger(Logger):
         step: int,
         key: str,
         image: Any,
-        caption: Optional[str] = None,
-    ):
+        caption: str | None = None,
+    ) -> None:
         import numpy as np
         import wandb
 
@@ -159,9 +171,9 @@ class WandbLogger(Logger):
         step: int,
         key: str,
         video_path: Path,
-        format: Optional[Literal["gif", "mp4", "webm", "ogg"]] = "mp4",
-        **kwargs,
-    ):
+        format: Literal["gif", "mp4", "webm", "ogg"] | None = "mp4",
+        **kwargs: Any,
+    ) -> None:
         import wandb
 
         wandb.log({key: wandb.Video(str(video_path), format=format, **kwargs)}, step=step)
@@ -170,9 +182,9 @@ class WandbLogger(Logger):
 def build_logger(
     logging_cfg: LoggingConfig,
     log_every: int = 1,
-    max_steps: Optional[int] = None,
+    max_steps: int | None = None,
     config: Any = None,
-    dir: Optional[str] = None,
+    dir: str | None = None,
 ) -> Logger:
     if logging_cfg.wandb_enabled:
         return WandbLogger(

@@ -41,7 +41,7 @@ logging:
 
 train:
   seed: 0
-  num_iters: 400
+  num_iters: 25_000
   selfplay_batch_size: 1024
   max_num_steps: 256
   search:
@@ -52,7 +52,7 @@ train:
     gumbel_scale: 1.0
     qtransform_value_scale: 0.1
     qtransform_rescale_values: false
-  batch_size: 4096
+  batch_size: 64
   log_interval: 1
 
 hydra:

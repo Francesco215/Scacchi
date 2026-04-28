@@ -90,6 +90,7 @@ def main(raw_cfg: DictConfig) -> None:
         start_iteration = 0
         frames = 0
         hours = 0.0
+        gradient_step = 0
         if cfg.checkpoint.resume:
             restored = restore_checkpoint(
                 checkpoint_manager, model=model, optimizer=optimizer, rng_key=rng_key
@@ -98,8 +99,11 @@ def main(raw_cfg: DictConfig) -> None:
             rng_key = restored.rng_key
             frames = int(restored.meta.get("metadata", {}).get("frames", frames))
             hours = float(restored.meta.get("metadata", {}).get("hours", hours))
+            gradient_step = int(
+                restored.meta.get("metadata", {}).get("gradient_step", gradient_step)
+            )
 
-        with tqdm(total=cfg.train.num_iters, initial=start_iteration, desc="training") as pbar:
+        with tqdm(total=cfg.train.num_iters, initial=start_iteration, desc="training", dynamic_ncols=True) as pbar:
             for iteration in range(start_iteration, cfg.train.num_iters):
                 rng_key, train_key = jax.random.split(rng_key)
                 start_time = time.time()
@@ -130,6 +134,7 @@ def main(raw_cfg: DictConfig) -> None:
                         "baseline_available": baseline_eval_fn is not None,
                         "frames": frames,
                         "hours": hours,
+                        "gradient_step": gradient_step,
                     },
                 )
             checkpoint_manager.wait_until_finished()

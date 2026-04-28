@@ -24,6 +24,7 @@ class UpdateMetrics(NamedTuple):
     loss: jax.Array
     policy_loss: jax.Array
     value_loss: jax.Array
+    per_update: LossMetrics
     samples: jax.Array
     num_updates: jax.Array
     value_mask_frac: jax.Array
