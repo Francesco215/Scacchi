@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import mctx
@@ -57,7 +59,11 @@ def run_search(
         num_simulations=cfg.num_simulations,
         invalid_actions=~state.legal_action_mask,
         max_depth=cfg.max_depth,
-        qtransform=mctx.qtransform_completed_by_mix_value,
+        qtransform=partial(
+            mctx.qtransform_completed_by_mix_value,
+            value_scale=cfg.qtransform_value_scale,
+            rescale_values=cfg.qtransform_rescale_values,
+        ),
         max_num_considered_actions=cfg.max_num_considered_actions,
         gumbel_scale=cfg.gumbel_scale,
     )

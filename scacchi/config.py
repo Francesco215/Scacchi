@@ -155,8 +155,10 @@ class SearchConfig:
     max_num_considered_actions: int
     max_depth: int | None
     gumbel_scale: float
+    qtransform_value_scale: float = 1.0
+    qtransform_rescale_values: bool = True
 
-    def __post_init__(self, prefix: str="search") -> None:
+    def __post_init__(self, prefix: str = "search") -> None:
         self.name = _as_str(self.name, f"{prefix}.name").lower()
         self.num_simulations = _as_int(
             self.num_simulations, f"{prefix}.num_simulations", min_value=1
@@ -168,6 +170,14 @@ class SearchConfig:
         )
         self.max_depth = _as_optional_int(self.max_depth, f"{prefix}.max_depth", min_value=1)
         self.gumbel_scale = _as_float(self.gumbel_scale, f"{prefix}.gumbel_scale", min_value=0.0)
+        self.qtransform_value_scale = _as_float(
+            self.qtransform_value_scale,
+            f"{prefix}.qtransform_value_scale",
+            min_value=0.0,
+        )
+        self.qtransform_rescale_values = _as_bool(
+            self.qtransform_rescale_values, f"{prefix}.qtransform_rescale_values"
+        )
 
 
 @dataclass
