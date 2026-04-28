@@ -8,7 +8,6 @@ from typing import Any, cast
 
 import hydra
 import jax
-import jax.numpy as jnp
 import pgx
 from absl import logging as absl_logging
 from flax import nnx
@@ -27,8 +26,7 @@ from scacchi.evaluation import (
 from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
 from scacchi.runtime import create_mesh, validate_batch_size
-from scacchi.selfplay import compute_training_batch, run_selfplay
-from scacchi.training import init_optimizer, make_minibatches, make_train_step
+from scacchi.training import init_optimizer, make_iteration_step
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -56,10 +54,7 @@ def main(raw_cfg: DictConfig) -> None:
     )
     tx = make_optimizer(cfg.optimizer)
     optimizer = init_optimizer(model, tx)
-    train_step = make_train_step()
-    selfplay_fn = nnx.jit(
-        lambda model, key: run_selfplay(env=env, model=model, rng_key=key, cfg=cfg.train)
-    )
+    iteration_step = make_iteration_step(env, cfg.train)
     baseline_id = f"{cfg.env.id}_v0"
     baseline = None
     if cfg.eval.enabled:
@@ -103,40 +98,25 @@ def main(raw_cfg: DictConfig) -> None:
             hours = float(restored.meta.get("metadata", {}).get("hours", hours))
 
         for iteration in range(start_iteration, cfg.train.num_iters):
-            rng_key, selfplay_key, shuffle_key = jax.random.split(rng_key, 3)
+            rng_key, train_key = jax.random.split(rng_key)
             start_time = time.time()
-            data = selfplay_fn(model, selfplay_key)
-            flat_batch = compute_training_batch(data)
-            minibatches = make_minibatches(flat_batch, cfg.train.batch_size, shuffle_key)
-            num_updates = int(minibatches.observation.shape[0])
-            metrics = []
-            for i in range(num_updates):
-                batch = jax.tree_util.tree_map(lambda x: x[i], minibatches)
-                metrics.append(train_step(model, optimizer, batch))
-            metrics = jax.tree_util.tree_map(
-                lambda *xs: jnp.mean(jnp.stack(xs)), *metrics
-            )
-            frames += int(data.observation.shape[0] * data.observation.shape[1])
+            metrics = iteration_step(model, optimizer, train_key)
+            frames += cfg.train.max_num_steps * cfg.train.selfplay_batch_size
             hours += (time.time() - start_time) / 3600
 
             metrics_host = jax.device_get(metrics)
-            value_mask = minibatches.value_mask.reshape((-1,)).astype(jnp.float32)
-            value_target = minibatches.value_target.reshape((-1,))
             log: dict[str, float | int] = {
                 "iteration": iteration,
                 "loss": float(metrics_host.loss),
                 "policy_loss": float(metrics_host.policy_loss),
                 "value_loss": float(metrics_host.value_loss),
-                "samples": int(value_mask.shape[0]),
-                "num_updates": num_updates,
+                "samples": int(metrics_host.samples),
+                "num_updates": int(metrics_host.num_updates),
                 "frames": frames,
                 "hours": hours,
-                "value_mask_frac": float(jnp.mean(value_mask)),
-                "mean_value_target": float(jnp.mean(value_target)),
-                "mean_abs_value_target": float(
-                    jnp.sum(jnp.abs(value_target) * value_mask)
-                    / jnp.maximum(jnp.sum(value_mask), 1.0)
-                ),
+                "value_mask_frac": float(metrics_host.value_mask_frac),
+                "mean_value_target": float(metrics_host.mean_value_target),
+                "mean_abs_value_target": float(metrics_host.mean_abs_value_target),
             }
             eval_ran = cfg.eval.enabled and iteration % cfg.eval.interval == 0
             if eval_ran:

@@ -9,7 +9,9 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
-from scacchi.types import TrainingBatch
+from scacchi.config import TrainConfig
+from scacchi.selfplay import run_selfplay
+from scacchi.types import SelfplayBatch, TrainingBatch
 
 
 class LossMetrics(NamedTuple):
@@ -18,33 +20,45 @@ class LossMetrics(NamedTuple):
     value_loss: jax.Array
 
 
+class UpdateMetrics(NamedTuple):
+    loss: jax.Array
+    policy_loss: jax.Array
+    value_loss: jax.Array
+    samples: jax.Array
+    num_updates: jax.Array
+    value_mask_frac: jax.Array
+    mean_value_target: jax.Array
+    mean_abs_value_target: jax.Array
+
+
 def init_optimizer(model: nnx.Module, tx: optax.GradientTransformation) -> nnx.Optimizer:
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
 
 
-def loss_fn(model: nnx.Module, batch: TrainingBatch):
-    logits, value = model(batch.observation, train=True)
-    policy_loss = optax.softmax_cross_entropy(logits, batch.policy_target).mean()
-    value_loss = jnp.mean(optax.l2_loss(value, batch.value_target) * batch.value_mask)
-    loss = policy_loss + value_loss
-    return loss, LossMetrics(loss, policy_loss, value_loss)
+def compute_training_batch(data: SelfplayBatch) -> TrainingBatch:
+    max_num_steps, batch_size = data.reward.shape
+    value_mask = jnp.cumsum(data.terminated[::-1], axis=0)[::-1] >= 1
+
+    def body_fn(carry, i):
+        ix = max_num_steps - i - 1
+        value = data.reward[ix] + data.discount[ix] * carry
+        return value, value
+
+    _, value_target = jax.lax.scan(
+        body_fn,
+        jnp.zeros(batch_size, dtype=data.reward.dtype),
+        jnp.arange(max_num_steps),
+    )
+
+    return TrainingBatch(
+        observation=data.observation.reshape((-1, *data.observation.shape[2:])),
+        policy_target=data.action_weights.reshape((-1, data.action_weights.shape[-1])),
+        value_target=value_target[::-1].reshape((-1,)),
+        value_mask=value_mask.reshape((-1,)),
+    )
 
 
-def make_train_step():
-    @nnx.jit
-    def train_step(model: nnx.Module, optimizer: nnx.Optimizer, batch: TrainingBatch):
-        (_, metrics), grads = nnx.value_and_grad(
-            loss_fn,
-            argnums=nnx.DiffState(0, nnx.Param),
-            has_aux=True,
-        )(model, batch)
-        optimizer.update(model, grads)
-        return metrics
-
-    return train_step
-
-
-def make_minibatches(batch: TrainingBatch, batch_size: int, rng_key) -> TrainingBatch:
+def _minibatches(batch: TrainingBatch, batch_size: int, rng_key) -> TrainingBatch:
     order = jax.random.permutation(rng_key, batch.observation.shape[0])
     size = min(int(batch_size), int(batch.observation.shape[0]))
     num_updates = max(1, int(batch.observation.shape[0]) // size)
@@ -59,3 +73,52 @@ def make_minibatches(batch: TrainingBatch, batch_size: int, rng_key) -> Training
         value_target=reshape(batch.value_target),
         value_mask=reshape(batch.value_mask),
     )
+
+
+def loss_fn(model: nnx.Module, batch: TrainingBatch):
+    logits, value = model(batch.observation, train=True)
+    policy_loss = optax.softmax_cross_entropy(logits, batch.policy_target).mean()
+    value_loss = jnp.mean(optax.l2_loss(value, batch.value_target) * batch.value_mask)
+    loss = policy_loss + value_loss
+    return loss, LossMetrics(loss, policy_loss, value_loss)
+
+
+def _update(model: nnx.Module, optimizer: nnx.Optimizer, data: SelfplayBatch, batch_size: int, rng_key):
+    minibatches = _minibatches(compute_training_batch(data), batch_size, rng_key)
+    metrics = []
+    for i in range(minibatches.observation.shape[0]):
+        batch = jax.tree_util.tree_map(lambda x: x[i], minibatches)
+        (_, metric), grads = nnx.value_and_grad(
+            loss_fn,
+            argnums=nnx.DiffState(0, nnx.Param),
+            has_aux=True,
+        )(model, batch)
+        optimizer.update(model, grads)
+        metrics.append(metric)
+
+    loss, policy_loss, value_loss = jax.tree_util.tree_map(
+        lambda *xs: jnp.mean(jnp.stack(xs)), *metrics
+    )
+    value_mask = minibatches.value_mask.reshape((-1,)).astype(jnp.float32)
+    value_target = minibatches.value_target.reshape((-1,))
+    return UpdateMetrics(
+        loss=loss,
+        policy_loss=policy_loss,
+        value_loss=value_loss,
+        samples=jnp.asarray(value_mask.shape[0]),
+        num_updates=jnp.asarray(minibatches.observation.shape[0]),
+        value_mask_frac=jnp.mean(value_mask),
+        mean_value_target=jnp.mean(value_target),
+        mean_abs_value_target=jnp.sum(jnp.abs(value_target) * value_mask)
+        / jnp.maximum(jnp.sum(value_mask), 1.0),
+    )
+
+
+def make_iteration_step(env, cfg: TrainConfig):
+    @nnx.jit
+    def iteration_step(model: nnx.Module, optimizer: nnx.Optimizer, rng_key):
+        selfplay_key, shuffle_key = jax.random.split(rng_key)
+        data = run_selfplay(env=env, model=model, rng_key=selfplay_key, cfg=cfg)
+        return _update(model, optimizer, data, cfg.batch_size, shuffle_key)
+
+    return iteration_step

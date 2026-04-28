@@ -11,8 +11,8 @@ from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
 from scacchi.runtime import batch_sharding, create_mesh, replicated_sharding, validate_batch_size
 from scacchi.search import run_search
-from scacchi.selfplay import compute_training_batch, run_selfplay
-from scacchi.training import init_optimizer, make_minibatches, make_train_step
+from scacchi.selfplay import run_selfplay
+from scacchi.training import compute_training_batch, init_optimizer, make_iteration_step
 from scacchi.types import SelfplayBatch
 
 
@@ -106,7 +106,7 @@ def test_mctx_search_returns_legal_actions():
     assert bool(jnp.all(legal))
 
 
-def test_tiny_selfplay_and_train_step():
+def test_tiny_selfplay_and_iteration_step():
     env, model, optimizer, _ = make_small_state()
     cfg = TrainConfig(
         seed=0,
@@ -131,14 +131,14 @@ def test_tiny_selfplay_and_train_step():
     assert data.action_weights.shape == (2, 2, env.num_actions)
     assert jnp.isfinite(data.action_weights).all()
 
-    minibatches = make_minibatches(compute_training_batch(data), 4, jax.random.key(3))
-    batch = jax.tree_util.tree_map(lambda x: x[0], minibatches)
     before = jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))
-    metrics = make_train_step()(model, optimizer, batch)
+    metrics = make_iteration_step(env, cfg)(model, optimizer, jax.random.key(3))
     after = jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))
     assert jnp.isfinite(metrics.loss)
     assert jnp.isfinite(metrics.policy_loss)
     assert jnp.isfinite(metrics.value_loss)
+    assert int(metrics.samples) == 4
+    assert int(metrics.num_updates) == 1
     changed = [jnp.any(a != b) for a, b in zip(before, after, strict=True)]
     assert bool(jnp.any(jnp.asarray(changed)))
 
