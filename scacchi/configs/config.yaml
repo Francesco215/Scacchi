@@ -50,7 +50,8 @@ train:
     max_num_considered_actions: 16
     max_depth: null
     gumbel_scale: 1.0
-  batch_size: 128
+  batch_size: 256
+  minibatch_size: 64
   log_interval: 10
 
 hydra:

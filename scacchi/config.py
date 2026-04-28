@@ -243,6 +243,7 @@ class TrainConfig:
     max_num_steps: int
     search: SearchConfig
     batch_size: int
+    minibatch_size: int
     log_interval: int
 
     def __post_init__(self) -> None:
@@ -254,6 +255,10 @@ class TrainConfig:
         self.max_num_steps = _as_int(self.max_num_steps, "train.max_num_steps", min_value=1)
         self.search = _as_section(self.search, SearchConfig, "train.search")
         self.batch_size = _as_int(self.batch_size, "train.batch_size", min_value=1)
+        self.minibatch_size = _as_int(self.minibatch_size, "train.minibatch_size", min_value=1)
+        if self.batch_size % self.minibatch_size != 0:
+            msg = "train.batch_size must be divisible by train.minibatch_size."
+            raise ValueError(msg)
         self.log_interval = _as_int(self.log_interval, "train.log_interval", min_value=1)
 
 

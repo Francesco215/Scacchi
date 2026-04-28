@@ -20,7 +20,7 @@ optimizer:
 
 eval:
   enabled: true
-  interval: 5
+  interval: 1
   batch_size: 64
   max_num_steps: 256
 
@@ -36,12 +36,12 @@ runtime:
   num_devices: 1
 
 logging:
-  wandb_enabled: false
+  wandb_enabled: true
   wandb_project: scacchi-az-gardner
 
 train:
   seed: 0
-  num_iters: 25_000
+  num_iters: 300
   selfplay_batch_size: 1024
   max_num_steps: 256
   search:
@@ -52,7 +52,8 @@ train:
     gumbel_scale: 1.0
     qtransform_value_scale: 0.1
     qtransform_rescale_values: false
-  batch_size: 64
+  batch_size: 4096
+  minibatch_size: 64
   log_interval: 1
 
 hydra:

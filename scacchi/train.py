@@ -79,7 +79,12 @@ def main(raw_cfg: DictConfig) -> None:
     )
     rng_key = jax.random.key(cfg.train.seed)
     print(OmegaConf.to_yaml(OmegaConf.create(cfg_dict)))
-    with build_logger(
+    mesh = create_mesh(cfg.runtime)
+    validate_batch_size("train.selfplay_batch_size", cfg.train.selfplay_batch_size, mesh)
+    validate_batch_size("train.batch_size", cfg.train.batch_size, mesh)
+    if cfg.eval.enabled:
+        validate_batch_size("eval.batch_size", cfg.eval.batch_size, mesh)
+    with jax.set_mesh(mesh), build_logger(
         cfg.logging,
         log_every=cfg.train.log_interval,
         max_steps=cfg.train.num_iters,
