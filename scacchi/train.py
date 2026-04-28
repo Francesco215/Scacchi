@@ -12,6 +12,7 @@ import pgx
 from absl import logging as absl_logging
 from flax import nnx
 from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
 from scacchi.checkpoint import (
     build_checkpoint_manager,
@@ -23,6 +24,7 @@ from scacchi.evaluation import (
     baseline_log,
     evaluate_baseline,
 )
+from scacchi.logger import build_logger
 from scacchi.models import AlphaZeroResNet
 from scacchi.optim import make_optimizer
 from scacchi.runtime import create_mesh, validate_batch_size
@@ -77,12 +79,12 @@ def main(raw_cfg: DictConfig) -> None:
     )
     rng_key = jax.random.key(cfg.train.seed)
     print(OmegaConf.to_yaml(OmegaConf.create(cfg_dict)))
-    wandb_run = None
-    if cfg.logging.wandb_enabled:
-        import wandb
-
-        wandb_run = wandb.init(project=cfg.logging.wandb_project, config=cfg_dict)
-    with build_checkpoint_manager(
+    with build_logger(
+        cfg.logging,
+        log_every=cfg.train.log_interval,
+        max_steps=cfg.train.num_iters,
+        config=cfg_dict,
+    ) as logger, build_checkpoint_manager(
         cfg.checkpoint, cfg.checkpoint.dir, max_steps=cfg.train.num_iters
     ) as checkpoint_manager:
         start_iteration = 0
@@ -97,54 +99,40 @@ def main(raw_cfg: DictConfig) -> None:
             frames = int(restored.meta.get("metadata", {}).get("frames", frames))
             hours = float(restored.meta.get("metadata", {}).get("hours", hours))
 
-        for iteration in range(start_iteration, cfg.train.num_iters):
-            rng_key, train_key = jax.random.split(rng_key)
-            start_time = time.time()
-            metrics = iteration_step(model, optimizer, train_key)
-            frames += cfg.train.max_num_steps * cfg.train.selfplay_batch_size
-            hours += (time.time() - start_time) / 3600
+        with tqdm(total=cfg.train.num_iters, initial=start_iteration, desc="training") as pbar:
+            for iteration in range(start_iteration, cfg.train.num_iters):
+                rng_key, train_key = jax.random.split(rng_key)
+                start_time = time.time()
+                metrics = iteration_step(model, optimizer, train_key)
+                frames += cfg.train.max_num_steps * cfg.train.selfplay_batch_size
+                hours += (time.time() - start_time) / 3600
 
-            metrics_host = jax.device_get(metrics)
-            log: dict[str, float | int] = {
-                "iteration": iteration,
-                "loss": float(metrics_host.loss),
-                "policy_loss": float(metrics_host.policy_loss),
-                "value_loss": float(metrics_host.value_loss),
-                "samples": int(metrics_host.samples),
-                "num_updates": int(metrics_host.num_updates),
-                "frames": frames,
-                "hours": hours,
-                "value_mask_frac": float(metrics_host.value_mask_frac),
-                "mean_value_target": float(metrics_host.mean_value_target),
-                "mean_abs_value_target": float(metrics_host.mean_abs_value_target),
-            }
-            eval_ran = cfg.eval.enabled and iteration % cfg.eval.interval == 0
-            if eval_ran:
-                rng_key, baseline_key = jax.random.split(rng_key)
-                if baseline_eval_fn is not None:
-                    returns = jax.device_get(baseline_eval_fn(model, baseline_key))
-                    log.update(baseline_log("eval/vs_baseline", returns))
-            if iteration % cfg.train.log_interval == 0 or eval_ran:
-                print(log)
-            if wandb_run is not None:
-                wandb_run.log(log)
-            maybe_save_checkpoint(
-                checkpoint_manager,
-                iteration,
-                cfg=cfg_dict,
-                model=model,
-                optimizer=optimizer,
-                rng_key=rng_key,
-                metadata={
-                    "baseline_id": baseline_id,
-                    "baseline_available": baseline_eval_fn is not None,
-                    "frames": frames,
-                    "hours": hours,
-                },
-            )
-        checkpoint_manager.wait_until_finished()
-    if wandb_run is not None:
-        wandb_run.finish()
+                metrics_host = jax.device_get(metrics)
+                logger.log(iteration, metrics_host, pbar=pbar, prefix="train/", pbar_filter=r"loss", frames=frames, hours=hours)
+                pbar.update(1)
+
+                eval_ran = cfg.eval.enabled and iteration % cfg.eval.interval == 0
+                if eval_ran:
+                    rng_key, baseline_key = jax.random.split(rng_key)
+                    if baseline_eval_fn is not None:
+                        returns = jax.device_get(baseline_eval_fn(model, baseline_key))
+                        logger.log_metrics(iteration, baseline_log("eval/vs_baseline", returns), prefix="")
+
+                maybe_save_checkpoint(
+                    checkpoint_manager,
+                    iteration,
+                    cfg=cfg_dict,
+                    model=model,
+                    optimizer=optimizer,
+                    rng_key=rng_key,
+                    metadata={
+                        "baseline_id": baseline_id,
+                        "baseline_available": baseline_eval_fn is not None,
+                        "frames": frames,
+                        "hours": hours,
+                    },
+                )
+            checkpoint_manager.wait_until_finished()
 
 
 if __name__ == "__main__":
