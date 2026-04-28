@@ -86,26 +86,24 @@ def loss_fn(model: nnx.Module, batch: TrainingBatch):
 
 def _update(model: nnx.Module, optimizer: nnx.Optimizer, data: SelfplayBatch, batch_size: int, rng_key):
     minibatches = _minibatches(compute_training_batch(data), batch_size, rng_key)
-    metrics = []
-    for i in range(minibatches.observation.shape[0]):
-        batch = jax.tree_util.tree_map(lambda x: x[i], minibatches)
-        (_, metric), grads = nnx.value_and_grad(
-            loss_fn,
-            argnums=nnx.DiffState(0, nnx.Param),
-            has_aux=True,
-        )(model, batch)
-        optimizer.update(model, grads)
-        metrics.append(metric)
+    grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, nnx.Param), has_aux=True)
 
-    loss, policy_loss, value_loss = jax.tree_util.tree_map(
-        lambda *xs: jnp.mean(jnp.stack(xs)), *metrics
-    )
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0), unroll=1)
+    def train_minibatch(carry, batch):
+        model, optimizer = carry
+        (_, metric), grads = grad_fn(model, batch)
+        optimizer.update(model, grads)
+        return (model, optimizer), metric
+
+    (_, _), per_update = train_minibatch((model, optimizer), minibatches)
     value_mask = minibatches.value_mask.reshape((-1,)).astype(jnp.float32)
     value_target = minibatches.value_target.reshape((-1,))
+
     return UpdateMetrics(
-        loss=loss,
-        policy_loss=policy_loss,
-        value_loss=value_loss,
+        loss=jnp.mean(per_update.loss),
+        policy_loss=jnp.mean(per_update.policy_loss),
+        value_loss=jnp.mean(per_update.value_loss),
+        per_update=per_update,
         samples=jnp.asarray(value_mask.shape[0]),
         num_updates=jnp.asarray(minibatches.observation.shape[0]),
         value_mask_frac=jnp.mean(value_mask),
