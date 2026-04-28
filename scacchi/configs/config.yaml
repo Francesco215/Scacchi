@@ -8,6 +8,9 @@ model:
   policy_channels: 2
   value_channels: 1
   value_hidden: 64
+  resnet_v2: true
+  batch_norm: true
+  batch_norm_momentum: 0.9
 
 optimizer:
   name: adamw
@@ -20,15 +23,6 @@ eval:
   interval: 10
   batch_size: 4
   max_num_steps: 64
-  search:
-    name: gumbel
-    num_simulations: 4
-    max_num_considered_actions: 8
-    max_depth: 16
-    gumbel_scale: 0.0
-  anchor_interval: 50
-  max_anchors: 4
-  initial_anchor_elo: 0.0
 
 checkpoint:
   dir: checkpoints
@@ -40,6 +34,10 @@ runtime:
   name: single_mesh
   axis_name: data
   num_devices: 1
+
+logging:
+  wandb_enabled: false
+  wandb_project: scacchi-az
 
 train:
   seed: 0

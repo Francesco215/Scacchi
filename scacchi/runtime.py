@@ -41,4 +41,10 @@ def replicated_sharding(mesh: Mesh) -> NamedSharding:
     return NamedSharding(mesh, P())
 
 
+def validate_batch_size(name: str, batch_size: int, mesh: Mesh) -> None:
+    """Require global batches to split evenly across the data mesh."""
 
+    axis_size = int(mesh.shape[mesh.axis_names[0]])
+    if int(batch_size) % axis_size:
+        msg = f"{name}={batch_size} must be divisible by data mesh size {axis_size}."
+        raise ValueError(msg)

@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 import pgx
 from flax import nnx
-from jaxtyping import PRNGKeyArray
 from pgx.experimental import auto_reset
 
 from scacchi.config import TrainConfig
@@ -18,42 +17,32 @@ def run_selfplay(
     *,
     env: pgx.Env,
     model: nnx.Module,
-    rng_key: PRNGKeyArray,
+    rng_key,
     cfg: TrainConfig,
 ) -> SelfplayBatch:
     """Generate a fixed-length batch of self-play trajectories."""
 
-    init = jax.vmap(env.init)
-    step = jax.vmap(auto_reset(env.step, env.init))
     batch_size = cfg.selfplay_batch_size
-    rng_key, init_key, scan_key = jax.random.split(rng_key, 3)
-    state = init(jax.random.split(init_key, batch_size))
+    rng_key, init_key = jax.random.split(rng_key)
+    state = jax.vmap(env.init)(jax.random.split(init_key, batch_size))
+    step = jax.vmap(auto_reset(env.step, env.init))
 
-    def step_fn(state: pgx.State, key: PRNGKeyArray) -> tuple[pgx.State, SelfplayBatch]:
+    def step_fn(state, key):
         search_key, reset_key = jax.random.split(key)
-        observation = state.observation
+        obs = state.observation
         actor = state.current_player
-        policy_output = run_search(
-            env=env,
-            model=model,
-            rng_key=search_key,
-            state=state,
-            cfg=cfg.search,
-        )
-        next_state = step(state, policy_output.action, jax.random.split(reset_key, batch_size))
-        reward = next_state.rewards[jnp.arange(batch_size), actor]
-        discount = jnp.where(next_state.terminated, 0.0, -jnp.ones_like(reward))
-        output = SelfplayBatch(
-            observation=observation,
-            action_weights=jnp.asarray(policy_output.action_weights),
+        policy = run_search(env=env, model=model, rng_key=search_key, state=state, cfg=cfg.search)
+        state = step(state, policy.action, jax.random.split(reset_key, batch_size))
+        reward = state.rewards[jnp.arange(batch_size), actor]
+        return state, SelfplayBatch(
+            observation=obs,
+            action_weights=policy.action_weights,
             reward=reward,
-            discount=discount,
-            terminated=next_state.terminated,
+            discount=jnp.where(state.terminated, 0.0, -jnp.ones_like(reward)),
+            terminated=state.terminated,
         )
-        return next_state, output
 
-    keys = jax.random.split(scan_key, cfg.max_num_steps)
-    _, data = jax.lax.scan(step_fn, state, keys)
+    _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, cfg.max_num_steps))
     return data
 
 

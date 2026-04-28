@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Any, Mapping, TypeVar, cast
 
 from omegaconf import DictConfig, OmegaConf
@@ -108,6 +108,9 @@ class ModelConfig:
     policy_channels: int
     value_channels: int
     value_hidden: int
+    resnet_v2: bool = True
+    batch_norm: bool = True
+    batch_norm_momentum: float = 0.9
 
     def __post_init__(self) -> None:
         self.name = _as_str(self.name, "model.name").lower()
@@ -118,14 +121,19 @@ class ModelConfig:
         )
         self.value_channels = _as_int(self.value_channels, "model.value_channels", min_value=1)
         self.value_hidden = _as_int(self.value_hidden, "model.value_hidden", min_value=1)
+        self.resnet_v2 = _as_bool(self.resnet_v2, "model.resnet_v2")
+        self.batch_norm = _as_bool(self.batch_norm, "model.batch_norm")
+        self.batch_norm_momentum = _as_float(
+            self.batch_norm_momentum, "model.batch_norm_momentum", min_value=0.0
+        )
 
 
 @dataclass
 class OptimizerConfig:
     name: str
     learning_rate: float
-    weight_decay: float
-    adam_weight_decay: float
+    weight_decay: float = 0.0
+    adam_weight_decay: float = 0.0
 
     def __post_init__(self) -> None:
         self.name = _as_str(self.name, "optimizer.name").lower()
@@ -168,10 +176,6 @@ class EvalConfig:
     interval: int
     batch_size: int
     max_num_steps: int
-    search: SearchConfig
-    anchor_interval: int
-    max_anchors: int
-    initial_anchor_elo: float
 
     def __post_init__(self) -> None:
         self.enabled = _as_bool(self.enabled, "eval.enabled")
@@ -181,12 +185,6 @@ class EvalConfig:
             msg = "eval.batch_size must be even for color-balanced matches."
             raise ValueError(msg)
         self.max_num_steps = _as_int(self.max_num_steps, "eval.max_num_steps", min_value=1)
-        self.search = _as_section(self.search, SearchConfig, "eval.search")
-        self.anchor_interval = _as_int(
-            self.anchor_interval, "eval.anchor_interval", min_value=1
-        )
-        self.max_anchors = _as_int(self.max_anchors, "eval.max_anchors", min_value=1)
-        self.initial_anchor_elo = _as_float(self.initial_anchor_elo, "eval.initial_anchor_elo")
 
 
 @dataclass
@@ -215,6 +213,16 @@ class RuntimeConfig:
         self.name = _as_str(self.name, "runtime.name").lower()
         self.axis_name = _as_str(self.axis_name, "runtime.axis_name")
         self.num_devices = _as_int(self.num_devices, "runtime.num_devices", min_value=1)
+
+
+@dataclass
+class LoggingConfig:
+    wandb_enabled: bool = False
+    wandb_project: str = "scacchi-az"
+
+    def __post_init__(self) -> None:
+        self.wandb_enabled = _as_bool(self.wandb_enabled, "logging.wandb_enabled")
+        self.wandb_project = _as_str(self.wandb_project, "logging.wandb_project")
 
 
 @dataclass
@@ -248,6 +256,7 @@ class ScacchiConfig:
     checkpoint: CheckpointConfig
     runtime: RuntimeConfig
     train: TrainConfig
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     def __post_init__(self) -> None:
         self.env = _as_section(self.env, EnvConfig, "env")
@@ -257,6 +266,7 @@ class ScacchiConfig:
         self.checkpoint = _as_section(self.checkpoint, CheckpointConfig, "checkpoint")
         self.runtime = _as_section(self.runtime, RuntimeConfig, "runtime")
         self.train = _as_section(self.train, TrainConfig, "train")
+        self.logging = _as_section(self.logging, LoggingConfig, "logging")
 
 
 def config_from_dict_config(cfg: DictConfig | Mapping[str, Any] | ScacchiConfig) -> ScacchiConfig:

@@ -20,15 +20,12 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false uv run python -m scacchi.train \
   train.search.max_depth=2 \
   eval.interval=1 \
   eval.batch_size=2 \
-  eval.max_num_steps=2 \
-  eval.search.num_simulations=2 \
-  eval.search.max_num_considered_actions=4 \
-  eval.search.max_depth=2
+  eval.max_num_steps=2
 ```
 
-Evaluation writes relative Elo progress against frozen anchors to `eval_history.jsonl`
-inside Hydra's run directory. Orbax checkpoints are saved under `checkpoint.dir`
-and can be disabled with `checkpoint.max_to_keep=0`.
+Evaluation logs PGX-baseline match stats when `pgx.make_baseline_model(env.id + "_v0")`
+exists. Orbax checkpoints are saved under `checkpoint.dir` and can be disabled
+with `checkpoint.max_to_keep=0`.
 
 Run checks:
 

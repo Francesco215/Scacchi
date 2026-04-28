@@ -12,7 +12,8 @@ from scacchi.optim import make_optimizer
 from scacchi.runtime import batch_sharding, create_mesh, replicated_sharding, validate_batch_size
 from scacchi.search import run_search
 from scacchi.selfplay import compute_training_batch, run_selfplay
-from scacchi.training import init_optimizer, make_train_step, take_batch
+from scacchi.training import init_optimizer, make_minibatches, make_train_step
+from scacchi.types import SelfplayBatch
 
 
 def small_model_cfg():
@@ -49,6 +50,7 @@ def test_pgx_chess_and_mesh_contracts():
     assert env.num_actions == 4672
 
     mesh = create_mesh(OmegaConf.create({"name": "single_mesh", "axis_name": "data", "num_devices": 1}))
+    validate_batch_size("batch", 2, mesh)
     assert batch_sharding(mesh, 2).spec == jax.sharding.PartitionSpec("data", None)
     assert replicated_sharding(mesh).spec == jax.sharding.PartitionSpec()
 
@@ -80,6 +82,7 @@ def test_model_and_optimizer_factories():
         )
     )
     assert muon is not None
+    assert make_optimizer(OmegaConf.create({"name": "adam", "learning_rate": 1.0e-3})) is not None
 
 
 def test_mctx_search_returns_legal_actions():
@@ -128,7 +131,8 @@ def test_tiny_selfplay_and_train_step():
     assert data.action_weights.shape == (2, 2, env.num_actions)
     assert jnp.isfinite(data.action_weights).all()
 
-    batch = take_batch(compute_training_batch(data), 4)
+    minibatches = make_minibatches(compute_training_batch(data), 4, jax.random.key(3))
+    batch = jax.tree_util.tree_map(lambda x: x[0], minibatches)
     before = jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))
     metrics = make_train_step()(model, optimizer, batch)
     after = jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))
@@ -137,3 +141,17 @@ def test_tiny_selfplay_and_train_step():
     assert jnp.isfinite(metrics.value_loss)
     changed = [jnp.any(a != b) for a, b in zip(before, after, strict=True)]
     assert bool(jnp.any(jnp.asarray(changed)))
+
+
+def test_training_targets_keep_drawn_terminal_values():
+    data = SelfplayBatch(
+        observation=jnp.zeros((3, 1, 1, 1, 1), dtype=jnp.float32),
+        action_weights=jnp.zeros((3, 1, 2), dtype=jnp.float32),
+        reward=jnp.zeros((3, 1), dtype=jnp.float32),
+        discount=jnp.asarray([[-1.0], [-1.0], [0.0]], dtype=jnp.float32),
+        terminated=jnp.asarray([[False], [False], [True]]),
+    )
+    batch = compute_training_batch(data)
+
+    assert bool(jnp.all(batch.value_mask))
+    assert bool(jnp.all(batch.value_target == 0.0))

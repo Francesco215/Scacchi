@@ -58,7 +58,7 @@ def test_orbax_checkpoint_round_trip(tmp_path):
             model=model,
             optimizer=optimizer,
             rng_key=rng_key,
-            metadata={"elo": 12.5},
+            metadata={"frames": 12},
         )
         manager.wait_until_finished()
         assert saved
@@ -72,7 +72,7 @@ def test_orbax_checkpoint_round_trip(tmp_path):
             rng_key=jax.random.key(0),
         )
         assert restored.start_step == 1
-        assert restored.meta["metadata"]["elo"] == 12.5
+        assert restored.meta["metadata"]["frames"] == 12
         assert jnp.array_equal(restored.rng_key, rng_key)
 
         original_leaves = jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))
