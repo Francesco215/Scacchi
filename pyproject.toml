@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = "==3.11.*"
 dependencies = [
     "einops",
-    "jax[cuda12]",
+    "jax[cuda13]",
     "matplotlib",
     "tqdm",
     "wandb",
