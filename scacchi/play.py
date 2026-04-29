@@ -20,16 +20,9 @@ class SelfplayOutput(NamedTuple):
 
 
 def make_selfplay(env, config):
-    @nnx.jit
     def selfplay(model: AZNet, rng_key: jax.Array) -> SelfplayOutput:
-        graphdef, model_state = nnx.split(model) #TODO: avoid this step by using nnx as it's supposed to be used
-
-        def apply_model(state, observation):
-            eval_model = nnx.merge(graphdef, state)
-            return eval_model(observation, train=False)
-
         def recurrent_fn(
-            state,
+            _,
             rng_key: chex.PRNGKey,
             action: chex.Array,
             env_state: pgx.State,
@@ -38,7 +31,7 @@ def make_selfplay(env, config):
 
             current_player = env_state.current_player
             env_state = jax.vmap(env.step)(env_state, action)
-            logits, value = apply_model(state, env_state.observation)
+            logits, value = model(env_state.observation, train=False)
             logits = logits - jnp.max(logits, axis=-1, keepdims=True)
             logits = jnp.where(
                 env_state.legal_action_mask,
@@ -71,7 +64,7 @@ def make_selfplay(env, config):
         ) -> tuple[pgx.State, SelfplayOutput]:
             search_key, reset_key = jax.random.split(key)
             observation = env_state.observation
-            logits, value = apply_model(model_state, observation)
+            logits, value = model(observation, train=False)
             root = mctx.RootFnOutput(
                 prior_logits=logits,
                 value=value,
@@ -79,7 +72,7 @@ def make_selfplay(env, config):
             )
 
             policy_output = mctx.gumbel_muzero_policy(
-                params=model_state,
+                params=(),
                 rng_key=search_key,
                 root=root,
                 recurrent_fn=recurrent_fn,
@@ -113,3 +106,4 @@ def make_selfplay(env, config):
         return data
 
     return selfplay
+

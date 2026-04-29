@@ -18,16 +18,15 @@ from typing import Any, cast
 from flax import nnx
 import hydra
 import jax
-import jax.numpy as jnp
 import optax
 import pgx
 from omegaconf import DictConfig, OmegaConf
 from pgx._src.baseline import BaselineModelId
 from pydantic import BaseModel
 
-from .loss import make_compute_loss_input, make_evaluate, train
+from .loss import make_evaluate
 from .network import AZNet
-from .play import make_selfplay
+from .pipeline import make_training_iteration
 
 
 class Config(BaseModel):
@@ -74,8 +73,7 @@ def main(cfg: DictConfig) -> None:
         wrt=nnx.Param,
     )
 
-    selfplay = make_selfplay(env, config)
-    compute_loss_input = make_compute_loss_input(config)
+    training_iteration = make_training_iteration(env, config)
     evaluate = make_evaluate(env, baseline, config)
 
     iteration: int = 0
@@ -113,47 +111,15 @@ def main(cfg: DictConfig) -> None:
         st = time.time()
 
         rng_key, subkey = jax.random.split(rng_key)
-        data = selfplay(model, subkey)
-        samples = compute_loss_input(data)
-
-        samples = jax.device_get(samples)
-        frames += samples.obs.shape[0] * samples.obs.shape[1]
-        samples = jax.tree_util.tree_map(
-            lambda x: x.reshape((-1, *x.shape[2:])),
-            samples,
-        )
-        rng_key, subkey = jax.random.split(rng_key)
-        ixs = jax.random.permutation(subkey, jnp.arange(samples.obs.shape[0]))
-        samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)
-
-        num_updates = samples.obs.shape[0] // config.training_batch_size
-        if num_updates == 0:
-            raise ValueError(
-                "training_batch_size must be less than or equal to "
-                "selfplay_batch_size * max_num_steps"
-            )
-        num_train_samples = num_updates * config.training_batch_size
-        samples = jax.tree_util.tree_map(lambda x: x[:num_train_samples], samples)
-        minibatches = jax.tree_util.tree_map(
-            lambda x: x.reshape(
-                (num_updates, config.training_batch_size) + x.shape[1:]
-            ),
-            samples,
-        )
-
-        policy_losses, value_losses = [], []
-        for i in range(num_updates):
-            minibatch = jax.tree_util.tree_map(lambda x: x[i], minibatches)
-            policy_loss, value_loss = train(model, optimizer, minibatch)
-            policy_losses.append(policy_loss.item())
-            value_losses.append(value_loss.item())
+        policy_losses, value_losses = training_iteration(model, optimizer, subkey)
+        frames += config.selfplay_batch_size * config.max_num_steps
 
         et = time.time()
         hours += (et - st) / 3600
         log.update(
             {
-                "train/policy_loss": sum(policy_losses) / len(policy_losses),
-                "train/value_loss": sum(value_losses) / len(value_losses),
+                "train/policy_loss": policy_losses.mean().item(),
+                "train/value_loss": value_losses.mean().item(),
                 "hours": hours,
                 "frames": frames,
             }

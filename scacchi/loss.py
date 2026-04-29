@@ -18,7 +18,6 @@ class Sample(NamedTuple):
 
 
 def make_compute_loss_input(config):
-    @nnx.jit
     def compute_loss_input(data: SelfplayOutput) -> Sample:
         value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
 
@@ -44,7 +43,6 @@ def make_compute_loss_input(config):
     return compute_loss_input
 
 
-@nnx.jit
 def train(model: AZNet, optimizer: nnx.Optimizer, data: Sample):
     def loss_fn(model: AZNet):
         logits, value = model(data.obs, train=True)
