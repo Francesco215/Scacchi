@@ -23,8 +23,10 @@ import pgx
 from omegaconf import DictConfig, OmegaConf
 from pgx._src.baseline import BaselineModelId
 from pydantic import BaseModel
+from tqdm import tqdm
 
-from .loss import make_evaluate
+from .evaluations import make_evaluate
+from .logger import build_logger
 from .network import AZNet
 from .pipeline import make_training_iteration
 
@@ -44,8 +46,12 @@ class Config(BaseModel):
     # training params
     training_batch_size: int = 4096
     learning_rate: float = 0.001
+    log_interval: int = 1
     # eval params
     eval_interval: int = 5
+    # logging params
+    wandb_enabled: bool = True
+    wandb_project: str = "scacchi-az"
 
     class Config:
         extra = "forbid"
@@ -55,7 +61,6 @@ class Config(BaseModel):
 def main(cfg: DictConfig) -> None:
     container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
     config: Config = Config(**container)
-    print(config)
 
     env = pgx.make(config.env_id)
     baseline = pgx.make_baseline_model(cast(BaselineModelId, config.env_id + "_v0"))
@@ -76,54 +81,27 @@ def main(cfg: DictConfig) -> None:
     training_iteration = make_training_iteration(env, config)
     evaluate = make_evaluate(env, baseline, config)
 
-    iteration: int = 0
     hours: float = 0.0
     frames: int = 0
-    log: dict[str, float] = {"iteration": iteration, "hours": hours, "frames": frames}
 
     rng_key = jax.random.PRNGKey(config.seed)
-    while True:
-        if iteration % config.eval_interval == 0:
+    with build_logger(config) as logger:
+        pbar = tqdm(range(config.max_num_iters), desc="training", dynamic_ncols=True, total=config.max_num_iters)
+        for iteration in pbar:
+            if iteration % config.eval_interval == 0:
+                rng_key, subkey = jax.random.split(rng_key)
+                returns = evaluate(subkey, model)
+                logger.log_returns(iteration, returns, prefix="eval/vs_baseline")
+
+            st = time.time()
             rng_key, subkey = jax.random.split(rng_key)
-            returns = evaluate(subkey, model)
-            log.update(
-                {
-                    "eval/vs_baseline/avg_R": returns.mean().item(),
-                    "eval/vs_baseline/win_rate": (
-                        (returns == 1).sum() / returns.size
-                    ).item(),
-                    "eval/vs_baseline/draw_rate": (
-                        (returns == 0).sum() / returns.size
-                    ).item(),
-                    "eval/vs_baseline/lose_rate": (
-                        (returns == -1).sum() / returns.size
-                    ).item(),
-                }
-            )
+            policy_losses, value_losses = training_iteration(model, optimizer, subkey)
+            frames += config.selfplay_batch_size * config.max_num_steps
 
-        print(log)
-
-        if iteration >= config.max_num_iters:
-            break
-
-        iteration += 1
-        log: dict[str, float] = {"iteration": iteration}
-        st = time.time()
-
-        rng_key, subkey = jax.random.split(rng_key)
-        policy_losses, value_losses = training_iteration(model, optimizer, subkey)
-        frames += config.selfplay_batch_size * config.max_num_steps
-
-        et = time.time()
-        hours += (et - st) / 3600
-        log.update(
-            {
-                "train/policy_loss": policy_losses.mean().item(),
-                "train/value_loss": value_losses.mean().item(),
-                "hours": hours,
-                "frames": frames,
-            }
-        )
+            et = time.time()
+            hours += (et - st) / 3600
+            dict_to_log = {"policy_loss": policy_losses.mean().item(), "value_loss": value_losses.mean().item(), "hours": hours, "frames": frames}
+            logger.log(iteration, dict_to_log, pbar=pbar, prefix="train/", pbar_filter=r"loss")
 
 
 if __name__ == "__main__":

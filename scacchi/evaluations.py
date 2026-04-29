@@ -1,5 +1,4 @@
 from typing import NamedTuple
-k
 
 import chex
 from flax import nnx
@@ -48,6 +47,7 @@ def make_evaluate(env, baseline, config):
 
 
 def make_mcts_evaluate(env, baseline, config):
+    # WARNING: THIS HAS NOT BEEN TESTED
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: AZNet):
         """MCTS evaluation: model vs baseline. Both sides search with
