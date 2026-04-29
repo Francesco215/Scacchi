@@ -19,43 +19,51 @@ class SelfplayOutput(NamedTuple):
     discount: jax.Array
 
 
+def make_recurrent_fn(env, predict_fn):
+    def recurrent_fn(
+        _,
+        rng_key: chex.PRNGKey,
+        action: chex.Array,
+        env_state: pgx.State,
+    ):
+        del rng_key
+
+        current_player = env_state.current_player
+        env_state = jax.vmap(env.step)(env_state, action)
+        logits, value = predict_fn(env_state.observation)
+        logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+        logits = jnp.where(
+            env_state.legal_action_mask,
+            logits,
+            jnp.finfo(logits.dtype).min,
+        )
+
+        reward = env_state.rewards[
+            jnp.arange(env_state.rewards.shape[0]),
+            current_player,
+        ]
+        value = jnp.where(env_state.terminated, 0.0, value)
+        discount = -jnp.ones_like(value)
+        discount = jnp.where(env_state.terminated, 0.0, discount)
+
+        return (
+            mctx.RecurrentFnOutput(
+                reward=reward,
+                discount=discount,
+                prior_logits=logits,
+                value=value,
+            ),
+            env_state,
+        )
+
+    return recurrent_fn
+
+
 def make_selfplay(env, config):
     def selfplay(model: AZNet, rng_key: jax.Array) -> SelfplayOutput:
-        def recurrent_fn(
-            _,
-            rng_key: chex.PRNGKey,
-            action: chex.Array,
-            env_state: pgx.State,
-        ):
-            del rng_key
-
-            current_player = env_state.current_player
-            env_state = jax.vmap(env.step)(env_state, action)
-            logits, value = model(env_state.observation, train=False)
-            logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-            logits = jnp.where(
-                env_state.legal_action_mask,
-                logits,
-                jnp.finfo(logits.dtype).min,
-            )
-
-            reward = env_state.rewards[
-                jnp.arange(env_state.rewards.shape[0]),
-                current_player,
-            ]
-            value = jnp.where(env_state.terminated, 0.0, value)
-            discount = -jnp.ones_like(value)
-            discount = jnp.where(env_state.terminated, 0.0, discount)
-
-            return (
-                mctx.RecurrentFnOutput(
-                    reward=reward,
-                    discount=discount,
-                    prior_logits=logits,
-                    value=value,
-                ),
-                env_state,
-            )
+        recurrent_fn = make_recurrent_fn(
+            env, lambda obs: model(obs, train=False)
+        )
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
         def step_fn(

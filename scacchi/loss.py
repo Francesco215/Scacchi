@@ -59,38 +59,3 @@ def train(model: AZNet, optimizer: nnx.Optimizer, data: Sample):
     optimizer.update(model, grads)
     return policy_loss, value_loss
 
-
-def make_evaluate(env, baseline, config):
-    @nnx.jit
-    def evaluate(rng_key: jax.Array, model: AZNet):
-        """A simplified evaluation by sampling. Only for debugging.
-        Please use MCTS and run tournaments for serious evaluation."""
-        my_player = 0
-
-        key, init_key = jax.random.split(rng_key)
-        init_keys = jax.random.split(init_key, config.selfplay_batch_size)
-        env_state = jax.vmap(env.init)(init_keys)
-
-        def body_fn(val):
-            key, env_state, returns = val
-            my_logits, _ = model(env_state.observation, train=False)
-            opp_logits, _ = baseline(env_state.observation)
-            is_my_turn = (env_state.current_player == my_player).reshape((-1, 1))
-            logits = jnp.where(is_my_turn, my_logits, opp_logits)
-            key, action_key = jax.random.split(key)
-            action = jax.random.categorical(action_key, logits, axis=-1)
-            env_state = jax.vmap(env.step)(env_state, action)
-            returns = returns + env_state.rewards[
-                jnp.arange(config.selfplay_batch_size),
-                my_player,
-            ]
-            return key, env_state, returns
-
-        _, _, returns = nnx.while_loop(
-            lambda x: ~(x[1].terminated.all()),
-            body_fn,
-            (key, env_state, jnp.zeros(config.selfplay_batch_size)),
-        )
-        return returns
-
-    return evaluate
