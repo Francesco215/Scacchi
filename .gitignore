@@ -54,6 +54,7 @@ cover/
 # Local training outputs
 outputs/
 checkpoints/
+baselines/
 
 # Translations
 *.mo
