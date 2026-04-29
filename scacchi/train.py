@@ -13,20 +13,21 @@
 # limitations under the License.
 
 import time
-from typing import NamedTuple
+from typing import Any, cast
 
 from flax import nnx
 import hydra
 import jax
 import jax.numpy as jnp
-import mctx
 import optax
 import pgx
 from omegaconf import DictConfig, OmegaConf
-from pgx.experimental import auto_reset
+from pgx._src.baseline import BaselineModelId
 from pydantic import BaseModel
 
+from .loss import make_compute_loss_input, make_evaluate, train
 from .network import AZNet
+from .play import make_selfplay
 
 
 class Config(BaseModel):
@@ -51,28 +52,14 @@ class Config(BaseModel):
         extra = "forbid"
 
 
-class SelfplayOutput(NamedTuple):
-    obs: jax.Array
-    reward: jax.Array
-    terminated: jax.Array
-    action_weights: jax.Array
-    discount: jax.Array
-
-
-class Sample(NamedTuple):
-    obs: jax.Array
-    policy_tgt: jax.Array
-    value_tgt: jax.Array
-    mask: jax.Array
-
-
 @hydra.main(version_base=None, config_path="configs", config_name="gardner_chess")
 def main(cfg: DictConfig) -> None:
-    config: Config = Config(**OmegaConf.to_container(cfg, resolve=True))
+    container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
+    config: Config = Config(**container)
     print(config)
 
     env = pgx.make(config.env_id)
-    baseline = pgx.make_baseline_model(config.env_id + "_v0")
+    baseline = pgx.make_baseline_model(cast(BaselineModelId, config.env_id + "_v0"))
     model = AZNet(
         num_actions=env.num_actions,
         observation_shape=env.observation_shape,
@@ -87,174 +74,14 @@ def main(cfg: DictConfig) -> None:
         wrt=nnx.Param,
     )
 
-    @nnx.jit
-    def selfplay(model: AZNet, rng_key: jax.Array) -> SelfplayOutput:
-        graphdef, model_state = nnx.split(model)
-
-        def apply_model(state, observation):
-            eval_model = nnx.merge(graphdef, state)
-            return eval_model(observation, train=False)
-
-        def recurrent_fn(
-            state,
-            rng_key: jax.Array,
-            action: jax.Array,
-            env_state: pgx.State,
-        ):
-            del rng_key
-
-            current_player = env_state.current_player
-            env_state = jax.vmap(env.step)(env_state, action)
-            logits, value = apply_model(state, env_state.observation)
-            logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-            logits = jnp.where(
-                env_state.legal_action_mask,
-                logits,
-                jnp.finfo(logits.dtype).min,
-            )
-
-            reward = env_state.rewards[
-                jnp.arange(env_state.rewards.shape[0]),
-                current_player,
-            ]
-            value = jnp.where(env_state.terminated, 0.0, value)
-            discount = -jnp.ones_like(value)
-            discount = jnp.where(env_state.terminated, 0.0, discount)
-
-            return (
-                mctx.RecurrentFnOutput(
-                    reward=reward,
-                    discount=discount,
-                    prior_logits=logits,
-                    value=value,
-                ),
-                env_state,
-            )
-
-        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
-        def step_fn(
-            env_state: pgx.State,
-            key: jax.Array,
-        ) -> tuple[pgx.State, SelfplayOutput]:
-            search_key, reset_key = jax.random.split(key)
-            observation = env_state.observation
-            logits, value = apply_model(model_state, observation)
-            root = mctx.RootFnOutput(
-                prior_logits=logits,
-                value=value,
-                embedding=env_state,
-            )
-
-            policy_output = mctx.gumbel_muzero_policy(
-                params=model_state,
-                rng_key=search_key,
-                root=root,
-                recurrent_fn=recurrent_fn,
-                num_simulations=config.num_simulations,
-                invalid_actions=~env_state.legal_action_mask,
-                qtransform=mctx.qtransform_completed_by_mix_value,
-                gumbel_scale=1.0,
-            )
-            actor = env_state.current_player
-            reset_keys = jax.random.split(reset_key, config.selfplay_batch_size)
-            env_state = jax.vmap(auto_reset(env.step, env.init))(
-                env_state,
-                policy_output.action,
-                reset_keys,
-            )
-            discount = -jnp.ones_like(value)
-            discount = jnp.where(env_state.terminated, 0.0, discount)
-            return env_state, SelfplayOutput(
-                obs=observation,
-                action_weights=policy_output.action_weights,
-                reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
-                terminated=env_state.terminated,
-                discount=discount,
-            )
-
-        rng_key, init_key = jax.random.split(rng_key)
-        init_keys = jax.random.split(init_key, config.selfplay_batch_size)
-        env_state = jax.vmap(env.init)(init_keys)
-        step_keys = jax.random.split(rng_key, config.max_num_steps)
-        _, data = step_fn(env_state, step_keys)
-        return data
-
-    @nnx.jit
-    def compute_loss_input(data: SelfplayOutput) -> Sample:
-        value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
-
-        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
-        def body_fn(carry: jax.Array, i: jax.Array) -> tuple[jax.Array, jax.Array]:
-            ix = config.max_num_steps - i - 1
-            value = data.reward[ix] + data.discount[ix] * carry
-            return value, value
-
-        _, value_tgt = body_fn(
-            jnp.zeros(config.selfplay_batch_size, dtype=data.reward.dtype),
-            jnp.arange(config.max_num_steps),
-        )
-        value_tgt = value_tgt[::-1, :]
-
-        return Sample(
-            obs=data.obs,
-            policy_tgt=data.action_weights,
-            value_tgt=value_tgt,
-            mask=value_mask,
-        )
-
-    @nnx.jit
-    def train(model: AZNet, optimizer: nnx.Optimizer, data: Sample):
-        def loss_fn(model: AZNet):
-            logits, value = model(data.obs, train=True)
-            policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt)
-            policy_loss = jnp.mean(policy_loss)
-            value_loss = optax.l2_loss(value, data.value_tgt)
-            value_loss = jnp.mean(value_loss * data.mask)
-            return policy_loss + value_loss, (policy_loss, value_loss)
-
-        (_, (policy_loss, value_loss)), grads = nnx.value_and_grad(
-            loss_fn,
-            has_aux=True,
-        )(model)
-        optimizer.update(model, grads)
-        return policy_loss, value_loss
-
-    @nnx.jit
-    def evaluate(rng_key: jax.Array, model: AZNet):
-        """A simplified evaluation by sampling. Only for debugging.
-        Please use MCTS and run tournaments for serious evaluation."""
-        my_player = 0
-
-        key, init_key = jax.random.split(rng_key)
-        init_keys = jax.random.split(init_key, config.selfplay_batch_size)
-        env_state = jax.vmap(env.init)(init_keys)
-
-        def body_fn(val):
-            key, env_state, returns = val
-            my_logits, _ = model(env_state.observation, train=False)
-            opp_logits, _ = baseline(env_state.observation)
-            is_my_turn = (env_state.current_player == my_player).reshape((-1, 1))
-            logits = jnp.where(is_my_turn, my_logits, opp_logits)
-            key, action_key = jax.random.split(key)
-            action = jax.random.categorical(action_key, logits, axis=-1)
-            env_state = jax.vmap(env.step)(env_state, action)
-            returns = returns + env_state.rewards[
-                jnp.arange(config.selfplay_batch_size),
-                my_player,
-            ]
-            return key, env_state, returns
-
-        _, _, returns = nnx.while_loop(
-            lambda x: ~(x[1].terminated.all()),
-            body_fn,
-            (key, env_state, jnp.zeros(config.selfplay_batch_size)),
-        )
-        return returns
+    selfplay = make_selfplay(env, config)
+    compute_loss_input = make_compute_loss_input(config)
+    evaluate = make_evaluate(env, baseline, config)
 
     iteration: int = 0
     hours: float = 0.0
     frames: int = 0
-    log = {"iteration": iteration, "hours": hours, "frames": frames}
+    log: dict[str, float] = {"iteration": iteration, "hours": hours, "frames": frames}
 
     rng_key = jax.random.PRNGKey(config.seed)
     while True:
@@ -282,7 +109,7 @@ def main(cfg: DictConfig) -> None:
             break
 
         iteration += 1
-        log = {"iteration": iteration}
+        log: dict[str, float] = {"iteration": iteration}
         st = time.time()
 
         rng_key, subkey = jax.random.split(rng_key)
