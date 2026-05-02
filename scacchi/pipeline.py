@@ -2,7 +2,7 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 
-from .loss import Sample, make_compute_loss_input, train
+from .loss import LossOutputs, Sample, make_compute_loss_input, make_train_step
 from .network import AZNet
 from .play import make_selfplay
 
@@ -29,31 +29,37 @@ def make_minibatches(
     return minibatches
 
 
-def train_minibatches(
-    model: AZNet,
-    optimizer: nnx.Optimizer,
-    minibatches: Sample,
-) -> tuple[jax.Array, jax.Array]:
-    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
-    def scan_step(state, minibatch):
-        model, optimizer = state
-        policy_loss, value_loss = train(model, optimizer, minibatch)
-        return (model, optimizer), (policy_loss, value_loss)
+def make_train_minibatches(config):
+    train_step = make_train_step(config)
 
-    _, (policy_losses, value_losses) = scan_step((model, optimizer), minibatches)
-    return policy_losses, value_losses
+    def train_minibatches(
+        model: AZNet,
+        optimizer: nnx.Optimizer,
+        minibatches: Sample,
+    ) -> LossOutputs:
+        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+        def scan_step(state, minibatch):
+            model, optimizer = state
+            losses = train_step(model, optimizer, minibatch)
+            return (model, optimizer), losses
+
+        _, losses = scan_step((model, optimizer), minibatches)
+        return losses
+
+    return train_minibatches
 
 
 def make_training_iteration(env, config):
     selfplay = make_selfplay(env, config)
     compute_loss_input = make_compute_loss_input(config)
+    train_minibatches = make_train_minibatches(config)
 
     @nnx.jit
     def training_iteration(
         model: AZNet,
         optimizer: nnx.Optimizer,
         rng_key: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> LossOutputs:
         selfplay_key, perm_key = jax.random.split(rng_key)
         data = selfplay(model, selfplay_key)
         samples = compute_loss_input(data)

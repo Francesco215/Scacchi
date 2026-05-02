@@ -49,6 +49,16 @@ class Config(BaseModel):
     log_interval: int = 1
     # eval params
     eval_interval: int = 5
+    # Dirichlet-Q params
+    policy_mc_samples: int = 32
+    search_evidence_rho: float = 1.0
+    policy_loss_weight: float = 1.0
+    value_outcome_weight: float = 1.0
+    q_outcome_weight: float = 1.0
+    dir_kl_weight: float = 0.0
+    evidence_schedule: str = "sqrt"
+    c_terminal: float = 8.0
+    c_leaf: float = 2.0
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"
@@ -95,12 +105,18 @@ def main(cfg: DictConfig) -> None:
 
             st = time.time()
             rng_key, subkey = jax.random.split(rng_key)
-            policy_losses, value_losses = training_iteration(model, optimizer, subkey)
+            losses = training_iteration(model, optimizer, subkey)
             frames += config.selfplay_batch_size * config.max_num_steps
 
             et = time.time()
             hours += (et - st) / 3600
-            dict_to_log = {"policy_loss": policy_losses.mean().item(), "value_loss": value_losses.mean().item(), "hours": hours, "frames": frames}
+            dict_to_log = {
+                "policy_loss": losses.policy_loss.mean().item(),
+                "value_outcome_loss": losses.value_outcome_loss.mean().item(),
+                "q_outcome_loss": losses.q_outcome_loss.mean().item(),
+                "hours": hours,
+                "frames": frames,
+            }
             logger.log(iteration, dict_to_log, pbar=pbar, prefix="train/", pbar_filter=r"loss")
 
 
