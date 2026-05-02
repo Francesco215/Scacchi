@@ -205,7 +205,7 @@ class BasicSelfAttention(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        return self.attn(x)
+        return self.attn(x, decode=False)
 
 
 class TransformerBlock(nnx.Module):
