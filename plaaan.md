@@ -9,8 +9,8 @@ The current code (`scacchi/play.py`, `scacchi/loss.py`, `scacchi/network.py`) ru
 Full fidelity to math.md cannot be expressed inside stock mctx — the `Tree` dataclass holds `children_values` as scalars, the backup at `mctx/_src/search.py:265` is hard-coded scalar averaging, and the `gumbel_muzero_root_action_selection` is not Thompson sampling. We adopt a **three-stage incremental path**: each stage is a meaningful, testable improvement; none of the work in earlier stages is throwaway.
 
 - **Stage B** (this plan's first deliverable): Dirichlet heads + losses + Bayesian wrapper for the policy target. No mctx changes.
-- **Stage A** (follow-up): Vendor a minimal mctx fork to get *search-improved* running WDL means at every node, not just at expansion-time snapshots.
-- **Stage Full** (further follow-up): Real Thompson root selection (§10), Dirichlet-KL losses (§14/§15), and terminal-vs-leaf evidence weighting (§8).
+- **Stage A** (follow-up): Vendor a minimal WDL tree/search fork to get *search-improved* running WDL means at every node and Thompson root selection (§10). Reuse `mctx.muzero_action_selection` for interior nodes.
+- **Stage Full** (further follow-up): Dirichlet-KL losses (§14/§15) and terminal-vs-leaf evidence weighting (§8).
 
 ---
 
@@ -136,73 +136,86 @@ The pgx baseline returns `(logits, value)` and we cannot change it.
 
 ---
 
-## Stage A — Forked mctx with running WDL means (~340 LoC)
+## Stage A — WDL tree/search fork + Thompson root (~260 LoC)
 
 **Trigger:** ship if Stage B's snapshot `y_a` proves to be the bottleneck (signal: flat policy loss with sane V/Q losses).
 
-Create `scacchi/dirichlet_mctx.py` — one new file, mostly direct copy from `mctx._src` with surgical edits.
+Create `scacchi/dirichlet_mctx.py` — one new file with the minimum code needed where stock mctx's scalar value assumption leaks. This is **not** a Gumbel fork.
 
-### A.1 What to fork
+### A.1 What remains custom
 
 | Component | Origin | Lines | Edit |
 |---|---|---|---|
 | `Tree` dataclass | `mctx/_src/tree.py:28-115` | ~90 | `node_values: [B,N,3]`, `children_values: [B,N,A,3]`. Update `_unbatched_qvalues` (broadcast). `summary.qvalues` collapses to scalar via U. |
-| `instantiate_tree_from_root` | `mctx/_src/search.py:345-385` | ~40 | Allocate at new shape. Stash `α^Q_prior` on `tree.extra_data` (Stage Full needs it). |
+| `RootFnOutput` | local small container | ~5 | Same fields as mctx root output, but `value: [B,3]` WDL mean. Could reuse `mctx.RootFnOutput`, but a local type avoids scalar-value ambiguity. |
+| `RecurrentFnOutput` | local small container | ~8 | `reward: [B]`, `is_flip: [B]`, `prior_logits: [B,A]`, `value: [B,3]`. `is_flip` replaces stock scalar `discount` semantics for WDL backup. |
+| `instantiate_tree_from_root` | `mctx/_src/search.py:345-385` | ~40 | Allocate WDL-shaped value arrays. Stash `alpha_Q_prior` and root invalid-action mask on the tree for Thompson root selection. |
 | `expand` | `mctx/_src/search.py:190-244` | ~55 | Drop `chex.assert_shape(step.value, [batch_size])`. Otherwise unchanged. |
 | `backward` | `mctx/_src/search.py:247-292` | ~45 | Replace `discount * leaf_value` with `jnp.where(is_flip, flip_wdl(leaf_value), leaf_value)` — vector flip is W↔L swap, *not* negation. `discount` becomes `is_flip: bool` in `RecurrentFnOutput`. |
-| `search` | `mctx/_src/search.py:31-114` | ~85 | Pure copy; calls our new `expand`/`backward`. |
-| `dirichlet_gumbel_policy` | `mctx/_src/policies.py:125-231` | ~110 | Pure copy of `gumbel_muzero_policy`; calls our `search`. Slim to drop muzero/stochastic variants. |
-| `wdl_qtransform` | new | ~15 | Collapse WDL → scalar U at the qtransform boundary so `gumbel_muzero_root_action_selection` and `gumbel_muzero_interior_action_selection` can be reused as-is. |
+| `search` | `mctx/_src/search.py:31-114` | ~85 | Mostly copied loop, but calls the WDL `instantiate_tree_from_root`, `expand`, and `backward`. Stock `mctx.search` cannot be reused because those calls are hard-wired to scalar internals. |
+| `thompson_root_action_selection` | new | ~25 | Implements math.md §10/§11: sample per-action Dirichlets from the current root posterior and select `argmax U(phi)`. |
+| `dirichlet_policy` | local small wrapper | ~35 | Masks illegal root actions, runs WDL search, returns `mctx.PolicyOutput` with the final MC posterior-best action weights. No Gumbel, no sequential halving. |
+| `wdl_qtransform` | new | ~15 | Collapse WDL → scalar U only at the qtransform boundary so `mctx.muzero_action_selection` can be reused for interior nodes. |
 
 ### A.2 What is reused untouched
 
 Imported from `mctx._src`:
-- `action_selection.gumbel_muzero_root_action_selection` and `gumbel_muzero_interior_action_selection` — they call `qtransform(tree, idx)` which our `wdl_qtransform` returns as scalar.
-- `seq_halving.score_considered`.
-- The pieces of `qtransforms.qtransform_completed_by_mix_value` we want to compose with.
+- `action_selection.muzero_action_selection` for non-root nodes. It only needs tree-like visit/prior fields and a scalar `qtransform`; our `wdl_qtransform` supplies scalar `U`.
+- Optionally `action_selection.switching_action_selection_wrapper` for root-vs-interior dispatch.
+- `action_selection.masked_argmax`, if useful.
+- `mctx.PolicyOutput` as the return container.
+
+Not reused:
+- `mctx.gumbel_muzero_policy`, `gumbel_muzero_root_action_selection`, `gumbel_muzero_interior_action_selection`, `GumbelMuZeroExtraData`, and `seq_halving`.
+- `mctx.search`, `mctx.expand`, `mctx.backward`, and `mctx.instantiate_tree_from_root`, because they allocate and update scalar value arrays.
 
 Pin `mctx>=0.0.6,<0.0.7` in `pyproject.toml` since we import from `_src`.
 
-### A.3 Effect on Stage B code
+### A.3 Thompson root posterior
+
+Root action selection follows math.md §10/§11 in Stage A, not Stage Full:
+
+```python
+def thompson_root_action_selection(rng, tree, node_index, *, rho, schedule):
+    alpha_prior = tree.extra_data.alpha_Q_prior[node_index]   # [A, 3]
+    y_bar = tree.children_values[node_index]                  # [A, 3]
+    visits = tree.children_visits[node_index]                 # [A]
+    evidence = evidence_schedule(visits, rho, schedule)       # [A]
+    alpha_post = alpha_prior + evidence[..., None] * y_bar
+    phi = jax.random.dirichlet(rng, alpha_post)               # [A, 3]
+    utility = phi[..., W] - phi[..., L]
+    utility = jnp.where(tree.root_invalid_actions, -jnp.inf, utility)
+    return jnp.argmax(utility)
+```
+
+For completed visit counts, `evidence_schedule(N, ρ, "sqrt") = ρ * jnp.sqrt(N)`, so unvisited actions add no search evidence. Also support `"linear"` (`ρ * N`) and `"log"` (`ρ * log1p(N)`).
+
+### A.4 Effect on Stage B code
 
 In `play.py`:
-- Drop the `NodeEmbedding`'s `alpha_V_mean` field; embedding goes back to bare `pgx.State`. The running WDL mean now lives at `tree.children_values[:, ROOT_INDEX, :, :]` directly.
-- `recurrent_fn` returns `value: [B, 3]` (the WDL mean from `α^V` of the leaf state) and `is_flip: [B]` (always `True` for two-player games when terminated is False; `False` when terminated, since reward already absorbed the terminal value).
-- The "perspective flip kludge" disappears — the forked `backward` handles it via `flip_wdl`.
+- Drop `NodeEmbedding`; embedding goes back to bare `pgx.State`. The running WDL mean now lives at `tree.children_values[:, ROOT_INDEX, :, :]` directly.
+- `make_recurrent_fn` returns the local `dirichlet_mctx.RecurrentFnOutput` with `value: [B, 3]` (the WDL mean from `α^V` of the leaf state) and `is_flip: [B]`.
+- For terminal children, return terminal one-hot WDL from the parent/root player's perspective and set `is_flip=False`; for non-terminal children, return the child state's WDL mean and set `is_flip=True`.
+- The Stage B "gather child embedding then flip" logic disappears — the forked `backward` maintains root-action WDL means directly.
+- Replace `mctx.gumbel_muzero_policy` with `dirichlet_mctx.dirichlet_policy`.
+- Build the final `policy_target` from the final root posterior (`alpha_Q + evidence * tree.children_values[:, ROOT, :, :]`) using the existing MC posterior-best helper.
 
 In `loss.py` and `train.py`: no changes from Stage B.
 
-### A.4 Verification (Stage A)
+In `evaluations.py`:
+- Sampling eval remains unchanged.
+- MCTS eval uses `dirichlet_mctx.dirichlet_policy` for both sides. The pgx baseline wrapper still synthesizes `alpha_V` so `U(mean(alpha_V))` preserves its scalar value.
+
+### A.5 Verification (Stage A)
 
 - Confirm `tree.children_values[:, ROOT_INDEX, :, :].sum(-1)` is approximately 1 across batch and actions (running mean of normalized WDL).
 - Run a unit-style script: 1 batch element, 8 simulations, terminal child reachable in 1 step. Check that the terminal's WDL one-hot back-propagates with correct flip across odd/even depths.
 
 ---
 
-## Stage Full — Thompson root + Dirichlet KL + evidence weighting (~150 LoC)
+## Stage Full — Dirichlet KL + evidence weighting (~100 LoC)
 
-### F.1 Real Thompson root selection (§10)
-
-Add to `scacchi/dirichlet_mctx.py`:
-
-```python
-def thompson_root_selection(rng, tree, node_indices, *, rho, schedule):
-    α_prior = tree.extra_data.alpha_Q_prior[node_indices]   # [A, 3]
-    ȳ      = tree.children_values[node_indices]             # [A, 3]
-    N      = tree.children_visits[node_indices]             # [A]
-    c      = evidence_schedule(N, rho, schedule)            # [A]
-    α_post = α_prior + c[..., None] * ȳ                     # [A, 3]
-    φ      = jax.random.dirichlet(rng, α_post)              # [A, 3]
-    U      = φ[..., W] - φ[..., L]
-    U      = jnp.where(invalid_actions, -jnp.inf, U)
-    return jnp.argmax(U)
-```
-
-Swap `gumbel_muzero_root_action_selection` → `thompson_root_selection` inside `dirichlet_gumbel_policy`. Keep `gumbel_muzero_interior_action_selection` for non-root nodes (Thompson everywhere is expensive and isn't what §10 specifies).
-
-For completed visit counts, `evidence_schedule(N, ρ, "sqrt") = ρ * jnp.sqrt(N)`, so unvisited actions add no search evidence. Also support `"linear"` (`ρ * N`) and `"log"` (`ρ * log1p(N)`) from §11. Reuses the `evidence_schedule` config from B.7.
-
-### F.2 Dirichlet-KL losses (§14, §15)
+### F.1 Dirichlet-KL losses (§14, §15)
 
 In `scacchi/loss.py`:
 - Implement §16 KL formula via `jax.scipy.special.gammaln` and `jax.lax.digamma`. ~15 LoC.
@@ -211,7 +224,7 @@ In `scacchi/loss.py`:
 
 Flip `dir_kl_weight` from `0.0` to a calibrated value (try 0.5, then sweep).
 
-### F.3 Terminal vs leaf evidence weighting (§8)
+### F.2 Terminal vs leaf evidence weighting (§8)
 
 Plan A's running mean treats every backup-step as 1 unit of evidence; §8 says terminals carry more weight (`c_terminal > c_leaf`).
 
@@ -222,22 +235,23 @@ Plan A's running mean treats every backup-step as 1 unit of evidence; §8 says t
   ```
 - Add a parallel `accumulated_evidence: [B, N]` field to the forked `Tree` (preserve `node_visits` for logging/debug).
 
-### F.4 What does not need change in Stage Full
+### F.3 What does not need change in Stage Full
 
 - Network architecture (heads stay).
 - `SelfplayOutput` shape.
 - `evaluations.py`.
 - `train.py` outer loop.
-- Stage A's forked `search`, `expand`, `instantiate_tree_from_root` (only `backward` and the policy wrapper change).
+- Stage A's Thompson root selection and interior `mctx.muzero_action_selection`.
+- Stage A's forked `search`, `expand`, `instantiate_tree_from_root` (only `backward` changes for weighted evidence).
 
-### F.5 Cumulative LoC (recap)
+### F.4 Cumulative LoC (recap)
 
 | Stage | New / changed LoC | Where |
 |---|---|---|
 | B | ~80 | network/play/loss/eval/train/yaml |
-| A | +340 | one new file `dirichlet_mctx.py` |
-| Full | +100–150 | inside the fork (~60) + loss.py KL terms (~50) + config (~10) |
-| **Total** | **~520–570** | one fork file + targeted edits in 6 existing files |
+| A | +260 | one new file `dirichlet_mctx.py` + targeted play/eval integration |
+| Full | +100 | inside the fork (~40) + loss.py KL terms (~50) + config (~10) |
+| **Total** | **~440** | one fork file + targeted edits in 6 existing files |
 
 ---
 
