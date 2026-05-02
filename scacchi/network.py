@@ -186,6 +186,28 @@ class RelativePositionAttention(nnx.Module):
         return self.out_proj(output)
 
 
+class BasicSelfAttention(nnx.Module):
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        num_heads: int,
+        rngs: nnx.Rngs,
+    ):
+        self.attn = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=embed_dim,
+            qkv_features=embed_dim,
+            out_features=embed_dim,
+            dropout_rate=0.0,
+            use_bias=False,
+            rngs=rngs,
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.attn(x)
+
+
 class TransformerBlock(nnx.Module):
     def __init__(
         self,
@@ -194,16 +216,27 @@ class TransformerBlock(nnx.Module):
         num_heads: int,
         mlp_dim: int,
         board_shape: tuple[int, int],
+        attention_type: str,
         rngs: nnx.Rngs,
     ):
         self.attn_norm = nnx.LayerNorm(embed_dim, use_bias=False, rngs=rngs)
         self.ffn_norm = nnx.LayerNorm(embed_dim, use_bias=False, rngs=rngs)
-        self.attn = RelativePositionAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            board_shape=board_shape,
-            rngs=rngs,
-        )
+        if attention_type == "relative_2d":
+            self.attn = RelativePositionAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                board_shape=board_shape,
+                rngs=rngs,
+            )
+        elif attention_type == "basic_learned":
+            self.attn = BasicSelfAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                rngs=rngs,
+            )
+        else:
+            msg = f"Unknown attention_type '{attention_type}'."
+            raise ValueError(msg)
         self.ffn_up = nnx.Linear(embed_dim, mlp_dim, rngs=rngs)
         self.ffn_down = nnx.Linear(mlp_dim, embed_dim, rngs=rngs)
 
@@ -226,6 +259,7 @@ class TransformerNet(nnx.Module):
         num_heads: int,
         mlp_dim: int,
         value_hidden_dim: int,
+        position_encoding: str,
         use_absolute_positions: bool,
         rngs: nnx.Rngs,
     ):
@@ -235,6 +269,7 @@ class TransformerNet(nnx.Module):
         self.board_shape = (height, width)
         self.num_tokens = height * width
         self.embed_dim = embed_dim
+        self.position_encoding = position_encoding
         self.use_absolute_positions = use_absolute_positions
         self.input_proj = nnx.Linear(input_channels, embed_dim, rngs=rngs)
         self.blocks = nnx.List(
@@ -244,6 +279,7 @@ class TransformerNet(nnx.Module):
                     num_heads=num_heads,
                     mlp_dim=mlp_dim,
                     board_shape=self.board_shape,
+                    attention_type=position_encoding,
                     rngs=rngs,
                 )
                 for _ in range(num_blocks)
@@ -267,7 +303,8 @@ class TransformerNet(nnx.Module):
         x = x.reshape((x.shape[0], self.num_tokens, self.observation_shape[-1]))
         x = self.input_proj(x)
 
-        if self.use_absolute_positions:
+        use_absolute = self.use_absolute_positions or self.position_encoding == "basic_learned"
+        if use_absolute:
             x = x * (1.0 + self.abs_mul[...]) + self.abs_add[...]
 
         for block in self.blocks:
@@ -307,6 +344,7 @@ def build_model(
             num_heads=int(getattr(config, "num_heads", 8)),
             mlp_dim=int(getattr(config, "mlp_dim", 512)),
             value_hidden_dim=int(getattr(config, "value_hidden_dim", 64)),
+            position_encoding=str(getattr(config, "position_encoding", "relative_2d")),
             use_absolute_positions=bool(getattr(config, "use_absolute_positions", True)),
             rngs=rngs,
         )

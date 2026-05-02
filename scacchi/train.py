@@ -44,6 +44,7 @@ class Config(BaseModel):
     num_heads: int = 8
     mlp_dim: int = 512
     value_hidden_dim: int = 64
+    position_encoding: str = "relative_2d"
     use_absolute_positions: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
@@ -69,6 +70,12 @@ def main(cfg: DictConfig) -> None:
     config: Config = Config(**container)
     if config.model_name == "transformer" and config.embed_dim % config.num_heads != 0:
         msg = "embed_dim must be divisible by num_heads."
+        raise ValueError(msg)
+    if config.model_name == "transformer" and config.position_encoding not in {
+        "relative_2d",
+        "basic_learned",
+    }:
+        msg = "position_encoding must be one of {'relative_2d', 'basic_learned'}."
         raise ValueError(msg)
 
     env = pgx.make(config.env_id)

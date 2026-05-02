@@ -7,6 +7,7 @@ embed_dim: 128
 num_heads: 8
 mlp_dim: 512
 value_hidden_dim: 64
+position_encoding: basic_learned
 use_absolute_positions: true
 selfplay_batch_size: 1024
 num_simulations: 32
