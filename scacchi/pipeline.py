@@ -3,7 +3,6 @@ import jax
 import jax.numpy as jnp
 
 from .loss import Sample, make_compute_loss_input, train
-from .network import AZNet
 from .play import make_selfplay
 
 
@@ -30,7 +29,7 @@ def make_minibatches(
 
 
 def train_minibatches(
-    model: AZNet,
+    model: nnx.Module,
     optimizer: nnx.Optimizer,
     minibatches: Sample,
 ) -> tuple[jax.Array, jax.Array]:
@@ -50,7 +49,7 @@ def make_training_iteration(env, config):
 
     @nnx.jit
     def training_iteration(
-        model: AZNet,
+        model: nnx.Module,
         optimizer: nnx.Optimizer,
         rng_key: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:

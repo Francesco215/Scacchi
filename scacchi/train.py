@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 from .evaluations import make_evaluate
 from .logger import build_logger
-from .network import AZNet
+from .network import build_model
 from .pipeline import make_training_iteration
 
 
@@ -36,9 +36,15 @@ class Config(BaseModel):
     seed: int = 0
     max_num_iters: int = 400
     # network params
+    model_name: str = "resnet"
     num_channels: int = 128
     num_layers: int = 6
     resnet_v2: bool = True
+    embed_dim: int = 128
+    num_heads: int = 8
+    mlp_dim: int = 512
+    value_hidden_dim: int = 64
+    use_absolute_positions: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
     num_simulations: int = 32
@@ -61,15 +67,16 @@ class Config(BaseModel):
 def main(cfg: DictConfig) -> None:
     container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
     config: Config = Config(**container)
+    if config.model_name == "transformer" and config.embed_dim % config.num_heads != 0:
+        msg = "embed_dim must be divisible by num_heads."
+        raise ValueError(msg)
 
     env = pgx.make(config.env_id)
     baseline = pgx.make_baseline_model(cast(BaselineModelId, config.env_id + "_v0"))
-    model = AZNet(
+    model = build_model(
+        config,
         num_actions=env.num_actions,
         observation_shape=env.observation_shape,
-        num_channels=config.num_channels,
-        num_blocks=config.num_layers,
-        resnet_v2=config.resnet_v2,
         rngs=nnx.Rngs(config.seed),
     )
     optimizer = nnx.Optimizer(

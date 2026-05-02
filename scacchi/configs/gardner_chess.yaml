@@ -1,9 +1,13 @@
 env_id: gardner_chess
 seed: 0
 max_num_iters: 300
-num_channels: 128
+model_name: transformer
 num_layers: 6
-resnet_v2: true
+embed_dim: 128
+num_heads: 8
+mlp_dim: 512
+value_hidden_dim: 64
+use_absolute_positions: true
 selfplay_batch_size: 1024
 num_simulations: 32
 max_num_steps: 256

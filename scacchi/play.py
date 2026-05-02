@@ -8,8 +8,6 @@ import mctx
 import pgx
 from pgx.experimental import auto_reset
 
-from .network import AZNet
-
 
 class SelfplayOutput(NamedTuple):
     obs: jax.Array
@@ -60,7 +58,7 @@ def make_recurrent_fn(env, predict_fn):
 
 
 def make_selfplay(env, config):
-    def selfplay(model: AZNet, rng_key: jax.Array) -> SelfplayOutput:
+    def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
         recurrent_fn = make_recurrent_fn(
             env, lambda obs: model(obs, train=False)
         )
@@ -114,4 +112,3 @@ def make_selfplay(env, config):
         return data
 
     return selfplay
-
