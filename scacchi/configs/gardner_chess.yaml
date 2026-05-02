@@ -20,5 +20,5 @@ dir_kl_weight: 0.0
 evidence_schedule: sqrt
 c_terminal: 8.0
 c_leaf: 2.0
-wandb_enabled: true
+wandb_enabled: false
 wandb_project: scacchi-az

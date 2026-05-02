@@ -122,7 +122,8 @@ def _gather_child_wdl(
 ) -> jax.Array:
     """For each root action, return y_a [B, A, 3] from the player-at-root's perspective.
 
-    Visited child actions: gather the child node's alpha_V_mean and flip W↔L.
+    Visited non-terminal child actions: gather child alpha_V_mean and flip W<->L.
+    Terminal child actions: use the actual terminal one-hot outcome.
     Unvisited actions: fall back to the root's α^Q mean for that action.
     """
     children_idx = tree.children_index[:, mctx.Tree.ROOT_INDEX, :]  # [B, A]
@@ -132,7 +133,15 @@ def _gather_child_wdl(
     batch_range = jnp.arange(batch_size)[:, None]
     child_wdl = tree.embeddings.alpha_V_mean[batch_range, safe_idx]  # [B, A, 3]
     flipped = _flip_wdl(child_wdl)
-    return jnp.where(visited[..., None], flipped, root_alpha_Q_mean)
+
+    child_discount = tree.children_discounts[:, mctx.Tree.ROOT_INDEX, :]
+    terminal = visited & (child_discount == 0.0)
+    child_reward = tree.children_rewards[:, mctx.Tree.ROOT_INDEX, :]
+    terminal_index = jnp.clip(jnp.round(child_reward).astype(jnp.int32) + 1, 0, WDL_DIM - 1)
+    terminal_wdl = jax.nn.one_hot(terminal_index, WDL_DIM, dtype=root_alpha_Q_mean.dtype)
+
+    visited_wdl = jnp.where(terminal[..., None], terminal_wdl, flipped)
+    return jnp.where(visited[..., None], visited_wdl, root_alpha_Q_mean)
 
 
 def make_selfplay(env, config):
@@ -173,7 +182,7 @@ def make_selfplay(env, config):
             visit_counts = tree.children_visits[:, mctx.Tree.ROOT_INDEX, :].astype(alpha_Q.dtype)
             root_alpha_Q_mean = _wdl_mean(alpha_Q)  # [B, A, 3]
             y_a = _gather_child_wdl(tree, root_alpha_Q_mean)  # [B, A, 3]
-            evidence = config.search_evidence_rho * jnp.sqrt(visit_counts + 1.0)  # [B, A]
+            evidence = config.search_evidence_rho * jnp.sqrt(visit_counts)  # [B, A]
             alpha_Q_post = alpha_Q + evidence[..., None] * y_a  # [B, A, 3]
             policy_target = _mc_posterior_best(
                 mc_key,

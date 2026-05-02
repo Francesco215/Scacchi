@@ -33,19 +33,23 @@ mctx still consumes scalar values in stage B. In `make_recurrent_fn` and the roo
 - Pass `policy_logits` as `prior_logits` (legal-mask same as today, `play.py:34`).
 - Keep mctx's existing `discount = -1` perspective flip (`play.py:47`); correct for scalar U because `U(flip(φ)) = −U(φ)`.
 
-### B.3 Stuff `alpha_Q_mean` into the embedding
+### B.3 Stuff `alpha_V_mean` into the embedding
 
 `tree.embeddings` is an arbitrary pytree. Replace the bare `pgx.State` with:
 
 ```python
 class NodeEmbedding(NamedTuple):
     state: pgx.State
-    alpha_Q_mean: jax.Array  # [B, A, 3] WDL mean from this node's α^Q
+    alpha_V_mean: jax.Array  # [B, 3] WDL mean from this node's α^V
 ```
 
-In `make_recurrent_fn`, after `env.step`, run the network on the new observation, derive `alpha_Q_mean = alpha_Q / alpha_Q.sum(-1, keepdims=True)`, and store it on the new node. After search, gather depth-1 children via `tree.children_index[:, ROOT_INDEX, :]` and look up `tree.embeddings.alpha_Q_mean` at those indices to get **per-root-action WDL targets `y_a [B, A, 3]`**.
+In `make_recurrent_fn`, after `env.step`, run the network on the new observation, derive `alpha_V_mean = alpha_V / alpha_V.sum(-1, keepdims=True)`, and store it on the new node. After search, gather depth-1 children via `tree.children_index[:, ROOT_INDEX, :]` and look up `tree.embeddings.alpha_V_mean` at those indices to get one state-value WDL snapshot for each visited root action.
 
-**Perspective flip on gather:** the child node was evaluated from the opponent's perspective. Apply `y_a = y_a[..., ::-1]` (swap W↔L, D fixed) before using as the root-action target.
+**Perspective flip on gather:** non-terminal child nodes are evaluated from the opponent's perspective. Apply `y_a = y_a[..., ::-1]` (swap W↔L, D fixed) before using as the root-action target.
+
+**Terminal override:** if a visited root child is terminal (`children_discounts[:, ROOT_INDEX, a] == 0`), use the actual immediate reward as a one-hot WDL target from the root player's perspective: `one_hot(round(children_rewards[:, ROOT_INDEX, a]) + 1, 3)`. Do not use the network value on terminal children.
+
+Unvisited actions keep their root prior `mean(alpha_Q[:, a])` as the fallback `y_a`, but receive zero search evidence (`c_a = 0`), so this fallback does not double-count the prior.
 
 This is a snapshot — one WDL evaluation per child at expansion time, not search-improved. Stage A upgrades this.
 
@@ -54,8 +58,8 @@ This is a snapshot — one WDL evaluation per child at expansion time, not searc
 After `mctx.gumbel_muzero_policy` returns:
 
 1. `N_a = search_tree.children_visits[:, ROOT_INDEX, :]` shape `[B, A]`.
-2. `y_a = flip_W_L(gather alpha_Q_mean from root children)` shape `[B, A, 3]`.
-3. `α_post[b,a] = alpha_Q[b,a] + ρ * sqrt(N_a[b,a] + 1) * y_a[b,a]` (§11 sublinear schedule).
+2. `y_a = terminal_one_hot_or_flip_W_L(gather alpha_V_mean from root children)` shape `[B, A, 3]`.
+3. `α_post[b,a] = alpha_Q[b,a] + ρ * sqrt(N_a[b,a]) * y_a[b,a]` (§11 sublinear schedule, using completed visit counts so unvisited actions add no evidence).
 4. `phi_samples = jax.random.dirichlet(key, alpha=α_post, shape=(M,))` → `[M, B, A, 3]`.
 5. `U_samples = phi_samples[..., W] − phi_samples[..., L]` → `[M, B, A]`.
 6. Mask invalid actions: `U_samples = jnp.where(invalid_actions[None, :, :], -jnp.inf, U_samples)`.
@@ -108,6 +112,7 @@ Update `train.py`'s `dict_to_log` to log all three loss terms.
 The pgx baseline returns `(logits, value)` and we cannot change it.
 - Replace `my_logits, _ = model(...)` → `my_logits, _, _ = model(...)` at lines 26, 68.
 - For `make_mcts_evaluate`, convert `alpha_V` → scalar `U(mean(alpha_V))` to feed mctx.
+- If the shared recurrent function needs a 3-tuple wrapper around a scalar baseline, synthesize `alpha_V` so that `U(mean(alpha_V))` preserves the baseline scalar value. Do not compress values to a smaller range such as `[-2/3, 2/3]`.
 - The shared `make_recurrent_fn` (used at line 57) already gets the new flow.
 
 ### B.9 Files to modify (Stage B)
@@ -161,7 +166,7 @@ Pin `mctx>=0.0.6,<0.0.7` in `pyproject.toml` since we import from `_src`.
 ### A.3 Effect on Stage B code
 
 In `play.py`:
-- Drop the `NodeEmbedding`'s `alpha_Q_mean` field; embedding goes back to bare `pgx.State`. The running WDL mean now lives at `tree.children_values[:, ROOT_INDEX, :, :]` directly.
+- Drop the `NodeEmbedding`'s `alpha_V_mean` field; embedding goes back to bare `pgx.State`. The running WDL mean now lives at `tree.children_values[:, ROOT_INDEX, :, :]` directly.
 - `recurrent_fn` returns `value: [B, 3]` (the WDL mean from `α^V` of the leaf state) and `is_flip: [B]` (always `True` for two-player games when terminated is False; `False` when terminated, since reward already absorbed the terminal value).
 - The "perspective flip kludge" disappears — the forked `backward` handles it via `flip_wdl`.
 
@@ -195,7 +200,7 @@ def thompson_root_selection(rng, tree, node_indices, *, rho, schedule):
 
 Swap `gumbel_muzero_root_action_selection` → `thompson_root_selection` inside `dirichlet_gumbel_policy`. Keep `gumbel_muzero_interior_action_selection` for non-root nodes (Thompson everywhere is expensive and isn't what §10 specifies).
 
-`evidence_schedule(N, ρ, "sqrt") = ρ * jnp.sqrt(N + 1)` — also `"linear"` and `"log"` from §11. Reuses the `evidence_schedule` config from B.7.
+For completed visit counts, `evidence_schedule(N, ρ, "sqrt") = ρ * jnp.sqrt(N)`, so unvisited actions add no search evidence. Also support `"linear"` (`ρ * N`) and `"log"` (`ρ * log1p(N)`) from §11. Reuses the `evidence_schedule` config from B.7.
 
 ### F.2 Dirichlet-KL losses (§14, §15)
 

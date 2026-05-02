@@ -10,17 +10,17 @@ from .play import NodeEmbedding, make_recurrent_fn
 def _baseline_as_dirichlet(baseline):
     """Adapt a baseline returning (logits, scalar_value) to the (logits, alpha_V, alpha_Q) shape.
 
-    The synthetic alpha_V is built so that U(mean(alpha_V)) ≈ scalar_value, with p_D fixed at
-    1/3 (a flat prior on draws). alpha_Q is uniform — it is not consumed during MCTS backup
-    for the baseline side of evaluation.
+    The synthetic alpha_V preserves U(mean(alpha_V)) ~= scalar_value. alpha_Q is uniform; it is
+    not consumed during MCTS backup for the baseline side of evaluation.
     """
 
     def wrapped(obs):
         logits, value = baseline(obs)
-        v = jnp.clip(value, -2.0 / 3.0, 2.0 / 3.0)
-        p_D = jnp.full_like(v, 1.0 / 3.0)
-        p_W = (2.0 / 3.0 + v) / 2.0
-        p_L = (2.0 / 3.0 - v) / 2.0
+        eps = jnp.asarray(1e-6, dtype=value.dtype)
+        v = jnp.clip(value, -1.0 + eps, 1.0 - eps)
+        p_D = jnp.full_like(v, eps)
+        p_W = (1.0 - eps + v) / 2.0
+        p_L = (1.0 - eps - v) / 2.0
         wdl_mean = jnp.stack([p_L, p_D, p_W], axis=-1)
         alpha_V = 10.0 * wdl_mean
         num_actions = logits.shape[-1]
