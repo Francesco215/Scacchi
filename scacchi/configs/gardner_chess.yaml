@@ -1,61 +1,15 @@
-env:
-  id: gardner_chess
-
-model:
-  name: resnet
-  channels: 128
-  blocks: 6
-  policy_channels: 2
-  value_channels: 1
-  value_hidden: 64
-  resnet_v2: true
-  batch_norm: true
-  batch_norm_momentum: 0.9
-
-optimizer:
-  name: adam
-  learning_rate: 1.0e-3
-  weight_decay: 0.0
-  adam_weight_decay: 0.0
-
-eval:
-  enabled: true
-  interval: 1
-  batch_size: 64
-  max_num_steps: 256
-
-checkpoint:
-  dir: checkpoints/gardner_chess
-  max_to_keep: 5
-  save_interval_steps: 25
-  resume: true
-
-runtime:
-  name: single_mesh
-  axis_name: data
-  num_devices: 1
-
-logging:
-  wandb_enabled: true
-  wandb_project: scacchi-az-gardner
-
-train:
-  seed: 0
-  num_iters: 300
-  selfplay_batch_size: 1024
-  max_num_steps: 256
-  search:
-    name: gumbel
-    num_simulations: 32
-    max_num_considered_actions: 16
-    max_depth: null
-    gumbel_scale: 1.0
-    qtransform_value_scale: 0.1
-    qtransform_rescale_values: false
-  batch_size: 4096
-  minibatch_size: 64
-  log_interval: 1
-
-hydra:
-  job:
-    chdir: true
+env_id: gardner_chess
+seed: 0
+max_num_iters: 300
+num_channels: 128
+num_layers: 6
+resnet_v2: true
+selfplay_batch_size: 1024
+num_simulations: 32
+max_num_steps: 256
+training_batch_size: 4096
+learning_rate: 1.0e-3
+log_interval: 1
+eval_interval: 1
+wandb_enabled: false
+wandb_project: scacchi-az

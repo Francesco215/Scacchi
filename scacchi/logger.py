@@ -8,9 +8,34 @@ from typing import Any, Literal, Protocol, Self, TypeGuard
 
 from tqdm import tqdm
 
-from scacchi.config import LoggingConfig
-
 Scalar = float | int
+
+
+def _to_scalar(value: Any) -> Scalar:
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, (float, int)):
+        return value
+    return float(value)
+
+
+def _config_to_dict(config: Any) -> dict[str, Any]:
+    if hasattr(config, "model_dump"):
+        return dict(config.model_dump())
+    if hasattr(config, "dict"):
+        return dict(config.dict())
+    return dict(config)
+
+
+def returns_metrics(prefix: str, returns: Any) -> dict[str, Scalar]:
+    """Convert eval returns into scalar win/draw/loss metrics."""
+
+    return {
+        f"{prefix}/avg_R": _to_scalar(returns.mean()),
+        f"{prefix}/win_rate": _to_scalar((returns == 1).sum() / returns.size),
+        f"{prefix}/draw_rate": _to_scalar((returns == 0).sum() / returns.size),
+        f"{prefix}/lose_rate": _to_scalar((returns == -1).sum() / returns.size),
+    }
 
 
 class _HasAsDict(Protocol):
@@ -22,11 +47,7 @@ def _has_asdict(obj: Any) -> TypeGuard[_HasAsDict]:
 
 
 class Logger:
-    """
-    Base logger with no-op backend — supports only tqdm progress bar updates.
-
-    Subclass or use WandbLogger for a real logging backend.
-    """
+    """Base logger with no-op backend and tqdm progress bar updates."""
 
     def __init__(self, log_every: int = 1, max_steps: int | None = None) -> None:
         self.log_every = log_every
@@ -37,19 +58,32 @@ class Logger:
         if self.log_every <= 0:
             return False
         is_periodic = step % self.log_every == 0
-        is_last = self.max_steps is not None and step == self.max_steps - 1
+        is_last = self.max_steps is not None and step == self.max_steps
         return is_periodic or is_last
 
     def __enter__(self) -> Self:
         self._initialized = True
         return self
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> Literal[False]:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> Literal[False]:
         self._initialized = False
         return False
 
     def log_metrics(self, step: int, metrics: dict[str, Scalar], prefix: str) -> None:
         pass
+
+    def log_returns(
+        self,
+        step: int,
+        returns: Any,
+        prefix: str = "eval/returns",
+    ) -> None:
+        self.log_metrics(step, returns_metrics(prefix, returns), prefix="")
 
     def log_image(self, *args: Any, **kwargs: Any) -> None:
         pass
@@ -70,7 +104,9 @@ class Logger:
         if not self.should_log(step):
             return
 
-        raw: dict[str, Any] = dict(metrics._asdict()) if _has_asdict(metrics) else dict(metrics)
+        raw: dict[str, Any] = (
+            dict(metrics._asdict()) if _has_asdict(metrics) else dict(metrics)
+        )
         raw.update(extra)
         clean = self._convert_metrics(raw)
 
@@ -81,16 +117,16 @@ class Logger:
 
     def _convert_metrics(self, metrics: dict[str, Any]) -> dict[str, Scalar]:
         clean: dict[str, Scalar] = {}
-        for k, v in metrics.items():
-            if hasattr(v, "item"):
-                v = v.item()
-            if isinstance(v, (float, int)):
-                clean[k] = v
-            else:
-                try:
-                    clean[k] = float(v)
-                except (ValueError, TypeError):
-                    clean[k] = v
+        for key, value in metrics.items():
+            if hasattr(value, "item"):
+                value = value.item()
+            if isinstance(value, (float, int)):
+                clean[key] = value
+                continue
+            try:
+                clean[key] = float(value)
+            except (ValueError, TypeError):
+                continue
         return clean
 
     def _update_pbar(
@@ -103,11 +139,13 @@ class Logger:
         filtered = metrics
         if pbar_filter is not None:
             pattern = re.compile(pbar_filter)
-            filtered = {k: v for k, v in metrics.items() if pattern.search(k)}
+            filtered = {
+                key: value for key, value in metrics.items() if pattern.search(key)
+            }
 
-        postfix: dict[str, str] = {
-            k: f"{v:{float_fmt}}" if isinstance(v, float) else str(v)
-            for k, v in filtered.items()
+        postfix = {
+            key: f"{value:{float_fmt}}" if isinstance(value, float) else str(value)
+            for key, value in filtered.items()
         }
         pbar.set_postfix(**postfix)
 
@@ -115,14 +153,14 @@ class Logger:
 class WandbLogger(Logger):
     def __init__(
         self,
-        logging_cfg: LoggingConfig,
+        project: str,
         log_every: int = 1,
         max_steps: int | None = None,
         config: Any = None,
         dir: str | None = None,
     ) -> None:
         super().__init__(log_every=log_every, max_steps=max_steps)
-        self.project = logging_cfg.wandb_project
+        self.project = project
         self.config = config
         self.dir = dir
         self._run: Any = None
@@ -139,7 +177,12 @@ class WandbLogger(Logger):
         self._initialized = True
         return self
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> Literal[False]:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> Literal[False]:
         if self._run is not None:
             import wandb
 
@@ -147,10 +190,18 @@ class WandbLogger(Logger):
         self._initialized = False
         return False
 
-    def log_metrics(self, step: int, metrics: dict[str, Scalar], prefix: str = "train/") -> None:
+    def log_metrics(
+        self,
+        step: int,
+        metrics: dict[str, Scalar],
+        prefix: str = "train/",
+    ) -> None:
         import wandb
 
-        wandb.log({f"{prefix}{k}": v for k, v in metrics.items()}, step=step)
+        wandb.log(
+            {f"{prefix}{key}": value for key, value in metrics.items()},
+            step=step,
+        )
 
     def log_image(
         self,
@@ -176,19 +227,25 @@ class WandbLogger(Logger):
     ) -> None:
         import wandb
 
-        wandb.log({key: wandb.Video(str(video_path), format=format, **kwargs)}, step=step)
+        wandb.log(
+            {key: wandb.Video(str(video_path), format=format, **kwargs)},
+            step=step,
+        )
 
 
 def build_logger(
-    logging_cfg: LoggingConfig,
-    log_every: int = 1,
-    max_steps: int | None = None,
-    config: Any = None,
+    training_config: Any,
     dir: str | None = None,
 ) -> Logger:
-    if logging_cfg.wandb_enabled:
+    wandb_enabled = bool(getattr(training_config, "wandb_enabled", False))
+    wandb_project = str(getattr(training_config, "wandb_project", "scacchi-az"))
+    log_every = int(getattr(training_config, "log_interval", 1))
+    max_steps = int(getattr(training_config, "max_num_iters"))
+    config = _config_to_dict(training_config)
+
+    if wandb_enabled:
         return WandbLogger(
-            logging_cfg,
+            wandb_project,
             log_every=log_every,
             max_steps=max_steps,
             config=config,

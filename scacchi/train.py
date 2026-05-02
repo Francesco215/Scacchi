@@ -1,148 +1,107 @@
-"""Hydra entrypoint for Gumbel AlphaZero training."""
-
-from __future__ import annotations
+# Copyright 2023 The Pgx Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import time
-from dataclasses import asdict
 from typing import Any, cast
 
+from flax import nnx
 import hydra
 import jax
+import optax
 import pgx
-from absl import logging as absl_logging
-from flax import nnx
 from omegaconf import DictConfig, OmegaConf
+from pgx._src.baseline import BaselineModelId
+from pydantic import BaseModel
 from tqdm import tqdm
 
-from scacchi.checkpoint import (
-    build_checkpoint_manager,
-    maybe_save_checkpoint,
-    restore_checkpoint,
-)
-from scacchi.config import config_from_dict_config
-from scacchi.evaluation import (
-    baseline_log,
-    evaluate_baseline,
-)
-from scacchi.logger import build_logger
-from scacchi.models import AlphaZeroResNet
-from scacchi.optim import make_optimizer
-from scacchi.runtime import create_mesh, validate_batch_size
-from scacchi.training import init_optimizer, make_iteration_step
+from .evaluations import make_evaluate
+from .logger import build_logger
+from .network import AZNet
+from .pipeline import make_training_iteration
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="config")
-def main(raw_cfg: DictConfig) -> None:
-    cfg = config_from_dict_config(raw_cfg)
-    cfg_dict = asdict(cfg)
-    absl_logging.set_verbosity(absl_logging.WARNING)
-    env = pgx.make(cast(pgx.EnvId, cfg.env.id))
-    observation_shape = tuple(env.observation_shape)
-    assert len(observation_shape) == 3, (
-        f"Expected a spatial PGX observation with rank 3, got {observation_shape}."
-    )
+class Config(BaseModel):
+    env_id: pgx.EnvId = "go_9x9"
+    seed: int = 0
+    max_num_iters: int = 400
+    # network params
+    num_channels: int = 128
+    num_layers: int = 6
+    resnet_v2: bool = True
+    # selfplay params
+    selfplay_batch_size: int = 1024
+    num_simulations: int = 32
+    max_num_steps: int = 256
+    # training params
+    training_batch_size: int = 4096
+    learning_rate: float = 0.001
+    log_interval: int = 1
+    # eval params
+    eval_interval: int = 5
+    # logging params
+    wandb_enabled: bool = True
+    wandb_project: str = "scacchi-az"
 
-    mesh = create_mesh(cfg.runtime)
-    validate_batch_size("train.selfplay_batch_size", cfg.train.selfplay_batch_size, mesh)
-    validate_batch_size("train.batch_size", cfg.train.batch_size, mesh)
-    if cfg.eval.enabled:
-        validate_batch_size("eval.batch_size", cfg.eval.batch_size, mesh)
+    class Config:
+        extra = "forbid"
 
-    model = AlphaZeroResNet(
-        cfg.model,
-        observation_shape=observation_shape,
+
+@hydra.main(version_base=None, config_path="configs", config_name="gardner_chess")
+def main(cfg: DictConfig) -> None:
+    container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
+    config: Config = Config(**container)
+
+    env = pgx.make(config.env_id)
+    baseline = pgx.make_baseline_model(cast(BaselineModelId, config.env_id + "_v0"))
+    model = AZNet(
         num_actions=env.num_actions,
-        seed=cfg.train.seed,
+        observation_shape=env.observation_shape,
+        num_channels=config.num_channels,
+        num_blocks=config.num_layers,
+        resnet_v2=config.resnet_v2,
+        rngs=nnx.Rngs(config.seed),
     )
-    tx = make_optimizer(cfg.optimizer)
-    optimizer = init_optimizer(model, tx)
-    iteration_step = make_iteration_step(env, cfg.train)
-    baseline_id = f"{cfg.env.id}_v0"
-    baseline = None
-    if cfg.eval.enabled:
-        try:
-            baseline = pgx.make_baseline_model(cast(Any, baseline_id))
-        except AssertionError:
-            print({"eval/baseline_id": baseline_id, "eval/baseline_available": 0})
-    baseline_eval_fn = (
-        None
-        if baseline is None
-        else nnx.jit(
-            lambda candidate_model, key: evaluate_baseline(
-                env=env,
-                model=candidate_model,
-                baseline=baseline,
-                rng_key=key,
-                cfg=cfg.eval,
-            )
-        )
+    optimizer = nnx.Optimizer(
+        model,
+        optax.adam(learning_rate=config.learning_rate),
+        wrt=nnx.Param,
     )
-    rng_key = jax.random.key(cfg.train.seed)
-    print(OmegaConf.to_yaml(OmegaConf.create(cfg_dict)))
-    mesh = create_mesh(cfg.runtime)
-    validate_batch_size("train.selfplay_batch_size", cfg.train.selfplay_batch_size, mesh)
-    validate_batch_size("train.batch_size", cfg.train.batch_size, mesh)
-    if cfg.eval.enabled:
-        validate_batch_size("eval.batch_size", cfg.eval.batch_size, mesh)
-    with jax.set_mesh(mesh), build_logger(
-        cfg.logging,
-        log_every=cfg.train.log_interval,
-        max_steps=cfg.train.num_iters,
-        config=cfg_dict,
-    ) as logger, build_checkpoint_manager(
-        cfg.checkpoint, cfg.checkpoint.dir, max_steps=cfg.train.num_iters
-    ) as checkpoint_manager:
-        start_iteration = 0
-        frames = 0
-        hours = 0.0
-        gradient_step = 0
-        if cfg.checkpoint.resume:
-            restored = restore_checkpoint(
-                checkpoint_manager, model=model, optimizer=optimizer, rng_key=rng_key
-            )
-            start_iteration = restored.start_step
-            rng_key = restored.rng_key
-            frames = int(restored.meta.get("metadata", {}).get("frames", frames))
-            hours = float(restored.meta.get("metadata", {}).get("hours", hours))
-            gradient_step = int(
-                restored.meta.get("metadata", {}).get("gradient_step", gradient_step)
-            )
 
-        with tqdm(total=cfg.train.num_iters, initial=start_iteration, desc="training", dynamic_ncols=True) as pbar:
-            for iteration in range(start_iteration, cfg.train.num_iters):
-                rng_key, train_key = jax.random.split(rng_key)
-                start_time = time.time()
-                metrics = iteration_step(model, optimizer, train_key)
-                frames += cfg.train.max_num_steps * cfg.train.selfplay_batch_size
-                hours += (time.time() - start_time) / 3600
+    training_iteration = make_training_iteration(env, config)
+    evaluate = make_evaluate(env, baseline, config)
 
-                metrics_host = jax.device_get(metrics)
-                logger.log(iteration, metrics_host, pbar=pbar, prefix="train/", pbar_filter=r"loss", frames=frames, hours=hours)
-                pbar.update(1)
+    hours: float = 0.0
+    frames: int = 0
 
-                eval_ran = cfg.eval.enabled and iteration % cfg.eval.interval == 0
-                if eval_ran:
-                    rng_key, baseline_key = jax.random.split(rng_key)
-                    if baseline_eval_fn is not None:
-                        returns = jax.device_get(baseline_eval_fn(model, baseline_key))
-                        logger.log_metrics(iteration, baseline_log("eval/vs_baseline", returns), prefix="")
+    rng_key = jax.random.PRNGKey(config.seed)
+    with build_logger(config) as logger:
+        pbar = tqdm(range(config.max_num_iters), desc="training", dynamic_ncols=True, total=config.max_num_iters)
+        for iteration in pbar:
+            if iteration % config.eval_interval == 0:
+                rng_key, subkey = jax.random.split(rng_key)
+                returns = evaluate(subkey, model)
+                logger.log_returns(iteration, returns, prefix="eval/vs_baseline")
 
-                maybe_save_checkpoint(
-                    checkpoint_manager,
-                    iteration,
-                    cfg=cfg_dict,
-                    model=model,
-                    optimizer=optimizer,
-                    rng_key=rng_key,
-                    metadata={
-                        "baseline_id": baseline_id,
-                        "baseline_available": baseline_eval_fn is not None,
-                        "frames": frames,
-                        "hours": hours,
-                        "gradient_step": gradient_step,
-                    },
-                )
-            checkpoint_manager.wait_until_finished()
+            st = time.time()
+            rng_key, subkey = jax.random.split(rng_key)
+            policy_losses, value_losses = training_iteration(model, optimizer, subkey)
+            frames += config.selfplay_batch_size * config.max_num_steps
+
+            et = time.time()
+            hours += (et - st) / 3600
+            dict_to_log = {"policy_loss": policy_losses.mean().item(), "value_loss": value_losses.mean().item(), "hours": hours, "frames": frames}
+            logger.log(iteration, dict_to_log, pbar=pbar, prefix="train/", pbar_filter=r"loss")
 
 
 if __name__ == "__main__":
