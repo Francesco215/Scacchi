@@ -51,12 +51,10 @@ class Config(BaseModel):
     eval_interval: int = 5
     # Dirichlet-Q params
     policy_mc_samples: int = 32
-    search_evidence_rho: float = 1.0
     policy_loss_weight: float = 1.0
     value_outcome_weight: float = 1.0
     q_outcome_weight: float = 1.0
     dir_kl_weight: float = 0.0
-    evidence_schedule: str = "sqrt"
     c_terminal: float = 8.0
     c_leaf: float = 2.0
     # logging params

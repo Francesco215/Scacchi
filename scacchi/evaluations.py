@@ -7,6 +7,17 @@ from .network import AZNet
 from .play import NodeEmbedding, make_recurrent_fn
 
 
+def _root_embedding(env_state, alpha_V_mean, c_leaf):
+    batch_size = alpha_V_mean.shape[0]
+    return NodeEmbedding(
+        state=env_state,
+        y=alpha_V_mean,
+        c=jnp.full((batch_size,), c_leaf, dtype=alpha_V_mean.dtype),
+        root_action=jnp.full((batch_size,), mctx.Tree.NO_PARENT, dtype=jnp.int32),
+        depth_parity=jnp.zeros((batch_size,), dtype=jnp.int32),
+    )
+
+
 def _baseline_as_dirichlet(baseline):
     """Adapt a baseline returning (logits, scalar_value) to the (logits, alpha_V, alpha_Q) shape.
 
@@ -86,8 +97,8 @@ def make_mcts_evaluate(env, baseline, config):
         my_player = 0
         my_predict = lambda obs: model(obs, train=False)
         baseline_predict = _baseline_as_dirichlet(baseline)
-        my_recurrent_fn = make_recurrent_fn(env, my_predict)
-        opp_recurrent_fn = make_recurrent_fn(env, baseline_predict)
+        my_recurrent_fn = make_recurrent_fn(env, my_predict, config.c_terminal, config.c_leaf)
+        opp_recurrent_fn = make_recurrent_fn(env, baseline_predict, config.c_terminal, config.c_leaf)
 
         key, init_key = jax.random.split(rng_key)
         init_keys = jax.random.split(init_key, config.selfplay_batch_size)
@@ -108,7 +119,7 @@ def make_mcts_evaluate(env, baseline, config):
             my_root = mctx.RootFnOutput(
                 prior_logits=my_logits,
                 value=my_value,
-                embedding=NodeEmbedding(state=env_state, alpha_V_mean=_wdl_mean(my_alpha_V)),
+                embedding=_root_embedding(env_state, _wdl_mean(my_alpha_V), config.c_leaf),
             )
             my_policy = mctx.gumbel_muzero_policy(
                 params=(),
@@ -124,7 +135,7 @@ def make_mcts_evaluate(env, baseline, config):
             opp_root = mctx.RootFnOutput(
                 prior_logits=opp_logits,
                 value=opp_value,
-                embedding=NodeEmbedding(state=env_state, alpha_V_mean=_wdl_mean(opp_alpha_V)),
+                embedding=_root_embedding(env_state, _wdl_mean(opp_alpha_V), config.c_leaf),
             )
             opp_policy = mctx.gumbel_muzero_policy(
                 params=(),

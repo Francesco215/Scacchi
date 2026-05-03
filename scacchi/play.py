@@ -18,7 +18,10 @@ L_IDX = 0
 
 class NodeEmbedding(NamedTuple):
     state: pgx.State
-    alpha_V_mean: jax.Array  # [B, 3] WDL mean from this node's α^V
+    y: jax.Array            # [B, 3] WDL distribution at this node, local (player-to-move) perspective
+    c: jax.Array            # [B] evidence weight: c_terminal at terminal nodes, else c_leaf
+    root_action: jax.Array  # [B] int32, NO_PARENT at root, action_taken at depth 1, inherited deeper
+    depth_parity: jax.Array # [B] int32, 0 at root, flipped each ply
 
 
 class SelfplayOutput(NamedTuple):
@@ -42,7 +45,7 @@ def _flip_wdl(wdl: jax.Array) -> jax.Array:
     return wdl[..., ::-1]
 
 
-def make_recurrent_fn(env, predict_fn):
+def make_recurrent_fn(env, predict_fn, c_terminal: float, c_leaf: float):
     def recurrent_fn(
         _,
         rng_key: chex.PRNGKey,
@@ -63,17 +66,32 @@ def make_recurrent_fn(env, predict_fn):
         )
 
         alpha_V_mean = _wdl_mean(alpha_V)
-        value = _utility(alpha_V_mean)
-
         reward = env_state.rewards[
             jnp.arange(env_state.rewards.shape[0]),
             current_player,
         ]
-        value = jnp.where(env_state.terminated, 0.0, value)
-        discount = -jnp.ones_like(value)
-        discount = jnp.where(env_state.terminated, 0.0, discount)
+        terminal_y_parent = jax.nn.one_hot(
+            jnp.round(reward).astype(jnp.int32) + 1, WDL_DIM, dtype=alpha_V_mean.dtype,
+        )
+        terminal_y_child = _flip_wdl(terminal_y_parent)
+        y = jnp.where(env_state.terminated[..., None], terminal_y_child, alpha_V_mean)
+        c = jnp.where(env_state.terminated, c_terminal, c_leaf).astype(alpha_V_mean.dtype)
+        new_root_action = jnp.where(
+            embedding.root_action == mctx.Tree.NO_PARENT, action, embedding.root_action,
+        )
+        new_depth_parity = 1 - embedding.depth_parity
 
-        new_embedding = NodeEmbedding(state=env_state, alpha_V_mean=alpha_V_mean)
+        value = _utility(alpha_V_mean)
+        value = jnp.where(env_state.terminated, 0.0, value)
+        discount = jnp.where(env_state.terminated, 0.0, -jnp.ones_like(value))
+
+        new_embedding = NodeEmbedding(
+            state=env_state,
+            y=y,
+            c=c,
+            root_action=new_root_action,
+            depth_parity=new_depth_parity,
+        )
 
         return (
             mctx.RecurrentFnOutput(
@@ -95,7 +113,7 @@ def _mc_posterior_best(
     legal_action_mask: jax.Array,
     num_samples: int,
 ) -> jax.Array:
-    """MC estimator of the posterior-best policy (math.md §6, §12).
+    """MC estimator of the posterior-best policy (math.md §6, §7).
 
     alpha_Q_post: [B, A, 3]
     invalid_actions: [B, A] bool — True for invalid
@@ -116,38 +134,36 @@ def _mc_posterior_best(
     return smoothed
 
 
-def _gather_child_wdl(
-    tree: mctx.Tree,
-    root_alpha_Q_mean: jax.Array,
-) -> jax.Array:
-    """For each root action, return y_a [B, A, 3] from the player-at-root's perspective.
+def _scatter_evidence(tree: mctx.Tree, alpha_Q: jax.Array) -> jax.Array:
+    """Linear Bayesian Dirichlet update: α_Q + Σ_n c_n · y_n^aligned over each subtree.
 
-    Visited non-terminal child actions: gather child alpha_V_mean and flip W<->L.
-    Terminal child actions: use the actual terminal one-hot outcome.
-    Unvisited actions: fall back to the root's α^Q mean for that action.
+    Math: math.md §4 (evidence update), §6 (search-tree posterior).
+    Routes every expanded node into its root-action bucket via NodeEmbedding.root_action
+    and aligns to root-player perspective via NodeEmbedding.depth_parity.
     """
-    children_idx = tree.children_index[:, mctx.Tree.ROOT_INDEX, :]  # [B, A]
-    visited = children_idx >= 0
-    safe_idx = jnp.where(visited, children_idx, 0)
-    batch_size = children_idx.shape[0]
+    emb = tree.embeddings
+    y_aligned = jnp.where(emb.depth_parity[..., None] == 1, _flip_wdl(emb.y), emb.y)
+    valid = (emb.root_action != mctx.Tree.NO_PARENT) & (tree.node_visits > 0)
+    weight = jnp.where(valid, emb.c, jnp.zeros((), dtype=emb.c.dtype)).astype(alpha_Q.dtype)
+
+    batch_size, num_nodes = tree.node_visits.shape
+    num_actions = alpha_Q.shape[1]
     batch_range = jnp.arange(batch_size)[:, None]
-    child_wdl = tree.embeddings.alpha_V_mean[batch_range, safe_idx]  # [B, A, 3]
-    flipped = _flip_wdl(child_wdl)
-
-    child_discount = tree.children_discounts[:, mctx.Tree.ROOT_INDEX, :]
-    terminal = visited & (child_discount == 0.0)
-    child_reward = tree.children_rewards[:, mctx.Tree.ROOT_INDEX, :]
-    terminal_index = jnp.clip(jnp.round(child_reward).astype(jnp.int32) + 1, 0, WDL_DIM - 1)
-    terminal_wdl = jax.nn.one_hot(terminal_index, WDL_DIM, dtype=root_alpha_Q_mean.dtype)
-
-    visited_wdl = jnp.where(terminal[..., None], terminal_wdl, flipped)
-    return jnp.where(visited[..., None], visited_wdl, root_alpha_Q_mean)
+    safe_root_action = jnp.where(valid, emb.root_action, 0)
+    evidence_sum = jnp.zeros((batch_size, num_actions, WDL_DIM), dtype=alpha_Q.dtype)
+    evidence_sum = evidence_sum.at[batch_range, safe_root_action].add(
+        weight[..., None] * y_aligned.astype(alpha_Q.dtype)
+    )
+    return alpha_Q + evidence_sum
 
 
 def make_selfplay(env, config):
     def selfplay(model: AZNet, rng_key: jax.Array) -> SelfplayOutput:
         recurrent_fn = make_recurrent_fn(
-            env, lambda obs: model(obs, train=False)
+            env,
+            lambda obs: model(obs, train=False),
+            config.c_terminal,
+            config.c_leaf,
         )
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
@@ -160,10 +176,17 @@ def make_selfplay(env, config):
             logits, alpha_V, alpha_Q = model(observation, train=False)
             alpha_V_mean = _wdl_mean(alpha_V)
             value = _utility(alpha_V_mean)
+            batch_size = alpha_V_mean.shape[0]
             root = mctx.RootFnOutput(
                 prior_logits=logits,
                 value=value,
-                embedding=NodeEmbedding(state=env_state, alpha_V_mean=alpha_V_mean),
+                embedding=NodeEmbedding(
+                    state=env_state,
+                    y=alpha_V_mean,
+                    c=jnp.full((batch_size,), config.c_leaf, dtype=alpha_V_mean.dtype),
+                    root_action=jnp.full((batch_size,), mctx.Tree.NO_PARENT, dtype=jnp.int32),
+                    depth_parity=jnp.zeros((batch_size,), dtype=jnp.int32),
+                ),
             )
 
             invalid_actions = ~env_state.legal_action_mask
@@ -178,12 +201,7 @@ def make_selfplay(env, config):
                 gumbel_scale=1.0,
             )
 
-            tree = policy_output.search_tree
-            visit_counts = tree.children_visits[:, mctx.Tree.ROOT_INDEX, :].astype(alpha_Q.dtype)
-            root_alpha_Q_mean = _wdl_mean(alpha_Q)  # [B, A, 3]
-            y_a = _gather_child_wdl(tree, root_alpha_Q_mean)  # [B, A, 3]
-            evidence = config.search_evidence_rho * jnp.sqrt(visit_counts)  # [B, A]
-            alpha_Q_post = alpha_Q + evidence[..., None] * y_a  # [B, A, 3]
+            alpha_Q_post = _scatter_evidence(policy_output.search_tree, alpha_Q)
             policy_target = _mc_posterior_best(
                 mc_key,
                 alpha_Q_post,

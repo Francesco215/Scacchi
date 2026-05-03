@@ -12,12 +12,10 @@ learning_rate: 1.0e-3
 log_interval: 1
 eval_interval: 1
 policy_mc_samples: 32
-search_evidence_rho: 1.0
 policy_loss_weight: 1.0
 value_outcome_weight: 1.0
 q_outcome_weight: 1.0
 dir_kl_weight: 0.0
-evidence_schedule: sqrt
 c_terminal: 8.0
 c_leaf: 2.0
 wandb_enabled: true
