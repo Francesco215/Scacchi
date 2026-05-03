@@ -51,6 +51,7 @@ class Config(BaseModel):
     num_simulations: int = 32
     max_num_steps: int = 256
     # training params
+    optimizer_name: str = "adam"
     training_batch_size: int = 4096
     learning_rate: float = 0.001
     log_interval: int = 1
@@ -77,6 +78,9 @@ def main(cfg: DictConfig) -> None:
     }:
         msg = "position_encoding must be one of {'relative_2d', 'basic_learned'}."
         raise ValueError(msg)
+    if config.optimizer_name not in {"adam", "muon"}:
+        msg = "optimizer_name must be one of {'adam', 'muon'}."
+        raise ValueError(msg)
 
     env = pgx.make(config.env_id)
     baseline = pgx.make_baseline_model(cast(BaselineModelId, config.env_id + "_v0"))
@@ -86,11 +90,12 @@ def main(cfg: DictConfig) -> None:
         observation_shape=env.observation_shape,
         rngs=nnx.Rngs(config.seed),
     )
-    optimizer = nnx.Optimizer(
-        model,
-        optax.adam(learning_rate=config.learning_rate),
-        wrt=nnx.Param,
+    tx = (
+        optax.adam(learning_rate=config.learning_rate)
+        if config.optimizer_name == "adam"
+        else optax.contrib.muon(learning_rate=config.learning_rate)
     )
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     training_iteration = make_training_iteration(env, config)
     evaluate = make_evaluate(env, baseline, config)
