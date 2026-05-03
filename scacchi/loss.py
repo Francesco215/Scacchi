@@ -16,12 +16,17 @@ class Sample(NamedTuple):
     wdl_tgt: jax.Array
     played_action: jax.Array
     mask: jax.Array
+    q_evidence_sum: chex.Array  # [B, A, 3] Σ_n c_n · y_n^aligned per root action
 
 
 class LossOutputs(NamedTuple):
     policy_loss: jax.Array
     value_outcome_loss: jax.Array
     q_outcome_loss: jax.Array
+    value_search_mean_loss: jax.Array
+    q_search_mean_loss: jax.Array
+    value_dir_kl_loss: jax.Array
+    q_dir_kl_loss: jax.Array
 
 
 def make_compute_loss_input(config):
@@ -49,6 +54,7 @@ def make_compute_loss_input(config):
             wdl_tgt=wdl_tgt,
             played_action=data.played_action,
             mask=value_mask,
+            q_evidence_sum=data.q_evidence_sum,
         )
 
     return compute_loss_input
@@ -61,6 +67,20 @@ def _wdl_mean(alpha: jax.Array) -> jax.Array:
 def _xent_against_wdl(target_one_hot: jax.Array, pred_mean: jax.Array) -> jax.Array:
     log_pred = jnp.log(jnp.clip(pred_mean, 1e-8, 1.0))
     return -(target_one_hot * log_pred).sum(axis=-1)
+
+
+def _dirichlet_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
+    """KL(Dir(beta) || Dir(alpha)) per math.md Appendix A. Inputs [..., K]; output [...]."""
+    beta_0 = beta.sum(-1)
+    alpha_0 = alpha.sum(-1)
+    digamma_diff = jax.lax.digamma(beta) - jax.lax.digamma(beta_0)[..., None]
+    return (
+        jax.scipy.special.gammaln(beta_0)
+        - jax.scipy.special.gammaln(beta).sum(-1)
+        - jax.scipy.special.gammaln(alpha_0)
+        + jax.scipy.special.gammaln(alpha).sum(-1)
+        + ((beta - alpha) * digamma_diff).sum(-1)
+    )
 
 
 def make_train_step(config):
@@ -83,15 +103,49 @@ def make_train_step(config):
             q_outcome_loss = _xent_against_wdl(data.wdl_tgt, q_mean)
             q_outcome_loss = (q_outcome_loss * mask_f).sum() / mask_sum
 
+            # Search-based mean and Dirichlet-KL losses (math.md §8.3, §8.4, Appendix A).
+            q_evidence_sum = data.q_evidence_sum.astype(alpha_Q.dtype)        # [B, A, 3]
+            q_evidence_w = q_evidence_sum.sum(-1)                              # [B, A]
+            q_search_mask_f = (q_evidence_w > 0).astype(alpha_Q.dtype)         # [B, A]
+            eps = jnp.asarray(1e-8, dtype=alpha_Q.dtype)
+            q_search_mean = q_evidence_sum / jnp.maximum(q_evidence_w[..., None], eps)
+            beta_Q = 1.0 + q_evidence_sum
+
+            policy_tgt_sg = jax.lax.stop_gradient(data.policy_tgt).astype(alpha_Q.dtype)
+            v_evidence_sum = (policy_tgt_sg[..., None] * q_evidence_sum).sum(-2)  # [B, 3]
+            v_evidence_w = v_evidence_sum.sum(-1)                                  # [B]
+            v_mask_f = (v_evidence_w > 0).astype(alpha_V.dtype)
+            v_search_mean = v_evidence_sum / jnp.maximum(v_evidence_w[..., None], eps)
+            beta_V = 1.0 + v_evidence_sum
+
+            v_search_xe = _xent_against_wdl(v_search_mean, v_mean)                 # [B]
+            value_search_mean_loss = (v_search_xe * v_mask_f).sum() / jnp.maximum(v_mask_f.sum(), 1.0)
+
+            q_pred_mean = _wdl_mean(alpha_Q)                                       # [B, A, 3]
+            q_search_xe = _xent_against_wdl(q_search_mean, q_pred_mean)            # [B, A]
+            q_search_mean_loss = (q_search_xe * q_search_mask_f).sum() / jnp.maximum(q_search_mask_f.sum(), 1.0)
+
+            v_dir_kl = _dirichlet_kl(jax.lax.stop_gradient(beta_V), alpha_V)       # [B]
+            value_dir_kl_loss = (v_dir_kl * v_mask_f).sum() / jnp.maximum(v_mask_f.sum(), 1.0)
+            q_dir_kl = _dirichlet_kl(jax.lax.stop_gradient(beta_Q), alpha_Q)       # [B, A]
+            q_dir_kl_loss = (q_dir_kl * q_search_mask_f).sum() / jnp.maximum(q_search_mask_f.sum(), 1.0)
+
             total = (
                 config.policy_loss_weight * policy_loss
                 + config.value_outcome_weight * value_outcome_loss
                 + config.q_outcome_weight * q_outcome_loss
+                + config.value_search_weight * value_search_mean_loss
+                + config.q_search_weight * q_search_mean_loss
+                + config.dir_kl_weight * (value_dir_kl_loss + q_dir_kl_loss)
             )
             return total, LossOutputs(
                 policy_loss=policy_loss,
                 value_outcome_loss=value_outcome_loss,
                 q_outcome_loss=q_outcome_loss,
+                value_search_mean_loss=value_search_mean_loss,
+                q_search_mean_loss=q_search_mean_loss,
+                value_dir_kl_loss=value_dir_kl_loss,
+                q_dir_kl_loss=q_dir_kl_loss,
             )
 
         (_, losses), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)

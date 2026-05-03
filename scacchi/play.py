@@ -31,6 +31,7 @@ class SelfplayOutput(NamedTuple):
     policy_target: chex.Array
     played_action: jax.Array
     discount: jax.Array
+    q_evidence_sum: chex.Array  # [B, A, 3] Σ_n c_n · y_n^aligned per root action
 
 
 def _wdl_mean(alpha: jax.Array) -> jax.Array:
@@ -134,8 +135,8 @@ def _mc_posterior_best(
     return smoothed
 
 
-def _scatter_evidence(tree: mctx.Tree, alpha_Q: jax.Array) -> jax.Array:
-    """Linear Bayesian Dirichlet update: α_Q + Σ_n c_n · y_n^aligned over each subtree.
+def _q_evidence_sum(tree: mctx.Tree, num_actions: int, dtype) -> jax.Array:
+    """Σ_n c_n · y_n^aligned per root action, shape [B, A, 3].
 
     Math: math.md §4 (evidence update), §6 (search-tree posterior).
     Routes every expanded node into its root-action bucket via NodeEmbedding.root_action
@@ -144,17 +145,15 @@ def _scatter_evidence(tree: mctx.Tree, alpha_Q: jax.Array) -> jax.Array:
     emb = tree.embeddings
     y_aligned = jnp.where(emb.depth_parity[..., None] == 1, _flip_wdl(emb.y), emb.y)
     valid = (emb.root_action != mctx.Tree.NO_PARENT) & (tree.node_visits > 0)
-    weight = jnp.where(valid, emb.c, jnp.zeros((), dtype=emb.c.dtype)).astype(alpha_Q.dtype)
+    weight = jnp.where(valid, emb.c, jnp.zeros((), dtype=emb.c.dtype)).astype(dtype)
 
-    batch_size, num_nodes = tree.node_visits.shape
-    num_actions = alpha_Q.shape[1]
+    batch_size, _ = tree.node_visits.shape
     batch_range = jnp.arange(batch_size)[:, None]
     safe_root_action = jnp.where(valid, emb.root_action, 0)
-    evidence_sum = jnp.zeros((batch_size, num_actions, WDL_DIM), dtype=alpha_Q.dtype)
-    evidence_sum = evidence_sum.at[batch_range, safe_root_action].add(
-        weight[..., None] * y_aligned.astype(alpha_Q.dtype)
+    out = jnp.zeros((batch_size, num_actions, WDL_DIM), dtype=dtype)
+    return out.at[batch_range, safe_root_action].add(
+        weight[..., None] * y_aligned.astype(dtype)
     )
-    return alpha_Q + evidence_sum
 
 
 def make_selfplay(env, config):
@@ -201,7 +200,10 @@ def make_selfplay(env, config):
                 gumbel_scale=1.0,
             )
 
-            alpha_Q_post = _scatter_evidence(policy_output.search_tree, alpha_Q)
+            q_evidence_sum = _q_evidence_sum(
+                policy_output.search_tree, alpha_Q.shape[1], alpha_Q.dtype,
+            )
+            alpha_Q_post = alpha_Q + q_evidence_sum
             policy_target = _mc_posterior_best(
                 mc_key,
                 alpha_Q_post,
@@ -226,6 +228,7 @@ def make_selfplay(env, config):
                 reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
                 terminated=env_state.terminated,
                 discount=discount,
+                q_evidence_sum=q_evidence_sum,
             )
 
         rng_key, init_key = jax.random.split(rng_key)

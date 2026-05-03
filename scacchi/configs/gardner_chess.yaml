@@ -15,6 +15,8 @@ policy_mc_samples: 32
 policy_loss_weight: 1.0
 value_outcome_weight: 1.0
 q_outcome_weight: 1.0
+value_search_weight: 1.0
+q_search_weight: 1.0
 dir_kl_weight: 0.0
 c_terminal: 8.0
 c_leaf: 2.0
