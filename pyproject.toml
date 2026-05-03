@@ -14,7 +14,7 @@ dependencies = [
     "grain>=0.2.15",
     "hydra-core>=1.3.2",
     "ipykernel>=7.1.0",
-    "mctx>=0.0.6",
+    "mctx==0.0.6",
     "pgx>=2.6.0",
     "flax>=0.12.7",
     "optax>=0.2.9.dev0",

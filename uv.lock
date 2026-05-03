@@ -162,7 +162,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda13"] },
     { name = "jaxtyping", specifier = ">=0.3.9" },
     { name = "matplotlib" },
-    { name = "mctx", specifier = ">=0.0.6" },
+    { name = "mctx", specifier = "==0.0.6" },
     { name = "optax", git = "https://github.com/google-deepmind/optax.git" },
     { name = "orbax-checkpoint", specifier = ">=0.11.36" },
     { name = "pgx", specifier = ">=2.6.0" },
