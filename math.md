@@ -132,19 +132,19 @@ $$
 then the opponent-perspective WDL distribution is
 
 $$
-\operatorname{flip}(y) = (y_W,y_D,y_L).
+\textrm{flip}(y) = (y_W,y_D,y_L).
 $$
 
 The utility changes sign under this flip:
 
 $$
-U(\operatorname{flip}(y)) = -U(y).
+U(\textrm{flip}(y)) = -U(y).
 $$
 
 The same flip applies to Dirichlet parameters:
 
 $$
-\operatorname{flip}(\alpha_L,\alpha_D,\alpha_W) = (\alpha_W,\alpha_D,\alpha_L).
+\textrm{flip}(\alpha_L,\alpha_D,\alpha_W) = (\alpha_W,\alpha_D,\alpha_L).
 $$
 
 During backup, apply this flip whenever the perspective changes between players.
@@ -168,7 +168,7 @@ $$
 The policy head is
 
 $$
-\pi_\theta(a \mid s) = \operatorname{softmax}(\ell_\theta(s,a)).
+\pi_\theta(a \mid s) = \textrm{softmax}(\ell_\theta(s,a)).
 $$
 
 Its intended meaning is
@@ -192,7 +192,7 @@ $$
 The latent WDL value distribution is modeled as
 
 $$
-\phi_s^V \sim \operatorname{Dirichlet}(\alpha_\theta^V(s)).
+\phi_s^V \sim \textrm{Dirichlet}(\alpha_\theta^V(s)).
 $$
 
 The value-head mean is
@@ -222,7 +222,7 @@ $$
 The latent WDL distribution for action $a$ is modeled as
 
 $$
-\phi_{s,a}^Q \sim \operatorname{Dirichlet}(\alpha_\theta^Q(s,a)).
+\phi_{s,a}^Q \sim \textrm{Dirichlet}(\alpha_\theta^Q(s,a)).
 $$
 
 The Q-head mean is
@@ -246,13 +246,13 @@ For either the value head or the Q head, use a mean-concentration parameterizati
 Let
 
 $$
-m_\theta = \operatorname{softmax}(r_\theta) \in \Delta^2.
+m_\theta = \textrm{softmax}(r_\theta) \in \Delta^2.
 $$
 
 Let
 
 $$
-e_\theta = \operatorname{softplus}(c_\theta) > 0.
+e_\theta = \textrm{softplus}(c_\theta) > 0.
 $$
 
 Then define
@@ -282,7 +282,7 @@ Low concentration means broad epistemic uncertainty over the true WDL probabilit
 Let
 
 $$
-\phi \sim \operatorname{Dirichlet}(\alpha)
+\phi \sim \textrm{Dirichlet}(\alpha)
 $$
 
 be a prior over WDL outcome probabilities.
@@ -302,7 +302,7 @@ $$
 Then the posterior is
 
 $$
-p(\phi \mid y,c) = \operatorname{Dirichlet}(\alpha + c y).
+p(\phi \mid y,c) = \textrm{Dirichlet}(\alpha + c y).
 $$
 
 Equivalently, the updated Dirichlet parameters are
@@ -322,7 +322,7 @@ $$
 Then the posterior is
 
 $$
-p(\phi \mid z^\star,c) = \operatorname{Dirichlet}(\alpha + c e_{z^\star}).
+p(\phi \mid z^\star,c) = \textrm{Dirichlet}(\alpha + c e_{z^\star}).
 $$
 
 If $c = 1$, this is the standard Dirichlet-categorical Bayesian update from one observed categorical sample.
@@ -336,7 +336,7 @@ $$
 the exact posterior is
 
 $$
-p(\phi \mid n) = \operatorname{Dirichlet}(\alpha + n).
+p(\phi \mid n) = \textrm{Dirichlet}(\alpha + n).
 $$
 
 The soft-evidence version is recovered by setting
@@ -356,7 +356,7 @@ Search may stop at either terminal or non-terminal leaves.
 The role of leaf evaluation is to return WDL evidence:
 
 $$
-\operatorname{Eval}(s_\ell) = (y_\ell,c_\ell),
+\textrm{Eval}(s_\ell) = (y_\ell,c_\ell),
 \qquad
 y_\ell \in \Delta^2,
 \qquad
@@ -420,13 +420,13 @@ During backup, return the evidence to the root action being evaluated.
 Whenever the player-to-move perspective changes, flip the WDL vector:
 
 $$
-y \leftarrow \operatorname{flip}(y).
+y \leftarrow \textrm{flip}(y).
 $$
 
 The backed-up evaluation for a root action $a$ has the form
 
 $$
-\operatorname{Eval}(s,a) = (y_a,c_a),
+\textrm{Eval}(s,a) = (y_a,c_a),
 \qquad
 y_a \in \Delta^2,
 \qquad
@@ -454,7 +454,7 @@ $$
 At simulation $t$, sample one WDL distribution per legal action:
 
 $$
-\phi_a^{(t)} \sim \operatorname{Dirichlet}(\alpha_a^{(t)}),
+\phi_a^{(t)} \sim \textrm{Dirichlet}(\alpha_a^{(t)}),
 \qquad
 a \in \mathcal{A}(s).
 $$
@@ -480,7 +480,7 @@ $$
 After evaluating $a_t$ by search, suppose the backed-up evaluation gives
 
 $$
-\operatorname{Eval}(s,a_t) = \left(y_{a_t}^{(t)},c_{a_t}^{(t)}\right),
+\textrm{Eval}(s,a_t) = \left(y_{a_t}^{(t)},c_{a_t}^{(t)}\right),
 \qquad
 y_{a_t}^{(t)} \in \Delta^2,
 \qquad
@@ -504,7 +504,7 @@ $$
 Equivalently,
 
 $$
-p(\phi_{a_t} \mid y_{a_t}^{(t)},c_{a_t}^{(t)}) = \operatorname{Dirichlet}\left(\alpha_{a_t}^{(t)} + c_{a_t}^{(t)} y_{a_t}^{(t)}\right).
+p(\phi_{a_t} \mid y_{a_t}^{(t)},c_{a_t}^{(t)}) = \textrm{Dirichlet}\left(\alpha_{a_t}^{(t)} + c_{a_t}^{(t)} y_{a_t}^{(t)}\right).
 $$
 
 This is exact Bayesian updating if the evidence corresponds to independent categorical outcome evidence. In neural search, it is calibrated pseudo-evidence.
@@ -528,7 +528,7 @@ For each legal action $a$,
 $$
 \pi_{\mathrm{search}}(a \mid s) = \mathbb{P}\left(a = \arg\max_{b \in \mathcal{A}(s)} U(\phi_b)\right),
 \qquad
-\phi_b \sim \operatorname{Dirichlet}(\alpha_b^{(T)}).
+\phi_b \sim \textrm{Dirichlet}(\alpha_b^{(T)}).
 $$
 
 Estimate this probability by Monte Carlo.
@@ -536,7 +536,7 @@ Estimate this probability by Monte Carlo.
 For $m = 1,\dots,M$, sample
 
 $$
-\phi_b^{(m)} \sim \operatorname{Dirichlet}(\alpha_b^{(T)}),
+\phi_b^{(m)} \sim \textrm{Dirichlet}(\alpha_b^{(T)}),
 \qquad
 b \in \mathcal{A}(s).
 $$
@@ -560,13 +560,13 @@ Unlike standard AlphaZero, the policy target is not just visit count. It is the 
 Train the policy head toward the search-improved posterior-best policy:
 
 $$
-\mathcal{L}_\pi(s) = -\sum_{a \in \mathcal{A}(s)} \operatorname{stopgrad}\left(\hat{\pi}_{\mathrm{search}}(a \mid s)\right) \log \pi_\theta(a \mid s).
+\mathcal{L}_\pi(s) = -\sum_{a \in \mathcal{A}(s)} \textrm{stopgrad}\left(\hat{\pi}_{\mathrm{search}}(a \mid s)\right) \log \pi_\theta(a \mid s).
 $$
 
 Equivalently,
 
 $$
-\mathcal{L}_\pi(s) = D_{\mathrm{KL}}\left(\operatorname{stopgrad}\left(\hat{\pi}_{\mathrm{search}}(\cdot \mid s)\right) \,\|\, \pi_\theta(\cdot \mid s)\right)
+\mathcal{L}_\pi(s) = D_{\mathrm{KL}}\left(\textrm{stopgrad}\left(\hat{\pi}_{\mathrm{search}}(\cdot \mid s)\right) \,\|\, \pi_\theta(\cdot \mid s)\right)
 $$
 
 up to an additive constant independent of $\theta$.
@@ -620,7 +620,7 @@ This trains the predicted WDL mean, but it does not directly train the concentra
 The Dirichlet KL loss is
 
 $$
-\mathcal{L}_{\mathrm{Dir}} = D_{\mathrm{KL}}\left(\operatorname{Dirichlet}\left(\operatorname{stopgrad}(\beta)\right) \,\|\, \operatorname{Dirichlet}(\alpha_\theta)\right).
+\mathcal{L}_{\mathrm{Dir}} = D_{\mathrm{KL}}\left(\textrm{Dirichlet}\left(\textrm{stopgrad}(\beta)\right) \,\|\, \textrm{Dirichlet}(\alpha_\theta)\right).
 $$
 
 This trains both the predicted WDL mean and the predicted concentration.
@@ -654,7 +654,7 @@ $$
 Then the value Dirichlet loss is
 
 $$
-\mathcal{L}_{V,\mathrm{Dir}}(s) = D_{\mathrm{KL}}\left(\operatorname{Dirichlet}\left(\operatorname{stopgrad}\left(\beta_V^{\mathrm{search}}(s)\right)\right) \,\|\, \operatorname{Dirichlet}\left(\alpha_\theta^V(s)\right)\right).
+\mathcal{L}_{V,\mathrm{Dir}}(s) = D_{\mathrm{KL}}\left(\textrm{Dirichlet}\left(\textrm{stopgrad}\left(\beta_V^{\mathrm{search}}(s)\right)\right) \,\|\, \textrm{Dirichlet}\left(\alpha_\theta^V(s)\right)\right).
 $$
 
 A practical early version can use only
@@ -698,7 +698,7 @@ $$
 Then use the Q Dirichlet KL loss:
 
 $$
-\mathcal{L}_{Q,\mathrm{Dir}}(s) = \sum_{a \in \mathcal{A}_{\mathrm{visited}}(s)} w_a D_{\mathrm{KL}}\left(\operatorname{Dirichlet}\left(\operatorname{stopgrad}\left(\beta_a^{\mathrm{search}}\right)\right) \,\|\, \operatorname{Dirichlet}\left(\alpha_\theta^Q(s,a)\right)\right).
+\mathcal{L}_{Q,\mathrm{Dir}}(s) = \sum_{a \in \mathcal{A}_{\mathrm{visited}}(s)} w_a D_{\mathrm{KL}}\left(\textrm{Dirichlet}\left(\textrm{stopgrad}\left(\beta_a^{\mathrm{search}}\right)\right) \,\|\, \textrm{Dirichlet}\left(\alpha_\theta^Q(s,a)\right)\right).
 $$
 
 The total Q loss can combine both terms:
@@ -810,7 +810,7 @@ After search, the policy target is the posterior probability that each action is
 $$
 \pi_{\mathrm{search}}(a \mid s) = \mathbb{P}\left(a = \arg\max_b U(\phi_b)\right),
 \qquad
-\phi_b \sim \operatorname{Dirichlet}(\alpha_b^{(T)}).
+\phi_b \sim \textrm{Dirichlet}(\alpha_b^{(T)}).
 $$
 
 The policy head learns this posterior-best distribution:
@@ -834,7 +834,7 @@ $$
 The central primitive is always the same Dirichlet evidence update:
 
 $$
-p(\phi \mid y,c) = \operatorname{Dirichlet}(\alpha + c y).
+p(\phi \mid y,c) = \textrm{Dirichlet}(\alpha + c y).
 $$
 
 ---
@@ -844,7 +844,7 @@ $$
 The KL divergence between two Dirichlet distributions is
 
 $$
-D_{\mathrm{KL}}\left(\operatorname{Dir}(\beta) \,\|\, \operatorname{Dir}(\alpha)\right) = \log\Gamma(\beta_0) - \sum_z \log\Gamma(\beta_z) - \log\Gamma(\alpha_0) + \sum_z \log\Gamma(\alpha_z) + \sum_z (\beta_z - \alpha_z)\left[\psi(\beta_z) - \psi(\beta_0)\right].
+D_{\mathrm{KL}}\left(\textrm{Dir}(\beta) \,\|\, \textrm{Dir}(\alpha)\right) = \log\Gamma(\beta_0) - \sum_z \log\Gamma(\beta_z) - \log\Gamma(\alpha_0) + \sum_z \log\Gamma(\alpha_z) + \sum_z (\beta_z - \alpha_z)\left[\psi(\beta_z) - \psi(\beta_0)\right].
 $$
 
 where
