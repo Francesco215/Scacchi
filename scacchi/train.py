@@ -46,6 +46,7 @@ class Config(BaseModel):
     value_hidden_dim: int = 64
     position_encoding: str = "relative_2d"
     use_absolute_positions: bool = True
+    num_history_steps: int = 8
     # selfplay params
     selfplay_batch_size: int = 1024
     num_simulations: int = 32
@@ -84,10 +85,12 @@ def main(cfg: DictConfig) -> None:
 
     env = pgx.make(config.env_id)
     baseline = pgx.make_baseline_model(cast(BaselineModelId, config.env_id + "_v0"))
+    h, w, _ = env.observation_shape
+    observation_shape = (h, w, config.num_history_steps * 14 + 3)
     model = build_model(
         config,
         num_actions=env.num_actions,
-        observation_shape=env.observation_shape,
+        observation_shape=observation_shape,
         rngs=nnx.Rngs(config.seed),
     )
     if config.optimizer_name == "adam":

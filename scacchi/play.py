@@ -17,6 +17,10 @@ class SelfplayOutput(NamedTuple):
     discount: jax.Array
 
 
+def slice_obs(obs: jax.Array, num_history_steps: int) -> jax.Array:
+    return jnp.concatenate([obs[..., : num_history_steps * 14], obs[..., 112:]], axis=-1)
+
+
 def make_recurrent_fn(env, predict_fn):
     def recurrent_fn(
         _,
@@ -58,9 +62,11 @@ def make_recurrent_fn(env, predict_fn):
 
 
 def make_selfplay(env, config):
+    nhs = config.num_history_steps
+
     def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
         recurrent_fn = make_recurrent_fn(
-            env, lambda obs: model(obs, train=False)
+            env, lambda obs: model(slice_obs(obs, nhs), train=False)
         )
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
@@ -69,7 +75,7 @@ def make_selfplay(env, config):
             key: jax.Array,
         ) -> tuple[pgx.State, SelfplayOutput]:
             search_key, reset_key = jax.random.split(key)
-            observation = env_state.observation
+            observation = slice_obs(env_state.observation, nhs)
             logits, value = model(observation, train=False)
             root = mctx.RootFnOutput(
                 prior_logits=logits,
@@ -97,7 +103,7 @@ def make_selfplay(env, config):
             discount = -jnp.ones_like(value)
             discount = jnp.where(env_state.terminated, 0.0, discount)
             return env_state, SelfplayOutput(
-                obs=observation,
+                obs=observation,  # already sliced above
                 action_weights=policy_output.action_weights,
                 reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
                 terminated=env_state.terminated,

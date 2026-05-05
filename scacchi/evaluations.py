@@ -8,9 +8,11 @@ import mctx
 import optax
 
 from .network import AZNet
-from .play import make_recurrent_fn
+from .play import make_recurrent_fn, slice_obs
 
 def make_evaluate(env, baseline, config):
+    nhs = config.num_history_steps
+
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: AZNet):
         """A simplified evaluation by sampling. Only for debugging.
@@ -23,7 +25,7 @@ def make_evaluate(env, baseline, config):
 
         def body_fn(val):
             key, env_state, returns = val
-            my_logits, _ = model(env_state.observation, train=False)
+            my_logits, _ = model(slice_obs(env_state.observation, nhs), train=False)
             opp_logits, _ = baseline(env_state.observation)
             is_my_turn = (env_state.current_player == my_player).reshape((-1, 1))
             logits = jnp.where(is_my_turn, my_logits, opp_logits)
@@ -48,12 +50,14 @@ def make_evaluate(env, baseline, config):
 
 def make_mcts_evaluate(env, baseline, config):
     # WARNING: THIS HAS NOT BEEN TESTED
+    nhs = config.num_history_steps
+
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: AZNet):
         """MCTS evaluation: model vs baseline. Both sides search with
         gumbel_muzero_policy using their own network."""
         my_player = 0
-        my_predict = lambda obs: model(obs, train=False)
+        my_predict = lambda obs: model(slice_obs(obs, nhs), train=False)
         my_recurrent_fn = make_recurrent_fn(env, my_predict)
         opp_recurrent_fn = make_recurrent_fn(env, baseline)
 
@@ -65,7 +69,7 @@ def make_mcts_evaluate(env, baseline, config):
             key, env_state, returns = val
             observation = env_state.observation
 
-            my_logits, my_value = my_predict(observation)
+            my_logits, my_value = my_predict(observation)  # slice_obs applied inside my_predict
             opp_logits, opp_value = baseline(observation)
 
             key, my_key, opp_key = jax.random.split(key, 3)
