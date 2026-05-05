@@ -78,8 +78,8 @@ def main(cfg: DictConfig) -> None:
     }:
         msg = "position_encoding must be one of {'relative_2d', 'basic_learned'}."
         raise ValueError(msg)
-    if config.optimizer_name not in {"adam", "muon"}:
-        msg = "optimizer_name must be one of {'adam', 'muon'}."
+    if config.optimizer_name not in {"adam", "adamw", "muon"}:
+        msg = "optimizer_name must be one of {'adam', 'adamw', 'muon'}."
         raise ValueError(msg)
 
     env = pgx.make(config.env_id)
@@ -90,11 +90,12 @@ def main(cfg: DictConfig) -> None:
         observation_shape=env.observation_shape,
         rngs=nnx.Rngs(config.seed),
     )
-    tx = (
-        optax.adam(learning_rate=config.learning_rate)
-        if config.optimizer_name == "adam"
-        else optax.contrib.muon(learning_rate=config.learning_rate)
-    )
+    if config.optimizer_name == "adam":
+        tx = optax.adam(learning_rate=config.learning_rate)
+    elif config.optimizer_name == "adamw":
+        tx = optax.adamw(learning_rate=config.learning_rate)
+    else:
+        tx = optax.contrib.muon(learning_rate=config.learning_rate)
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     training_iteration = make_training_iteration(env, config)
