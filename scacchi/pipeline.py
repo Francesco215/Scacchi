@@ -56,7 +56,7 @@ def make_training_iteration(env, config):
 
     @nnx.jit
     def training_iteration(
-        model: AZNet,
+        model: nnx.Module,
         optimizer: nnx.Optimizer,
         rng_key: jax.Array,
     ) -> LossOutputs:

@@ -8,8 +8,6 @@ import mctx
 import pgx
 from pgx.experimental import auto_reset
 
-from .network import AZNet
-
 
 WDL_DIM = 3
 W_IDX = 2
@@ -43,6 +41,10 @@ def _utility(wdl_mean: jax.Array) -> jax.Array:
 
 def _flip_wdl(wdl: jax.Array) -> jax.Array:
     return wdl[..., ::-1]
+
+
+def slice_obs(obs: jax.Array, num_history_steps: int) -> jax.Array:
+    return jnp.concatenate([obs[..., : num_history_steps * 14], obs[..., 112:]], axis=-1)
 
 
 def make_recurrent_fn(env, predict_fn, c_terminal: float, c_leaf: float):
@@ -158,10 +160,12 @@ def _scatter_evidence(tree: mctx.Tree, alpha_Q: jax.Array) -> jax.Array:
 
 
 def make_selfplay(env, config):
-    def selfplay(model: AZNet, rng_key: jax.Array) -> SelfplayOutput:
+    nhs = config.num_history_steps
+
+    def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
         recurrent_fn = make_recurrent_fn(
             env,
-            lambda obs: model(obs, train=False),
+            lambda obs: model(slice_obs(obs, nhs), train=False),
             config.c_terminal,
             config.c_leaf,
         )
@@ -172,7 +176,7 @@ def make_selfplay(env, config):
             key: jax.Array,
         ) -> tuple[pgx.State, SelfplayOutput]:
             search_key, mc_key, reset_key = jax.random.split(key, 3)
-            observation = env_state.observation
+            observation = slice_obs(env_state.observation, nhs)
             logits, alpha_V, alpha_Q = model(observation, train=False)
             alpha_V_mean = _wdl_mean(alpha_V)
             value = _utility(alpha_V_mean)
@@ -220,7 +224,7 @@ def make_selfplay(env, config):
             discount = -jnp.ones_like(value)
             discount = jnp.where(env_state.terminated, 0.0, discount)
             return env_state, SelfplayOutput(
-                obs=observation,
+                obs=observation,  # already sliced above
                 policy_target=policy_target,
                 played_action=policy_output.action,
                 reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],

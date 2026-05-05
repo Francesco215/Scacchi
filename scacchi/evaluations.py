@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import mctx
 
 from .network import AZNet
-from .play import NodeEmbedding, make_recurrent_fn
+from .play import NodeEmbedding, make_recurrent_fn, slice_obs
 
 
 def _root_embedding(env_state, alpha_V_mean, c_leaf):
@@ -51,8 +51,9 @@ def _wdl_mean(alpha):
 def _utility(wdl_mean):
     return wdl_mean[..., 2] - wdl_mean[..., 0]
 
-
 def make_evaluate(env, baseline, config):
+    nhs = config.num_history_steps
+
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: AZNet):
         """A simplified evaluation by sampling. Only for debugging.
@@ -65,7 +66,7 @@ def make_evaluate(env, baseline, config):
 
         def body_fn(val):
             key, env_state, returns = val
-            my_logits, _, _ = model(env_state.observation, train=False)
+            my_logits, _, _ = model(slice_obs(env_state.observation, nhs), train=False)
             opp_logits, _ = baseline(env_state.observation)
             is_my_turn = (env_state.current_player == my_player).reshape((-1, 1))
             logits = jnp.where(is_my_turn, my_logits, opp_logits)
@@ -90,12 +91,14 @@ def make_evaluate(env, baseline, config):
 
 def make_mcts_evaluate(env, baseline, config):
     # WARNING: THIS HAS NOT BEEN TESTED
+    nhs = config.num_history_steps
+
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: AZNet):
         """MCTS evaluation: model vs baseline. Both sides search with
         gumbel_muzero_policy using their own network."""
         my_player = 0
-        my_predict = lambda obs: model(obs, train=False)
+        my_predict = lambda obs: model(slice_obs(obs, nhs), train=False)
         baseline_predict = _baseline_as_dirichlet(baseline)
         my_recurrent_fn = make_recurrent_fn(env, my_predict, config.c_terminal, config.c_leaf)
         opp_recurrent_fn = make_recurrent_fn(env, baseline_predict, config.c_terminal, config.c_leaf)
