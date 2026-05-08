@@ -5,6 +5,8 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 import mctx
+from mctx._src import action_selection
+from mctx._src import search as mctx_search
 import pgx
 from pgx.experimental import auto_reset
 
@@ -34,6 +36,10 @@ class SelfplayOutput(NamedTuple):
     q_evidence_sum: chex.Array  # [B, A, 3] Σ_n evidence_weight_n · wdl_dist_n^aligned per root action
 
 
+class DirichletRootExtra(NamedTuple):
+    alpha_Q_prior: jax.Array  # [B, A, 3] outside search, [A, 3] inside vmapped selectors
+
+
 def _wdl_mean(alpha: jax.Array) -> jax.Array:
     return alpha / jnp.sum(alpha, axis=-1, keepdims=True)
 
@@ -52,7 +58,7 @@ def make_recurrent_fn(env, predict_fn, c_terminal: float, c_leaf: float):
     The returned function applies one environment action from a stored
     NodeEmbedding, evaluates the resulting observation with predict_fn, and
     packages the transition, priors, value, and updated embedding in the shape
-    expected by mctx.gumbel_muzero_policy.
+    expected by MCTX search.
     """
     def recurrent_fn(_, rng_key: chex.PRNGKey, action: chex.Array, embedding: NodeEmbedding):
         """Advance a batch of tree nodes by one action during MCTS expansion and evaluates the result"""
@@ -152,11 +158,102 @@ def _q_evidence_sum(tree: mctx.Tree, num_actions: int, dtype) -> jax.Array:
     )
 
 
+def _q_evidence_sum_unbatched(tree: mctx.Tree, num_actions: int, dtype) -> jax.Array:
+    """Single-tree version of _q_evidence_sum, shape [A, 3]."""
+    emb = tree.embeddings
+    wdl_aligned = jnp.where(
+        emb.depth_parity[..., None] == 1,
+        _flip_wdl(emb.wdl_dist),
+        emb.wdl_dist,
+    )
+    valid = (emb.root_action != mctx.Tree.NO_PARENT) & (tree.node_visits > 0)
+    weight = jnp.where(
+        valid,
+        emb.evidence_weight,
+        jnp.zeros((), dtype=emb.evidence_weight.dtype),
+    ).astype(dtype)
+
+    safe_root_action = jnp.where(valid, emb.root_action, 0)
+    out = jnp.zeros((num_actions, WDL_DIM), dtype=dtype)
+    return out.at[safe_root_action].add(weight[..., None] * wdl_aligned.astype(dtype))
+
+
+def _dirichlet_root_action_selection(
+    rng_key: jax.Array,
+    tree: mctx.Tree,
+    node_index: chex.Array,
+) -> jax.Array:
+    """Thompson-sample root actions from live Dirichlet-Q posteriors."""
+    del node_index
+    alpha_Q_prior = tree.extra_data.alpha_Q_prior
+    q_evidence_sum = _q_evidence_sum_unbatched(
+        tree, alpha_Q_prior.shape[0], alpha_Q_prior.dtype,
+    )
+    alpha_Q_post = alpha_Q_prior + q_evidence_sum
+    phi = jax.random.dirichlet(rng_key, alpha_Q_post)
+    score = _utility(phi)
+    return action_selection.masked_argmax(score, tree.root_invalid_actions)
+
+
+def _policy_prior_interior_action_selection(
+    rng_key: jax.Array,
+    tree: mctx.Tree,
+    node_index: chex.Array,
+    depth: chex.Array,
+) -> jax.Array:
+    """Policy-prior visit balancing for non-root tree traversal."""
+    del rng_key, depth
+    prior_logits = tree.children_prior_logits[node_index]
+    visit_counts = tree.children_visits[node_index]
+    probs = jax.nn.softmax(prior_logits)
+    score = probs - visit_counts / (1 + jnp.sum(visit_counts, keepdims=True))
+    invalid_actions = prior_logits <= (jnp.finfo(prior_logits.dtype).min / 2)
+    return action_selection.masked_argmax(score, invalid_actions)
+
+
+def _mask_invalid_logits(logits: jax.Array, invalid_actions: jax.Array | None) -> jax.Array:
+    if invalid_actions is None:
+        return logits
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    return jnp.where(invalid_actions, jnp.finfo(logits.dtype).min, logits)
+
+
+def _dirichlet_thompson_search(
+    rng_key: jax.Array,
+    root: mctx.RootFnOutput,
+    recurrent_fn: mctx.RecurrentFn,
+    alpha_Q_prior: jax.Array,
+    num_simulations: int,
+    invalid_actions: jax.Array,
+    max_depth: int | None = None,
+) -> mctx.Tree:
+    """Run MCTX search with Dirichlet-Q Thompson root selection.
+
+    This is intentionally the only call site for mctx._src.search.search, so an
+    MCTX upgrade has one obvious integration point.
+    """
+    root = root.replace(
+        prior_logits=_mask_invalid_logits(root.prior_logits, invalid_actions),
+    )
+    return mctx_search.search(
+        params=(),
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        root_action_selection_fn=_dirichlet_root_action_selection,
+        interior_action_selection_fn=_policy_prior_interior_action_selection,
+        num_simulations=num_simulations,
+        max_depth=max_depth,
+        invalid_actions=invalid_actions,
+        extra_data=DirichletRootExtra(alpha_Q_prior=alpha_Q_prior),
+    )
+
+
 def make_selfplay(env, config):
     """Build a self-play rollout function for the configured environment.
 
     The returned function initializes a vectorized batch of games, repeatedly
-    selects moves with Gumbel MuZero search, converts search evidence into
+    selects moves with Dirichlet-Q Thompson root search, converts search evidence into
     training targets, and returns the per-step data used by training.
     """
     def selfplay(model: AZNet, rng_key: jax.Array) -> SelfplayOutput:
@@ -169,7 +266,7 @@ def make_selfplay(env, config):
             key: jax.Array,
         ) -> tuple[pgx.State, SelfplayOutput]:
             """Run one environment/search step and emit its training sample."""
-            search_key, mc_key, reset_key = jax.random.split(key, 3)
+            search_key, mc_key, action_key, reset_key = jax.random.split(key, 4)
             observation = env_state.observation
             logits, alpha_V, alpha_Q = model(observation, train=False)
             alpha_V_mean = _wdl_mean(alpha_V)
@@ -188,19 +285,17 @@ def make_selfplay(env, config):
             )
 
             invalid_actions = ~env_state.legal_action_mask
-            policy_output = mctx.gumbel_muzero_policy(
-                params=(),
+            search_tree = _dirichlet_thompson_search(
                 rng_key=search_key,
                 root=root,
                 recurrent_fn=recurrent_fn,
+                alpha_Q_prior=alpha_Q,
                 num_simulations=config.num_simulations,
                 invalid_actions=invalid_actions,
-                qtransform=mctx.qtransform_completed_by_mix_value, #what is this?
-                gumbel_scale=1.0,
             )
 
             q_evidence_sum = _q_evidence_sum(
-                policy_output.search_tree, alpha_Q.shape[1], alpha_Q.dtype,
+                search_tree, alpha_Q.shape[1], alpha_Q.dtype,
             )
             alpha_Q_post = alpha_Q + q_evidence_sum
             policy_target = _mc_posterior_best(
@@ -210,12 +305,19 @@ def make_selfplay(env, config):
                 env_state.legal_action_mask,
                 config.policy_mc_samples,
             )
+            action_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
+            action_logits = jnp.where(
+                env_state.legal_action_mask,
+                action_logits,
+                jnp.finfo(action_logits.dtype).min,
+            )
+            action = jax.random.categorical(action_key, action_logits, axis=-1)
 
             actor = env_state.current_player
             reset_keys = jax.random.split(reset_key, config.selfplay_batch_size)
             env_state = jax.vmap(auto_reset(env.step, env.init))(
                 env_state,
-                policy_output.action,
+                action,
                 reset_keys,
             )
             discount = -jnp.ones_like(value)
@@ -223,7 +325,7 @@ def make_selfplay(env, config):
             return env_state, SelfplayOutput(
                 obs=observation,
                 policy_target=policy_target,
-                played_action=policy_output.action,
+                played_action=action,
                 reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
                 terminated=env_state.terminated,
                 discount=discount,
