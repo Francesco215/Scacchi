@@ -57,6 +57,7 @@ class Config(BaseModel):
     value_search_weight: float = 1.0
     q_search_weight: float = 1.0
     dir_kl_weight: float = 0.0
+    dir_ent_weight: float = 0.0
     c_terminal: float = 8.0
     c_leaf: float = 2.0
     # logging params
@@ -118,6 +119,8 @@ def main(cfg: DictConfig) -> None:
                 "q_search_mean_loss": losses.q_search_mean_loss.mean().item(),
                 "value_dir_kl_loss": losses.value_dir_kl_loss.mean().item(),
                 "q_dir_kl_loss": losses.q_dir_kl_loss.mean().item(),
+                "value_dir_ent_loss": losses.value_dir_ent_loss.mean().item(),
+                "q_dir_ent_loss": losses.q_dir_ent_loss.mean().item(),
                 "hours": hours,
                 "frames": frames,
             }

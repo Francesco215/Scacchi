@@ -27,6 +27,8 @@ class LossOutputs(NamedTuple):
     q_search_mean_loss: jax.Array
     value_dir_kl_loss: jax.Array
     q_dir_kl_loss: jax.Array
+    value_dir_ent_loss: jax.Array
+    q_dir_ent_loss: jax.Array
 
 
 def make_compute_loss_input(config):
@@ -69,18 +71,32 @@ def _xent_against_wdl(target_one_hot: jax.Array, pred_mean: jax.Array) -> jax.Ar
     return -(target_one_hot * log_pred).sum(axis=-1)
 
 
-def _dirichlet_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
-    """KL(Dir(beta) || Dir(alpha)) per math.md Appendix A. Inputs [..., K]; output [...]."""
+def dirichlet_cross_entropy(beta: jax.Array, alpha: jax.Array) -> jax.Array:
+    """H(Dir(beta), Dir(alpha)) = -E_{Dir(beta)}[log Dir(alpha)]. Inputs [..., K]; output [...]."""
     beta_0 = beta.sum(-1)
     alpha_0 = alpha.sum(-1)
-    digamma_diff = jax.lax.digamma(beta) - jax.lax.digamma(beta_0)[..., None]
+    expected_log_x = jax.lax.digamma(beta) - jax.lax.digamma(beta_0)[..., None]
     return (
-        jax.scipy.special.gammaln(beta_0)
-        - jax.scipy.special.gammaln(beta).sum(-1)
-        - jax.scipy.special.gammaln(alpha_0)
+        -jax.scipy.special.gammaln(alpha_0)
         + jax.scipy.special.gammaln(alpha).sum(-1)
-        + ((beta - alpha) * digamma_diff).sum(-1)
+        - ((alpha - 1.0) * expected_log_x).sum(-1)
     )
+
+
+def dirichlet_entropy(beta: jax.Array) -> jax.Array:
+    """H(Dir(beta)). Inputs [..., K]; output [...]."""
+    beta_0 = beta.sum(-1)
+    expected_log_x = jax.lax.digamma(beta) - jax.lax.digamma(beta_0)[..., None]
+    return (
+        jax.scipy.special.gammaln(beta).sum(-1)
+        - jax.scipy.special.gammaln(beta_0)
+        - ((beta - 1.0) * expected_log_x).sum(-1)
+    )
+
+
+def dirichlet_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
+    """KL(Dir(beta) || Dir(alpha)) per math.md Appendix A. Inputs [..., K]; output [...]."""
+    return dirichlet_cross_entropy(beta, alpha) - dirichlet_entropy(beta)
 
 
 def make_train_step(config):
@@ -125,10 +141,14 @@ def make_train_step(config):
             q_search_xe = _xent_against_wdl(q_search_mean, q_pred_mean)            # [B, A]
             q_search_mean_loss = (q_search_xe * q_search_mask_f).sum() / jnp.maximum(q_search_mask_f.sum(), 1.0)
 
-            v_dir_kl = _dirichlet_kl(jax.lax.stop_gradient(beta_V), alpha_V)       # [B]
+            v_dir_kl = dirichlet_kl(jax.lax.stop_gradient(beta_V), alpha_V)       # [B]
             value_dir_kl_loss = (v_dir_kl * v_mask_f).sum() / jnp.maximum(v_mask_f.sum(), 1.0)
-            q_dir_kl = _dirichlet_kl(jax.lax.stop_gradient(beta_Q), alpha_Q)       # [B, A]
+            q_dir_kl = dirichlet_kl(jax.lax.stop_gradient(beta_Q), alpha_Q)       # [B, A]
             q_dir_kl_loss = (q_dir_kl * q_search_mask_f).sum() / jnp.maximum(q_search_mask_f.sum(), 1.0)
+            v_dir_ent = dirichlet_entropy(alpha_V)                                # [B]
+            value_dir_ent_loss = (v_dir_ent * v_mask_f).sum() / jnp.maximum(v_mask_f.sum(), 1.0)
+            q_dir_ent = dirichlet_entropy(alpha_Q)                                # [B, A]
+            q_dir_ent_loss = (q_dir_ent * q_search_mask_f).sum() / jnp.maximum(q_search_mask_f.sum(), 1.0)
 
             total = (
                 config.policy_loss_weight * policy_loss
@@ -137,6 +157,7 @@ def make_train_step(config):
                 + config.value_search_weight * value_search_mean_loss
                 + config.q_search_weight * q_search_mean_loss
                 + config.dir_kl_weight * (value_dir_kl_loss + q_dir_kl_loss)
+                + config.dir_ent_weight * (value_dir_ent_loss + q_dir_ent_loss)
             )
             return total, LossOutputs(
                 policy_loss=policy_loss,
@@ -146,6 +167,8 @@ def make_train_step(config):
                 q_search_mean_loss=q_search_mean_loss,
                 value_dir_kl_loss=value_dir_kl_loss,
                 q_dir_kl_loss=q_dir_kl_loss,
+                value_dir_ent_loss=value_dir_ent_loss,
+                q_dir_ent_loss=q_dir_ent_loss,
             )
 
         (_, losses), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)

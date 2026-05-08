@@ -13,11 +13,12 @@ log_interval: 1
 eval_interval: 1
 policy_mc_samples: 32
 policy_loss_weight: 1.0
-value_outcome_weight: 1.0
-q_outcome_weight: 1.0
-value_search_weight: 1.0
-q_search_weight: 1.0
-dir_kl_weight: 0.0
+value_outcome_weight: 0.0
+q_outcome_weight: 0.0
+value_search_weight: 0.0
+q_search_weight: 0.0
+dir_kl_weight: 1.0
+dir_ent_weight: 0.3
 c_terminal: 8.0
 c_leaf: 2.0
 wandb_enabled: true

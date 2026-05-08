@@ -58,19 +58,12 @@ def make_recurrent_fn(env, predict_fn, c_terminal: float, c_leaf: float):
         env_state = embedding.state
         current_player = env_state.current_player
         env_state = jax.vmap(env.step)(env_state, action)
-        logits, alpha_V, _ = predict_fn(env_state.observation)
+        logits, alpha_V, _ = predict_fn(env_state.observation) # model(observation)
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-        logits = jnp.where(
-            env_state.legal_action_mask,
-            logits,
-            jnp.finfo(logits.dtype).min,
-        )
+        logits = jnp.where(env_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
 
         alpha_V_mean = _wdl_mean(alpha_V)
-        reward = env_state.rewards[
-            jnp.arange(env_state.rewards.shape[0]),
-            current_player,
-        ]
+        reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), current_player]
         terminal_y_parent = jax.nn.one_hot(
             jnp.round(reward).astype(jnp.int32) + 1, WDL_DIM, dtype=alpha_V_mean.dtype,
         )
