@@ -35,10 +35,10 @@ $$
 Search starts from the Q-head prior, evaluates actions, and updates action posteriors with WDL evidence:
 
 $$
-\alpha_a \leftarrow \alpha_a + c y_a.
+\alpha_a \leftarrow \alpha_a + \lambda d_a.
 $$
 
-Here $y_a$ is a WDL target distribution and $c$ is an evidence-strength parameter.
+Here $d_a$ is a WDL target distribution and $\lambda$ is an evidence-strength parameter.
 
 ## Search
 
@@ -53,13 +53,13 @@ Search samples from these posteriors to decide which action to explore. After ev
 Terminal leaves return one-hot WDL evidence:
 
 $$
-y = e_z.
+d = e_z.
 $$
 
 Non-terminal leaves are evaluated using the value head:
 
 $$
-y = \bar{\phi}_\theta^V(s_\ell).
+d = \bar{\phi}_\theta^V(s_\ell).
 $$
 
 This allows search to combine exact terminal outcomes with bootstrapped neural value estimates.
@@ -120,5 +120,4 @@ This gives a more probabilistic interpretation of search:
 - the policy head amortizes this expensive Bayesian search procedure.
 
 The goal is to make AlphaZero-style planning more uncertainty-aware, especially in settings where different actions have different levels of evidence.
-
 

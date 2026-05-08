@@ -6,7 +6,7 @@
 
 The pre-Dirichlet baseline (`scacchi/play.py`, `scacchi/loss.py`, `scacchi/network.py`) ran vanilla AlphaZero on `mctx.gumbel_muzero_policy` with a scalar value head and visit-count-based policy targets. Stage B adapts that path without changing mctx internals.
 
-Full fidelity to math.md cannot be expressed inside stock mctx because root action selection is not Thompson sampling and the live root posterior is not updated as `α_a <- α_a + c y` during search. Stock mctx can still be used for a useful intermediate path: carry WDL/evidence metadata through embeddings, reconstruct post-search Dirichlet evidence, and train the same posterior/loss targets. We adopt a staged path where loss completion and Thompson root selection are deliberately separate.
+Full fidelity to math.md cannot be expressed inside stock mctx because root action selection is not Thompson sampling and the live root posterior is not updated as `α_a <- α_a + λ d` during search. Stock mctx can still be used for a useful intermediate path: carry WDL/evidence metadata through embeddings, reconstruct post-search Dirichlet evidence, and train the same posterior/loss targets. We adopt a staged path where loss completion and Thompson root selection are deliberately separate.
 
 - **Stage B** (this plan's first deliverable): Dirichlet heads + losses + Bayesian wrapper for the policy target. No mctx changes.
 - **Stage A** (follow-up): Linear evidence aggregation through `tree.embeddings`, still using `mctx.gumbel_muzero_policy`. This changes the evidence/search trajectory distribution relative to math.md's Thompson search, but keeps the posterior-best target and loss forms compatible.
@@ -46,11 +46,11 @@ class NodeEmbedding(NamedTuple):
 
 In `make_recurrent_fn`, after `env.step`, run the network on the new observation, derive `alpha_V_mean = alpha_V / alpha_V.sum(-1, keepdims=True)`, and store it on the new node. After search, gather depth-1 children via `tree.children_index[:, ROOT_INDEX, :]` and look up `tree.embeddings.alpha_V_mean` at those indices to get one state-value WDL snapshot for each visited root action.
 
-**Perspective flip on gather:** non-terminal child nodes are evaluated from the opponent's perspective. Apply `y_a = y_a[..., ::-1]` (swap W↔L, D fixed) before using as the root-action target.
+**Perspective flip on gather:** non-terminal child nodes are evaluated from the opponent's perspective. Apply `wdl_dist_a = wdl_dist_a[..., ::-1]` (swap W↔L, D fixed) before using as the root-action target.
 
 **Terminal override:** if a visited root child is terminal (`children_discounts[:, ROOT_INDEX, a] == 0`), use the actual immediate reward as a one-hot WDL target from the root player's perspective: `one_hot(round(children_rewards[:, ROOT_INDEX, a]) + 1, 3)`. Do not use the network value on terminal children.
 
-Unvisited actions keep their root prior `mean(alpha_Q[:, a])` as the fallback `y_a`, but receive zero search evidence (`c_a = 0`), so this fallback does not double-count the prior.
+Unvisited actions keep their root prior `mean(alpha_Q[:, a])` as the fallback `wdl_dist_a`, but receive zero search evidence (`evidence_weight_a = 0`), so this fallback does not double-count the prior.
 
 This is a snapshot — one WDL evaluation per child at expansion time, not search-improved. Stage A upgrades this.
 
@@ -59,8 +59,8 @@ This is a snapshot — one WDL evaluation per child at expansion time, not searc
 After `mctx.gumbel_muzero_policy` returns:
 
 1. `N_a = search_tree.children_visits[:, ROOT_INDEX, :]` shape `[B, A]`.
-2. `y_a = terminal_one_hot_or_flip_W_L(gather alpha_V_mean from root children)` shape `[B, A, 3]`.
-3. `α_post[b,a] = alpha_Q[b,a] + ρ * sqrt(N_a[b,a]) * y_a[b,a]` — a deliberate Stage B approximation to math.md's linear evidence update, using completed visit counts so unvisited actions add no evidence.
+2. `wdl_dist_a = terminal_one_hot_or_flip_W_L(gather alpha_V_mean from root children)` shape `[B, A, 3]`.
+3. `α_post[b,a] = alpha_Q[b,a] + ρ * sqrt(N_a[b,a]) * wdl_dist_a[b,a]` — a deliberate Stage B approximation to math.md's linear evidence update, using completed visit counts so unvisited actions add no evidence.
 4. `phi_samples = jax.random.dirichlet(key, alpha=α_post, shape=(M,))` → `[M, B, A, 3]`.
 5. `U_samples = phi_samples[..., W] − phi_samples[..., L]` → `[M, B, A]`.
 6. Mask invalid actions: `U_samples = jnp.where(invalid_actions[None, :, :], -jnp.inf, U_samples)`.
@@ -139,20 +139,20 @@ The pgx baseline returns `(logits, value)` and we cannot change it.
 
 ## Stage A — Linear evidence summing via embedding aggregation (~80 LoC)
 
-**Trigger:** ship if Stage B's snapshot `y_a` (depth-1 children only, no deeper search aggregation) proves to be the bottleneck (signal: flat policy loss with sane V/Q losses).
+**Trigger:** ship if Stage B's snapshot `wdl_dist_a` (depth-1 children only, no deeper search aggregation) proves to be the bottleneck (signal: flat policy loss with sane V/Q losses).
 
 **Math change.** Stage B uses the sublinear approximation `α_post = α_prior + ρ √N · ȳ`. Stage A switches to the linear Dirichlet evidence update from math.md §4/§6:
 
 $$
 \alpha_a^{\mathrm{post}} =
 \alpha_\theta^Q(s,a) +
-\sum_{n \in \mathrm{subtree}(a)} c_n \cdot y_n^{\mathrm{aligned}}.
+\sum_{n \in \mathrm{subtree}(a)} \lambda_n \cdot d_n^{\mathrm{aligned}}.
 $$
 
-This is the literal Bayesian update for a Dirichlet under independent categorical evidence: prior alphas plus a sum of `c · y` contributions. Per-leaf evidence weight `c` is `c_terminal` for terminal nodes and `c_leaf` for non-terminal — so this stage absorbs what was previously F.2 (terminal-vs-leaf weighting). `y_n^{\mathrm{aligned}}` is the node's WDL distribution, W↔L-flipped if the node sits at odd depth from root (opponent perspective).
+This is the literal Bayesian update for a Dirichlet under independent categorical evidence: prior alphas plus a sum of `evidence_weight · wdl_dist` contributions. Per-leaf evidence weight `evidence_weight` is `c_terminal` for terminal nodes and `c_leaf` for non-terminal — so this stage absorbs what was previously F.2 (terminal-vs-leaf weighting). `wdl_dist_n^{\mathrm{aligned}}` is the node's WDL distribution, W↔L-flipped if the node sits at odd depth from root (opponent perspective).
 
-- mctx's scalar `<U>` running mean cannot recover `Σ y_D` (one linear functional + simplex constraint = 2 equations, 3 unknowns — a leaf at `(0.5, 0, 0.5)` and one at `(0, 1, 0)` are indistinguishable to mctx). So we *cannot* reconstruct the per-action WDL sum from mctx's tree alone.
-- *But* the embedding is an arbitrary pytree mctx never inspects. We can carry the WDL info there and reconstruct `Σ c · y` by post-hoc scatter-sum after search.
+- mctx's scalar `<U>` running mean cannot recover `Σ d_D` (one linear functional + simplex constraint = 2 equations, 3 unknowns — a leaf at `(0.5, 0, 0.5)` and one at `(0, 1, 0)` are indistinguishable to mctx). So we *cannot* reconstruct the per-action WDL sum from mctx's tree alone.
+- *But* the embedding is an arbitrary pytree mctx never inspects. We can carry the WDL info there and reconstruct `Σ evidence_weight · wdl_dist` by post-hoc scatter-sum after search.
 - This works only if root selection does **not** need a live per-action posterior during search — i.e., we drop Thompson root sampling. mctx's `gumbel_muzero_policy` (sequential halving over Gumbel-perturbed priors) replaces it. This is the one algorithmic concession; in exchange we delete ~600 LoC of vendored code.
 
 ### A.1 Embedding becomes the side channel
@@ -162,33 +162,33 @@ This is the literal Bayesian update for a Dirichlet under independent categorica
 ```python
 class NodeEmbedding(NamedTuple):
     state: pgx.State
-    y: jax.Array            # [B, 3] WDL distribution at this node
-                            #   terminal: one-hot reward from this node's perspective
-                            #   non-terminal: mean(α^V) from the network
-    c: jax.Array            # [B] evidence weight: c_terminal if terminal else c_leaf
+    wdl_dist: jax.Array  # [B, 3] WDL distribution at this node
+                         #   terminal: one-hot reward from this node's perspective
+                         #   non-terminal: mean(α^V) from the network
+    evidence_weight: jax.Array  # [B] evidence weight: c_terminal if terminal else c_leaf
     root_action: jax.Array  # [B] which root action's subtree this node belongs to
                             #   (NO_PARENT = -1 at root; set on the depth-1 transition)
     depth_parity: jax.Array # [B] 0 = root player's perspective, 1 = opponent's
 ```
 
 `make_recurrent_fn` populates these on every expansion. The invariant is that
-`y` is always stored from the expanded node's local perspective; the
+`wdl_dist` is always stored from the expanded node's local perspective; the
 post-search scatter handles root-player alignment uniformly via `depth_parity`.
 
 - `root_action = parent.root_action if parent.root_action != NO_PARENT else action_taken`
 - `depth_parity = 1 - parent.depth_parity`
-- non-terminal `y = mean(α^V)` from the network on the new state.
-- terminal `y` is **not** the Stage B root/parent-aligned terminal override. `recurrent_fn` observes `reward = rewards[..., current_player]`, which is from the parent/action-taker perspective. Convert that to a one-hot WDL, then W↔L-flip before storing it on the child node:
+- non-terminal `wdl_dist = mean(α^V)` from the network on the new state.
+- terminal `wdl_dist` is **not** the Stage B root/parent-aligned terminal override. `recurrent_fn` observes `reward = rewards[..., current_player]`, which is from the parent/action-taker perspective. Convert that to a one-hot WDL, then W↔L-flip before storing it on the child node:
 
 ```python
-terminal_y_parent = jax.nn.one_hot(jnp.round(reward).astype(jnp.int32) + 1, 3)
-terminal_y_child = terminal_y_parent[..., ::-1]
-y = jnp.where(terminated[..., None], terminal_y_child, alpha_V_mean)
+terminal_wdl_parent = jax.nn.one_hot(jnp.round(reward).astype(jnp.int32) + 1, 3)
+terminal_wdl_child = terminal_wdl_parent[..., ::-1]
+wdl_dist = jnp.where(terminated[..., None], terminal_wdl_child, alpha_V_mean)
 ```
 
-- `c = c_terminal` for terminal nodes, else `c_leaf`.
+- `evidence_weight = c_terminal` for terminal nodes, else `c_leaf`.
 
-`recurrent_fn` still returns scalar `value = U(y) = y[W] − y[L]` to mctx. The existing `discount = -1` perspective trick (`play.py:47`) handles scalar perspective flips for selection — `U(flip(y)) = −U(y)`. **mctx's tree is unchanged.**
+`recurrent_fn` still returns scalar `value = U(wdl_dist) = wdl_dist[W] − wdl_dist[L]` to mctx. The existing `discount = -1` perspective trick (`play.py:47`) handles scalar perspective flips for selection — `U(flip(wdl_dist)) = −U(wdl_dist)`. **mctx's tree is unchanged.**
 
 ### A.2 Post-search scatter-sum
 
@@ -196,18 +196,18 @@ After `mctx.gumbel_muzero_policy(...)` returns:
 
 ```python
 # Pull metadata from the tree's embedding pytree.
-y            = search_tree.embeddings.y             # [B, N, 3]
-c            = search_tree.embeddings.c             # [B, N]
+wdl_dist = search_tree.embeddings.wdl_dist               # [B, N, 3]
+evidence_weight = search_tree.embeddings.evidence_weight # [B, N]
 root_action  = search_tree.embeddings.root_action   # [B, N]
 depth_parity = search_tree.embeddings.depth_parity  # [B, N]
 node_visits  = search_tree.node_visits              # [B, N]
 
 # Align every node to root-player perspective.
-y_aligned = jnp.where(depth_parity[..., None] == 1, y[..., ::-1], y)
+wdl_aligned = jnp.where(depth_parity[..., None] == 1, wdl_dist[..., ::-1], wdl_dist)
 
 # Mask out (a) the root itself (no root_action) and (b) any unexpanded slot.
 valid = (root_action != NO_PARENT) & (node_visits > 0)
-weight = jnp.where(valid, c, 0.0)
+weight = jnp.where(valid, evidence_weight, 0.0)
 
 # Scatter-add per (batch, root_action) into [B, A, 3].
 B, N = node_visits.shape
@@ -216,7 +216,7 @@ batch_idx = jnp.broadcast_to(jnp.arange(B)[:, None], (B, N))
 safe_root_action = jnp.where(valid, root_action, 0)  # any in-range index, masked by weight=0
 evidence_sum = jnp.zeros((B, A, 3), dtype=alpha_Q_prior.dtype)
 evidence_sum = evidence_sum.at[batch_idx, safe_root_action].add(
-    weight[..., None] * y_aligned)
+    weight[..., None] * wdl_aligned)
 
 alpha_Q_post = alpha_Q_prior + evidence_sum
 ```
@@ -236,8 +236,8 @@ Stage B's `_mc_posterior_best(alpha_Q_post, ...)` consumes this unchanged.
 ### A.4 What changes in the Stage B code
 
 In `play.py`:
-- Extend `NodeEmbedding` with the four new fields above; rename `alpha_V_mean → y` for clarity (semantic: the WDL distribution at this node, which is `mean(α^V)` for non-terminals).
-- `make_recurrent_fn` populates `c`, `root_action`, `depth_parity` (purely arithmetic — no extra network calls).
+- Extend `NodeEmbedding` with the four new fields above; rename `alpha_V_mean → wdl_dist` for clarity (semantic: the WDL distribution at this node, which is `mean(α^V)` for non-terminals).
+- `make_recurrent_fn` populates `evidence_weight`, `root_action`, `depth_parity` (purely arithmetic — no extra network calls).
 - After `mctx.gumbel_muzero_policy(...)`, replace Stage B's depth-1 gather with the scatter-sum in §A.2.
 - Drop Stage B's `search_evidence_rho` and `evidence_schedule` config knobs from the policy-target path. Add `c_terminal` and `c_leaf`.
 
@@ -245,7 +245,7 @@ In `loss.py`, `train.py`, `evaluations.py`: no changes from Stage B (config keys
 
 ### A.5 Caveat: linear evidence vs. correlated neural evals
 
-math.md §4 explicitly frames neural search evidence as calibrated pseudo-evidence rather than independent categorical observations. Linear summing of bootstrapped network evaluations can become overconfident because the evidence is correlated. At high simulation counts `Σ c · y_i ≈ N · c_leaf · ȳ`, which can drown the prior.
+math.md §4 explicitly frames neural search evidence as calibrated pseudo-evidence rather than independent categorical observations. Linear summing of bootstrapped network evaluations can become overconfident because the evidence is correlated. At high simulation counts `Σ evidence_weight_i · wdl_dist_i ≈ N · c_leaf · d̄`, which can drown the prior.
 
 Mitigations:
 - Set `c_leaf` small enough that `N_root_action · c_leaf` stays comparable to `α_Q_prior.sum(-1)` at the simulation budget you actually use. Reasonable starting points: `c_leaf = 1.0`, `c_terminal = 8.0`.
@@ -255,9 +255,9 @@ Mitigations:
 ### A.6 Verification (Stage A)
 
 1. **Shape sanity:** `evidence_sum.shape == (B, A, 3)`; no NaNs; `(α_Q_post / α_Q_post.sum(-1, keepdims=True)).sum(-1) ≈ 1`.
-2. **Scatter correctness:** 1-batch, 4-simulation toy run. Manually trace which expanded nodes belong to which root action; hand-verify `evidence_sum[0, a, :]` matches `Σ c_n · y_n^aligned` over those nodes.
-3. **Parity flip:** terminal child reachable in 1 step — confirm the stored child `y` is W↔L-flipped from the parent reward, then `depth_parity=1` flips it back during scatter so the final root-aligned evidence equals the root/player-to-move outcome.
-4. **Equivalence to Stage B at depth 1:** with `num_simulations = 1` and only one root action visited, `evidence_sum[:, a, :]` should equal Stage B's `c · flip(y_child)` for that action — i.e., Stage A degenerates cleanly to Stage B for trivial trees.
+2. **Scatter correctness:** 1-batch, 4-simulation toy run. Manually trace which expanded nodes belong to which root action; hand-verify `evidence_sum[0, a, :]` matches `Σ evidence_weight_n · wdl_dist_n^aligned` over those nodes.
+3. **Parity flip:** terminal child reachable in 1 step — confirm the stored child `wdl_dist` is W↔L-flipped from the parent reward, then `depth_parity=1` flips it back during scatter so the final root-aligned evidence equals the root/player-to-move outcome.
+4. **Equivalence to Stage B at depth 1:** with `num_simulations = 1` and only one root action visited, `evidence_sum[:, a, :]` should equal Stage B's `evidence_weight · flip(wdl_child)` for that action — i.e., Stage A degenerates cleanly to Stage B for trivial trees.
 
 ---
 
@@ -270,7 +270,7 @@ Mitigations:
 Stage A should make these targets available from self-play:
 
 ```python
-q_evidence_sum: [T, B, A, 3]  # Σ c_n · y_n^aligned per root action
+q_evidence_sum: [T, B, A, 3]  # Σ evidence_weight_n · wdl_dist_n^aligned per root action
 q_evidence_w:   [T, B, A]     # q_evidence_sum.sum(-1)
 q_search_mask:  [T, B, A]     # legal and q_evidence_w > 0
 ```
@@ -324,7 +324,7 @@ Mask `L_Q_Dir` to searched/legal actions only. Start with `dir_kl_weight = 0.0`,
 
 ---
 
-## Stage Full-Selection — Thompson root sampling (~150-260 LoC)
+## Stage Full-Selection — Thompson root sampling (~80-140 LoC)
 
 **Goal:** make the search trajectory match math.md §6 more closely by replacing Gumbel root action selection with Thompson sampling from the live root action posteriors.
 
@@ -334,7 +334,7 @@ At each root simulation:
 phi_a ~ Dirichlet(alpha_a_current)
 a_t = argmax_a U(phi_a)  # or p_W if explicitly using exploratory win-probability mode
 evaluate a_t
-alpha_a_current[a_t] += c_t * y_t
+alpha_a_current[a_t] += evidence_weight_t * wdl_dist_t
 ```
 
 This phase changes which actions and nodes are expanded, and therefore changes:
@@ -347,20 +347,139 @@ This phase changes which actions and nodes are expanded, and therefore changes:
 
 It should not change the loss formulas from Stage Full-Losses.
 
-### FS.1 Implementation constraint
+### FS.1 Implementation path
 
-Post-hoc embedding scatter is sufficient for Stage A evidence aggregation and Stage Full-Losses, but it is not sufficient for true Thompson root selection. Thompson root selection needs the posterior to update during the simulation loop. That requires either:
+Do not keep using `mctx.gumbel_muzero_policy` as the top-level wrapper for this phase. That wrapper hardcodes Gumbel root selection and final Gumbel action/logit handling.
 
-- a small custom root-search loop that keeps live root `alpha_a_current`, or
-- a refreshed minimal mctx fork/wrapper where only root selection and root evidence updates are custom.
+Instead, add a small custom policy wrapper around the pinned private search API:
 
-Interior node selection can still reuse scalar `U(mean WDL)` with existing mctx-style selection unless we decide to make the whole tree WDL-native later.
+```python
+from mctx._src import action_selection
+from mctx._src import search
+```
 
-### FS.2 Verification
+The wrapper should:
+
+1. Build the same `mctx.RootFnOutput` as Stage A / Full-Losses.
+2. Pass the root Q prior through `extra_data`, e.g.
+
+```python
+class DirichletRootExtra(NamedTuple):
+    alpha_Q_prior: jax.Array  # [B, A, 3] outside search, [A, 3] inside vmapped selectors
+```
+
+3. Call `search.search(...)` directly with:
+
+```python
+search_tree = search.search(
+    params=(),
+    rng_key=search_key,
+    root=root,
+    recurrent_fn=recurrent_fn,
+    root_action_selection_fn=dirichlet_root_action_selection,
+    interior_action_selection_fn=policy_prior_interior_action_selection,
+    num_simulations=config.num_simulations,
+    invalid_actions=invalid_actions,
+    extra_data=DirichletRootExtra(alpha_Q_prior=alpha_Q),
+)
+```
+
+4. Implement `dirichlet_root_action_selection(rng_key, tree, node_index)` as an unbatched root selector:
+
+```python
+alpha_Q_prior = tree.extra_data.alpha_Q_prior  # [A, 3]
+q_evidence_sum = _q_evidence_sum_unbatched(tree, alpha_Q_prior.shape[0], alpha_Q_prior.dtype)
+alpha_Q_post = alpha_Q_prior + q_evidence_sum
+phi = jax.random.dirichlet(rng_key, alpha_Q_post)  # [A, 3]
+score = phi[..., W_IDX] - phi[..., L_IDX]
+return action_selection.masked_argmax(score, tree.root_invalid_actions)
+```
+
+`_q_evidence_sum_unbatched` should be the single-tree version of Stage A's scatter-sum: read `tree.embeddings`, align `wdl_dist` by `depth_parity`, mask `root_action != NO_PARENT` and `node_visits > 0`, then scatter-add into `[A, 3]`.
+
+5. After `search.search` returns, use the existing batched Stage A path:
+
+```python
+q_evidence_sum = _q_evidence_sum(search_tree, alpha_Q.shape[1], alpha_Q.dtype)
+alpha_Q_post = alpha_Q + q_evidence_sum
+policy_target = _mc_posterior_best(...)
+```
+
+Then choose the played self-play action from the posterior-best target rather than from Gumbel MuZero's final action rule:
+
+```python
+action = jax.random.categorical(action_key, jnp.log(jnp.clip(policy_target, 1e-8, 1.0)))
+```
+
+For evaluation, use `jnp.argmax(policy_target, axis=-1)` or a temperature-controlled variant.
+
+This uses a private MCTX module, but `pyproject.toml` pins `mctx==0.0.6`; keep the import and wrapper isolated so an MCTX upgrade has one obvious integration point.
+
+### FS.2 Interior selection
+
+Use a policy-prior interior selector as the first implementation. This keeps the root mathematically aligned with Dirichlet-Q Thompson sampling while treating deeper traversal as a simple policy-guided mechanism for collecting leaf evidence:
+
+```python
+def policy_prior_interior_action_selection(rng_key, tree, node_index, depth):
+    del rng_key, depth
+    prior_logits = tree.children_prior_logits[node_index]
+    visit_counts = tree.children_visits[node_index]
+
+    probs = jax.nn.softmax(prior_logits)
+    score = probs - visit_counts / (1 + jnp.sum(visit_counts, keepdims=True))
+    return jnp.argmax(score, axis=-1).astype(jnp.int32)
+```
+
+This intentionally ignores MCTX scalar Q-values at interior nodes. The benefit is conceptual clarity: root selection is Dirichlet-Q, and interior selection is just policy-prior visit balancing. It avoids using `mctx.qtransform_completed_by_mix_value`, which only has access to scalar `U(mean WDL)` values and cannot see the full WDL evidence distribution.
+
+If policy-only interior traversal is too weak early in training, the fallback is to use MCTX's scalar interior selector:
+
+```python
+interior_action_selection_fn=functools.partial(
+    action_selection.gumbel_muzero_interior_action_selection,
+    qtransform=mctx.qtransform_completed_by_mix_value,
+)
+```
+
+That fallback uses `softmax(prior_logits + completed_qvalues)` balancing, where `completed_qvalues` comes from scalar MCTX backups. It is a stronger heuristic, but less clean relative to math.md because it compresses WDL evidence to scalar utility.
+
+A fully WDL-native interior search would require each interior node to carry per-action Dirichlet posteriors and live evidence updates; that is a larger algorithmic change and should be treated as a separate phase if needed.
+
+### FS.3 Verification
 
 1. With `num_simulations=1`, verify the selected root action is `argmax U(phi_a)` from one Dirichlet sample under the root prior.
-2. With a deterministic fake evaluator, verify only the selected root action receives `+c*y` after each simulation.
-3. Compare Gumbel vs Thompson runs with the same network seed and confirm policy/loss code paths are unchanged while visited root-action histograms differ.
+2. With a deterministic fake evaluator, verify only the selected root action receives `+evidence_weight*wdl_dist` after each simulation.
+3. Confirm `tree.extra_data.alpha_Q_prior` has shape `[A, 3]` inside the unbatched root selector and `[B, A, 3]` outside search.
+4. Compare Gumbel vs Thompson runs with the same network seed and confirm policy/loss code paths are unchanged while visited root-action histograms differ.
+
+---
+
+## Stage WDL-Interior — Interior Thompson sampling (later)
+
+**Goal:** replace the policy-prior interior heuristic with WDL-native Thompson sampling at interior nodes.
+
+At an interior node, maintain or reconstruct per-action Dirichlet posteriors:
+
+```python
+alpha_child_post[a] = alpha_Q_child_prior[a] + child_evidence_sum[a]
+```
+
+Then sample one WDL distribution per legal action and select the action with the best sampled utility:
+
+```python
+phi_a = jax.random.dirichlet(rng_key, alpha_child_post)  # [A, 3]
+score = phi_a[..., W_IDX] - phi_a[..., L_IDX]
+action = masked_argmax(score, invalid_actions)
+```
+
+If using an exploratory win-probability variant, score by `phi_a[..., W_IDX]` instead. This is Thompson sampling over the updated Dirichlet belief; it samples a categorical/WDL probability vector from the Dirichlet posterior, then chooses the action whose sampled WDL belief has the highest utility.
+
+This is intentionally a later stage because MCTX's tree stores scalar backed-up values, not per-action WDL posteriors, for interior nodes. Implementing this cleanly likely requires one of:
+
+- extending the embedding/routing metadata enough to reconstruct evidence under each child of an arbitrary interior node, or
+- introducing a WDL-native search tree/fork that stores per-node and per-action WDL evidence directly.
+
+The loss formulas and root posterior-best policy target should remain unchanged; this stage changes only the trajectory distribution and the quality/diversity of evidence collected below the root.
 
 ### Recap
 
@@ -369,7 +488,8 @@ Interior node selection can still reuse scalar `U(mean WDL)` with existing mctx-
 | B | ~80 | network/play/loss/eval/train/yaml |
 | A | ~80 | embedding metadata + post-search scatter-sum |
 | Full-Losses | ~120 | self-play outputs + loss.py KL/mean terms + logging |
-| Full-Selection | ~150-260 | custom root selection/search wrapper or refreshed fork |
+| Full-Selection | ~80-140 | custom policy wrapper around `mctx._src.search.search` + Thompson root selector |
+| WDL-Interior | TBD | interior Thompson sampling with per-action WDL posteriors |
 
 ---
 
@@ -381,7 +501,7 @@ Interior node selection can still reuse scalar `U(mean WDL)` with existing mctx-
 4. **Posterior calibration spot-check:** One-shot debug print at `iteration == 0`: `mean(alpha_V).sum() ≈ 1`, `mean(alpha_Q).sum(-1) ≈ 1`, `policy_target.sum(-1) ≈ 1`. Remove after verifying.
 5. **Imports clean:** `uv run python -c "import scacchi.train"`.
 
-Stage A adds: confirm `q_evidence_sum.shape == (T, B, A, 3)`, `alpha_Q_post = alpha_Q_prior + q_evidence_sum` is positive, and MC `policy_target.sum(-1) ≈ 1`. Stage Full-Losses adds: confirm Dirichlet-KL terms are finite before enabling nonzero `dir_kl_weight`. Stage Full-Selection adds: confirm loss code paths are unchanged while Gumbel and Thompson runs produce different visited-action histograms.
+Stage A adds: confirm `q_evidence_sum.shape == (T, B, A, 3)`, `alpha_Q_post = alpha_Q_prior + q_evidence_sum` is positive, and MC `policy_target.sum(-1) ≈ 1`. Stage Full-Losses adds: confirm Dirichlet-KL terms are finite before enabling nonzero `dir_kl_weight`. Stage Full-Selection adds: confirm loss code paths are unchanged while Gumbel and Thompson runs produce different visited-action histograms. Stage WDL-Interior adds: confirm interior sampled actions match `argmax U(phi_a)` from the reconstructed per-action WDL posteriors in a deterministic toy tree.
 
 ## Recommendation
 

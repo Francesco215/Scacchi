@@ -11,8 +11,8 @@ def _root_embedding(env_state, alpha_V_mean, c_leaf):
     batch_size = alpha_V_mean.shape[0]
     return NodeEmbedding(
         state=env_state,
-        y=alpha_V_mean,
-        c=jnp.full((batch_size,), c_leaf, dtype=alpha_V_mean.dtype),
+        wdl_dist=alpha_V_mean,
+        evidence_weight=jnp.full((batch_size,), c_leaf, dtype=alpha_V_mean.dtype),
         root_action=jnp.full((batch_size,), mctx.Tree.NO_PARENT, dtype=jnp.int32),
         depth_parity=jnp.zeros((batch_size,), dtype=jnp.int32),
     )

@@ -18,8 +18,8 @@ L_IDX = 0
 
 class NodeEmbedding(NamedTuple):
     state: pgx.State
-    y: jax.Array            # [B, 3] WDL distribution at this node, local (player-to-move) perspective
-    c: jax.Array            # [B] evidence weight: c_terminal at terminal nodes, else c_leaf
+    wdl_dist: jax.Array  # [B, 3] WDL distribution at this node, local player-to-move perspective
+    evidence_weight: jax.Array  # [B] c_terminal at terminal nodes, else c_leaf
     root_action: jax.Array  # [B] int32, NO_PARENT at root, action_taken at depth 1, inherited deeper
     depth_parity: jax.Array # [B] int32, 0 at root, flipped each ply
 
@@ -31,7 +31,7 @@ class SelfplayOutput(NamedTuple):
     policy_target: chex.Array
     played_action: jax.Array
     discount: jax.Array
-    q_evidence_sum: chex.Array  # [B, A, 3] Σ_n c_n · y_n^aligned per root action
+    q_evidence_sum: chex.Array  # [B, A, 3] Σ_n evidence_weight_n · wdl_dist_n^aligned per root action
 
 
 def _wdl_mean(alpha: jax.Array) -> jax.Array:
@@ -47,12 +47,15 @@ def _flip_wdl(wdl: jax.Array) -> jax.Array:
 
 
 def make_recurrent_fn(env, predict_fn, c_terminal: float, c_leaf: float):
-    def recurrent_fn(
-        _,
-        rng_key: chex.PRNGKey,
-        action: chex.Array,
-        embedding: NodeEmbedding,
-    ):
+    """Build the MuZero recurrent function used to expand search-tree nodes.
+
+    The returned function applies one environment action from a stored
+    NodeEmbedding, evaluates the resulting observation with predict_fn, and
+    packages the transition, priors, value, and updated embedding in the shape
+    expected by mctx.gumbel_muzero_policy.
+    """
+    def recurrent_fn(_, rng_key: chex.PRNGKey, action: chex.Array, embedding: NodeEmbedding):
+        """Advance a batch of tree nodes by one action during MCTS expansion and evaluates the result"""
         del rng_key
 
         env_state = embedding.state
@@ -64,12 +67,12 @@ def make_recurrent_fn(env, predict_fn, c_terminal: float, c_leaf: float):
 
         alpha_V_mean = _wdl_mean(alpha_V)
         reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), current_player]
-        terminal_y_parent = jax.nn.one_hot(
+        terminal_wdl_parent = jax.nn.one_hot(
             jnp.round(reward).astype(jnp.int32) + 1, WDL_DIM, dtype=alpha_V_mean.dtype,
         )
-        terminal_y_child = _flip_wdl(terminal_y_parent)
-        y = jnp.where(env_state.terminated[..., None], terminal_y_child, alpha_V_mean)
-        c = jnp.where(env_state.terminated, c_terminal, c_leaf).astype(alpha_V_mean.dtype)
+        terminal_wdl_child = _flip_wdl(terminal_wdl_parent)
+        wdl_dist = jnp.where(env_state.terminated[..., None], terminal_wdl_child, alpha_V_mean)
+        evidence_weight = jnp.where(env_state.terminated, c_terminal, c_leaf).astype(alpha_V_mean.dtype)
         new_root_action = jnp.where(
             embedding.root_action == mctx.Tree.NO_PARENT, action, embedding.root_action,
         )
@@ -79,23 +82,10 @@ def make_recurrent_fn(env, predict_fn, c_terminal: float, c_leaf: float):
         value = jnp.where(env_state.terminated, 0.0, value)
         discount = jnp.where(env_state.terminated, 0.0, -jnp.ones_like(value))
 
-        new_embedding = NodeEmbedding(
-            state=env_state,
-            y=y,
-            c=c,
-            root_action=new_root_action,
-            depth_parity=new_depth_parity,
-        )
+        new_embedding = NodeEmbedding(state=env_state, wdl_dist=wdl_dist, evidence_weight=evidence_weight, root_action=new_root_action, depth_parity=new_depth_parity)
 
-        return (
-            mctx.RecurrentFnOutput(
-                reward=reward,
-                discount=discount,
-                prior_logits=logits,
-                value=value,
-            ),
-            new_embedding,
-        )
+        mctx_output = mctx.RecurrentFnOutput(reward=reward, discount=discount, prior_logits=logits, value=value)
+        return mctx_output, new_embedding
 
     return recurrent_fn
 
@@ -109,15 +99,17 @@ def _mc_posterior_best(
 ) -> jax.Array:
     """MC estimator of the posterior-best policy (math.md §6, §7).
 
+    Samples WDL outcomes from each action posterior, counts how often each legal
+    action has the highest sampled utility, and returns those counts as a
+    smoothed policy target.
+
     alpha_Q_post: [B, A, 3]
     invalid_actions: [B, A] bool — True for invalid
     legal_action_mask: [B, A] bool — True for legal
     Returns: [B, A] probabilities, Laplace-smoothed over legal actions.
     """
     batch_size, num_actions, _ = alpha_Q_post.shape
-    phi = jax.random.dirichlet(
-        rng_key, alpha=alpha_Q_post, shape=(num_samples, batch_size, num_actions)
-    )
+    phi = jax.random.dirichlet(rng_key, alpha=alpha_Q_post, shape=(num_samples, batch_size, num_actions))
     utilities = phi[..., W_IDX] - phi[..., L_IDX]
     utilities = jnp.where(invalid_actions[None, :, :], -jnp.inf, utilities)
     argmax_action = jnp.argmax(utilities, axis=-1)
@@ -129,40 +121,54 @@ def _mc_posterior_best(
 
 
 def _q_evidence_sum(tree: mctx.Tree, num_actions: int, dtype) -> jax.Array:
-    """Σ_n c_n · y_n^aligned per root action, shape [B, A, 3].
+    """Σ_n evidence_weight_n · wdl_dist_n^aligned per root action, shape [B, A, 3].
+
+    Aggregates value evidence gathered by search so it can be added to the
+    network's alpha_Q prior before computing the training policy target.
 
     Math: math.md §4 (evidence update), §6 (search-tree posterior).
     Routes every expanded node into its root-action bucket via NodeEmbedding.root_action
     and aligns to root-player perspective via NodeEmbedding.depth_parity.
     """
     emb = tree.embeddings
-    y_aligned = jnp.where(emb.depth_parity[..., None] == 1, _flip_wdl(emb.y), emb.y)
+    wdl_aligned = jnp.where(
+        emb.depth_parity[..., None] == 1,
+        _flip_wdl(emb.wdl_dist),
+        emb.wdl_dist,
+    )
     valid = (emb.root_action != mctx.Tree.NO_PARENT) & (tree.node_visits > 0)
-    weight = jnp.where(valid, emb.c, jnp.zeros((), dtype=emb.c.dtype)).astype(dtype)
+    weight = jnp.where(
+        valid,
+        emb.evidence_weight,
+        jnp.zeros((), dtype=emb.evidence_weight.dtype),
+    ).astype(dtype)
 
     batch_size, _ = tree.node_visits.shape
     batch_range = jnp.arange(batch_size)[:, None]
     safe_root_action = jnp.where(valid, emb.root_action, 0)
     out = jnp.zeros((batch_size, num_actions, WDL_DIM), dtype=dtype)
     return out.at[batch_range, safe_root_action].add(
-        weight[..., None] * y_aligned.astype(dtype)
+        weight[..., None] * wdl_aligned.astype(dtype)
     )
 
 
 def make_selfplay(env, config):
+    """Build a self-play rollout function for the configured environment.
+
+    The returned function initializes a vectorized batch of games, repeatedly
+    selects moves with Gumbel MuZero search, converts search evidence into
+    training targets, and returns the per-step data used by training.
+    """
     def selfplay(model: AZNet, rng_key: jax.Array) -> SelfplayOutput:
-        recurrent_fn = make_recurrent_fn(
-            env,
-            lambda obs: model(obs, train=False),
-            config.c_terminal,
-            config.c_leaf,
-        )
+        """Generate one batched self-play trajectory with the current model."""
+        recurrent_fn = make_recurrent_fn(env, lambda obs: model(obs, train=False), config.c_terminal, config.c_leaf)
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
         def step_fn(
             env_state: pgx.State,
             key: jax.Array,
         ) -> tuple[pgx.State, SelfplayOutput]:
+            """Run one environment/search step and emit its training sample."""
             search_key, mc_key, reset_key = jax.random.split(key, 3)
             observation = env_state.observation
             logits, alpha_V, alpha_Q = model(observation, train=False)
@@ -174,8 +180,8 @@ def make_selfplay(env, config):
                 value=value,
                 embedding=NodeEmbedding(
                     state=env_state,
-                    y=alpha_V_mean,
-                    c=jnp.full((batch_size,), config.c_leaf, dtype=alpha_V_mean.dtype),
+                    wdl_dist=alpha_V_mean,
+                    evidence_weight=jnp.full((batch_size,), config.c_leaf, dtype=alpha_V_mean.dtype),
                     root_action=jnp.full((batch_size,), mctx.Tree.NO_PARENT, dtype=jnp.int32),
                     depth_parity=jnp.zeros((batch_size,), dtype=jnp.int32),
                 ),
@@ -189,7 +195,7 @@ def make_selfplay(env, config):
                 recurrent_fn=recurrent_fn,
                 num_simulations=config.num_simulations,
                 invalid_actions=invalid_actions,
-                qtransform=mctx.qtransform_completed_by_mix_value,
+                qtransform=mctx.qtransform_completed_by_mix_value, #what is this?
                 gumbel_scale=1.0,
             )
 

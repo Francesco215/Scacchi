@@ -16,7 +16,7 @@ class Sample(NamedTuple):
     wdl_tgt: jax.Array
     played_action: jax.Array
     mask: jax.Array
-    q_evidence_sum: chex.Array  # [B, A, 3] Σ_n c_n · y_n^aligned per root action
+    q_evidence_sum: chex.Array  # [B, A, 3] Σ_n evidence_weight_n · wdl_dist_n^aligned per root action
 
 
 class LossOutputs(NamedTuple):

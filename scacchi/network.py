@@ -115,6 +115,7 @@ class AZNet(nnx.Module):
         v = jax.nn.relu(v)
         r_V = self.value_dir_out(v)
         c_V = self.value_conc_out(v).reshape((-1,))
+        # TODO: don't return directly the alpha parameters from the dirichelet distributions. returning something else might make the loss more numerically stable.
         alpha_V = 1.0 + jax.nn.softplus(c_V)[..., None] * jax.nn.softmax(r_V, axis=-1)
 
         q = self.q_conv(x)

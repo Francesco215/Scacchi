@@ -24,7 +24,7 @@ $$
 Search starts from the Q-head prior, evaluates actions, and updates root action posteriors with WDL evidence:
 
 $$
-\alpha_a \longrightarrow \alpha_a + c y_a.
+\alpha_a \longrightarrow \alpha_a + \lambda d_a.
 $$
 
 After search, the improved policy target is the posterior probability that each action is optimal:
@@ -126,19 +126,19 @@ Therefore maximizing $p_W$ and maximizing $U(\phi)$ are equivalent in binary win
 WDL distributions are always represented from the perspective of the player to move. If
 
 $$
-y = (y_L,y_D,y_W),
+d = (d_L,d_D,d_W),
 $$
 
 then the opponent-perspective WDL distribution is
 
 $$
-\operatorname{flip}(y) = (y_W,y_D,y_L).
+\operatorname{flip}(d) = (d_W,d_D,d_L).
 $$
 
 The utility changes sign under this flip:
 
 $$
-U(\operatorname{flip}(y)) = -U(y).
+U(\operatorname{flip}(d)) = -U(d).
 $$
 
 The same flip applies to Dirichlet parameters:
@@ -290,25 +290,25 @@ be a prior over WDL outcome probabilities.
 Suppose we receive WDL evidence
 
 $$
-y = (y_L,y_D,y_W) \in \Delta^2
+d = (d_L,d_D,d_W) \in \Delta^2
 $$
 
 with evidence strength
 
 $$
-c > 0.
+\lambda > 0.
 $$
 
 Then the posterior is
 
 $$
-p(\phi \mid y,c) = \operatorname{Dirichlet}(\alpha + c y).
+p(\phi \mid d,\lambda) = \operatorname{Dirichlet}(\alpha + \lambda d).
 $$
 
 Equivalently, the updated Dirichlet parameters are
 
 $$
-\alpha'_z = \alpha_z + c y_z,
+\alpha'_z = \alpha_z + \lambda d_z,
 \qquad
 z \in \{L,D,W\}.
 $$
@@ -316,16 +316,16 @@ $$
 For a terminal outcome $z^\star$, the target is one-hot:
 
 $$
-y = e_{z^\star}.
+d = e_{z^\star}.
 $$
 
 Then the posterior is
 
 $$
-p(\phi \mid z^\star,c) = \operatorname{Dirichlet}(\alpha + c e_{z^\star}).
+p(\phi \mid z^\star,\lambda) = \operatorname{Dirichlet}(\alpha + \lambda e_{z^\star}).
 $$
 
-If $c = 1$, this is the standard Dirichlet-categorical Bayesian update from one observed categorical sample.
+If $\lambda = 1$, this is the standard Dirichlet-categorical Bayesian update from one observed categorical sample.
 
 For multiple independent categorical observations with counts
 
@@ -342,10 +342,10 @@ $$
 The soft-evidence version is recovered by setting
 
 $$
-n = c y.
+n = \lambda d.
 $$
 
-In neural search, $c y$ should be interpreted as calibrated pseudo-evidence unless it comes from actual independent terminal samples.
+In neural search, $\lambda d$ should be interpreted as calibrated pseudo-evidence unless it comes from actual independent terminal samples.
 
 ---
 
@@ -356,11 +356,11 @@ Search may stop at either terminal or non-terminal leaves.
 The role of leaf evaluation is to return WDL evidence:
 
 $$
-\operatorname{Eval}(s_\ell) = (y_\ell,c_\ell),
+\operatorname{Eval}(s_\ell) = (d_\ell,\lambda_\ell),
 \qquad
-y_\ell \in \Delta^2,
+d_\ell \in \Delta^2,
 \qquad
-c_\ell > 0.
+\lambda_\ell > 0.
 $$
 
 ### 5.1 Terminal leaf
@@ -368,19 +368,19 @@ $$
 If the leaf is terminal with outcome $z$, return the one-hot WDL target:
 
 $$
-y_\ell = e_z.
+d_\ell = e_z.
 $$
 
 Use terminal evidence strength:
 
 $$
-c_\ell = c_{\mathrm{terminal}}.
+\lambda_\ell = c_{\mathrm{terminal}}.
 $$
 
 Therefore, the evidence contribution is
 
 $$
-c_\ell y_\ell = c_{\mathrm{terminal}} e_z.
+\lambda_\ell d_\ell = c_{\mathrm{terminal}} e_z.
 $$
 
 ### 5.2 Non-terminal leaf
@@ -390,19 +390,19 @@ If the leaf is non-terminal, use the value head.
 The value-head mean is
 
 $$
-y_\ell = \bar{\phi}_\theta^V(s_\ell) = \frac{\alpha_\theta^V(s_\ell)}{\alpha_{\theta,0}^V(s_\ell)}.
+d_\ell = \bar{\phi}_\theta^V(s_\ell) = \frac{\alpha_\theta^V(s_\ell)}{\alpha_{\theta,0}^V(s_\ell)}.
 $$
 
 Use neural leaf evidence strength:
 
 $$
-c_\ell = c_{\mathrm{leaf}}.
+\lambda_\ell = c_{\mathrm{leaf}}.
 $$
 
 Therefore, the evidence contribution is
 
 $$
-c_\ell y_\ell = c_{\mathrm{leaf}} \bar{\phi}_\theta^V(s_\ell).
+\lambda_\ell d_\ell = c_{\mathrm{leaf}} \bar{\phi}_\theta^V(s_\ell).
 $$
 
 Usually,
@@ -420,23 +420,23 @@ During backup, return the evidence to the root action being evaluated.
 Whenever the player-to-move perspective changes, flip the WDL vector:
 
 $$
-y \leftarrow \operatorname{flip}(y).
+d \leftarrow \operatorname{flip}(d).
 $$
 
 The backed-up evaluation for a root action $a$ has the form
 
 $$
-\operatorname{Eval}(s,a) = (y_a,c_a),
+\operatorname{Eval}(s,a) = (d_a,\lambda_a),
 \qquad
-y_a \in \Delta^2,
+d_a \in \Delta^2,
 \qquad
-c_a > 0.
+\lambda_a > 0.
 $$
 
 The root action posterior can then be updated with the evidence update:
 
 $$
-\alpha_a \leftarrow \alpha_a + c_a y_a.
+\alpha_a \leftarrow \alpha_a + \lambda_a d_a.
 $$
 
 ---
@@ -480,17 +480,17 @@ $$
 After evaluating $a_t$ by search, suppose the backed-up evaluation gives
 
 $$
-\operatorname{Eval}(s,a_t) = \left(y_{a_t}^{(t)},c_{a_t}^{(t)}\right),
+\operatorname{Eval}(s,a_t) = \left(d_{a_t}^{(t)},\lambda_{a_t}^{(t)}\right),
 \qquad
-y_{a_t}^{(t)} \in \Delta^2,
+d_{a_t}^{(t)} \in \Delta^2,
 \qquad
-c_{a_t}^{(t)} > 0.
+\lambda_{a_t}^{(t)} > 0.
 $$
 
 Update the selected action posterior as
 
 $$
-\alpha_{a_t}^{(t+1)} = \alpha_{a_t}^{(t)} + c_{a_t}^{(t)} y_{a_t}^{(t)}.
+\alpha_{a_t}^{(t+1)} = \alpha_{a_t}^{(t)} + \lambda_{a_t}^{(t)} d_{a_t}^{(t)}.
 $$
 
 For actions not selected at simulation $t$,
@@ -504,7 +504,7 @@ $$
 Equivalently,
 
 $$
-p(\phi_{a_t} \mid y_{a_t}^{(t)},c_{a_t}^{(t)}) = \operatorname{Dirichlet}\left(\alpha_{a_t}^{(t)} + c_{a_t}^{(t)} y_{a_t}^{(t)}\right).
+p(\phi_{a_t} \mid d_{a_t}^{(t)},\lambda_{a_t}^{(t)}) = \operatorname{Dirichlet}\left(\alpha_{a_t}^{(t)} + \lambda_{a_t}^{(t)} d_{a_t}^{(t)}\right).
 $$
 
 This is exact Bayesian updating if the evidence corresponds to independent categorical outcome evidence. In neural search, it is calibrated pseudo-evidence.
@@ -580,19 +580,19 @@ The training targets produced by search can be represented either as WDL mean ta
 Given a WDL target
 
 $$
-y \in \Delta^2
+d \in \Delta^2
 $$
 
 and evidence strength
 
 $$
-c > 0,
+\lambda > 0,
 $$
 
 define the Dirichlet target
 
 $$
-\beta = \alpha_{\mathrm{base}} + c y.
+\beta = \alpha_{\mathrm{base}} + \lambda d.
 $$
 
 There are two useful losses.
@@ -610,7 +610,7 @@ $$
 The mean loss is
 
 $$
-\mathcal{L}_{\mathrm{mean}} = -\sum_{z \in \{L,D,W\}} y_z \log \bar{\phi}_{\theta,z}.
+\mathcal{L}_{\mathrm{mean}} = -\sum_{z \in \{L,D,W\}} d_z \log \bar{\phi}_{\theta,z}.
 $$
 
 This trains the predicted WDL mean, but it does not directly train the concentration.
@@ -630,7 +630,7 @@ This trains both the predicted WDL mean and the predicted concentration.
 For each searched state $s$, suppose search produces a value target
 
 $$
-y_V^{\mathrm{search}}(s) \in \Delta^2.
+d_V^{\mathrm{search}}(s) \in \Delta^2.
 $$
 
 The value-head predicted mean is
@@ -642,13 +642,13 @@ $$
 The value mean loss is
 
 $$
-\mathcal{L}_{V,\mathrm{mean}}(s) = -\sum_{z \in \{L,D,W\}} y_{V,z}^{\mathrm{search}}(s) \log \bar{\phi}_{\theta,z}^V(s).
+\mathcal{L}_{V,\mathrm{mean}}(s) = -\sum_{z \in \{L,D,W\}} d_{V,z}^{\mathrm{search}}(s) \log \bar{\phi}_{\theta,z}^V(s).
 $$
 
-If search also provides an evidence strength $c_V^{\mathrm{search}}(s)$, define
+If search also provides an evidence strength $\lambda_V^{\mathrm{search}}(s)$, define
 
 $$
-\beta_V^{\mathrm{search}}(s) = \alpha_{\mathrm{base}} + c_V^{\mathrm{search}}(s) y_V^{\mathrm{search}}(s).
+\beta_V^{\mathrm{search}}(s) = \alpha_{\mathrm{base}} + \lambda_V^{\mathrm{search}}(s) d_V^{\mathrm{search}}(s).
 $$
 
 Then the value Dirichlet loss is
@@ -674,7 +674,7 @@ $$
 For searched root actions, suppose search produces an action-level WDL target
 
 $$
-y_a^{\mathrm{search}} = \left(y_{a,L}^{\mathrm{search}},y_{a,D}^{\mathrm{search}},y_{a,W}^{\mathrm{search}}\right) \in \Delta^2.
+d_a^{\mathrm{search}} = \left(d_{a,L}^{\mathrm{search}},d_{a,D}^{\mathrm{search}},d_{a,W}^{\mathrm{search}}\right) \in \Delta^2.
 $$
 
 The Q-head predicted mean is
@@ -686,13 +686,13 @@ $$
 The Q mean loss is
 
 $$
-\mathcal{L}_{Q,\mathrm{mean}}(s) = -\sum_{a \in \mathcal{A}_{\mathrm{visited}}(s)} w_a \sum_{z \in \{L,D,W\}} y_{a,z}^{\mathrm{search}} \log \bar{\phi}_{\theta,z}^Q(s,a).
+\mathcal{L}_{Q,\mathrm{mean}}(s) = -\sum_{a \in \mathcal{A}_{\mathrm{visited}}(s)} w_a \sum_{z \in \{L,D,W\}} d_{a,z}^{\mathrm{search}} \log \bar{\phi}_{\theta,z}^Q(s,a).
 $$
 
 To train both the Q mean and Q concentration, construct a Dirichlet target:
 
 $$
-\beta_a^{\mathrm{search}} = \alpha_{\mathrm{base}} + c_a^{\mathrm{search}} y_a^{\mathrm{search}}.
+\beta_a^{\mathrm{search}} = \alpha_{\mathrm{base}} + \lambda_a^{\mathrm{search}} d_a^{\mathrm{search}}.
 $$
 
 Then use the Q Dirichlet KL loss:
@@ -790,19 +790,19 @@ $$
 Search repeatedly samples from these posteriors, chooses an action, evaluates it, and updates its posterior:
 
 $$
-\alpha_{a_t}^{(t+1)} = \alpha_{a_t}^{(t)} + c_{a_t}^{(t)} y_{a_t}^{(t)}.
+\alpha_{a_t}^{(t+1)} = \alpha_{a_t}^{(t)} + \lambda_{a_t}^{(t)} d_{a_t}^{(t)}.
 $$
 
 Terminal leaves return one-hot WDL evidence:
 
 $$
-y = e_z.
+d = e_z.
 $$
 
 Non-terminal leaves return value-head WDL evidence:
 
 $$
-y = \bar{\phi}_\theta^V(s_\ell).
+d = \bar{\phi}_\theta^V(s_\ell).
 $$
 
 After search, the policy target is the posterior probability that each action is optimal:
@@ -834,7 +834,7 @@ $$
 The central primitive is always the same Dirichlet evidence update:
 
 $$
-p(\phi \mid y,c) = \operatorname{Dirichlet}(\alpha + c y).
+p(\phi \mid d,\lambda) = \operatorname{Dirichlet}(\alpha + \lambda d).
 $$
 
 ---
