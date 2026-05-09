@@ -21,5 +21,7 @@ dir_kl_weight: 1.0
 dir_ent_weight: 0.3
 c_terminal: 8.0
 c_leaf: 2.0
+train_interior_selector: policy_prior
+inference_interior_selector: wdl
 wandb_enabled: true
 wandb_project: scacchi-az

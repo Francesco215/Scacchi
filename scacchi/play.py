@@ -1,4 +1,4 @@
-from typing import NamedTuple
+from typing import Any, NamedTuple, cast
 
 import chex
 from flax import nnx
@@ -188,7 +188,7 @@ def _q_evidence_sum_unbatched(tree: mctx.Tree, num_actions: int, dtype) -> jax.A
 
 def _dirichlet_root_action_selection(
     rng_key: jax.Array,
-    tree: mctx.Tree,
+    tree: Any,
     node_index: chex.Array,
 ) -> jax.Array:
     """Thompson-sample root actions from live Dirichlet-Q posteriors."""
@@ -200,11 +200,27 @@ def _dirichlet_root_action_selection(
     alpha_Q_post = alpha_Q_prior + q_evidence_sum
     phi = jax.random.dirichlet(rng_key, alpha_Q_post)
     score = _utility(phi)
-    return action_selection.masked_argmax(score, tree.root_invalid_actions)
+    return cast(jax.Array, action_selection.masked_argmax(score, tree.root_invalid_actions))
+
+
+def _policy_prior_interior_action_selection(
+    rng_key: jax.Array,
+    tree: Any,
+    node_index: chex.Array,
+    depth: chex.Array,
+) -> jax.Array:
+    """Policy-prior visit balancing for non-root training traversal."""
+    del rng_key, depth
+    prior_logits = tree.children_prior_logits[node_index]
+    visit_counts = tree.children_visits[node_index]
+    probs = jax.nn.softmax(prior_logits)
+    score = probs - visit_counts / (1 + jnp.sum(visit_counts, keepdims=True))
+    invalid_actions = prior_logits <= (jnp.finfo(prior_logits.dtype).min / 2)
+    return cast(jax.Array, action_selection.masked_argmax(score, invalid_actions))
 
 
 def _child_action_from_ancestor(
-    tree: mctx.Tree,
+    tree: Any,
     ancestor_index: chex.Array,
     node_index: chex.Array,
 ) -> tuple[jax.Array, jax.Array]:
@@ -245,7 +261,7 @@ def _child_action_from_ancestor(
 
 
 def _child_evidence_sum_unbatched(
-    tree: mctx.Tree,
+    tree: Any,
     node_index: chex.Array,
     num_actions: int,
     dtype,
@@ -277,7 +293,7 @@ def _child_evidence_sum_unbatched(
 
 def _wdl_interior_action_selection(
     rng_key: jax.Array,
-    tree: mctx.Tree,
+    tree: Any,
     node_index: chex.Array,
     depth: chex.Array,
 ) -> jax.Array:
@@ -292,7 +308,15 @@ def _wdl_interior_action_selection(
     phi = jax.random.dirichlet(rng_key, alpha_Q_post)
     score = _utility(phi)
     invalid_actions = prior_logits <= (jnp.finfo(prior_logits.dtype).min / 2)
-    return action_selection.masked_argmax(score, invalid_actions)
+    return cast(jax.Array, action_selection.masked_argmax(score, invalid_actions))
+
+
+def _get_interior_action_selection_fn(interior_selector: str):
+    if interior_selector == "policy_prior":
+        return _policy_prior_interior_action_selection
+    if interior_selector == "wdl":
+        return _wdl_interior_action_selection
+    raise ValueError(f"Unknown interior selector: {interior_selector}")
 
 
 def _mask_invalid_logits(logits: jax.Array, invalid_actions: jax.Array | None) -> jax.Array:
@@ -309,6 +333,7 @@ def _dirichlet_thompson_search(
     alpha_Q_prior: jax.Array,
     num_simulations: int,
     invalid_actions: jax.Array,
+    interior_selector: str,
     max_depth: int | None = None,
 ) -> mctx.Tree:
     """Run MCTX search with Dirichlet-Q Thompson root selection.
@@ -316,8 +341,10 @@ def _dirichlet_thompson_search(
     This is intentionally the only call site for mctx._src.search.search, so an
     MCTX upgrade has one obvious integration point.
     """
-    root = root.replace(
-        prior_logits=_mask_invalid_logits(root.prior_logits, invalid_actions),
+    root = mctx.RootFnOutput(
+        prior_logits=_mask_invalid_logits(cast(jax.Array, root.prior_logits), invalid_actions),
+        value=root.value,
+        embedding=root.embedding,
     )
     return mctx_search.search(
         params=(),
@@ -325,7 +352,7 @@ def _dirichlet_thompson_search(
         root=root,
         recurrent_fn=recurrent_fn,
         root_action_selection_fn=_dirichlet_root_action_selection,
-        interior_action_selection_fn=_wdl_interior_action_selection,
+        interior_action_selection_fn=_get_interior_action_selection_fn(interior_selector),
         num_simulations=num_simulations,
         max_depth=max_depth,
         invalid_actions=invalid_actions,
@@ -377,6 +404,7 @@ def make_selfplay(env, config):
                 alpha_Q_prior=alpha_Q,
                 num_simulations=config.num_simulations,
                 invalid_actions=invalid_actions,
+                interior_selector=getattr(config, "train_interior_selector", "policy_prior"),
             )
 
             q_evidence_sum = _q_evidence_sum(

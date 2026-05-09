@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from flax import nnx
 import hydra
@@ -60,6 +60,8 @@ class Config(BaseModel):
     dir_ent_weight: float = 0.0
     c_terminal: float = 8.0
     c_leaf: float = 2.0
+    train_interior_selector: Literal["policy_prior", "wdl"] = "policy_prior"
+    inference_interior_selector: Literal["policy_prior", "wdl"] = "wdl"
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"

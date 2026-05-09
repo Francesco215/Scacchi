@@ -1,3 +1,5 @@
+from typing import Any, cast
+
 import jax
 import jax.numpy as jnp
 import mctx
@@ -7,6 +9,8 @@ from scacchi.play import (
     NodeEmbedding,
     _child_evidence_sum_unbatched,
     _dirichlet_root_action_selection,
+    _get_interior_action_selection_fn,
+    _policy_prior_interior_action_selection,
     _q_evidence_sum_unbatched,
     _wdl_interior_action_selection,
 )
@@ -28,12 +32,13 @@ def _make_tree(
     embedding_alpha_Q_prior=None,
 ):
     num_nodes = node_visits.shape[0]
-    num_actions = (
-        alpha_Q_prior.shape[0]
-        if alpha_Q_prior is not None
-        else children_prior_logits.shape[-1]
-    )
     dtype = wdl_dist.dtype
+    if alpha_Q_prior is not None:
+        num_actions = alpha_Q_prior.shape[0]
+    elif children_prior_logits is not None:
+        num_actions = children_prior_logits.shape[-1]
+    else:
+        raise ValueError("alpha_Q_prior or children_prior_logits is required")
     if children_prior_logits is None:
         children_prior_logits = jnp.zeros((num_nodes, num_actions), dtype=dtype)
     if children_visits is None:
@@ -69,7 +74,7 @@ def _make_tree(
         children_discounts=jnp.zeros((num_nodes, num_actions), dtype=dtype),
         children_values=jnp.zeros((num_nodes, num_actions), dtype=dtype),
         embeddings=NodeEmbedding(
-            state=jnp.zeros((num_nodes,), dtype=jnp.int32),
+            state=cast(Any, jnp.zeros((num_nodes,), dtype=jnp.int32)),
             wdl_dist=wdl_dist,
             evidence_weight=evidence_weight,
             root_action=root_action,
@@ -293,3 +298,31 @@ def test_wdl_interior_action_selection_ignores_masked_logits():
     )
 
     assert int(action) != 1
+
+
+def test_policy_prior_interior_action_selection_ignores_masked_logits():
+    min_logit = jnp.finfo(jnp.float32).min
+    tree = _make_tree(
+        wdl_dist=jnp.array([[0.2, 0.3, 0.5]], dtype=jnp.float32),
+        evidence_weight=jnp.array([0.0], dtype=jnp.float32),
+        root_action=jnp.array([mctx.Tree.NO_PARENT], dtype=jnp.int32),
+        depth_parity=jnp.array([0], dtype=jnp.int32),
+        node_visits=jnp.array([1], dtype=jnp.int32),
+        children_prior_logits=jnp.array([[0.0, min_logit, 2.0, 1.0]], dtype=jnp.float32),
+        children_visits=jnp.array([[100, 0, 0, 0]], dtype=jnp.int32),
+        alpha_Q_prior=jnp.ones((4, 3), dtype=jnp.float32),
+    )
+
+    action = _policy_prior_interior_action_selection(
+        jax.random.PRNGKey(0),
+        tree,
+        jnp.array(0, dtype=jnp.int32),
+        jnp.array(1, dtype=jnp.int32),
+    )
+
+    assert int(action) == 2
+
+
+def test_get_interior_action_selection_fn_dispatches_modes():
+    assert _get_interior_action_selection_fn("policy_prior") is _policy_prior_interior_action_selection
+    assert _get_interior_action_selection_fn("wdl") is _wdl_interior_action_selection
