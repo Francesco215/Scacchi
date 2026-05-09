@@ -24,6 +24,7 @@ class NodeEmbedding(NamedTuple):
     evidence_weight: jax.Array  # [B] c_terminal at terminal nodes, else c_leaf
     root_action: jax.Array  # [B] int32, NO_PARENT at root, action_taken at depth 1, inherited deeper
     depth_parity: jax.Array # [B] int32, 0 at root, flipped each ply
+    alpha_Q_prior: jax.Array  # [B, A, 3] Q Dirichlet prior for actions at this node
 
 
 class SelfplayOutput(NamedTuple):
@@ -67,7 +68,7 @@ def make_recurrent_fn(env, predict_fn, c_terminal: float, c_leaf: float):
         env_state = embedding.state
         current_player = env_state.current_player
         env_state = jax.vmap(env.step)(env_state, action)
-        logits, alpha_V, _ = predict_fn(env_state.observation) # model(observation)
+        logits, alpha_V, alpha_Q = predict_fn(env_state.observation) # model(observation)
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
         logits = jnp.where(env_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
 
@@ -88,7 +89,14 @@ def make_recurrent_fn(env, predict_fn, c_terminal: float, c_leaf: float):
         value = jnp.where(env_state.terminated, 0.0, value)
         discount = jnp.where(env_state.terminated, 0.0, -jnp.ones_like(value))
 
-        new_embedding = NodeEmbedding(state=env_state, wdl_dist=wdl_dist, evidence_weight=evidence_weight, root_action=new_root_action, depth_parity=new_depth_parity)
+        new_embedding = NodeEmbedding(
+            state=env_state,
+            wdl_dist=wdl_dist,
+            evidence_weight=evidence_weight,
+            root_action=new_root_action,
+            depth_parity=new_depth_parity,
+            alpha_Q_prior=alpha_Q,
+        )
 
         mctx_output = mctx.RecurrentFnOutput(reward=reward, discount=discount, prior_logits=logits, value=value)
         return mctx_output, new_embedding
@@ -195,18 +203,94 @@ def _dirichlet_root_action_selection(
     return action_selection.masked_argmax(score, tree.root_invalid_actions)
 
 
-def _policy_prior_interior_action_selection(
+def _child_action_from_ancestor(
+    tree: mctx.Tree,
+    ancestor_index: chex.Array,
+    node_index: chex.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Find which child action under ancestor_index reaches node_index."""
+    int_dtype = tree.parents.dtype
+    no_parent = jnp.asarray(mctx.Tree.NO_PARENT, dtype=int_dtype)
+    node_index = node_index.astype(int_dtype)
+    ancestor_index = ancestor_index.astype(int_dtype)
+
+    def cond_fn(carry):
+        _, _, _, done = carry
+        return jnp.logical_not(done)
+
+    def body_fn(carry):
+        current, child_action, found, _ = carry
+        parent = tree.parents[current]
+        action = tree.action_from_parent[current]
+        is_direct_child = parent == ancestor_index
+        reached_top = parent == no_parent
+        return (
+            parent,
+            jnp.where(is_direct_child, action, child_action),
+            found | is_direct_child,
+            is_direct_child | reached_top,
+        )
+
+    _, child_action, found, _ = jax.lax.while_loop(
+        cond_fn,
+        body_fn,
+        (
+            node_index,
+            jnp.zeros((), dtype=int_dtype),
+            jnp.asarray(False),
+            node_index == ancestor_index,
+        ),
+    )
+    return child_action, found
+
+
+def _child_evidence_sum_unbatched(
+    tree: mctx.Tree,
+    node_index: chex.Array,
+    num_actions: int,
+    dtype,
+) -> jax.Array:
+    """Σ evidence under each child action of an interior node, shape [A, 3]."""
+    emb = tree.embeddings
+    node_indices = jnp.arange(tree.node_visits.shape[0], dtype=tree.parents.dtype)
+    child_action, is_descendant = jax.vmap(
+        lambda candidate: _child_action_from_ancestor(tree, node_index, candidate)
+    )(node_indices)
+
+    node_parity = emb.depth_parity[node_index]
+    wdl_aligned = jnp.where(
+        emb.depth_parity[..., None] != node_parity,
+        _flip_wdl(emb.wdl_dist),
+        emb.wdl_dist,
+    )
+    valid = is_descendant & (tree.node_visits > 0)
+    weight = jnp.where(
+        valid,
+        emb.evidence_weight,
+        jnp.zeros((), dtype=emb.evidence_weight.dtype),
+    ).astype(dtype)
+
+    safe_child_action = jnp.where(valid, child_action, 0)
+    out = jnp.zeros((num_actions, WDL_DIM), dtype=dtype)
+    return out.at[safe_child_action].add(weight[..., None] * wdl_aligned.astype(dtype))
+
+
+def _wdl_interior_action_selection(
     rng_key: jax.Array,
     tree: mctx.Tree,
     node_index: chex.Array,
     depth: chex.Array,
 ) -> jax.Array:
-    """Policy-prior visit balancing for non-root tree traversal."""
-    del rng_key, depth
+    """Thompson-sample interior actions from reconstructed WDL posteriors."""
+    del depth
     prior_logits = tree.children_prior_logits[node_index]
-    visit_counts = tree.children_visits[node_index]
-    probs = jax.nn.softmax(prior_logits)
-    score = probs - visit_counts / (1 + jnp.sum(visit_counts, keepdims=True))
+    alpha_Q_prior = tree.embeddings.alpha_Q_prior[node_index]
+    child_evidence_sum = _child_evidence_sum_unbatched(
+        tree, node_index, alpha_Q_prior.shape[0], alpha_Q_prior.dtype,
+    )
+    alpha_Q_post = alpha_Q_prior + child_evidence_sum
+    phi = jax.random.dirichlet(rng_key, alpha_Q_post)
+    score = _utility(phi)
     invalid_actions = prior_logits <= (jnp.finfo(prior_logits.dtype).min / 2)
     return action_selection.masked_argmax(score, invalid_actions)
 
@@ -241,7 +325,7 @@ def _dirichlet_thompson_search(
         root=root,
         recurrent_fn=recurrent_fn,
         root_action_selection_fn=_dirichlet_root_action_selection,
-        interior_action_selection_fn=_policy_prior_interior_action_selection,
+        interior_action_selection_fn=_wdl_interior_action_selection,
         num_simulations=num_simulations,
         max_depth=max_depth,
         invalid_actions=invalid_actions,
@@ -281,6 +365,7 @@ def make_selfplay(env, config):
                     evidence_weight=jnp.full((batch_size,), config.c_leaf, dtype=alpha_V_mean.dtype),
                     root_action=jnp.full((batch_size,), mctx.Tree.NO_PARENT, dtype=jnp.int32),
                     depth_parity=jnp.zeros((batch_size,), dtype=jnp.int32),
+                    alpha_Q_prior=alpha_Q,
                 ),
             )
 

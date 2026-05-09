@@ -106,7 +106,10 @@ def make_train_step(config):
             mask_f = data.mask.astype(logits.dtype)
             mask_sum = jnp.maximum(mask_f.sum(), 1.0)
 
-            policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt)
+            policy_loss = optax.kl_divergence(
+                jax.nn.log_softmax(logits),
+                jax.lax.stop_gradient(data.policy_tgt),
+            )
             policy_loss = policy_loss.mean()
 
             v_mean = _wdl_mean(alpha_V)
