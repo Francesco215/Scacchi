@@ -73,14 +73,14 @@ class AZNet(nnx.Module):
         self.policy_bn = nnx.BatchNorm(2, momentum=0.9, rngs=rngs)
         self.policy_linear = nnx.Linear(height * width * 2, num_actions, rngs=rngs)
 
-        # State Dirichlet value head: outputs (r_V [B,3], c_V [B]) → α_V = 1 + softplus(c_V) * softmax(r_V)
+        # State Dirichlet value head: outputs (r_V [B,3], t_V [B]) -> alpha_V = exp(t_V) * softmax(r_V).
         self.value_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", rngs=rngs)
         self.value_bn = nnx.BatchNorm(1, momentum=0.9, rngs=rngs)
         self.value_linear = nnx.Linear(height * width, num_channels, rngs=rngs)
         self.value_dir_out = nnx.Linear(num_channels, 3, rngs=rngs)
         self.value_conc_out = nnx.Linear(num_channels, 1, rngs=rngs)
 
-        # Action Dirichlet Q head: outputs (r_Q [B,A,3], c_Q [B,A]) → α_Q = 1 + softplus(c_Q) * softmax(r_Q)
+        # Action Dirichlet Q head: outputs (r_Q [B,A,3], t_Q [B,A]) -> alpha_Q = exp(t_Q) * softmax(r_Q).
         self.q_conv = nnx.Conv(num_channels, 2, kernel_size=1, padding="SAME", rngs=rngs)
         self.q_bn = nnx.BatchNorm(2, momentum=0.9, rngs=rngs)
         self.q_dir_linear = nnx.Linear(height * width * 2, num_actions * 3, rngs=rngs)
@@ -114,16 +114,19 @@ class AZNet(nnx.Module):
         v = self.value_linear(v)
         v = jax.nn.relu(v)
         r_V = self.value_dir_out(v)
-        c_V = self.value_conc_out(v).reshape((-1,))
-        # TODO: don't return directly the alpha parameters from the dirichelet distributions. returning something else might make the loss more numerically stable.
-        alpha_V = 1.0 + jax.nn.softplus(c_V)[..., None] * jax.nn.softmax(r_V, axis=-1)
+        t_V = self.value_conc_out(v).reshape((-1,))
+        alpha_V = _dirichlet_from_logits(r_V, t_V)
 
         q = self.q_conv(x)
         q = self.q_bn(q, use_running_average=not train)
         q = jax.nn.relu(q)
         q = q.reshape((q.shape[0], -1))
         r_Q = self.q_dir_linear(q).reshape((-1, self.num_actions, 3))
-        c_Q = self.q_conc_linear(q)
-        alpha_Q = 1.0 + jax.nn.softplus(c_Q)[..., None] * jax.nn.softmax(r_Q, axis=-1)
+        t_Q = self.q_conc_linear(q)
+        alpha_Q = _dirichlet_from_logits(r_Q, t_Q)
 
         return logits, alpha_V, alpha_Q
+
+
+def _dirichlet_from_logits(mean_logits: jax.Array, concentration_logit: jax.Array) -> jax.Array:
+    return jnp.exp(concentration_logit)[..., None] * jax.nn.softmax(mean_logits, axis=-1)

@@ -34,7 +34,10 @@ class SelfplayOutput(NamedTuple):
     policy_target: chex.Array
     played_action: jax.Array
     discount: jax.Array
-    q_evidence_sum: chex.Array  # [B, A, 3] Σ_n evidence_weight_n · wdl_dist_n^aligned per root action
+    beta_V_target: jax.Array  # [B, 3] posterior Dirichlet target for the value head
+    value_target_mask: jax.Array  # [B] True when search produced value evidence
+    beta_Q_target: jax.Array  # [B, A, 3] posterior Dirichlet target for the Q head
+    q_target_mask: jax.Array  # [B, A] True for actions with search evidence
 
 
 class DirichletRootExtra(NamedTuple):
@@ -127,6 +130,22 @@ def _mc_posterior_best(
     argmax_action = jnp.argmax(utilities, axis=-1)
     counts = jax.nn.one_hot(argmax_action, num_actions).sum(axis=0)
     return counts / num_samples
+
+
+def _posterior_targets(
+    alpha_V_prior: jax.Array,
+    alpha_Q_prior: jax.Array,
+    q_evidence_sum: jax.Array,
+    policy_target: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    beta_Q_target = alpha_Q_prior + q_evidence_sum
+    q_target_mask = q_evidence_sum.sum(axis=-1) > 0
+    v_evidence_sum = (
+        policy_target.astype(q_evidence_sum.dtype)[..., None] * q_evidence_sum
+    ).sum(axis=-2)
+    beta_V_target = alpha_V_prior + v_evidence_sum
+    value_target_mask = v_evidence_sum.sum(axis=-1) > 0
+    return beta_V_target, value_target_mask, beta_Q_target, q_target_mask
 
 
 def _q_evidence_sum(tree: mctx.Tree, num_actions: int, dtype) -> jax.Array:
@@ -355,6 +374,45 @@ def _dirichlet_thompson_search(
     )
 
 
+def _repeated_dirichlet_thompson_search(
+    rng_key: jax.Array,
+    root: mctx.RootFnOutput,
+    recurrent_fn: mctx.RecurrentFn,
+    alpha_Q_prior: jax.Array,
+    num_simulations: int,
+    invalid_actions: jax.Array,
+    interior_selector: str,
+    num_search_blocks: int,
+    max_depth: int | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Run repeated MCTX blocks, carrying the root posterior between blocks."""
+    alpha_Q_post = alpha_Q_prior
+    q_evidence_total = jnp.zeros_like(alpha_Q_prior)
+
+    for block_index in range(num_search_blocks):
+        block_key = jax.random.fold_in(rng_key, block_index)
+        block_root = mctx.RootFnOutput(
+            prior_logits=root.prior_logits,
+            value=root.value,
+            embedding=root.embedding._replace(alpha_Q_prior=alpha_Q_post),
+        )
+        search_tree = _dirichlet_thompson_search(
+            rng_key=block_key,
+            root=block_root,
+            recurrent_fn=recurrent_fn,
+            alpha_Q_prior=alpha_Q_post,
+            num_simulations=num_simulations,
+            invalid_actions=invalid_actions,
+            interior_selector=interior_selector,
+            max_depth=max_depth,
+        )
+        q_evidence_sum = _q_evidence_sum(search_tree, alpha_Q_prior.shape[1], alpha_Q_prior.dtype)
+        q_evidence_total = q_evidence_total + q_evidence_sum
+        alpha_Q_post = alpha_Q_post + q_evidence_sum
+
+    return q_evidence_total, alpha_Q_post
+
+
 def make_selfplay(env, config):
     """Build a self-play rollout function for the configured environment.
 
@@ -392,7 +450,7 @@ def make_selfplay(env, config):
             )
 
             invalid_actions = ~env_state.legal_action_mask
-            search_tree = _dirichlet_thompson_search(
+            q_evidence_sum, alpha_Q_post = _repeated_dirichlet_thompson_search(
                 rng_key=search_key,
                 root=root,
                 recurrent_fn=recurrent_fn,
@@ -400,17 +458,19 @@ def make_selfplay(env, config):
                 num_simulations=config.num_simulations,
                 invalid_actions=invalid_actions,
                 interior_selector=getattr(config, "train_interior_selector", "policy_prior"),
+                num_search_blocks=getattr(config, "num_search_blocks", 1),
             )
-
-            q_evidence_sum = _q_evidence_sum(
-                search_tree, alpha_Q.shape[1], alpha_Q.dtype,
-            )
-            alpha_Q_post = alpha_Q + q_evidence_sum
             policy_target = _mc_posterior_best(
                 mc_key,
                 alpha_Q_post,
                 invalid_actions,
                 config.policy_mc_samples,
+            )
+            beta_V_target, value_target_mask, beta_Q_target, q_target_mask = _posterior_targets(
+                alpha_V,
+                alpha_Q,
+                q_evidence_sum,
+                policy_target,
             )
             action_logits = jnp.where(
                 policy_target > 0,
@@ -440,7 +500,10 @@ def make_selfplay(env, config):
                 reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
                 terminated=env_state.terminated,
                 discount=discount,
-                q_evidence_sum=q_evidence_sum,
+                beta_V_target=beta_V_target,
+                value_target_mask=value_target_mask,
+                beta_Q_target=beta_Q_target,
+                q_target_mask=q_target_mask,
             )
 
         rng_key, init_key = jax.random.split(rng_key)

@@ -6,6 +6,7 @@ num_layers: 6
 resnet_v2: true
 selfplay_batch_size: 1024
 num_simulations: 32
+num_search_blocks: 1
 max_num_steps: 256
 training_batch_size: 4096
 learning_rate: 1.0e-3
@@ -13,12 +14,8 @@ log_interval: 1
 eval_interval: 1
 policy_mc_samples: 32
 policy_loss_weight: 1.0
-value_outcome_weight: 0.0
-q_outcome_weight: 0.0
-value_search_weight: 0.0
-q_search_weight: 0.0
-dir_kl_weight: 1.0
-dir_ent_weight: 0.0
+value_loss_weight: 1.0
+q_loss_weight: 1.0
 c_terminal: 8.0
 c_leaf: 2.0
 train_interior_selector: policy_prior

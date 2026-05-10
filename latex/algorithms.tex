@@ -45,7 +45,7 @@ s &\in \mathcal{S}^{B},\\
 \alpha &\in \R_{>0}^{B \times A \times 3},\\
 a &\in \N^{B \times K},\\
 d &\in \Delta^2,\\
-\lambda &> 0.
+\lambda &\ge 0.
 \end{align*}
 
 The utility used for search selection and policy improvement is
@@ -79,7 +79,7 @@ $a \gets \arg\max_{\mathrm{action}} u$\\
 \> $\lambda \gets c_{\mathrm{terminal}}$\\
 \textbf{else}\\
 \> $d \gets \softmax(r_\theta^V(s_f))$\\
-\> $\lambda \gets c_{\mathrm{leaf}}$\\
+\> $\lambda \gets 0$\\
 \textbf{end if}\\
 $d \gets \fliproot(d)$\\
 \textbf{return} $(d,\lambda)$
@@ -152,13 +152,13 @@ a =
 \Dirichlet\left(\alpha_{\mathrm{search}}(s,b)\right).
 \]
 
-\section*{MCTX Implementation of Algorithm 6 Used by \texttt{play.py}}
+\section*{Planned Terminal-Only MCTX Implementation}
 
 Algorithms 8 and 9 are not a second search rule. They describe how
-\texttt{play.py} realizes Algorithm 6 inside the fixed-size MCTX tree
-machinery. MCTX owns the simulation loop and tree storage. The Dirichlet-Q
-logic owns the root action selection rule and the reconstruction of the live
-root posterior from evidence stored in the tree.
+\texttt{play.py} should realize the root-search primitive inside the fixed-size
+MCTX tree machinery. MCTX owns the simulation loop and tree storage. The
+Dirichlet-Q logic owns the root action selection rule and the terminal-evidence
+posterior updates performed between MCTX blocks.
 
 For a search budget $T$, MCTX allocates
 \[
@@ -192,9 +192,9 @@ p_n,\,
 \]
 where $s_n$ is the environment state at the node, $d_n$ is the WDL
 distribution in the node-local player-to-move perspective, $w_n$ is the
-evidence weight, $a^{\mathrm{root}}_n$ is the first action taken from the root
-on the path to $n$, and $p_n \in \{0,1\}$ is the depth parity relative to the
-root.
+Dirichlet evidence weight, $a^{\mathrm{root}}_n$ is the first action taken from
+the root on the path to $n$, and $p_n \in \{0,1\}$ is the depth parity relative
+to the root.
 
 When MCTX expands a child by action $a$ from a parent node, \texttt{play.py}
 applies the environment step and evaluates the resulting observation:
@@ -203,31 +203,36 @@ applies the environment step and evaluates the resulting observation:
 \]
 If $s'$ is terminal, the stored WDL distribution is terminal one-hot evidence
 in the child-local perspective and $w_n=c_{\mathrm{terminal}}$. Otherwise, the
-stored WDL distribution is the value-head mean
+stored WDL distribution may be the value-head mean
 \[
 d_n = \bar{\phi}_\theta^V(s')
 \]
-and $w_n=c_{\mathrm{leaf}}$. The root action is set to the action taken from
-the root at depth one and then inherited by all deeper descendants. The depth
-parity flips at every ply.
+for MCTX's scalar value backup, but it is not Dirichlet-Q evidence and
+$w_n=0$. The root action is set to the action taken from the root at depth one
+and then inherited by all deeper descendants. The depth parity flips at every
+ply.
 
-The accumulated root evidence represented by the tree is
+The terminal root evidence represented by the tree is
 \[
+\begin{aligned}
 \RootEvidenceSum(\mathrm{tree})_{b,a}
-=
+&=
 \sum_{n=1}^{N-1}
 \mathbf{1}
 \left[
-a^{\mathrm{root}}_{b,n}=a
-\;\wedge\;
-\mathrm{node\_visits}_{b,n}>0
+\begin{array}{c}
+a^{\mathrm{root}}_{b,n}=a,\\
+\mathrm{node\_visits}_{b,n}>0,\\
+s_{b,n}\ \mathrm{is\ terminal}
+\end{array}
 \right]
 w_{b,n}\,
-\alignroot(d_{b,n},p_{b,n}),
+\alignroot(d_{b,n},p_{b,n}).
+\end{aligned}
 \]
 where $\alignroot(d,p)$ flips the WDL vector when $p=1$ and leaves it unchanged
-when $p=0$. Thus all evidence is accumulated in the root player's perspective
-and bucketed by the first action chosen from the root.
+when $p=0$. Thus only terminal evidence is accumulated in the root player's
+perspective and bucketed by the first action chosen from the root.
 
 Each MCTX simulation proceeds as follows:
 \[
@@ -254,24 +259,26 @@ environment or the network.
 \textbf{MCTXExpandAndStoreEvidence} evaluates the selected edge $(i,a)$. It
 reads the parent embedding, applies $\Step(s_i,a)$, evaluates the resulting
 state with the network, and writes a child node into the tree. The stored child
-embedding contains the new environment state, the WDL evidence $d_n$, the
-evidence weight $w_n$, the inherited root action $a_n^{\mathrm{root}}$, the
-flipped depth parity $p_n$, and the local Q prior
-$\alpha_\theta^Q(s_n,\cdot)$. This step also records the tree topology:
-parent pointer, action-from-parent, child index, prior logits, reward, and
-discount.
+embedding contains the new environment state, terminal WDL evidence $d_n$ when
+the node is terminal, evidence weight $w_n$ equal to $c_{\mathrm{terminal}}$
+for terminal nodes and $0$ otherwise, the inherited root action
+$a_n^{\mathrm{root}}$, the flipped depth parity $p_n$, and the local Q prior
+$\alpha_\theta^Q(s_n,\cdot)$. Non-terminal value predictions may still be
+stored for scalar backup, but they do not update Dirichlet-Q alphas. This step
+also records the tree topology: parent pointer, action-from-parent, child
+index, prior logits, reward, and discount.
 
 \item
 \textbf{MCTXBackward} runs MCTX's ordinary scalar backup from the expanded
 child back to the root. Along the path it increments node and edge visit
 counts and updates averaged scalar values using the recurrent reward and
 discount. These scalar values are useful for MCTX bookkeeping and interior
-selection, but the Dirichlet-Q root posterior is reconstructed from the stored
+selection, but the Dirichlet-Q root posterior is updated only from terminal
 WDL evidence through $\RootEvidenceSum(\mathrm{tree})$.
 \end{itemize}
 
-The final policy target does not use MCTX visit counts directly. It uses the
-Dirichlet posterior
+The final policy target does not use MCTX visit counts directly. After an MCTX
+block finishes, it uses the Dirichlet posterior
 \[
 \alpha_{\mathrm{search}}
 =
@@ -280,27 +287,18 @@ Dirichlet posterior
 \RootEvidenceSum(\mathrm{tree})
 \]
 and then applies Algorithm 7.
-Equivalently, after simulation $t$ inside one MCTX block, the live root
-posterior is
-$\alpha_{\mathrm{block}}^{(t)}
-=\alpha_{\mathrm{base}}+\RootEvidenceSum(\mathrm{tree})$.
-The implementation does not store $\alpha^{(t)}$ as a separate mutable array;
-it reconstructs it from the current tree whenever root Thompson selection is
-called.
 Within one call to Algorithm 9,
 \[
 K=1.
 \]
-Each pass through the loop is one Thompson root selection. The call to
-\texttt{MCTXSimulate} begins at the root, so it calls
-\texttt{MCTXRootThompsonSelect} once per pass, using the posterior
-$\alpha^{(t-1)}$ accumulated from all previous expanded evidence.
+Each pass through the loop is one Thompson root selection from the block's
+starting posterior $\alpha_{\mathrm{base}}$. Terminal Dirichlet evidence found
+inside the block is summed after the loop, not used to mutate alphas inside the
+loop.
 
 \begin{algorithmblock}{Algorithm 8: MCTXRootThompsonSelect$(\mathrm{tree})$}
 $\alpha_{\mathrm{base}} \gets \mathrm{tree.extra\_data.alpha\_Q\_prior}$\\
-$E \gets \RootEvidenceSum(\mathrm{tree})$\\
-$\alpha_{\mathrm{post}} \gets \alpha_{\mathrm{base}} + E$\\
-Sample $\phi \sim \Dirichlet(\alpha_{\mathrm{post}})$\\
+Sample $\phi \sim \Dirichlet(\alpha_{\mathrm{base}})$\\
 $u \gets U(\phi)$\\
 $u \gets \MaskIllegal(u,\mathrm{tree.root\_invalid\_actions},-\infty)$\\
 $a \gets \arg\max_{\mathrm{action}} u$\\
@@ -311,10 +309,8 @@ $a \gets \arg\max_{\mathrm{action}} u$\\
 \textbf{Input:} root state $s$, network parameters $\theta$, simulations $T$, starting posterior $\alpha_{\mathrm{base}}$\\
 \textbf{if} $\alpha_{\mathrm{base}}$ is omitted \textbf{then} $\alpha_{\mathrm{base}} \gets \alpha_\theta^Q(s,\cdot)$ \textbf{end if}\\
 $\mathrm{tree} \gets \operatorname{InstantiateTreeFromRoot}(s,\theta,N=T+1,\alpha_{\mathrm{base}})$\\
-$E_0 \gets 0$\\
-$\alpha_{\mathrm{block}}^{(0)} \gets \alpha_{\mathrm{base}}$\\
 \textbf{for} $t=1,\ldots,T$ \textbf{do}\\
-\> \textit{Root Thompson selection uses $\alpha_{\mathrm{block}}^{(t-1)}$}\\
+\> \textit{Root Thompson selection uses $\alpha_{\mathrm{base}}$}\\
 \> $(i,a) \gets
    \operatorname{MCTXSimulate}
    (\mathrm{tree},
@@ -322,11 +318,9 @@ $\alpha_{\mathrm{block}}^{(0)} \gets \alpha_{\mathrm{base}}$\\
 \> $\mathrm{tree} \gets
    \operatorname{MCTXExpandAndStoreEvidence}(\mathrm{tree},i,a,\theta)$\\
 \> $\mathrm{tree} \gets \operatorname{MCTXBackward}(\mathrm{tree})$\\
-\> $E_t \gets \RootEvidenceSum(\mathrm{tree})$\\
-\> $\alpha_{\mathrm{block}}^{(t)} \gets \alpha_{\mathrm{base}} + E_t$\\
 \textbf{end for}\\
 $E_T \gets \RootEvidenceSum(\mathrm{tree})$\\
-$\alpha_{\mathrm{search}} \gets \alpha_{\mathrm{block}}^{(T)} = \alpha_{\mathrm{base}} + E_T$\\
+$\alpha_{\mathrm{search}} \gets \alpha_{\mathrm{base}} + E_T$\\
 \textbf{return} $(\mathrm{tree},E_T,\alpha_{\mathrm{search}})$
 \end{algorithmblock}
 
@@ -345,15 +339,14 @@ $\alpha_{\mathrm{search}} \gets \alpha^{(G)}
 \textbf{return} $(\{\mathrm{tree}_g\}_{g=1}^{G},E_{\mathrm{total}},\alpha_{\mathrm{search}})$
 \end{algorithmblock}
 
-In this implementation,
+For the planned implementation,
 \[
 T = \texttt{num\_simulations},
 \qquad
 M = \texttt{policy\_mc\_samples},
 \]
-and the current \texttt{play.py} path uses one call to Algorithm 9 with
-$\alpha_{\mathrm{base}}=\alpha_\theta^Q(s,\cdot)$. Algorithm 10 is the planned
-outer wrapper for repeated MCTX blocks; it performs $G$ calls to Algorithm 9
-and carries the posterior $\alpha^{(g)}$ into the next call.
+and the current \texttt{play.py} search shape is closest to $G=1$. Algorithm
+10 is the planned outer wrapper for repeated MCTX blocks; it performs $G$ calls
+to Algorithm 9 and carries the posterior $\alpha^{(g)}$ into the next call.
 
 \end{document}

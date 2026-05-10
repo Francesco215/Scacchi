@@ -6,9 +6,8 @@ import mctx
 from .network import AZNet
 from .play import (
     NodeEmbedding,
-    _dirichlet_thompson_search,
     _mc_posterior_best,
-    _q_evidence_sum,
+    _repeated_dirichlet_thompson_search,
     make_recurrent_fn,
 )
 
@@ -130,7 +129,7 @@ def make_mcts_evaluate(env, baseline, config):
                 value=my_value,
                 embedding=_root_embedding(env_state, _wdl_mean(my_alpha_V), my_alpha_Q, config.c_leaf),
             )
-            my_tree = _dirichlet_thompson_search(
+            _, my_alpha_Q_post = _repeated_dirichlet_thompson_search(
                 rng_key=my_search_key,
                 root=my_root,
                 recurrent_fn=my_recurrent_fn,
@@ -138,11 +137,11 @@ def make_mcts_evaluate(env, baseline, config):
                 num_simulations=config.num_simulations,
                 invalid_actions=invalid_actions,
                 interior_selector=interior_selector,
+                num_search_blocks=getattr(config, "num_search_blocks", 1),
             )
-            my_q_evidence_sum = _q_evidence_sum(my_tree, my_alpha_Q.shape[1], my_alpha_Q.dtype)
             my_policy_target = _mc_posterior_best(
                 my_mc_key,
-                my_alpha_Q + my_q_evidence_sum,
+                my_alpha_Q_post,
                 invalid_actions,
                 config.policy_mc_samples,
             )
@@ -152,7 +151,7 @@ def make_mcts_evaluate(env, baseline, config):
                 value=opp_value,
                 embedding=_root_embedding(env_state, _wdl_mean(opp_alpha_V), opp_alpha_Q, config.c_leaf),
             )
-            opp_tree = _dirichlet_thompson_search(
+            _, opp_alpha_Q_post = _repeated_dirichlet_thompson_search(
                 rng_key=opp_search_key,
                 root=opp_root,
                 recurrent_fn=opp_recurrent_fn,
@@ -160,11 +159,11 @@ def make_mcts_evaluate(env, baseline, config):
                 num_simulations=config.num_simulations,
                 invalid_actions=invalid_actions,
                 interior_selector=interior_selector,
+                num_search_blocks=getattr(config, "num_search_blocks", 1),
             )
-            opp_q_evidence_sum = _q_evidence_sum(opp_tree, opp_alpha_Q.shape[1], opp_alpha_Q.dtype)
             opp_policy_target = _mc_posterior_best(
                 opp_mc_key,
-                opp_alpha_Q + opp_q_evidence_sum,
+                opp_alpha_Q_post,
                 invalid_actions,
                 config.policy_mc_samples,
             )

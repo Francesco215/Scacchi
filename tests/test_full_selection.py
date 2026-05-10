@@ -11,6 +11,7 @@ from scacchi.play import (
     _dirichlet_root_action_selection,
     _get_interior_action_selection_fn,
     _mc_posterior_best,
+    _posterior_targets,
     _policy_prior_interior_action_selection,
     _q_evidence_sum_unbatched,
     _wdl_interior_action_selection,
@@ -113,6 +114,35 @@ def test_q_evidence_sum_unbatched_routes_and_flips_wdl():
             2.0 * jnp.array([0.7, 0.2, 0.1]),
             3.0 * jnp.array([0.3, 0.4, 0.3]),
             5.0 * jnp.array([0.0, 1.0, 0.0]),
+        ],
+        dtype=jnp.float32,
+    )
+    assert jnp.allclose(evidence, expected)
+
+
+def test_q_evidence_sum_includes_nonterminal_leaf_weight():
+    tree = _make_tree(
+        wdl_dist=jnp.array(
+            [
+                [0.2, 0.3, 0.5],
+                [0.1, 0.2, 0.7],
+                [1.0, 0.0, 0.0],
+            ],
+            dtype=jnp.float32,
+        ),
+        evidence_weight=jnp.array([0.0, 2.0, 8.0], dtype=jnp.float32),
+        root_action=jnp.array([mctx.Tree.NO_PARENT, 0, 1], dtype=jnp.int32),
+        depth_parity=jnp.array([0, 1, 0], dtype=jnp.int32),
+        node_visits=jnp.array([1, 1, 1], dtype=jnp.int32),
+        alpha_Q_prior=jnp.ones((2, 3), dtype=jnp.float32),
+    )
+
+    evidence = _q_evidence_sum_unbatched(tree, 2, jnp.float32)
+
+    expected = jnp.array(
+        [
+            2.0 * jnp.array([0.7, 0.2, 0.1]),
+            8.0 * jnp.array([1.0, 0.0, 0.0]),
         ],
         dtype=jnp.float32,
     )
@@ -354,6 +384,45 @@ def test_mc_posterior_best_returns_raw_sample_counts_without_smoothing():
     assert jnp.allclose(actual, expected)
     assert jnp.allclose(actual.sum(axis=-1), jnp.array([1.0], dtype=jnp.float32))
     assert actual[0, 2] == 0.0
+
+
+def test_posterior_targets_use_stored_priors_directly():
+    alpha_V_prior = jnp.array([[0.5, 1.0, 2.0]], dtype=jnp.float32)
+    alpha_Q_prior = jnp.array(
+        [
+            [
+                [0.2, 0.4, 0.6],
+                [2.0, 3.0, 4.0],
+                [1.5, 1.0, 0.5],
+            ],
+        ],
+        dtype=jnp.float32,
+    )
+    q_evidence_sum = jnp.array(
+        [
+            [
+                [0.0, 2.0, 0.0],
+                [1.0, 0.0, 3.0],
+                [0.0, 0.0, 0.0],
+            ],
+        ],
+        dtype=jnp.float32,
+    )
+    policy_target = jnp.array([[0.25, 0.75, 0.0]], dtype=jnp.float32)
+
+    beta_V, value_mask, beta_Q, q_mask = _posterior_targets(
+        alpha_V_prior,
+        alpha_Q_prior,
+        q_evidence_sum,
+        policy_target,
+    )
+
+    expected_v_evidence = jnp.array([[0.75, 0.5, 2.25]], dtype=jnp.float32)
+    assert jnp.allclose(beta_V, alpha_V_prior + expected_v_evidence)
+    assert jnp.allclose(beta_Q, alpha_Q_prior + q_evidence_sum)
+    assert bool(value_mask[0])
+    assert jnp.array_equal(q_mask, jnp.array([[True, True, False]]))
+    assert not jnp.allclose(beta_Q, 1.0 + q_evidence_sum)
 
 
 def test_get_interior_action_selection_fn_dispatches_modes():

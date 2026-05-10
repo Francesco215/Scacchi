@@ -42,6 +42,7 @@ class Config(BaseModel):
     # selfplay params
     selfplay_batch_size: int = 1024
     num_simulations: int = 32
+    num_search_blocks: int = 1
     max_num_steps: int = 256
     # training params
     training_batch_size: int = 4096
@@ -52,12 +53,8 @@ class Config(BaseModel):
     # Dirichlet-Q params
     policy_mc_samples: int = 32
     policy_loss_weight: float = 1.0
-    value_outcome_weight: float = 1.0
-    q_outcome_weight: float = 1.0
-    value_search_weight: float = 1.0
-    q_search_weight: float = 1.0
-    dir_kl_weight: float = 0.0
-    dir_ent_weight: float = 0.0
+    value_loss_weight: float = 1.0
+    q_loss_weight: float = 1.0
     c_terminal: float = 8.0
     c_leaf: float = 2.0
     train_interior_selector: Literal["policy_prior", "wdl"] = "policy_prior"
@@ -116,14 +113,8 @@ def main(cfg: DictConfig) -> None:
             dict_to_log = {
                 "policy_nll_loss": losses.policy_nll_loss.mean().item(),
                 "policy_kl_hat": losses.policy_kl_hat.mean().item(),
-                "value_outcome_loss": losses.value_outcome_loss.mean().item(),
-                "q_outcome_loss": losses.q_outcome_loss.mean().item(),
-                "value_search_mean_loss": losses.value_search_mean_loss.mean().item(),
-                "q_search_mean_loss": losses.q_search_mean_loss.mean().item(),
                 "value_dir_kl_loss": losses.value_dir_kl_loss.mean().item(),
                 "q_dir_kl_loss": losses.q_dir_kl_loss.mean().item(),
-                "value_dir_ent_loss": losses.value_dir_ent_loss.mean().item(),
-                "q_dir_ent_loss": losses.q_dir_ent_loss.mean().item(),
                 "hours": hours,
                 "frames": frames,
             }
