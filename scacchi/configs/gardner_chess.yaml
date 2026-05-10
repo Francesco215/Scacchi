@@ -18,7 +18,7 @@ q_outcome_weight: 0.0
 value_search_weight: 0.0
 q_search_weight: 0.0
 dir_kl_weight: 1.0
-dir_ent_weight: 0.3
+dir_ent_weight: 0.0
 c_terminal: 8.0
 c_leaf: 2.0
 train_interior_selector: policy_prior

@@ -10,6 +10,7 @@ from scacchi.play import (
     _child_evidence_sum_unbatched,
     _dirichlet_root_action_selection,
     _get_interior_action_selection_fn,
+    _mc_posterior_best,
     _policy_prior_interior_action_selection,
     _q_evidence_sum_unbatched,
     _wdl_interior_action_selection,
@@ -321,6 +322,38 @@ def test_policy_prior_interior_action_selection_ignores_masked_logits():
     )
 
     assert int(action) == 2
+
+
+def test_mc_posterior_best_returns_raw_sample_counts_without_smoothing():
+    alpha_Q_post = jnp.array(
+        [
+            [
+                [2.0, 1.0, 5.0],
+                [4.0, 1.0, 2.0],
+                [1.0, 1.0, 20.0],
+            ],
+        ],
+        dtype=jnp.float32,
+    )
+    invalid_actions = jnp.array([[False, False, True]])
+    key = jax.random.PRNGKey(7)
+
+    phi = jax.random.dirichlet(key, alpha_Q_post, shape=(1, 1, 3))
+    utilities = phi[..., 2] - phi[..., 0]
+    utilities = jnp.where(invalid_actions[None, :, :], -jnp.inf, utilities)
+    expected_action = jnp.argmax(utilities, axis=-1)[0, 0]
+    expected = jax.nn.one_hot(expected_action, 3)[None, :]
+
+    actual = _mc_posterior_best(
+        key,
+        alpha_Q_post,
+        invalid_actions,
+        num_samples=1,
+    )
+
+    assert jnp.allclose(actual, expected)
+    assert jnp.allclose(actual.sum(axis=-1), jnp.array([1.0], dtype=jnp.float32))
+    assert actual[0, 2] == 0.0
 
 
 def test_get_interior_action_selection_fn_dispatches_modes():

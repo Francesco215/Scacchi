@@ -108,19 +108,17 @@ def _mc_posterior_best(
     rng_key: jax.Array,
     alpha_Q_post: jax.Array,
     invalid_actions: jax.Array,
-    legal_action_mask: jax.Array,
     num_samples: int,
 ) -> jax.Array:
     """MC estimator of the posterior-best policy (math.md §6, §7).
 
     Samples WDL outcomes from each action posterior, counts how often each legal
-    action has the highest sampled utility, and returns those counts as a
-    smoothed policy target.
+    action has the highest sampled utility, and returns the empirical
+    posterior-best policy.
 
     alpha_Q_post: [B, A, 3]
     invalid_actions: [B, A] bool — True for invalid
-    legal_action_mask: [B, A] bool — True for legal
-    Returns: [B, A] probabilities, Laplace-smoothed over legal actions.
+    Returns: [B, A] probabilities from raw sample counts.
     """
     batch_size, num_actions, _ = alpha_Q_post.shape
     phi = jax.random.dirichlet(rng_key, alpha=alpha_Q_post, shape=(num_samples, batch_size, num_actions))
@@ -128,10 +126,7 @@ def _mc_posterior_best(
     utilities = jnp.where(invalid_actions[None, :, :], -jnp.inf, utilities)
     argmax_action = jnp.argmax(utilities, axis=-1)
     counts = jax.nn.one_hot(argmax_action, num_actions).sum(axis=0)
-    legal_f = legal_action_mask.astype(counts.dtype)
-    num_legal = jnp.maximum(legal_f.sum(axis=-1, keepdims=True), 1.0)
-    smoothed = (counts + legal_f) / (num_samples + num_legal)
-    return smoothed
+    return counts / num_samples
 
 
 def _q_evidence_sum(tree: mctx.Tree, num_actions: int, dtype) -> jax.Array:
@@ -415,10 +410,13 @@ def make_selfplay(env, config):
                 mc_key,
                 alpha_Q_post,
                 invalid_actions,
-                env_state.legal_action_mask,
                 config.policy_mc_samples,
             )
-            action_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
+            action_logits = jnp.where(
+                policy_target > 0,
+                jnp.log(jnp.clip(policy_target, 1e-8, 1.0)),
+                jnp.finfo(policy_target.dtype).min,
+            )
             action_logits = jnp.where(
                 env_state.legal_action_mask,
                 action_logits,

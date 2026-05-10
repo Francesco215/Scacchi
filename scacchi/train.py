@@ -114,7 +114,8 @@ def main(cfg: DictConfig) -> None:
             et = time.time()
             hours += (et - st) / 3600
             dict_to_log = {
-                "policy_loss": losses.policy_loss.mean().item(),
+                "policy_nll_loss": losses.policy_nll_loss.mean().item(),
+                "policy_kl_hat": losses.policy_kl_hat.mean().item(),
                 "value_outcome_loss": losses.value_outcome_loss.mean().item(),
                 "q_outcome_loss": losses.q_outcome_loss.mean().item(),
                 "value_search_mean_loss": losses.value_search_mean_loss.mean().item(),
@@ -126,7 +127,7 @@ def main(cfg: DictConfig) -> None:
                 "hours": hours,
                 "frames": frames,
             }
-            logger.log(iteration, dict_to_log, pbar=pbar, prefix="train/", pbar_filter=r"loss")
+            logger.log(iteration, dict_to_log, pbar=pbar, prefix="train/", pbar_filter=r"loss|kl_hat")
 
 
 if __name__ == "__main__":

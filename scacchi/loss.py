@@ -4,7 +4,6 @@ import chex
 from flax import nnx
 import jax
 import jax.numpy as jnp
-import optax
 
 from .network import AZNet
 from .play import SelfplayOutput
@@ -20,7 +19,8 @@ class Sample(NamedTuple):
 
 
 class LossOutputs(NamedTuple):
-    policy_loss: jax.Array
+    policy_nll_loss: jax.Array
+    policy_kl_hat: jax.Array
     value_outcome_loss: jax.Array
     q_outcome_loss: jax.Array
     value_search_mean_loss: jax.Array
@@ -106,11 +106,13 @@ def make_train_step(config):
             mask_f = data.mask.astype(logits.dtype)
             mask_sum = jnp.maximum(mask_f.sum(), 1.0)
 
-            policy_loss = optax.kl_divergence(
-                jax.nn.log_softmax(logits),
-                jax.lax.stop_gradient(data.policy_tgt),
-            )
-            policy_loss = policy_loss.mean()
+            policy_log_probs = jax.nn.log_softmax(logits)
+            policy_tgt_sg = jax.lax.stop_gradient(data.policy_tgt).astype(logits.dtype)
+            policy_nll = -(policy_tgt_sg * policy_log_probs).sum(axis=-1)
+            policy_nll_loss = policy_nll.mean()
+            policy_tgt_log = jnp.log(jnp.clip(policy_tgt_sg, 1e-8, 1.0))
+            policy_kl_hat = (policy_tgt_sg * (policy_tgt_log - policy_log_probs)).sum(axis=-1)
+            policy_kl_hat = policy_kl_hat.mean()
 
             v_mean = _wdl_mean(alpha_V)
             value_outcome_loss = _xent_against_wdl(data.wdl_tgt, v_mean)
@@ -130,8 +132,8 @@ def make_train_step(config):
             q_search_mean = q_evidence_sum / jnp.maximum(q_evidence_w[..., None], eps)
             beta_Q = 1.0 + q_evidence_sum
 
-            policy_tgt_sg = jax.lax.stop_gradient(data.policy_tgt).astype(alpha_Q.dtype)
-            v_evidence_sum = (policy_tgt_sg[..., None] * q_evidence_sum).sum(-2)  # [B, 3]
+            policy_tgt_alpha_sg = policy_tgt_sg.astype(alpha_Q.dtype)
+            v_evidence_sum = (policy_tgt_alpha_sg[..., None] * q_evidence_sum).sum(-2)  # [B, 3]
             v_evidence_w = v_evidence_sum.sum(-1)                                  # [B]
             v_mask_f = (v_evidence_w > 0).astype(alpha_V.dtype)
             v_search_mean = v_evidence_sum / jnp.maximum(v_evidence_w[..., None], eps)
@@ -154,7 +156,7 @@ def make_train_step(config):
             q_dir_ent_loss = (q_dir_ent * q_search_mask_f).sum() / jnp.maximum(q_search_mask_f.sum(), 1.0)
 
             total = (
-                config.policy_loss_weight * policy_loss
+                config.policy_loss_weight * policy_nll_loss
                 + config.value_outcome_weight * value_outcome_loss
                 + config.q_outcome_weight * q_outcome_loss
                 + config.value_search_weight * value_search_mean_loss
@@ -163,7 +165,8 @@ def make_train_step(config):
                 + config.dir_ent_weight * (value_dir_ent_loss + q_dir_ent_loss)
             )
             return total, LossOutputs(
-                policy_loss=policy_loss,
+                policy_nll_loss=policy_nll_loss,
+                policy_kl_hat=policy_kl_hat,
                 value_outcome_loss=value_outcome_loss,
                 q_outcome_loss=q_outcome_loss,
                 value_search_mean_loss=value_search_mean_loss,

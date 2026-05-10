@@ -144,7 +144,6 @@ def make_mcts_evaluate(env, baseline, config):
                 my_mc_key,
                 my_alpha_Q + my_q_evidence_sum,
                 invalid_actions,
-                env_state.legal_action_mask,
                 config.policy_mc_samples,
             )
 
@@ -167,7 +166,6 @@ def make_mcts_evaluate(env, baseline, config):
                 opp_mc_key,
                 opp_alpha_Q + opp_q_evidence_sum,
                 invalid_actions,
-                env_state.legal_action_mask,
                 config.policy_mc_samples,
             )
 
