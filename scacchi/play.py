@@ -29,11 +29,7 @@ class NodeEmbedding(NamedTuple):
 
 class SelfplayOutput(NamedTuple):
     obs: jax.Array
-    reward: jax.Array
-    terminated: jax.Array
     policy_target: chex.Array
-    played_action: jax.Array
-    discount: jax.Array
     beta_V_target: jax.Array  # [B, 3] posterior Dirichlet target for the value head
     value_target_mask: jax.Array  # [B] True when search produced value evidence
     beta_Q_target: jax.Array  # [B, A, 3] posterior Dirichlet target for the Q head
@@ -484,22 +480,15 @@ def make_selfplay(env, config):
             )
             action = jax.random.categorical(action_key, action_logits, axis=-1)
 
-            actor = env_state.current_player
             reset_keys = jax.random.split(reset_key, config.selfplay_batch_size)
             env_state = jax.vmap(auto_reset(env.step, env.init))(
                 env_state,
                 action,
                 reset_keys,
             )
-            discount = -jnp.ones_like(value)
-            discount = jnp.where(env_state.terminated, 0.0, discount)
             return env_state, SelfplayOutput(
                 obs=observation,
                 policy_target=policy_target,
-                played_action=action,
-                reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
-                terminated=env_state.terminated,
-                discount=discount,
                 beta_V_target=beta_V_target,
                 value_target_mask=value_target_mask,
                 beta_Q_target=beta_Q_target,

@@ -29,11 +29,7 @@ def test_compute_loss_input_carries_stored_posterior_targets_directly():
     )
     data = SelfplayOutput(
         obs=jnp.zeros((2, 1, 2, 2, 1), dtype=jnp.float32),
-        reward=jnp.zeros((2, 1), dtype=jnp.float32),
-        terminated=jnp.array([[False], [True]]),
         policy_target=jnp.array([[[0.75, 0.25]], [[0.25, 0.75]]], dtype=jnp.float32),
-        played_action=jnp.zeros((2, 1), dtype=jnp.int32),
-        discount=jnp.zeros((2, 1), dtype=jnp.float32),
         beta_V_target=beta_V_target,
         value_target_mask=jnp.array([[True], [False]]),
         beta_Q_target=beta_Q_target,

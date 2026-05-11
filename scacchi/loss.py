@@ -12,7 +12,6 @@ from .play import SelfplayOutput
 class Sample(NamedTuple):
     obs: jax.Array
     policy_tgt: chex.Array
-    mask: jax.Array
     beta_V_tgt: jax.Array
     value_tgt_mask: jax.Array
     beta_Q_tgt: jax.Array
@@ -27,13 +26,12 @@ class LossOutputs(NamedTuple):
 
 
 def make_compute_loss_input(config):
-    def compute_loss_input(data: SelfplayOutput) -> Sample:
-        value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
+    del config
 
+    def compute_loss_input(data: SelfplayOutput) -> Sample:
         return Sample(
             obs=data.obs,
             policy_tgt=data.policy_target,
-            mask=value_mask,
             beta_V_tgt=data.beta_V_target,
             value_tgt_mask=data.value_target_mask,
             beta_Q_tgt=data.beta_Q_target,
@@ -75,7 +73,6 @@ def make_train_step(config):
     def train(model: AZNet, optimizer: nnx.Optimizer, data: Sample) -> LossOutputs:
         def loss_fn(model: AZNet):
             logits, alpha_V, alpha_Q = model(data.obs, train=True)
-            mask_f = data.mask.astype(logits.dtype)
 
             policy_log_probs = jax.nn.log_softmax(logits)
             policy_tgt_sg = jax.lax.stop_gradient(data.policy_tgt).astype(logits.dtype)
@@ -87,13 +84,12 @@ def make_train_step(config):
 
             beta_V = jax.lax.stop_gradient(data.beta_V_tgt).astype(alpha_V.dtype)
             beta_Q = jax.lax.stop_gradient(data.beta_Q_tgt).astype(alpha_Q.dtype)
-            v_mask_f = data.value_tgt_mask.astype(alpha_V.dtype) * mask_f
+            v_mask_f = data.value_tgt_mask.astype(alpha_V.dtype)
             q_mask_f = data.q_tgt_mask.astype(alpha_Q.dtype)
 
             v_dir_kl = dirichlet_kl(beta_V, alpha_V)
             value_dir_kl_loss = (v_dir_kl * v_mask_f).sum() / jnp.maximum(v_mask_f.sum(), 1.0)
             q_dir_kl = dirichlet_kl(beta_Q, alpha_Q)
-            q_mask_f = q_mask_f * mask_f[..., None]
             q_dir_kl_loss = (q_dir_kl * q_mask_f).sum() / jnp.maximum(q_mask_f.sum(), 1.0)
 
             total = (
