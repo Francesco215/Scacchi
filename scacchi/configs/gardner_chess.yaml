@@ -28,5 +28,6 @@ c_terminal: 8.0
 c_leaf: 2.0
 train_interior_selector: policy_prior
 inference_interior_selector: wdl
-wandb_enabled: true
 wandb_project: scacchi-az
+ckpt_max_to_keep: 3
+ckpt_save_interval_steps: 10

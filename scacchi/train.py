@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import time
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from flax import nnx
@@ -25,6 +26,7 @@ from pgx._src.baseline import BaselineModelId
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from .checkpoint import build_checkpoint_manager, maybe_save, restore
 from .evaluations import make_evaluate
 from .logger import build_logger
 from .network import build_model
@@ -71,6 +73,10 @@ class Config(BaseModel):
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"
+    # checkpoint params
+    ckpt_dir: str | None = None          # None → hydra working dir / checkpoints
+    ckpt_max_to_keep: int = 3            # 0 disables checkpointing
+    ckpt_save_interval_steps: int = 10
 
     class Config:
         extra = "forbid"
@@ -114,12 +120,13 @@ def main(cfg: DictConfig) -> None:
     training_iteration = make_training_iteration(env, config)
     evaluate = make_evaluate(env, baseline, config)
 
-    hours: float = 0.0
-    frames: int = 0
-
+    ckpt_dir = Path(config.ckpt_dir) if config.ckpt_dir else Path.cwd() / "checkpoints"
+    ckpt_manager = build_checkpoint_manager(config, ckpt_dir)
     rng_key = jax.random.PRNGKey(config.seed)
+    start_iter, rng_key, hours, frames = restore(ckpt_manager, model, optimizer, rng_key)
+
     with build_logger(config) as logger:
-        pbar = tqdm(range(config.max_num_iters), desc="training", dynamic_ncols=True, total=config.max_num_iters)
+        pbar = tqdm(range(start_iter, config.max_num_iters), desc="training", dynamic_ncols=True, total=config.max_num_iters)
         for iteration in pbar:
             if iteration % config.eval_interval == 0:
                 rng_key, subkey = jax.random.split(rng_key)
@@ -133,6 +140,7 @@ def main(cfg: DictConfig) -> None:
 
             et = time.time()
             hours += (et - st) / 3600
+            maybe_save(ckpt_manager, iteration, model, optimizer, rng_key, config, hours, frames)
             dict_to_log = {
                 "policy_nll_loss": losses.policy_nll_loss.mean().item(),
                 "policy_kl_hat": losses.policy_kl_hat.mean().item(),
