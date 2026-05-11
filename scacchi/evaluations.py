@@ -3,19 +3,15 @@ import jax
 import jax.numpy as jnp
 import mctx
 
+from .dirichlet_q_search import (
+    dirichlet_q_policy,
+    make_dirichlet_recurrent_fn,
+    make_root_embedding,
+    utility,
+    wdl_mean,
+)
 from .network import AZNet
-from .play import NodeEmbedding, make_recurrent_fn, slice_obs
-
-
-def _root_embedding(env_state, alpha_V_mean, c_leaf):
-    batch_size = alpha_V_mean.shape[0]
-    return NodeEmbedding(
-        state=env_state,
-        y=alpha_V_mean,
-        c=jnp.full((batch_size,), c_leaf, dtype=alpha_V_mean.dtype),
-        root_action=jnp.full((batch_size,), mctx.Tree.NO_PARENT, dtype=jnp.int32),
-        depth_parity=jnp.zeros((batch_size,), dtype=jnp.int32),
-    )
+from .play import slice_obs
 
 
 def _baseline_as_dirichlet(baseline):
@@ -43,13 +39,6 @@ def _baseline_as_dirichlet(baseline):
 
     return wrapped
 
-
-def _wdl_mean(alpha):
-    return alpha / jnp.sum(alpha, axis=-1, keepdims=True)
-
-
-def _utility(wdl_mean):
-    return wdl_mean[..., 2] - wdl_mean[..., 0]
 
 def make_evaluate(env, baseline, config):
     nhs = config.num_history_steps
@@ -96,12 +85,12 @@ def make_mcts_evaluate(env, baseline, config):
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: AZNet):
         """MCTS evaluation: model vs baseline. Both sides search with
-        gumbel_muzero_policy using their own network."""
+        Dirichlet-Q Thompson search using their own network."""
         my_player = 0
         my_predict = lambda obs: model(slice_obs(obs, nhs), train=False)
         baseline_predict = _baseline_as_dirichlet(baseline)
-        my_recurrent_fn = make_recurrent_fn(env, my_predict, config.c_terminal, config.c_leaf)
-        opp_recurrent_fn = make_recurrent_fn(env, baseline_predict, config.c_terminal, config.c_leaf)
+        my_recurrent_fn = make_dirichlet_recurrent_fn(env, my_predict, config.c_terminal, config.c_leaf)
+        opp_recurrent_fn = make_dirichlet_recurrent_fn(env, baseline_predict, config.c_terminal, config.c_leaf)
 
         key, init_key = jax.random.split(rng_key)
         init_keys = jax.random.split(init_key, config.selfplay_batch_size)
@@ -111,48 +100,60 @@ def make_mcts_evaluate(env, baseline, config):
             key, env_state, returns = val
             observation = env_state.observation
 
-            my_logits, my_alpha_V, _ = my_predict(observation)
-            opp_logits, opp_alpha_V, _ = baseline_predict(observation)
+            my_logits, my_alpha_V, my_alpha_Q = my_predict(observation)
+            opp_logits, opp_alpha_V, opp_alpha_Q = baseline_predict(observation)
 
-            my_value = _utility(_wdl_mean(my_alpha_V))
-            opp_value = _utility(_wdl_mean(opp_alpha_V))
+            my_value = utility(wdl_mean(my_alpha_V))
+            opp_value = utility(wdl_mean(opp_alpha_V))
 
-            key, my_key, opp_key = jax.random.split(key, 3)
+            key, my_search_key, opp_search_key = jax.random.split(key, 3)
+            invalid_actions = ~env_state.legal_action_mask
+            interior_selector = getattr(config, "inference_interior_selector", "wdl")
 
             my_root = mctx.RootFnOutput(
                 prior_logits=my_logits,
                 value=my_value,
-                embedding=_root_embedding(env_state, _wdl_mean(my_alpha_V), config.c_leaf),
+                embedding=make_root_embedding(env_state, wdl_mean(my_alpha_V), my_alpha_Q, config.c_leaf),
             )
-            my_policy = mctx.gumbel_muzero_policy(
+            my_search = dirichlet_q_policy(
                 params=(),
-                rng_key=my_key,
+                rng_key=my_search_key,
                 root=my_root,
                 recurrent_fn=my_recurrent_fn,
                 num_simulations=config.num_simulations,
-                invalid_actions=~env_state.legal_action_mask,
-                qtransform=mctx.qtransform_completed_by_mix_value,
-                gumbel_scale=1.0,
+                alpha_Q_prior=my_alpha_Q,
+                invalid_actions=invalid_actions,
+                policy_mc_samples=config.policy_mc_samples,
+                interior_selector=interior_selector,
+                num_search_blocks=getattr(config, "num_search_blocks", 1),
+                action_selection_mode="argmax",
             )
 
             opp_root = mctx.RootFnOutput(
                 prior_logits=opp_logits,
                 value=opp_value,
-                embedding=_root_embedding(env_state, _wdl_mean(opp_alpha_V), config.c_leaf),
+                embedding=make_root_embedding(env_state, wdl_mean(opp_alpha_V), opp_alpha_Q, config.c_leaf),
             )
-            opp_policy = mctx.gumbel_muzero_policy(
+            opp_search = dirichlet_q_policy(
                 params=(),
-                rng_key=opp_key,
+                rng_key=opp_search_key,
                 root=opp_root,
                 recurrent_fn=opp_recurrent_fn,
                 num_simulations=config.num_simulations,
-                invalid_actions=~env_state.legal_action_mask,
-                qtransform=mctx.qtransform_completed_by_mix_value,
-                gumbel_scale=1.0,
+                alpha_Q_prior=opp_alpha_Q,
+                invalid_actions=invalid_actions,
+                policy_mc_samples=config.policy_mc_samples,
+                interior_selector=interior_selector,
+                num_search_blocks=getattr(config, "num_search_blocks", 1),
+                action_selection_mode="argmax",
             )
 
             is_my_turn = env_state.current_player == my_player
-            action = jnp.where(is_my_turn, my_policy.action, opp_policy.action)
+            action = jnp.where(
+                is_my_turn,
+                my_search.action,
+                opp_search.action,
+            )
 
             env_state = jax.vmap(env.step)(env_state, action)
             returns = returns + env_state.rewards[

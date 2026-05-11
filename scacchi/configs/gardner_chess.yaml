@@ -12,6 +12,7 @@ use_absolute_positions: true
 num_history_steps: 1
 selfplay_batch_size: 1024
 num_simulations: 32
+num_search_blocks: 1
 max_num_steps: 256
 optimizer_name: adamw
 training_batch_size: 4096
@@ -21,10 +22,11 @@ eval_interval: 1
 wandb_enabled: true
 policy_mc_samples: 32
 policy_loss_weight: 1.0
-value_outcome_weight: 1.0
-q_outcome_weight: 1.0
-dir_kl_weight: 0.0
+value_loss_weight: 1.0
+q_loss_weight: 1.0
 c_terminal: 8.0
 c_leaf: 2.0
+train_interior_selector: policy_prior
+inference_interior_selector: wdl
 wandb_enabled: true
 wandb_project: scacchi-az

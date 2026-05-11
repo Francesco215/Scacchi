@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from flax import nnx
 import hydra
@@ -50,6 +50,7 @@ class Config(BaseModel):
     # selfplay params
     selfplay_batch_size: int = 1024
     num_simulations: int = 32
+    num_search_blocks: int = 1
     max_num_steps: int = 256
     # training params
     optimizer_name: str = "adam"
@@ -61,11 +62,12 @@ class Config(BaseModel):
     # Dirichlet-Q params
     policy_mc_samples: int = 32
     policy_loss_weight: float = 1.0
-    value_outcome_weight: float = 1.0
-    q_outcome_weight: float = 1.0
-    dir_kl_weight: float = 0.0
+    value_loss_weight: float = 1.0
+    q_loss_weight: float = 1.0
     c_terminal: float = 8.0
     c_leaf: float = 2.0
+    train_interior_selector: Literal["policy_prior", "wdl"] = "policy_prior"
+    inference_interior_selector: Literal["policy_prior", "wdl"] = "wdl"
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"
@@ -132,13 +134,14 @@ def main(cfg: DictConfig) -> None:
             et = time.time()
             hours += (et - st) / 3600
             dict_to_log = {
-                "policy_loss": losses.policy_loss.mean().item(),
-                "value_outcome_loss": losses.value_outcome_loss.mean().item(),
-                "q_outcome_loss": losses.q_outcome_loss.mean().item(),
+                "policy_nll_loss": losses.policy_nll_loss.mean().item(),
+                "policy_kl_hat": losses.policy_kl_hat.mean().item(),
+                "value_dir_kl_loss": losses.value_dir_kl_loss.mean().item(),
+                "q_dir_kl_loss": losses.q_dir_kl_loss.mean().item(),
                 "hours": hours,
                 "frames": frames,
             }
-            logger.log(iteration, dict_to_log, pbar=pbar, prefix="train/", pbar_filter=r"loss")
+            logger.log(iteration, dict_to_log, pbar=pbar, prefix="train/", pbar_filter=r"loss|kl_hat")
 
 
 if __name__ == "__main__":
