@@ -78,19 +78,39 @@ def make_evaluate(env, baseline, config):
     return evaluate
 
 
+def make_gumbel_recurrent_fn(env, baseline):
+    """Recurrent function for Gumbel MuZero search using a scalar-value baseline."""
+
+    def recurrent_fn(_, rng_key, action, embedding):
+        del rng_key
+        current_player = embedding.current_player
+        env_state = jax.vmap(env.step)(embedding, action)
+        logits, value = baseline(env_state.observation)
+        logits = jnp.where(env_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+        reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), current_player]
+        value = jnp.where(env_state.terminated, 0.0, value)
+        discount = jnp.where(env_state.terminated, 0.0, -jnp.ones_like(value))
+        return mctx.RecurrentFnOutput(
+            reward=reward,
+            discount=discount,
+            prior_logits=logits,
+            value=value,
+        ), env_state
+
+    return recurrent_fn
+
+
 def make_mcts_evaluate(env, baseline, config):
     # WARNING: THIS HAS NOT BEEN TESTED
     nhs = config.num_history_steps
 
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: AZNet):
-        """MCTS evaluation: model vs baseline. Both sides search with
-        Dirichlet-Q Thompson search using their own network."""
+        """MCTS evaluation: model (Dirichlet-Q search) vs baseline (Gumbel MuZero search)."""
         my_player = 0
         my_predict = lambda obs: model(slice_obs(obs, nhs), train=False)
-        baseline_predict = _baseline_as_dirichlet(baseline)
         my_recurrent_fn = make_dirichlet_recurrent_fn(env, my_predict, config.c_terminal, config.c_leaf)
-        opp_recurrent_fn = make_dirichlet_recurrent_fn(env, baseline_predict, config.c_terminal, config.c_leaf)
+        opp_recurrent_fn = make_gumbel_recurrent_fn(env, baseline)
 
         key, init_key = jax.random.split(rng_key)
         init_keys = jax.random.split(init_key, config.selfplay_batch_size)
@@ -101,10 +121,9 @@ def make_mcts_evaluate(env, baseline, config):
             observation = env_state.observation
 
             my_logits, my_alpha_V, my_alpha_Q = my_predict(observation)
-            opp_logits, opp_alpha_V, opp_alpha_Q = baseline_predict(observation)
+            opp_logits, opp_value = baseline(observation)
 
             my_value = utility(wdl_mean(my_alpha_V))
-            opp_value = utility(wdl_mean(opp_alpha_V))
 
             key, my_search_key, opp_search_key = jax.random.split(key, 3)
             invalid_actions = ~env_state.legal_action_mask
@@ -132,20 +151,15 @@ def make_mcts_evaluate(env, baseline, config):
             opp_root = mctx.RootFnOutput(
                 prior_logits=opp_logits,
                 value=opp_value,
-                embedding=make_root_embedding(env_state, wdl_mean(opp_alpha_V), opp_alpha_Q, config.c_leaf),
+                embedding=env_state,
             )
-            opp_search = dirichlet_q_policy(
+            opp_search = mctx.gumbel_muzero_policy(
                 params=(),
                 rng_key=opp_search_key,
                 root=opp_root,
                 recurrent_fn=opp_recurrent_fn,
                 num_simulations=config.num_simulations,
-                alpha_Q_prior=opp_alpha_Q,
                 invalid_actions=invalid_actions,
-                policy_mc_samples=config.policy_mc_samples,
-                interior_selector=interior_selector,
-                num_search_blocks=getattr(config, "num_search_blocks", 1),
-                action_selection_mode="argmax",
             )
 
             is_my_turn = env_state.current_player == my_player
