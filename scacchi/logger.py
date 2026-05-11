@@ -27,14 +27,26 @@ def _config_to_dict(config: Any) -> dict[str, Any]:
     return dict(config)
 
 
+def _elo_from_score(score: float, baseline_elo: float = 0.0) -> float:
+    """Compute ELO from actual score (wins + 0.5*draws) / n_games vs a baseline."""
+    score = max(1e-6, min(1.0 - 1e-6, score))
+    import math
+    return baseline_elo + 400.0 * math.log10(score / (1.0 - score))
+
+
 def returns_metrics(prefix: str, returns: Any) -> dict[str, Scalar]:
     """Convert eval returns into scalar win/draw/loss metrics."""
-
+    n = returns.size
+    win_rate = _to_scalar((returns == 1).sum() / n)
+    draw_rate = _to_scalar((returns == 0).sum() / n)
+    lose_rate = _to_scalar((returns == -1).sum() / n)
+    score = win_rate + 0.5 * draw_rate
     return {
         f"{prefix}/avg_R": _to_scalar(returns.mean()),
-        f"{prefix}/win_rate": _to_scalar((returns == 1).sum() / returns.size),
-        f"{prefix}/draw_rate": _to_scalar((returns == 0).sum() / returns.size),
-        f"{prefix}/lose_rate": _to_scalar((returns == -1).sum() / returns.size),
+        f"{prefix}/win_rate": win_rate,
+        f"{prefix}/draw_rate": draw_rate,
+        f"{prefix}/lose_rate": lose_rate,
+        f"{prefix}/elo": _elo_from_score(score),
     }
 
 
