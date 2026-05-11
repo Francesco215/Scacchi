@@ -4,17 +4,17 @@ import jax
 import jax.numpy as jnp
 import mctx
 
-from scacchi.play import (
+from scacchi.dirichlet_q_search import (
     DirichletRootExtra,
     NodeEmbedding,
     _child_evidence_sum_unbatched,
     _dirichlet_root_action_selection,
     _get_interior_action_selection_fn,
-    _mc_posterior_best,
-    _posterior_targets,
     _policy_prior_interior_action_selection,
     _q_evidence_sum_unbatched,
     _wdl_interior_action_selection,
+    posterior_best_policy_target,
+    posterior_targets,
 )
 
 
@@ -354,7 +354,7 @@ def test_policy_prior_interior_action_selection_ignores_masked_logits():
     assert int(action) == 2
 
 
-def test_mc_posterior_best_returns_raw_sample_counts_without_smoothing():
+def test_posterior_best_policy_target_returns_raw_sample_counts_without_smoothing():
     alpha_Q_post = jnp.array(
         [
             [
@@ -374,7 +374,7 @@ def test_mc_posterior_best_returns_raw_sample_counts_without_smoothing():
     expected_action = jnp.argmax(utilities, axis=-1)[0, 0]
     expected = jax.nn.one_hot(expected_action, 3)[None, :]
 
-    actual = _mc_posterior_best(
+    actual = posterior_best_policy_target(
         key,
         alpha_Q_post,
         invalid_actions,
@@ -410,7 +410,7 @@ def test_posterior_targets_use_stored_priors_directly():
     )
     policy_target = jnp.array([[0.25, 0.75, 0.0]], dtype=jnp.float32)
 
-    beta_V, value_mask, beta_Q, q_mask = _posterior_targets(
+    beta_V, value_mask, beta_Q, q_mask = posterior_targets(
         alpha_V_prior,
         alpha_Q_prior,
         q_evidence_sum,
