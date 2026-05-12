@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,8 +9,8 @@ import jax
 import jax.numpy as jnp
 
 
-MOHEX_BINARY = (
-    Path.cwd()
+DEFAULT_MOHEX_BINARY = (
+    Path(__file__).resolve().parents[1]
     / "third_party"
     / "benzene-vanilla-cmake"
     / "build"
@@ -19,6 +20,10 @@ MOHEX_BINARY = (
 )
 
 
+def mohex_binary() -> Path:
+    return Path(os.environ.get("MOHEX_BINARY", DEFAULT_MOHEX_BINARY))
+
+
 def _action_to_notation(action: int, board_size: int) -> str:
     row, col = divmod(action, board_size)
     return f"{chr(ord('a') + col)}{row + 1}"
@@ -26,7 +31,7 @@ def _action_to_notation(action: int, board_size: int) -> str:
 
 def _state_to_sgf(state, board_size: int) -> str:
     board = jax.device_get(state._x.board).reshape(board_size, board_size)
-    to_play = int(jax.device_get(state._x.color))
+    to_play = int(jax.device_get(state.current_player))
 
     if to_play == 0:
         black = board > 0
@@ -51,8 +56,12 @@ def _mohex_move_to_action(move: str, board_size: int) -> int:
     move = move.strip().lower()
     if move in {"swap-pieces", "swap"}:
         return board_size * board_size
+    if len(move) < 2 or not move[0].isalpha() or not move[1:].isdigit():
+        raise ValueError(f"MoHex returned invalid move: {move!r}")
     col = ord(move[0]) - ord("a")
     row = int(move[1:]) - 1
+    if not (0 <= row < board_size and 0 <= col < board_size):
+        raise ValueError(f"MoHex returned out-of-bounds move: {move!r}")
     return row * board_size + col
 
 
@@ -69,7 +78,13 @@ def _state_at(batch_state, index: int):
 
 
 class MoHexProcess:
-    def __init__(self, binary: str):
+    def __init__(
+        self,
+        binary: str,
+        max_memory: int | None = None,
+        max_time: float | None = None,
+        max_games: int | None = None,
+    ):
         self._proc = subprocess.Popen(
             [binary, "--use-logfile=0"],
             stdin=subprocess.PIPE,
@@ -77,6 +92,12 @@ class MoHexProcess:
             stderr=subprocess.PIPE,
             text=True,
         )
+        if max_memory is not None:
+            self.query(f"param_mohex max_memory {max_memory}")
+        if max_time is not None:
+            self.query(f"param_mohex max_time {max_time}")
+        if max_games is not None:
+            self.query(f"param_mohex max_games {max_games}")
 
     def _read_answer(self) -> str:
         assert self._proc.stdout is not None
@@ -111,7 +132,7 @@ class MoHexProcess:
             self.query(f"boardsize {board_size}")
             self.query("clear_board")
             self.query(f"loadsgf {handle.name}")
-        color = "black" if int(jax.device_get(state._x.color)) == 0 else "white"
+        color = "black" if int(jax.device_get(state.current_player)) == 0 else "white"
         move = self.query(f"reg_genmove {color}")
         if move.strip().lower() == "resign":
             return _first_legal_action(state)
@@ -130,24 +151,43 @@ class MoHexProcess:
 def make_mohex_action_selector(env, config, my_player: int = 0):
     del env
     board_size = 11 if config.board_size is None else int(config.board_size)
-    if not MOHEX_BINARY.exists():
-        raise FileNotFoundError(f"MoHex binary not found at {MOHEX_BINARY}")
-    opponents = [MoHexProcess(str(MOHEX_BINARY)) for _ in range(config.selfplay_batch_size)]
+    binary = mohex_binary()
+    if not binary.exists():
+        raise FileNotFoundError(f"MoHex binary not found at {binary}")
+    max_memory = getattr(config, "mohex_max_memory", None)
+    max_time = getattr(config, "mohex_max_time", None)
+    max_games = getattr(config, "mohex_max_games", None)
+
+    def new_opponent() -> MoHexProcess:
+        return MoHexProcess(
+            str(binary),
+            max_memory=max_memory,
+            max_time=max_time,
+            max_games=max_games,
+        )
+
+    opponent = new_opponent()
 
     def choose_mohex_actions(env_state) -> jax.Array:
-        actions = jnp.zeros((config.selfplay_batch_size,), dtype=jnp.int32)
-        for i in range(config.selfplay_batch_size):
+        nonlocal opponent
+        batch_size = int(env_state.terminated.shape[0])
+        actions = jnp.zeros((batch_size,), dtype=jnp.int32)
+        for i in range(batch_size):
             if bool(jax.device_get(env_state.terminated[i])):
                 continue
             if int(jax.device_get(env_state.current_player[i])) == my_player:
                 continue
             single_state = _state_at(env_state, i)
-            action = opponents[i].genmove(single_state, board_size)
+            try:
+                action = opponent.genmove(single_state, board_size)
+            except (RuntimeError, ValueError):
+                opponent.close()
+                opponent = new_opponent()
+                action = _first_legal_action(single_state)
             actions = actions.at[i].set(action)
         return actions
 
     def close() -> None:
-        for opponent in opponents:
-            opponent.close()
+        opponent.close()
 
     return choose_mohex_actions, close

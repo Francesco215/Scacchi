@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from typing import Any, cast
+
+# Training is GPU-only by default. Override JAX_PLATFORMS deliberately for
+# diagnostics, and set SCACCHI_ALLOW_CPU=1 only when a CPU run is intentional.
+os.environ.setdefault("JAX_PLATFORMS", "cuda")
 
 from flax import nnx
 import hydra
@@ -21,15 +26,26 @@ import jax
 import optax
 import pgx
 from omegaconf import DictConfig, OmegaConf
-from pgx._src.baseline import BaselineModelId
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from tqdm import tqdm
 
 from .envs import make_env
-from .evaluations import make_evaluate
+from .evaluations import make_mcts_evaluate
 from .logger import build_logger
 from .network import AZNet
 from .pipeline import make_training_iteration
+
+
+def report_jax_backend() -> None:
+    backend = jax.default_backend()
+    devices = jax.devices()
+    print(f"JAX backend: {backend}")
+    print(f"JAX devices: {devices}")
+    if os.environ.get("SCACCHI_ALLOW_CPU") != "1" and backend != "gpu":
+        raise RuntimeError(
+            "JAX is not using a GPU backend. Set SCACCHI_ALLOW_CPU=1 only for "
+            "intentional CPU runs."
+        )
 
 
 class Config(BaseModel):
@@ -51,21 +67,24 @@ class Config(BaseModel):
     log_interval: int = 1
     # eval params
     eval_interval: int = 5
+    eval_batch_size: int = 16
+    mohex_max_memory: int | None = None
+    mohex_max_time: float | None = None
+    mohex_max_games: int | None = None
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"
 
-    class Config:
-        extra = "forbid"
+    model_config = ConfigDict(extra="forbid")
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="gardner_chess")
+@hydra.main(version_base=None, config_path="configs", config_name="hex")
 def main(cfg: DictConfig) -> None:
     container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
-    config: Config = Config(**container)
+    config = Config(**container)
+    report_jax_backend()
 
     env = make_env(config.env_id, config.board_size)
-    baseline = pgx.make_baseline_model(cast(BaselineModelId, config.env_id + "_v0"))
     model = AZNet(
         num_actions=env.num_actions,
         observation_shape=env.observation_shape,
@@ -81,16 +100,22 @@ def main(cfg: DictConfig) -> None:
     )
 
     training_iteration = make_training_iteration(env, config)
-    evaluate = make_evaluate(env, baseline, config)
+    evaluate = make_mcts_evaluate(env, config)
 
     hours: float = 0.0
     frames: int = 0
 
     rng_key = jax.random.PRNGKey(config.seed)
     with build_logger(config) as logger:
-        pbar = tqdm(range(config.max_num_iters), desc="training", dynamic_ncols=True, total=config.max_num_iters)
+        pbar = tqdm(
+            range(config.max_num_iters),
+            desc="training",
+            dynamic_ncols=True,
+            total=config.max_num_iters,
+        )
+        pbar.refresh()
         for iteration in pbar:
-            if iteration % config.eval_interval == 0:
+            if config.eval_interval > 0 and iteration % config.eval_interval == 0:
                 rng_key, subkey = jax.random.split(rng_key)
                 returns = evaluate(subkey, model)
                 logger.log_returns(iteration, returns, prefix="eval/vs_baseline")
@@ -102,8 +127,19 @@ def main(cfg: DictConfig) -> None:
 
             et = time.time()
             hours += (et - st) / 3600
-            dict_to_log = {"policy_loss": policy_losses.mean().item(), "value_loss": value_losses.mean().item(), "hours": hours, "frames": frames}
-            logger.log(iteration, dict_to_log, pbar=pbar, prefix="train/", pbar_filter=r"loss")
+            dict_to_log = {
+                "policy_loss": policy_losses.mean().item(),
+                "value_loss": value_losses.mean().item(),
+                "hours": hours,
+                "frames": frames,
+            }
+            logger.log(
+                iteration,
+                dict_to_log,
+                pbar=pbar,
+                prefix="train/",
+                pbar_filter=r"loss",
+            )
 
 
 if __name__ == "__main__":

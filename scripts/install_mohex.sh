@@ -38,6 +38,16 @@ require_cmd git
 require_cmd cmake
 require_cmd c++
 
+if ! printf '#include <db.h>\nint main() { return 0; }\n' | c++ -x c++ - -o /tmp/scacchi-check-db >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+Missing Berkeley DB development headers.
+
+On Ubuntu/Debian:
+  apt-get install -y libdb-dev
+EOF
+  exit 1
+fi
+
 if [[ ! -d "${SRC_DIR}" ]]; then
   git clone "${REPO_URL}" "${SRC_DIR}"
 fi

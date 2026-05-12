@@ -1,5 +1,5 @@
-env_id: gardner_chess
-board_size: null
+env_id: hex
+board_size: 5
 seed: 0
 max_num_iters: 300
 num_channels: 128
@@ -13,5 +13,8 @@ learning_rate: 1.0e-3
 log_interval: 1
 eval_interval: 1
 eval_batch_size: 16
-wandb_enabled: false
+mohex_max_memory: 67108864
+mohex_max_time: 1.0
+mohex_max_games: 1000
+wandb_enabled: true
 wandb_project: scacchi-az

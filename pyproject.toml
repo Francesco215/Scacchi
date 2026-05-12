@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = "==3.11.*"
 dependencies = [
     "einops",
-    "jax[cuda13]",
+    "jax[cuda12-local]==0.7.2",
     "matplotlib",
     "tqdm",
     "wandb",
@@ -14,10 +14,10 @@ dependencies = [
     "grain>=0.2.15",
     "hydra-core>=1.3.2",
     "ipykernel>=7.1.0",
-    "mctx>=0.0.6",
+    "mctx ==0.0.6",
     "pgx>=2.6.0",
-    "flax>=0.12.7",
-    "optax>=0.2.9.dev0",
+    "flax",
+    "optax",
     "dm-haiku",
     "jaxtyping>=0.3.9",
     "ty>=0.0.32",
@@ -25,10 +25,21 @@ dependencies = [
     "orbax-checkpoint>=0.11.36",
 ]
 
+[project.scripts]
+scacchi-install-mohex = "scacchi.install_mohex:main"
+scacchi-train = "scacchi.train:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.uv]
+package = true
 
 [tool.uv.sources]
 optax = { git = "https://github.com/google-deepmind/optax.git" }

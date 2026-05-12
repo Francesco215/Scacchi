@@ -55,6 +55,7 @@ cover/
 outputs/
 checkpoints/
 baselines/
+third_party/
 
 # Translations
 *.mo
