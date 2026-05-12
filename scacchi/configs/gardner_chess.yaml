@@ -1,4 +1,5 @@
 env_id: gardner_chess
+board_size: null
 seed: 0
 max_num_iters: 300
 num_channels: 128

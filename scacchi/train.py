@@ -25,6 +25,7 @@ from pgx._src.baseline import BaselineModelId
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from .envs import make_env
 from .evaluations import make_evaluate
 from .logger import build_logger
 from .network import AZNet
@@ -33,6 +34,7 @@ from .pipeline import make_training_iteration
 
 class Config(BaseModel):
     env_id: pgx.EnvId = "go_9x9"
+    board_size: int | None = None
     seed: int = 0
     max_num_iters: int = 400
     # network params
@@ -62,7 +64,7 @@ def main(cfg: DictConfig) -> None:
     container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
     config: Config = Config(**container)
 
-    env = pgx.make(config.env_id)
+    env = make_env(config.env_id, config.board_size)
     baseline = pgx.make_baseline_model(cast(BaselineModelId, config.env_id + "_v0"))
     model = AZNet(
         num_actions=env.num_actions,
