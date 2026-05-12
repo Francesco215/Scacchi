@@ -59,6 +59,12 @@ def make_evaluate(env, baseline, config):
             opp_logits, _ = baseline(env_state.observation)
             is_my_turn = (env_state.current_player == my_player).reshape((-1, 1))
             logits = jnp.where(is_my_turn, my_logits, opp_logits)
+            logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+            logits = jnp.where(
+                env_state.legal_action_mask,
+                logits,
+                jnp.finfo(logits.dtype).min,
+            )
             key, action_key = jax.random.split(key)
             action = jax.random.categorical(action_key, logits, axis=-1)
             env_state = jax.vmap(env.step)(env_state, action)
