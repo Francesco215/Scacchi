@@ -11,6 +11,38 @@ from .mohex import make_mohex_action_selector
 from .network import AZNet
 from .play import make_recurrent_fn
 
+
+def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations):
+    logits, value = predict(env_state.observation)
+    root = mctx.RootFnOutput(
+        prior_logits=logits,
+        value=value,
+        embedding=env_state,
+    )
+    return mctx.gumbel_muzero_policy(
+        params=(),
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=num_simulations,
+        invalid_actions=~env_state.legal_action_mask,
+        qtransform=mctx.qtransform_completed_by_mix_value,
+        gumbel_scale=1.0,
+    )
+
+
+@nnx.jit(static_argnums=(0, 4))
+def _make_model_mcts_policy(env, model, rng_key, env_state, num_simulations):
+    predict = lambda obs: model(obs, train=False)
+    return _make_mcts_policy(
+        predict,
+        make_recurrent_fn(env, predict),
+        rng_key,
+        env_state,
+        num_simulations,
+    )
+
+
 def make_evaluate(env, baseline, config):
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: AZNet):
@@ -28,6 +60,8 @@ def make_evaluate(env, baseline, config):
             opp_logits, _ = baseline(env_state.observation)
             is_my_turn = (env_state.current_player == my_player).reshape((-1, 1))
             logits = jnp.where(is_my_turn, my_logits, opp_logits)
+            logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+            logits = jnp.where(env_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
             key, action_key = jax.random.split(key)
             action = jax.random.categorical(action_key, logits, axis=-1)
             env_state = jax.vmap(env.step)(env_state, action)
@@ -60,33 +94,18 @@ def make_mcts_evaluate(env, baseline, config):
         choose_mohex_actions, close_mohex = make_mohex_action_selector(
             env, config, my_player
         )
-
         def body_fn(val):
             key, env_state, returns = val
-            observation = env_state.observation
+            key, my_key = jax.random.split(key, 3)
 
-            my_logits, my_value = my_predict(observation)
-
-            key, my_key = jax.random.split(key)
-
-            my_root = mctx.RootFnOutput(
-                prior_logits=my_logits,
-                value=my_value,
-                embedding=env_state,
+            my_policy = _make_model_mcts_policy(
+                env,
+                model,
+                my_key,
+                env_state,
+                config.num_simulations,
             )
-            my_policy = mctx.gumbel_muzero_policy(
-                params=(),
-                rng_key=my_key,
-                root=my_root,
-                recurrent_fn=my_recurrent_fn,
-                num_simulations=config.num_simulations,
-                invalid_actions=~env_state.legal_action_mask,
-                qtransform=mctx.qtransform_completed_by_mix_value,
-                gumbel_scale=1.0,
-            )
-
             opp_action = choose_mohex_actions(env_state)
-
             is_my_turn = env_state.current_player == my_player
             action = jnp.where(is_my_turn, my_policy.action, opp_action)
 
