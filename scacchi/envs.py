@@ -24,5 +24,17 @@ def make_env(env_id: str, board_size: int | None = None):
             _x=x,
         )
 
+    def _step(state, action, key):
+        del key
+        x = env._game.step(state._x, action)
+        return state.replace(
+            current_player=state._player_order[x.color],
+            legal_action_mask=env._game.legal_action_mask(x).at[-1].set(jnp.bool_(False)),
+            terminated=env._game.is_terminal(x),
+            rewards=env._game.rewards(x)[state._player_order],
+            _x=x,
+        )
+
     env._init = _init
+    env._step = _step
     return env

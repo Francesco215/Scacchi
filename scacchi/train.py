@@ -72,6 +72,10 @@ class Config(BaseModel):
     mohex_max_time: float | None = None
     mohex_max_games: int | None = None
     mohex_max_nodes: int | None = None
+    mohex_num_processes: int = 1
+    mohex_num_threads: int | None = None
+    mohex_dfpn_threads: int | None = None
+    mohex_parallel_solver: bool = False
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"
