@@ -73,7 +73,7 @@ def test_hex_env_disables_swap_rule():
     assert not bool(jax.device_get(state.legal_action_mask[-1]))
 
 
-def test_mohex_selector_concedes_after_retry_failure(monkeypatch, tmp_path):
+def test_mohex_selector_does_not_silently_replace_failed_moves(monkeypatch, tmp_path):
     binary = tmp_path / "mohex"
     binary.write_text("")
     monkeypatch.setattr(mohex_module, "mohex_binary", lambda: binary)
@@ -106,11 +106,57 @@ def test_mohex_selector_concedes_after_retry_failure(monkeypatch, tmp_path):
         my_player=1 - current_player,
     )
     try:
-        actions = choose(batch_state)
-        chosen = int(jax.device_get(actions[0]))
-        assert bool(jax.device_get(state.legal_action_mask[chosen]))
+        with pytest.raises(RuntimeError, match="MoHex failed after restart"):
+            choose(batch_state)
     finally:
         close()
+
+
+def test_mohex_selector_recovers_search_crash_with_fallback_move(monkeypatch, tmp_path):
+    binary = tmp_path / "mohex"
+    binary.write_text("")
+    monkeypatch.setattr(mohex_module, "mohex_binary", lambda: binary)
+
+    class SearchCrashMoHex:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def genmove(self, state, board_size):
+            raise RuntimeError(
+                "MoHex exited unexpectedly. stderr:\n"
+                "Fillin caused win! Removing...\n"
+                "Best move cannot be determined, must search state.\n"
+            )
+
+        def fallback_move(self, state, board_size):
+            return 4
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mohex_module, "MoHexProcess", SearchCrashMoHex)
+
+    env = make_env("hex", 3)
+    state = env.init(jax.random.PRNGKey(0))
+    current_player = int(jax.device_get(state.current_player))
+    batch_state = jax.tree_util.tree_map(lambda x: x[None], state)
+    config = SimpleNamespace(
+        board_size=3,
+        mohex_num_processes=1,
+        mohex_num_threads=1,
+        mohex_dfpn_threads=1,
+    )
+    choose, close = mohex_module.make_mohex_action_selector(
+        env,
+        config,
+        my_player=1 - current_player,
+    )
+    try:
+        action = choose(batch_state)
+    finally:
+        close()
+
+    assert int(jax.device_get(action[0])) == 4
 
 
 @pytest.mark.skipif(not MOHEX_BINARY.exists(), reason="MoHex binary is not built")
@@ -134,6 +180,28 @@ def test_mohex_genmove_crashes_on_known_fillin_position():
             mohex.genmove(state, 5)
     finally:
         mohex.close()
+
+
+@pytest.mark.skipif(not MOHEX_BINARY.exists(), reason="MoHex binary is not built")
+def test_mohex_fallback_move_handles_known_fillin_position():
+    env = make_env("hex", 5)
+    state = _build_state(env, [8, 1, 17, 19])
+
+    mohex = MoHexProcess(
+        str(MOHEX_BINARY),
+        max_memory=67108864,
+        max_time=1.0,
+        max_games=1000,
+        num_threads=1,
+        dfpn_threads=1,
+        parallel_solver=False,
+    )
+    try:
+        action = mohex.fallback_move(state, 5)
+    finally:
+        mohex.close()
+
+    assert bool(jax.device_get(state.legal_action_mask[action]))
 
 
 @pytest.mark.skipif(not MOHEX_BINARY.exists(), reason="MoHex binary is not built")

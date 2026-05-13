@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import random
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -79,12 +78,18 @@ def _first_legal_action(state) -> int:
     raise ValueError("No legal actions available for non-terminal state.")
 
 
-def _random_legal_action(state) -> int:
-    legal = jax.device_get(state.legal_action_mask)
-    candidates = [i for i, is_legal in enumerate(legal) if bool(is_legal)]
-    if not candidates:
-        raise ValueError("No legal actions available for non-terminal state.")
-    return random.choice(candidates)
+def _is_mohex_search_crash(exc: BaseException) -> bool:
+    text = str(exc)
+    if "MoHex exited unexpectedly" not in text:
+        return False
+    return (
+        "curMostHits == 0" in text
+        or (
+            "Fillin caused win! Removing..." in text
+            and "Best move cannot be determined, must search state." in text
+        )
+        or "Opponent has won; playing most blocking move." in text
+    )
 
 
 def _state_at(batch_state, index: int):
@@ -188,7 +193,7 @@ class MoHexProcess:
         self._proc.stdin.flush()
         return self._read_answer()
 
-    def genmove(self, state, board_size: int) -> int:
+    def _load_state(self, state, board_size: int) -> None:
         sgf = _state_to_sgf(state, board_size)
         with tempfile.NamedTemporaryFile("w") as handle:
             handle.write(sgf)
@@ -196,14 +201,50 @@ class MoHexProcess:
             self.query(f"boardsize {board_size}")
             self.query("clear_board")
             self.query(f"loadsgf {handle.name}")
-        color = "black" if int(jax.device_get(state._x.color)) == 0 else "white"
-        move = self.query(f"reg_genmove {color}")
-        if move.strip().lower() in {"invalid", "resign"}:
-            return _first_legal_action(state)
+
+    def _color_to_move(self, state) -> str:
+        return "black" if int(jax.device_get(state._x.color)) == 0 else "white"
+
+    def _checked_action(self, state, board_size: int, move: str, source: str) -> int:
         action = _mohex_move_to_action(move, board_size)
         if not bool(jax.device_get(state.legal_action_mask[action])):
-            raise ValueError(f"MoHex returned illegal move {move!r} (action {action})")
+            raise ValueError(
+                f"MoHex returned illegal {source} move {move!r} (action {action})"
+            )
         return action
+
+    def genmove(self, state, board_size: int) -> int:
+        self._load_state(state, board_size)
+        color = self._color_to_move(state)
+        move = self.query(f"reg_genmove {color}")
+        if move.strip().lower() in {"invalid", "resign"}:
+            return self.fallback_move(state, board_size)
+        return self._checked_action(state, board_size, move, "genmove")
+
+    def fallback_move(self, state, board_size: int) -> int:
+        self._load_state(state, board_size)
+        color = self._color_to_move(state)
+
+        try:
+            response = self.query(f"mohex-find-top-moves {color}")
+        except ValueError as exc:
+            if "State is determined." not in str(exc):
+                raise
+        else:
+            move = response.split()[0] if response.split() else "resign"
+            if move.lower() not in {"invalid", "resign"}:
+                return self._checked_action(state, board_size, move, "top")
+
+        try:
+            move = self.query(f"mohex-playout-move {color}")
+        except ValueError as exc:
+            if "State is determined." not in str(exc):
+                raise
+        else:
+            if move.lower() not in {"invalid", "resign"}:
+                return self._checked_action(state, board_size, move, "playout")
+
+        return _first_legal_action(state)
 
     def close(self) -> None:
         if self._proc.poll() is None:
@@ -255,16 +296,34 @@ def make_mohex_action_selector(env, config, my_player: int = 0):
 
     def solve_chunk(slot: int, states):
         out = []
+
+        def recover(single_state) -> int:
+            try:
+                return opponents[slot].fallback_move(single_state, board_size)
+            except (RuntimeError, ValueError):
+                restart(slot)
+                return _first_legal_action(single_state)
+
         for index, single_state in states:
             try:
                 action = opponents[slot].genmove(single_state, board_size)
-            except (RuntimeError, ValueError):
+            except (RuntimeError, ValueError) as first_exc:
                 restart(slot)
+                if _is_mohex_search_crash(first_exc):
+                    action = recover(single_state)
+                    out.append((index, action))
+                    continue
                 try:
                     action = opponents[slot].genmove(single_state, board_size)
-                except (RuntimeError, ValueError):
+                except (RuntimeError, ValueError) as retry_exc:
                     restart(slot)
-                    action = _random_legal_action(single_state)
+                    if _is_mohex_search_crash(retry_exc):
+                        action = recover(single_state)
+                        out.append((index, action))
+                        continue
+                    raise RuntimeError(
+                        f"MoHex failed after restart for batch index {index}"
+                    ) from retry_exc
             out.append((index, action))
         return out
 

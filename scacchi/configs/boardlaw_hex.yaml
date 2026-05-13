@@ -1,0 +1,34 @@
+env_id: hex
+board_size: 5
+seed: 0
+max_num_iters: 1000
+# network — fully-connected ReZero residual net (Jones 2021, arXiv:2104.03113)
+# BEST table for 5x5: width=16, depth=4
+network: boardlaw
+fc_width: 16
+fc_depth: 4
+# unused by BoardlawNet but kept so the pydantic schema validates:
+num_channels: 128
+num_layers: 6
+resnet_v2: true
+# selfplay — boardlaw uses 32*1024 parallel envs; scaled down here to 4096
+# (raise toward 32768 if hardware allows)
+selfplay_batch_size: 4096
+num_simulations: 64
+max_num_steps: 256
+# training
+training_batch_size: 4096
+learning_rate: 1.0e-3
+log_interval: 1
+# eval
+eval_interval: 10
+eval_batch_size: 64
+mohex_max_memory: 67108864
+mohex_max_time: 1.0
+mohex_max_games: 1000
+mohex_num_processes: 8
+mohex_num_threads: 1
+mohex_dfpn_threads: 1
+mohex_parallel_solver: false
+wandb_enabled: false
+wandb_project: scacchi-az
