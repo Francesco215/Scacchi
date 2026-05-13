@@ -31,7 +31,7 @@ from tqdm import tqdm
 
 from .envs import make_env
 from .evaluations import make_mcts_evaluate
-from .logger import build_logger
+from .logger import build_logger, returns_metrics
 from .network import AZNet
 from .pipeline import make_training_iteration
 
@@ -71,6 +71,7 @@ class Config(BaseModel):
     mohex_max_memory: int | None = None
     mohex_max_time: float | None = None
     mohex_max_games: int | None = None
+    mohex_max_nodes: int | None = None
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"
@@ -115,10 +116,11 @@ def main(cfg: DictConfig) -> None:
         )
         pbar.refresh()
         for iteration in pbar:
+            dict_to_log = {}
             if config.eval_interval > 0 and iteration % config.eval_interval == 0:
                 rng_key, subkey = jax.random.split(rng_key)
                 returns = evaluate(subkey, model)
-                logger.log_returns(iteration, returns, prefix="eval/vs_baseline")
+                dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
 
             st = time.time()
             rng_key, subkey = jax.random.split(rng_key)
@@ -127,18 +129,20 @@ def main(cfg: DictConfig) -> None:
 
             et = time.time()
             hours += (et - st) / 3600
-            dict_to_log = {
-                "policy_loss": policy_losses.mean().item(),
-                "value_loss": value_losses.mean().item(),
-                "hours": hours,
-                "frames": frames,
-            }
+            dict_to_log.update(
+                {
+                    "train/policy_loss": policy_losses.mean().item(),
+                    "train/value_loss": value_losses.mean().item(),
+                    "train/hours": hours,
+                    "train/frames": frames,
+                }
+            )
             logger.log(
                 iteration,
                 dict_to_log,
                 pbar=pbar,
-                prefix="train/",
-                pbar_filter=r"loss",
+                prefix="",
+                pbar_filter=r"loss|avg_R",
             )
 
 

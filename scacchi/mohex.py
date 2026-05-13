@@ -24,6 +24,9 @@ def mohex_binary() -> Path:
     return Path(os.environ.get("MOHEX_BINARY", DEFAULT_MOHEX_BINARY))
 
 
+MOHEX_BINARY = mohex_binary()
+
+
 def _action_to_notation(action: int, board_size: int) -> str:
     row, col = divmod(action, board_size)
     return f"{chr(ord('a') + col)}{row + 1}"
@@ -31,7 +34,7 @@ def _action_to_notation(action: int, board_size: int) -> str:
 
 def _state_to_sgf(state, board_size: int) -> str:
     board = jax.device_get(state._x.board).reshape(board_size, board_size)
-    to_play = int(jax.device_get(state.current_player))
+    to_play = int(jax.device_get(state._x.color))
 
     if to_play == 0:
         black = board > 0
@@ -84,20 +87,58 @@ class MoHexProcess:
         max_memory: int | None = None,
         max_time: float | None = None,
         max_games: int | None = None,
+        max_nodes: int | None = None,
+        solver: bool = True,
     ):
+        config = self._write_config(
+            max_memory=max_memory,
+            max_time=max_time,
+            max_games=max_games,
+            max_nodes=max_nodes,
+            solver=solver,
+        )
+        self._config_path = config.name
+        config.close()
         self._proc = subprocess.Popen(
-            [binary, "--use-logfile=0"],
+            [binary, "--use-logfile=0", f"--config={self._config_path}"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        if max_memory is not None:
-            self.query(f"param_mohex max_memory {max_memory}")
-        if max_time is not None:
-            self.query(f"param_mohex max_time {max_time}")
+
+    @staticmethod
+    def _write_config(
+        max_memory: int | None,
+        max_time: float | None,
+        max_games: int | None,
+        max_nodes: int | None,
+        solver: bool,
+    ):
+        lines: list[str] = []
         if max_games is not None:
-            self.query(f"param_mohex max_games {max_games}")
+            lines.append(f"param_mohex max_games {max_games}")
+            if max_games < 11:
+                lines.append(f"param_mohex expand_threshold {max_games - 1}")
+        if solver:
+            lines.extend(
+                [
+                    "param_mohex knowledge_threshold 0",
+                    "param_mohex use_parallel_solver 1",
+                    "param_dfpn threads 4",
+                ]
+            )
+        if max_memory is not None:
+            lines.append(f"param_mohex max_memory {max_memory}")
+        if max_time is not None:
+            lines.append("param_mohex use_time_management 1")
+            lines.append(f"param_game game_time {max_time / 2}")
+        if max_nodes is not None:
+            lines.append(f"param_mohex max_nodes {max_nodes}")
+
+        config = tempfile.NamedTemporaryFile("w", delete=False, prefix="mohex-config-")
+        config.write("\n".join(lines))
+        return config
 
     def _read_answer(self) -> str:
         assert self._proc.stdout is not None
@@ -132,7 +173,7 @@ class MoHexProcess:
             self.query(f"boardsize {board_size}")
             self.query("clear_board")
             self.query(f"loadsgf {handle.name}")
-        color = "black" if int(jax.device_get(state.current_player)) == 0 else "white"
+        color = "black" if int(jax.device_get(state._x.color)) == 0 else "white"
         move = self.query(f"reg_genmove {color}")
         if move.strip().lower() == "resign":
             return _first_legal_action(state)
@@ -146,6 +187,10 @@ class MoHexProcess:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait()
+        try:
+            os.unlink(self._config_path)
+        except FileNotFoundError:
+            pass
 
 
 def make_mohex_action_selector(env, config, my_player: int = 0):
@@ -157,6 +202,7 @@ def make_mohex_action_selector(env, config, my_player: int = 0):
     max_memory = getattr(config, "mohex_max_memory", None)
     max_time = getattr(config, "mohex_max_time", None)
     max_games = getattr(config, "mohex_max_games", None)
+    max_nodes = getattr(config, "mohex_max_nodes", None)
 
     def new_opponent() -> MoHexProcess:
         return MoHexProcess(
@@ -164,6 +210,7 @@ def make_mohex_action_selector(env, config, my_player: int = 0):
             max_memory=max_memory,
             max_time=max_time,
             max_games=max_games,
+            max_nodes=max_nodes,
         )
 
     opponent = new_opponent()

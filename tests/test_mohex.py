@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import pytest
 
 from scacchi.envs import make_env
-from scacchi.mohex import MOHEX_BINARY, MoHexProcess
+from scacchi.mohex import MOHEX_BINARY, MoHexProcess, _state_to_sgf
 
 
 def _build_state(env, seq):
@@ -47,6 +47,19 @@ def _solve_state(env, state, cache):
 
     cache[key] = (best_value, tuple(best_actions))
     return cache[key]
+
+
+def test_state_to_sgf_uses_internal_hex_color_not_external_player_id():
+    env = make_env("hex", 3)
+    state = env.init(jax.random.PRNGKey(0))
+    state = state.replace(_player_order=jnp.array([1, 0]), current_player=jnp.int32(1))
+
+    state = env.step(state, jnp.int32(0))
+    state = env.step(state, jnp.int32(4))
+
+    assert int(jax.device_get(state.current_player)) == 1
+    assert int(jax.device_get(state._x.color)) == 0
+    assert _state_to_sgf(state, 3) == "(;AP[Scacchi]FF[4]GM[11]SZ[3]PL[B];B[a1];W[b2])"
 
 
 @pytest.mark.skipif(not MOHEX_BINARY.exists(), reason="MoHex binary is not built")
