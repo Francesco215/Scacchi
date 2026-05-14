@@ -14,6 +14,7 @@
 
 import os
 import time
+from pathlib import Path
 from typing import Any, cast
 
 # Training is GPU-only by default. Override JAX_PLATFORMS deliberately for
@@ -22,6 +23,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cuda")
 
 from flax import nnx
 import hydra
+from hydra.utils import get_original_cwd
 import jax
 import optax
 import pgx
@@ -29,10 +31,11 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from tqdm import tqdm
 
+from .checkpoint import build_checkpoint_manager, maybe_save, restore
 from .envs import make_env
 from .evaluations import make_mcts_evaluate
 from .logger import build_logger, returns_metrics
-from .network import AZNet, BoardlawNet
+from .network import build_model
 from .pipeline import make_training_iteration
 
 
@@ -80,6 +83,9 @@ class Config(BaseModel):
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"
+    # checkpoint params
+    ckpt_max_to_keep: int = 3
+    ckpt_save_interval_steps: int = 50
 
     model_config = ConfigDict(extra="forbid")
 
@@ -91,25 +97,12 @@ def main(cfg: DictConfig) -> None:
     report_jax_backend()
 
     env = make_env(config.env_id, config.board_size)
-    if config.network == "aznet":
-        model = AZNet(
-            num_actions=env.num_actions,
-            observation_shape=env.observation_shape,
-            num_channels=config.num_channels,
-            num_blocks=config.num_layers,
-            resnet_v2=config.resnet_v2,
-            rngs=nnx.Rngs(config.seed),
-        )
-    elif config.network == "boardlaw":
-        model = BoardlawNet(
-            num_actions=env.num_actions,
-            observation_shape=env.observation_shape,
-            width=config.num_channels,
-            depth=config.num_layers,
-            rngs=nnx.Rngs(config.seed),
-        )
-    else:
-        raise ValueError(f"unknown network: {config.network!r}")
+    model = build_model(
+        config,
+        num_actions=env.num_actions,
+        observation_shape=env.observation_shape,
+        rngs=nnx.Rngs(config.seed),
+    )
     optimizer = nnx.Optimizer(
         model,
         optax.adam(learning_rate=config.learning_rate),
@@ -124,42 +117,51 @@ def main(cfg: DictConfig) -> None:
 
     rng_key = jax.random.PRNGKey(config.seed)
     with build_logger(config) as logger:
-        pbar = tqdm(
-            range(config.max_num_iters),
-            desc="training",
-            dynamic_ncols=True,
-            total=config.max_num_iters,
-        )
-        pbar.refresh()
-        for iteration in pbar:
-            dict_to_log = {}
-            if iteration == config.max_num_iters - 1 or (config.eval_interval > 0 and iteration % config.eval_interval == 0):
+        ckpt_dir = (Path(get_original_cwd()) / "checkpoints" / f"{config.board_size}").resolve()
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        with build_checkpoint_manager(config, ckpt_dir) as ckpt_mgr:
+            start_iter, rng_key, hours, frames = restore(ckpt_mgr, model, optimizer, rng_key)
+            pbar = tqdm(range(start_iter, config.max_num_iters), desc="training", dynamic_ncols=True, total=config.max_num_iters, initial=start_iter)
+            pbar.refresh()
+            for iteration in pbar:
+                dict_to_log = {}
+                if iteration == config.max_num_iters - 1 or (config.eval_interval > 0 and iteration % config.eval_interval == 0):
+                    rng_key, subkey = jax.random.split(rng_key)
+                    returns = evaluate(subkey, model)
+                    dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
+
+                st = time.time()
                 rng_key, subkey = jax.random.split(rng_key)
-                returns = evaluate(subkey, model)
-                dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
+                policy_losses, value_losses = training_iteration(model, optimizer, subkey)
+                frames += config.selfplay_batch_size * config.max_num_steps
 
-            st = time.time()
-            rng_key, subkey = jax.random.split(rng_key)
-            policy_losses, value_losses = training_iteration(model, optimizer, subkey)
-            frames += config.selfplay_batch_size * config.max_num_steps
-
-            et = time.time()
-            hours += (et - st) / 3600
-            dict_to_log.update(
-                {
-                    "train/policy_loss": policy_losses.mean().item(),
-                    "train/value_loss": value_losses.mean().item(),
-                    "train/hours": hours,
-                    "train/frames": frames,
-                }
-            )
-            logger.log(
-                iteration,
-                dict_to_log,
-                pbar=pbar,
-                prefix="",
-                pbar_filter=r"loss|avg_R",
-            )
+                et = time.time()
+                hours += (et - st) / 3600
+                dict_to_log.update(
+                    {
+                        "train/policy_loss": policy_losses.mean().item(),
+                        "train/value_loss": value_losses.mean().item(),
+                        "train/hours": hours,
+                        "train/frames": frames,
+                    }
+                )
+                logger.log(
+                    iteration,
+                    dict_to_log,
+                    pbar=pbar,
+                    prefix="",
+                    pbar_filter=r"loss|avg_R",
+                )
+                maybe_save(
+                    ckpt_mgr,
+                    iteration,
+                    model,
+                    optimizer,
+                    rng_key,
+                    config,
+                    hours,
+                    frames,
+                )
 
 
 if __name__ == "__main__":

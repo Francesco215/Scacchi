@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 import math
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+
+if TYPE_CHECKING:
+    from .train import Config
 
 
 class BlockV1(nnx.Module):
@@ -162,3 +168,30 @@ class BoardlawNet(nnx.Module):
         logits = self.policy_head(x)
         value = jnp.tanh(self.value_head(x)).reshape((-1,))
         return logits, value
+
+
+def build_model(
+    config: Config,
+    *,
+    num_actions: int,
+    observation_shape: Sequence[int],
+    rngs: nnx.Rngs,
+) -> nnx.Module:
+    if config.network == "aznet":
+        return AZNet(
+            num_actions=num_actions,
+            observation_shape=observation_shape,
+            num_channels=config.num_channels,
+            num_blocks=config.num_layers,
+            resnet_v2=config.resnet_v2,
+            rngs=rngs,
+        )
+    if config.network == "boardlaw":
+        return BoardlawNet(
+            num_actions=num_actions,
+            observation_shape=observation_shape,
+            width=config.num_channels,
+            depth=config.num_layers,
+            rngs=rngs,
+        )
+    raise ValueError(f"unknown network: {config.network!r}")

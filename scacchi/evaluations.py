@@ -26,7 +26,7 @@ def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations
         num_simulations=num_simulations,
         invalid_actions=~env_state.legal_action_mask,
         qtransform=mctx.qtransform_completed_by_mix_value,
-        gumbel_scale=1.0,
+        gumbel_scale=0.0,
     )
 
 

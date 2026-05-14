@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any, Literal, Protocol, Self, TypeGuard
 
@@ -53,6 +54,7 @@ class Logger:
         self.log_every = log_every
         self.max_steps = max_steps
         self._initialized = False
+        self.run_name: str = f"local-{time.strftime('%Y%m%d-%H%M%S')}"
 
     def should_log(self, step: int) -> bool:
         if self.log_every <= 0:
@@ -174,6 +176,8 @@ class WandbLogger(Logger):
             dir=self.dir,
             save_code=True,
         )
+        if self._run is not None and getattr(self._run, "name", None):
+            self.run_name = self._run.name
         self._initialized = True
         return self
 
