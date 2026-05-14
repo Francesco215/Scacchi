@@ -1,9 +1,10 @@
 env_id: hex
 board_size: 5
+network: boardlaw
 seed: 0
 max_num_iters: 300
-num_channels: 128
-num_layers: 6
+num_channels: 256
+num_layers: 8
 resnet_v2: true
 selfplay_batch_size: 1024
 num_simulations: 32
@@ -11,7 +12,7 @@ max_num_steps: 256
 training_batch_size: 4096
 learning_rate: 1.0e-3
 log_interval: 1
-eval_interval: 10
+eval_interval: 0
 eval_batch_size: 64
 mohex_max_memory: 67108864
 mohex_max_time: 1.0
@@ -20,5 +21,5 @@ mohex_num_processes: 8
 mohex_num_threads: 1
 mohex_dfpn_threads: 1
 mohex_parallel_solver: false
-wandb_enabled: false
+wandb_enabled: true
 wandb_project: scacchi-az

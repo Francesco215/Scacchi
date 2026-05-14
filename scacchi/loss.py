@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from .network import AZNet
 from .play import SelfplayOutput
 
 
@@ -43,8 +42,8 @@ def make_compute_loss_input(config):
     return compute_loss_input
 
 
-def train(model: AZNet, optimizer: nnx.Optimizer, data: Sample):
-    def loss_fn(model: AZNet):
+def train(model: nnx.Module, optimizer: nnx.Optimizer, data: Sample):
+    def loss_fn(model: nnx.Module):
         logits, value = model(data.obs, train=True)
         policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt)
         policy_loss = jnp.mean(policy_loss)

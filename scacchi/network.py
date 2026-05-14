@@ -1,3 +1,4 @@
+import math
 from collections.abc import Sequence
 
 import jax
@@ -109,4 +110,55 @@ class AZNet(nnx.Module):
         value = jnp.tanh(value)
         value = value.reshape((-1,))
 
+        return logits, value
+
+
+class ReZeroResidual(nnx.Module):
+    """ReZero residual block: x + α · Linear(ReLU(x)) with α initialized to 0."""
+
+    def __init__(self, width: int, *, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(
+            width,
+            width,
+            kernel_init=jax.nn.initializers.orthogonal(scale=math.sqrt(2.0)),
+            rngs=rngs,
+        )
+        self.alpha = nnx.Param(jnp.zeros(()))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return x + self.alpha * self.linear(jax.nn.relu(x))
+
+
+class BoardlawNet(nnx.Module):
+    """Fully-connected ReZero residual net from Jones (2021),
+    "Scaling Scaling Laws with Board Games" (arXiv:2104.03113)."""
+
+    def __init__(
+        self,
+        num_actions: int,
+        observation_shape: Sequence[int],
+        *,
+        width: int = 512,
+        depth: int = 8,
+        rngs: nnx.Rngs,
+    ):
+        self.num_actions = num_actions
+        self.width = width
+        self.depth = depth
+
+        input_dim = math.prod(observation_shape)
+        self.intake = nnx.Linear(input_dim, width, rngs=rngs)
+        self.blocks = nnx.List([ReZeroResidual(width, rngs=rngs) for _ in range(depth)])
+        self.policy_head = nnx.Linear(width, num_actions, rngs=rngs)
+        self.value_head = nnx.Linear(width, 1, rngs=rngs)
+
+    def __call__(self, x: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array]:
+        del train
+        x = x.astype(jnp.float32)
+        x = x.reshape((x.shape[0], -1))
+        x = self.intake(x)
+        for block in self.blocks:
+            x = block(x)
+        logits = self.policy_head(x)
+        value = jnp.tanh(self.value_head(x)).reshape((-1,))
         return logits, value

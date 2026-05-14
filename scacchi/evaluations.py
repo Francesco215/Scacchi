@@ -8,7 +8,6 @@ import mctx
 import optax
 
 from .mohex import make_mohex_action_selector
-from .network import AZNet
 from .play import make_recurrent_fn
 
 
@@ -47,7 +46,7 @@ def make_evaluate(env, baseline, config):
     eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
 
     @nnx.jit
-    def evaluate(rng_key: jax.Array, model: AZNet):
+    def evaluate(rng_key: jax.Array, model: nnx.Module):
         """A simplified evaluation by sampling. Only for debugging.
         Please use MCTS and run tournaments for serious evaluation."""
         my_player = 0
@@ -86,7 +85,7 @@ def make_evaluate(env, baseline, config):
 def make_mcts_evaluate(env, config):
     eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
 
-    def evaluate(rng_key: jax.Array, model: AZNet):
+    def evaluate(rng_key: jax.Array, model: nnx.Module):
         """MCTS evaluation: model search vs MoHex opponent."""
         my_player = 0
 

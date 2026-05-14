@@ -32,7 +32,7 @@ from tqdm import tqdm
 from .envs import make_env
 from .evaluations import make_mcts_evaluate
 from .logger import build_logger, returns_metrics
-from .network import AZNet
+from .network import AZNet, BoardlawNet
 from .pipeline import make_training_iteration
 
 
@@ -54,6 +54,7 @@ class Config(BaseModel):
     seed: int = 0
     max_num_iters: int = 400
     # network params
+    network: str = "aznet"  # "aznet" | "boardlaw"
     num_channels: int = 128
     num_layers: int = 6
     resnet_v2: bool = True
@@ -90,14 +91,25 @@ def main(cfg: DictConfig) -> None:
     report_jax_backend()
 
     env = make_env(config.env_id, config.board_size)
-    model = AZNet(
-        num_actions=env.num_actions,
-        observation_shape=env.observation_shape,
-        num_channels=config.num_channels,
-        num_blocks=config.num_layers,
-        resnet_v2=config.resnet_v2,
-        rngs=nnx.Rngs(config.seed),
-    )
+    if config.network == "aznet":
+        model = AZNet(
+            num_actions=env.num_actions,
+            observation_shape=env.observation_shape,
+            num_channels=config.num_channels,
+            num_blocks=config.num_layers,
+            resnet_v2=config.resnet_v2,
+            rngs=nnx.Rngs(config.seed),
+        )
+    elif config.network == "boardlaw":
+        model = BoardlawNet(
+            num_actions=env.num_actions,
+            observation_shape=env.observation_shape,
+            width=config.num_channels,
+            depth=config.num_layers,
+            rngs=nnx.Rngs(config.seed),
+        )
+    else:
+        raise ValueError(f"unknown network: {config.network!r}")
     optimizer = nnx.Optimizer(
         model,
         optax.adam(learning_rate=config.learning_rate),
@@ -121,7 +133,7 @@ def main(cfg: DictConfig) -> None:
         pbar.refresh()
         for iteration in pbar:
             dict_to_log = {}
-            if config.eval_interval > 0 and iteration % config.eval_interval == 0:
+            if iteration == config.max_num_iters - 1 or (config.eval_interval > 0 and iteration % config.eval_interval == 0):
                 rng_key, subkey = jax.random.split(rng_key)
                 returns = evaluate(subkey, model)
                 dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
