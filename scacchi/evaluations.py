@@ -25,7 +25,6 @@ def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations
     )
 
 
-@nnx.jit(static_argnums=(0, 4))
 def _make_model_mcts_policy(env, model, rng_key, env_state, num_simulations):
     predict = lambda obs: model(obs, train=False)
     return _make_mcts_policy(
@@ -80,6 +79,7 @@ def make_evaluate(env, baseline, config):
 def make_mcts_evaluate(env, config, baseline_model):
     eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
 
+    @nnx.jit
     def evaluate(rng_key: jax.Array, model: nnx.Module):
         """MCTS evaluation: model search vs pretrained opponent."""
         my_player = 0
@@ -105,9 +105,11 @@ def make_mcts_evaluate(env, config, baseline_model):
             ]
             return key, env_state, returns
 
-        val = (key, env_state, jnp.zeros(eval_batch_size))
-        while not bool(jax.device_get(val[1].terminated.all())):
-            val = body_fn(val)
-        return val[2]
+        _, _, returns = nnx.while_loop(
+            lambda x: ~(x[1].terminated.all()),
+            body_fn,
+            (key, env_state, jnp.zeros(eval_batch_size)),
+        )
+        return returns
 
     return evaluate    
