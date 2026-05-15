@@ -31,7 +31,7 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from tqdm import tqdm
 
-from .checkpoint import build_checkpoint_manager, maybe_save, restore
+from .checkpoint import build_checkpoint_manager, maybe_save, restore, from_pretrained
 from .envs import make_env
 from .evaluations import make_mcts_evaluate
 from .logger import build_logger, returns_metrics
@@ -97,6 +97,12 @@ def main(cfg: DictConfig) -> None:
     report_jax_backend()
 
     env = make_env(config.env_id, config.board_size)
+    
+    # >> from pretrained here (aka load the model), get board size load eval model. <<
+    checkpoint_path = 'something' + str(config.board_size ) + 'something'
+    baseline_model = from_pretrained(checkpoint_path, env, rngs=nnx.Rngs(0))
+    
+    
     model = build_model(
         config,
         num_actions=env.num_actions,
@@ -110,7 +116,10 @@ def main(cfg: DictConfig) -> None:
     )
 
     training_iteration = make_training_iteration(env, config)
-    evaluate = make_mcts_evaluate(env, config)
+    
+    # pass eval model here.
+    
+    evaluate = make_mcts_evaluate(env, config, baseline_model)
 
     hours: float = 0.0
     frames: int = 0

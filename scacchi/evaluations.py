@@ -1,13 +1,8 @@
-from typing import NamedTuple
-
-import chex
 from flax import nnx
 import jax
 import jax.numpy as jnp
 import mctx
-import optax
 
-from .mohex import make_mohex_action_selector
 from .play import make_recurrent_fn
 
 
@@ -41,7 +36,7 @@ def _make_model_mcts_policy(env, model, rng_key, env_state, num_simulations):
         num_simulations,
     )
 
-
+# this isnt used why keep?
 def make_evaluate(env, baseline, config):
     eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
 
@@ -82,27 +77,26 @@ def make_evaluate(env, baseline, config):
     return evaluate
 
 
-def make_mcts_evaluate(env, config):
+def make_mcts_evaluate(env, config, baseline_model):
     eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
 
     def evaluate(rng_key: jax.Array, model: nnx.Module):
-        """MCTS evaluation: model search vs MoHex opponent."""
+        """MCTS evaluation: model search vs pretrained opponent."""
         my_player = 0
 
         key, init_key = jax.random.split(rng_key)
         init_keys = jax.random.split(init_key, eval_batch_size)
         env_state = jax.vmap(env.init)(init_keys)
-        choose_mohex_actions, close_mohex = make_mohex_action_selector(
-            env, config, my_player
-        )
+       
         def body_fn(val):
             key, env_state, returns = val
-            key, my_key = jax.random.split(key)
+            key, my_key, opp_key = jax.random.split(key, 3)
 
             my_policy = _make_model_mcts_policy(env, model, my_key, env_state, config.num_simulations)
-            opp_action = choose_mohex_actions(env_state)
+            opp_policy = _make_model_mcts_policy(env, baseline_model, opp_key, env_state, config.num_simulations)
+            
             is_my_turn = env_state.current_player == my_player
-            action = jnp.where(is_my_turn, my_policy.action, opp_action)
+            action = jnp.where(is_my_turn, my_policy.action, opp_policy.action)
 
             env_state = jax.vmap(env.step)(env_state, action)
             returns = returns + env_state.rewards[
@@ -111,12 +105,9 @@ def make_mcts_evaluate(env, config):
             ]
             return key, env_state, returns
 
-        try:
-            val = (key, env_state, jnp.zeros(eval_batch_size))
-            while not bool(jax.device_get(val[1].terminated.all())):
-                val = body_fn(val)
-            return val[2]
-        finally:
-            close_mohex()
+        val = (key, env_state, jnp.zeros(eval_batch_size))
+        while not bool(jax.device_get(val[1].terminated.all())):
+            val = body_fn(val)
+        return val[2]
 
-    return evaluate
+    return evaluate    
