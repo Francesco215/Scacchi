@@ -72,14 +72,6 @@ class Config(BaseModel):
     # eval params
     eval_interval: int = 5
     eval_batch_size: int = 16
-    mohex_max_memory: int | None = None
-    mohex_max_time: float | None = None
-    mohex_max_games: int | None = None
-    mohex_max_nodes: int | None = None
-    mohex_num_processes: int = 1
-    mohex_num_threads: int | None = None
-    mohex_dfpn_threads: int | None = None
-    mohex_parallel_solver: bool = False
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"
@@ -99,9 +91,15 @@ def main(cfg: DictConfig) -> None:
     env = make_env(config.env_id, config.board_size)
     
     # >> from pretrained here (aka load the model), get board size load eval model. <<
-    checkpoint_path = 'something' + str(config.board_size ) + 'something'
-    baseline_model = from_pretrained(checkpoint_path, env, rngs=nnx.Rngs(0))
-    
+    #checkpoint_path = 'something' + str(config.board_size ) + 'something'
+    #baseline_model = from_pretrained(checkpoint_path, env, rngs=nnx.Rngs(0))
+    # random baseline test.
+    baseline_model = build_model(
+        config,
+        num_actions=env.num_actions,
+        observation_shape=env.observation_shape,
+        rngs=nnx.Rngs(config.seed),
+    )
     
     model = build_model(
         config,
