@@ -115,7 +115,7 @@ def from_pretrained(
         meta_restored = manager.restore(
             step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
         )
-        config = Config(**meta_restored["meta"]["config"])
+        config = Config.model_validate(meta_restored["meta"]["config"], extra="ignore")
         model = build_model(
             config,
             num_actions=env.num_actions,
