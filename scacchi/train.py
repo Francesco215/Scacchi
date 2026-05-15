@@ -124,7 +124,15 @@ def main(cfg: DictConfig) -> None:
 
     rng_key = jax.random.PRNGKey(config.seed)
     with build_logger(config) as logger:
-        ckpt_dir = (Path(get_original_cwd()) / "checkpoints" / f"{config.board_size}").resolve()
+        board_size = "none" if config.board_size is None else str(config.board_size)
+        ckpt_dir = (
+            Path(get_original_cwd())
+            / "checkpoints"
+            / (
+                f"{config.env_id}_bs{board_size}_{config.network}"
+                f"_c{config.num_channels}_l{config.num_layers}_seed{config.seed}"
+            )
+        ).resolve()
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         with build_checkpoint_manager(config, ckpt_dir) as ckpt_mgr:
             start_iter, rng_key, hours, frames = restore(ckpt_mgr, model, optimizer, rng_key)
