@@ -1,12 +1,12 @@
 env_id: hex
-board_size: 8
+board_size: 7
 network: boardlaw
 seed: 0
-max_num_iters: 3000
-num_channels: 512
+max_num_iters: 300
+num_channels: 128
 num_layers: 8
 resnet_v2: true
-selfplay_batch_size: 1024
+selfplay_batch_size: 8_192
 num_simulations: 32
 max_num_steps: 256
 training_batch_size: 4096
