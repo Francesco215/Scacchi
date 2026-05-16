@@ -9,12 +9,12 @@ import pgx
 from pgx.experimental import auto_reset
 
 
-
 class SelfplayOutput(NamedTuple):
     obs: jax.Array
     reward: jax.Array
     terminated: jax.Array
     action_weights: chex.Array
+    legal_action_mask: jax.Array
     discount: jax.Array
 
 
@@ -70,6 +70,7 @@ def make_selfplay(env, config):
         ) -> tuple[pgx.State, SelfplayOutput]:
             search_key, reset_key = jax.random.split(key)
             observation = env_state.observation
+            legal_action_mask = env_state.legal_action_mask
             logits, value = model(observation, train=False)
             root = mctx.RootFnOutput(
                 prior_logits=logits,
@@ -99,6 +100,7 @@ def make_selfplay(env, config):
             return env_state, SelfplayOutput(
                 obs=observation,
                 action_weights=policy_output.action_weights,
+                legal_action_mask=legal_action_mask,
                 reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
                 terminated=env_state.terminated,
                 discount=discount,
@@ -112,4 +114,3 @@ def make_selfplay(env, config):
         return data
 
     return selfplay
-
