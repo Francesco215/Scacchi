@@ -1,6 +1,7 @@
 env_id: hex
 board_size: 5
-network: boardlaw
+network: boardlaw_dirichlet
+num_outcomes: null
 seed: 0
 max_num_iters: 300
 num_channels: 128
@@ -11,6 +12,10 @@ num_simulations: 32
 max_num_steps: 256
 training_batch_size: 4096
 learning_rate: 1e-3
+policy_loss_weight: 1.0
+value_outcome_weight: 1.0
+q_outcome_weight: 0.25
+dirichlet_concentration_clip: 8.0
 log_interval: 1
 eval_interval: 1
 eval_batch_size: 64

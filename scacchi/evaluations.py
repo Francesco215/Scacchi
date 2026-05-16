@@ -3,11 +3,12 @@ import jax
 import jax.numpy as jnp
 import mctx
 
+from .network import policy_value_from_output
 from .play import make_recurrent_fn
 
 
 def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations):
-    logits, value = predict(env_state.observation)
+    logits, value = policy_value_from_output(predict(env_state.observation))
     root = mctx.RootFnOutput(
         prior_logits=logits,
         value=value,

@@ -3,7 +3,12 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import optax
 
-from scacchi.loss import Sample, _compute_losses, make_compute_loss_input
+from scacchi.loss import (
+    Sample,
+    _compute_dirichlet_losses,
+    _compute_losses,
+    make_compute_loss_input,
+)
 from scacchi.play import SelfplayOutput
 
 
@@ -19,6 +24,13 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
             ]
         ),
         action_weights=jnp.zeros((3, 2, 4)),
+        played_action=jnp.array(
+            [
+                [0, 2],
+                [1, 0],
+                [3, 1],
+            ]
+        ),
         legal_action_mask=jnp.array(
             [
                 [[True, True, False, False], [True, False, True, False]],
@@ -33,6 +45,7 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
     sample = make_compute_loss_input(config)(data)
 
     assert jnp.array_equal(sample.policy_mask, data.legal_action_mask)
+    assert jnp.array_equal(sample.played_action, data.played_action)
     assert jnp.array_equal(
         sample.value_mask,
         jnp.array(
@@ -50,6 +63,7 @@ def test_policy_loss_ignores_illegal_logits():
         obs=jnp.zeros((1, 1)),
         policy_tgt=jnp.array([[1.0, 0.0, 0.0]]),
         value_tgt=jnp.array([0.0]),
+        played_action=jnp.array([0]),
         policy_mask=jnp.array([[True, False, True]]),
         value_mask=jnp.array([True]),
     )
@@ -80,6 +94,7 @@ def test_value_mask_excludes_policy_and_value_losses_from_average():
             ]
         ),
         value_tgt=jnp.array([0.0, 0.0]),
+        played_action=jnp.array([0, 1]),
         policy_mask=jnp.ones((2, 2), dtype=jnp.bool_),
         value_mask=jnp.array([True, False]),
     )
@@ -99,3 +114,27 @@ def test_value_mask_excludes_policy_and_value_losses_from_average():
     )[0]
     assert jnp.allclose(policy_loss, expected_policy_loss)
     assert jnp.allclose(value_loss, 0.0)
+
+
+def test_dirichlet_outcome_losses_use_played_action():
+    data = Sample(
+        obs=jnp.zeros((1, 1)),
+        policy_tgt=jnp.array([[1.0, 0.0]]),
+        value_tgt=jnp.array([1.0]),
+        played_action=jnp.array([1]),
+        policy_mask=jnp.array([[True, True]]),
+        value_mask=jnp.array([True]),
+    )
+    logits = jnp.array([[0.0, 0.0]])
+    alpha_v = jnp.array([[1.0, 3.0]])
+    alpha_q = jnp.array([[[100.0, 1.0], [1.0, 4.0]]])
+    config = SimpleNamespace(
+        policy_loss_weight=1.0,
+        value_outcome_weight=1.0,
+        q_outcome_weight=0.25,
+    )
+
+    _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
+
+    assert jnp.allclose(metrics.value_outcome_loss, -jnp.log(0.75))
+    assert jnp.allclose(metrics.q_outcome_loss, -jnp.log(0.8))

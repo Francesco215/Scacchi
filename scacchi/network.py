@@ -12,6 +12,37 @@ if TYPE_CHECKING:
     from .train import Config
 
 
+def dirichlet_from_logits(
+    mean_logits: jax.Array,
+    concentration_logit: jax.Array,
+    *,
+    concentration_clip: float | None = None,
+) -> jax.Array:
+    if concentration_clip is not None:
+        concentration_logit = jnp.clip(
+            concentration_logit,
+            -concentration_clip,
+            concentration_clip,
+        )
+    concentration = jax.nn.softplus(concentration_logit)
+    return concentration[..., None] * jax.nn.softmax(mean_logits, axis=-1)
+
+
+def outcome_mean(alpha: jax.Array) -> jax.Array:
+    return alpha / jnp.sum(alpha, axis=-1, keepdims=True)
+
+
+def outcome_utility(outcome_dist: jax.Array) -> jax.Array:
+    return outcome_dist[..., -1] - outcome_dist[..., 0]
+
+
+def policy_value_from_output(output):
+    if len(output) == 2:
+        return output
+    logits, alpha_v, _alpha_q = output
+    return logits, outcome_utility(outcome_mean(alpha_v))
+
+
 class BlockV1(nnx.Module):
     def __init__(self, num_channels: int, *, rngs: nnx.Rngs):
         self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=3, padding="SAME", rngs=rngs)
@@ -170,6 +201,65 @@ class BoardlawNet(nnx.Module):
         return logits, value
 
 
+class BoardlawDirichletNet(nnx.Module):
+    """Boardlaw-style MLP with policy, value-Dirichlet, and Q-Dirichlet heads."""
+
+    def __init__(
+        self,
+        num_actions: int,
+        observation_shape: Sequence[int],
+        *,
+        num_outcomes: int = 2,
+        width: int = 512,
+        depth: int = 8,
+        dirichlet_concentration_clip: float | None = 8.0,
+        rngs: nnx.Rngs,
+    ):
+        self.num_actions = num_actions
+        self.num_outcomes = num_outcomes
+        self.width = width
+        self.depth = depth
+        self.dirichlet_concentration_clip = dirichlet_concentration_clip
+
+        input_dim = math.prod(observation_shape)
+        self.intake = nnx.Linear(input_dim, width, rngs=rngs)
+        self.blocks = nnx.List([ReZeroResidual(width, rngs=rngs) for _ in range(depth)])
+        self.policy_head = nnx.Linear(width, num_actions, rngs=rngs)
+        self.value_dir_head = nnx.Linear(width, num_outcomes, rngs=rngs)
+        self.value_conc_head = nnx.Linear(width, 1, rngs=rngs)
+        self.q_dir_head = nnx.Linear(width, num_actions * num_outcomes, rngs=rngs)
+        self.q_conc_head = nnx.Linear(width, num_actions, rngs=rngs)
+
+    def __call__(self, x: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array, jax.Array]:
+        del train
+        x = x.astype(jnp.float32)
+        x = x.reshape((x.shape[0], -1))
+        x = self.intake(x)
+        for block in self.blocks:
+            x = block(x)
+
+        logits = self.policy_head(x)
+
+        value_mean_logits = self.value_dir_head(x)
+        value_concentration_logit = self.value_conc_head(x).reshape((x.shape[0],))
+        alpha_v = dirichlet_from_logits(
+            value_mean_logits,
+            value_concentration_logit,
+            concentration_clip=self.dirichlet_concentration_clip,
+        )
+
+        q_mean_logits = self.q_dir_head(x).reshape(
+            (x.shape[0], self.num_actions, self.num_outcomes)
+        )
+        q_concentration_logit = self.q_conc_head(x)
+        alpha_q = dirichlet_from_logits(
+            q_mean_logits,
+            q_concentration_logit,
+            concentration_clip=self.dirichlet_concentration_clip,
+        )
+        return logits, alpha_v, alpha_q
+
+
 def build_model(
     config: Config,
     *,
@@ -192,6 +282,19 @@ def build_model(
             observation_shape=observation_shape,
             width=config.num_channels,
             depth=config.num_layers,
+            rngs=rngs,
+        )
+    if config.network == "boardlaw_dirichlet":
+        num_outcomes = config.num_outcomes
+        if num_outcomes is None:
+            num_outcomes = 2 if config.env_id == "hex" else 3
+        return BoardlawDirichletNet(
+            num_actions=num_actions,
+            observation_shape=observation_shape,
+            num_outcomes=num_outcomes,
+            width=config.num_channels,
+            depth=config.num_layers,
+            dirichlet_concentration_clip=config.dirichlet_concentration_clip,
             rngs=rngs,
         )
     raise ValueError(f"unknown network: {config.network!r}")

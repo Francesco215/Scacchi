@@ -8,12 +8,15 @@ import mctx
 import pgx
 from pgx.experimental import auto_reset
 
+from .network import policy_value_from_output
+
 
 class SelfplayOutput(NamedTuple):
     obs: jax.Array
     reward: jax.Array
     terminated: jax.Array
     action_weights: chex.Array
+    played_action: jax.Array
     legal_action_mask: jax.Array
     discount: jax.Array
 
@@ -29,7 +32,7 @@ def make_recurrent_fn(env, predict_fn):
 
         current_player = env_state.current_player
         env_state = jax.vmap(env.step)(env_state, action)
-        logits, value = predict_fn(env_state.observation)
+        logits, value = policy_value_from_output(predict_fn(env_state.observation))
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
         logits = jnp.where(
             env_state.legal_action_mask,
@@ -71,7 +74,7 @@ def make_selfplay(env, config):
             search_key, reset_key = jax.random.split(key)
             observation = env_state.observation
             legal_action_mask = env_state.legal_action_mask
-            logits, value = model(observation, train=False)
+            logits, value = policy_value_from_output(model(observation, train=False))
             root = mctx.RootFnOutput(
                 prior_logits=logits,
                 value=value,
@@ -100,6 +103,7 @@ def make_selfplay(env, config):
             return env_state, SelfplayOutput(
                 obs=observation,
                 action_weights=policy_output.action_weights,
+                played_action=policy_output.action,
                 legal_action_mask=legal_action_mask,
                 reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
                 terminated=env_state.terminated,
