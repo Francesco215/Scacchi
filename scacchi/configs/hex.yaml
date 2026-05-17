@@ -10,6 +10,10 @@ resnet_v2: true
 selfplay_batch_size: 1024
 num_simulations: 32
 max_num_steps: 256
+policy_mc_samples: 32
+c_leaf: 1.0
+c_terminal: 8.0
+selfplay_action_source: posterior_best
 training_batch_size: 4096
 learning_rate: 1e-3
 policy_loss_weight: 1.0

@@ -8,6 +8,7 @@
 \newcommand{\N}{\mathbb{N}}
 \newcommand{\legal}{\mathrm{legal}}
 \newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\softplus}{\operatorname{softplus}}
 \newcommand{\Dirichlet}{\operatorname{Dirichlet}}
 \newcommand{\MaskIllegal}{\operatorname{MaskIllegal}}
 \newcommand{\LegalActions}{\operatorname{LegalActions}}
@@ -58,7 +59,7 @@ U(\phi) = \phi_W - \phi_L.
 \begin{algorithmblock}{Algorithm 1: Dirichlet Q-head parameters}
 \textbf{Input:} state $s$, action $a$, network parameters $\theta$\\
 $\bar{\phi}_\theta^Q(s,a) \gets \softmax(r_\theta^Q(s,a))$\\
-$\alpha_{\theta,0}^Q(s,a) \gets \exp(t_\theta^Q(s,a))$\\
+$\alpha_{\theta,0}^Q(s,a) \gets \softplus(t_\theta^Q(s,a))$\\
 $\alpha_\theta^Q(s,a) \gets \alpha_{\theta,0}^Q(s,a)\bar{\phi}_\theta^Q(s,a)$\\
 \textbf{return} $\alpha_\theta^Q(s,a)$
 \end{algorithmblock}

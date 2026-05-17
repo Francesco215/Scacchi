@@ -268,7 +268,7 @@ Define the Dirichlet concentration as
 
 $$
 \alpha_{\theta,0} =
-\exp(t_\theta) > 0.
+\operatorname{softplus}(t_\theta) > 0.
 $$
 
 Then define the Dirichlet parameters as
@@ -282,7 +282,7 @@ Equivalently, component-wise:
 
 $$
 \alpha_{\theta,z} =
-\exp(t_\theta)\bar{\phi}_{\theta,z},
+\operatorname{softplus}(t_\theta)\bar{\phi}_{\theta,z},
 \qquad
 z \in \{L,D,W\}.
 $$
@@ -316,7 +316,7 @@ $$
 \operatorname{softmax}(r_\theta^V(s)),
 \qquad
 \alpha_{\theta,0}^V(s) =
-\exp(t_\theta^V(s)),
+\operatorname{softplus}(t_\theta^V(s)),
 $$
 
 and
@@ -334,7 +334,7 @@ $$
 \operatorname{softmax}(r_\theta^Q(s,a)),
 \qquad
 \alpha_{\theta,0}^Q(s,a) =
-\exp(t_\theta^Q(s,a)),
+\operatorname{softplus}(t_\theta^Q(s,a)),
 $$
 
 and
@@ -581,7 +581,7 @@ Using the stable Q parameterization:
 
 $$
 \alpha_a^{(0)} =
-\exp(t_\theta^Q(s,a))
+\operatorname{softplus}(t_\theta^Q(s,a))
 \operatorname{softmax}
 \left(
 r_\theta^Q(s,a)
@@ -1280,7 +1280,7 @@ Using the stable parameterization:
 
 $$
 \alpha_\theta^Q(s,a) =
-\exp(t_\theta^Q(s,a))
+\operatorname{softplus}(t_\theta^Q(s,a))
 \operatorname{softmax}
 \left(
 r_\theta^Q(s,a)
@@ -1394,7 +1394,7 @@ The central network parameterization is always the same mean-concentration form:
 
 $$
 \alpha_\theta =
-\exp(t_\theta)
+\operatorname{softplus}(t_\theta)
 \operatorname{softmax}(r_\theta).
 $$
 

@@ -17,6 +17,10 @@ class Sample(NamedTuple):
     played_action: jax.Array
     policy_mask: jax.Array
     value_mask: jax.Array
+    beta_Q_target: jax.Array
+    q_target_mask: jax.Array
+    beta_V_target: jax.Array
+    value_target_mask: jax.Array
 
 
 class TrainMetrics(NamedTuple):
@@ -51,6 +55,10 @@ def make_compute_loss_input(config):
             played_action=data.played_action,
             policy_mask=data.legal_action_mask,
             value_mask=value_mask,
+            beta_Q_target=data.beta_Q_target,
+            q_target_mask=data.q_target_mask,
+            beta_V_target=data.beta_V_target,
+            value_target_mask=data.value_target_mask,
         )
 
     return compute_loss_input
