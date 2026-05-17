@@ -107,10 +107,8 @@ def posterior_targets(
     alpha_Q_prior: jax.Array,
     q_evidence_sum: jax.Array,
     policy_target: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     beta_Q_target = alpha_Q_prior + q_evidence_sum
-    q_target_mask = jnp.sum(q_evidence_sum, axis=-1) > 0
     v_evidence_sum = jnp.sum(policy_target[..., None] * q_evidence_sum, axis=-2)
     beta_V_target = alpha_V_prior + v_evidence_sum
-    value_target_mask = jnp.sum(v_evidence_sum, axis=-1) > 0
-    return beta_Q_target, q_target_mask, beta_V_target, value_target_mask
+    return beta_Q_target, beta_V_target

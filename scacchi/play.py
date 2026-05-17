@@ -30,9 +30,8 @@ class SelfplayOutput(NamedTuple):
     played_action: jax.Array
     legal_action_mask: jax.Array
     beta_Q_target: jax.Array
-    q_target_mask: jax.Array
     beta_V_target: jax.Array
-    value_target_mask: jax.Array
+    q_evidence_mass: jax.Array
     discount: jax.Array
 
 
@@ -151,16 +150,15 @@ def make_dirichlet_recurrent_fn(env, predict_fn, config):
 def _empty_posterior_targets(
     policy_target: jax.Array,
     num_outcomes: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     batch_size, num_actions = policy_target.shape
     beta_q = jnp.zeros(
         (batch_size, num_actions, num_outcomes),
         dtype=policy_target.dtype,
     )
-    q_mask = jnp.zeros((batch_size, num_actions), dtype=jnp.bool_)
     beta_v = jnp.zeros((batch_size, num_outcomes), dtype=policy_target.dtype)
-    value_mask = jnp.zeros((batch_size,), dtype=jnp.bool_)
-    return beta_q, q_mask, beta_v, value_mask
+    q_evidence_mass = jnp.zeros((batch_size, num_actions), dtype=policy_target.dtype)
+    return beta_q, beta_v, q_evidence_mass
 
 
 def make_selfplay(env, config):
@@ -202,7 +200,7 @@ def make_selfplay(env, config):
                 num_outcomes = config.num_outcomes
                 if num_outcomes is None:
                     num_outcomes = 2 if config.env_id == "hex" else 3
-                beta_Q_target, q_target_mask, beta_V_target, value_target_mask = (
+                beta_Q_target, beta_V_target, q_evidence_mass = (
                     _empty_posterior_targets(policy_target, num_outcomes)
                 )
             else:
@@ -240,9 +238,10 @@ def make_selfplay(env, config):
                     legal_action_mask,
                     config.policy_mc_samples,
                 )
-                beta_Q_target, q_target_mask, beta_V_target, value_target_mask = (
+                beta_Q_target, beta_V_target = (
                     posterior_targets(alpha_v, alpha_q, q_evidence_sum, policy_target)
                 )
+                q_evidence_mass = jnp.sum(q_evidence_sum, axis=-1)
                 action_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
                 action_logits = jnp.where(
                     legal_action_mask,
@@ -270,9 +269,8 @@ def make_selfplay(env, config):
                 played_action=played_action,
                 legal_action_mask=legal_action_mask,
                 beta_Q_target=beta_Q_target,
-                q_target_mask=q_target_mask,
                 beta_V_target=beta_V_target,
-                value_target_mask=value_target_mask,
+                q_evidence_mass=q_evidence_mass,
                 reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
                 terminated=env_state.terminated,
                 discount=discount,

@@ -74,8 +74,10 @@ class Config(BaseModel):
     training_batch_size: int = 4096
     learning_rate: float = 0.001
     policy_loss_weight: float = 1.0
-    value_outcome_weight: float = 1.0
-    q_outcome_weight: float = 0.25
+    value_dir_kl_weight: float = 1.0
+    q_dir_kl_weight: float = 1.0
+    value_outcome_weight: float = 0.0
+    q_outcome_weight: float = 0.0
     dirichlet_concentration_clip: float | None = 8.0
     log_interval: int = 1
     # eval params
@@ -155,10 +157,16 @@ def main(cfg: DictConfig) -> None:
                     {
                         "train/policy_loss": train_metrics.policy_loss.mean().item(),
                         "train/value_loss": train_metrics.value_loss.mean().item(),
+                        "train/policy_nll_loss": train_metrics.policy_nll_loss.mean().item(),
+                        "train/policy_kl_hat": train_metrics.policy_kl_hat.mean().item(),
+                        "train/policy_target_entropy": train_metrics.policy_target_entropy.mean().item(),
+                        "train/value_dir_kl_loss": train_metrics.value_dir_kl_loss.mean().item(),
+                        "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
                         "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
                         "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
                         "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
                         "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
+                        "train/q_evidence_mass_mean": train_metrics.q_evidence_mass_mean.mean().item(),
                         "train/hours": hours,
                         "train/frames": frames,
                     }

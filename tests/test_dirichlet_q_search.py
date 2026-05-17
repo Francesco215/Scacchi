@@ -90,7 +90,7 @@ def test_posterior_targets_add_q_evidence_and_weight_value_evidence():
     q_evidence_sum = jnp.array([[[2.0, 0.0], [0.0, 0.0], [0.5, 1.5]]])
     policy_target = jnp.array([[0.25, 0.0, 0.75]])
 
-    beta_Q_target, q_target_mask, beta_V_target, value_target_mask = posterior_targets(
+    beta_Q_target, beta_V_target = posterior_targets(
         alpha_V_prior,
         alpha_Q_prior,
         q_evidence_sum,
@@ -98,7 +98,5 @@ def test_posterior_targets_add_q_evidence_and_weight_value_evidence():
     )
 
     assert jnp.allclose(beta_Q_target, alpha_Q_prior + q_evidence_sum)
-    assert jnp.array_equal(q_target_mask, jnp.array([[True, False, True]]))
     expected_v_evidence = 0.25 * jnp.array([2.0, 0.0]) + 0.75 * jnp.array([0.5, 1.5])
     assert jnp.allclose(beta_V_target, alpha_V_prior + expected_v_evidence)
-    assert jnp.array_equal(value_target_mask, jnp.array([True]))

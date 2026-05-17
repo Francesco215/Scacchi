@@ -4,6 +4,7 @@ import chex
 from flax import nnx
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import digamma, gammaln
 import optax
 
 from .network import outcome_mean
@@ -18,18 +19,23 @@ class Sample(NamedTuple):
     policy_mask: jax.Array
     value_mask: jax.Array
     beta_Q_target: jax.Array
-    q_target_mask: jax.Array
     beta_V_target: jax.Array
-    value_target_mask: jax.Array
+    q_evidence_mass: jax.Array
 
 
 class TrainMetrics(NamedTuple):
     policy_loss: jax.Array
     value_loss: jax.Array
+    policy_nll_loss: jax.Array
+    policy_kl_hat: jax.Array
+    policy_target_entropy: jax.Array
+    value_dir_kl_loss: jax.Array
+    q_dir_kl_loss: jax.Array
     value_outcome_loss: jax.Array
     q_outcome_loss: jax.Array
     alpha_V_concentration: jax.Array
     alpha_Q_concentration: jax.Array
+    q_evidence_mass_mean: jax.Array
 
 
 def make_compute_loss_input(config):
@@ -56,9 +62,8 @@ def make_compute_loss_input(config):
             policy_mask=data.legal_action_mask,
             value_mask=value_mask,
             beta_Q_target=data.beta_Q_target,
-            q_target_mask=data.q_target_mask,
             beta_V_target=data.beta_V_target,
-            value_target_mask=data.value_target_mask,
+            q_evidence_mass=data.q_evidence_mass,
         )
 
     return compute_loss_input
@@ -87,6 +92,31 @@ def _categorical_ce_from_probs(probs: jax.Array, target: jax.Array) -> jax.Array
     return -jnp.sum(target * log_probs, axis=-1)
 
 
+def _categorical_entropy_from_probs(probs: jax.Array, mask: jax.Array) -> jax.Array:
+    log_probs = jnp.log(jnp.clip(probs, jnp.finfo(probs.dtype).tiny, 1.0))
+    entropy_terms = jnp.where(mask, probs * log_probs, 0.0)
+    return -jnp.sum(entropy_terms, axis=-1)
+
+
+def _dirichlet_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
+    dtype = jnp.result_type(beta, alpha)
+    eps = jnp.asarray(1e-6, dtype=dtype)
+    beta = jax.lax.stop_gradient(jnp.maximum(beta.astype(dtype), eps))
+    alpha = jnp.maximum(alpha.astype(dtype), eps)
+
+    beta_sum = jnp.sum(beta, axis=-1)
+    alpha_sum = jnp.sum(alpha, axis=-1)
+    return (
+        gammaln(beta_sum)
+        - gammaln(alpha_sum)
+        + jnp.sum(gammaln(alpha) - gammaln(beta), axis=-1)
+        + jnp.sum(
+            (beta - alpha) * (digamma(beta) - digamma(beta_sum)[..., None]),
+            axis=-1,
+        )
+    )
+
+
 def _gather_played_action(alpha_q: jax.Array, played_action: jax.Array) -> jax.Array:
     gather_ix = jnp.broadcast_to(
         played_action[..., None, None],
@@ -104,6 +134,16 @@ def _compute_dirichlet_losses(
 ) -> tuple[jax.Array, TrainMetrics]:
     policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt, where=data.policy_mask)
     policy_loss = _masked_mean(policy_loss, data.value_mask)
+    policy_target_entropy = _categorical_entropy_from_probs(data.policy_tgt, data.policy_mask)
+    policy_target_entropy = _masked_mean(policy_target_entropy, data.value_mask)
+    policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
+
+    value_dir_kl = _dirichlet_kl(data.beta_V_target, alpha_v)
+    value_dir_kl_loss = _masked_mean(value_dir_kl, data.value_mask)
+
+    q_dir_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
+    q_loss_mask = data.policy_mask & data.value_mask[..., None]
+    q_dir_kl_loss = _masked_mean(q_dir_kl, q_loss_mask)
 
     outcome_tgt = _outcome_target(data.value_tgt, alpha_v.shape[-1])
     value_outcome_loss = _categorical_ce_from_probs(outcome_mean(alpha_v), outcome_tgt)
@@ -116,21 +156,30 @@ def _compute_dirichlet_losses(
     alpha_v_concentration = _masked_mean(jnp.sum(alpha_v, axis=-1), data.value_mask)
     alpha_q_concentration = _masked_mean(
         jnp.sum(alpha_q, axis=-1),
-        data.policy_mask & data.value_mask[..., None],
+        q_loss_mask,
     )
+    q_evidence_mass_mean = _masked_mean(data.q_evidence_mass, q_loss_mask)
 
     total_loss = (
         config.policy_loss_weight * policy_loss
+        + config.value_dir_kl_weight * value_dir_kl_loss
+        + config.q_dir_kl_weight * q_dir_kl_loss
         + config.value_outcome_weight * value_outcome_loss
         + config.q_outcome_weight * q_outcome_loss
     )
     metrics = TrainMetrics(
         policy_loss=policy_loss,
-        value_loss=value_outcome_loss,
+        value_loss=value_dir_kl_loss,
+        policy_nll_loss=policy_loss,
+        policy_kl_hat=policy_kl_hat,
+        policy_target_entropy=policy_target_entropy,
+        value_dir_kl_loss=value_dir_kl_loss,
+        q_dir_kl_loss=q_dir_kl_loss,
         value_outcome_loss=value_outcome_loss,
         q_outcome_loss=q_outcome_loss,
         alpha_V_concentration=alpha_v_concentration,
         alpha_Q_concentration=alpha_q_concentration,
+        q_evidence_mass_mean=q_evidence_mass_mean,
     )
     return total_loss, metrics
 
@@ -144,10 +193,16 @@ def train(model: nnx.Module, optimizer: nnx.Optimizer, data: Sample, config):
             metrics = TrainMetrics(
                 policy_loss=policy_loss,
                 value_loss=value_loss,
+                policy_nll_loss=policy_loss,
+                policy_kl_hat=jnp.zeros_like(policy_loss),
+                policy_target_entropy=jnp.zeros_like(policy_loss),
+                value_dir_kl_loss=jnp.zeros_like(value_loss),
+                q_dir_kl_loss=jnp.zeros_like(value_loss),
                 value_outcome_loss=jnp.zeros_like(value_loss),
                 q_outcome_loss=jnp.zeros_like(value_loss),
                 alpha_V_concentration=jnp.zeros_like(value_loss),
                 alpha_Q_concentration=jnp.zeros_like(value_loss),
+                q_evidence_mass_mean=jnp.zeros_like(value_loss),
             )
             return policy_loss + value_loss, metrics
 
