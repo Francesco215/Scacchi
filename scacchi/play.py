@@ -161,6 +161,17 @@ def _empty_posterior_targets(
     return beta_q, beta_v, q_evidence_mass
 
 
+def _root_action_value_priors(env, predict_fn, env_state: pgx.State) -> jax.Array:
+    batch_size, num_actions = env_state.legal_action_mask.shape
+    actions = jnp.broadcast_to(jnp.arange(num_actions), (batch_size, num_actions))
+    fallback = jnp.argmax(env_state.legal_action_mask, axis=-1, keepdims=True)
+    actions = jnp.where(env_state.legal_action_mask, actions, fallback)
+    flat_state = jax.tree_util.tree_map(lambda x: jnp.repeat(x, num_actions, axis=0), env_state)
+    next_state = jax.vmap(env.step)(flat_state, actions.reshape(-1))
+    _, alpha_v, _ = predict_fn(next_state.observation)
+    return flip_outcome(alpha_v.reshape(batch_size, num_actions, alpha_v.shape[-1]))
+
+
 def make_selfplay(env, config):
     @nnx.jit
     def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
@@ -231,15 +242,21 @@ def make_selfplay(env, config):
                     gumbel_scale=1.0,
                 )
                 q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
-                alpha_Q_post = alpha_q + q_evidence_sum
+                action_value_prior = _root_action_value_priors(env, predict_fn, env_state)
+                action_alpha_post = action_value_prior + q_evidence_sum
                 policy_target = posterior_best_policy_target(
                     posterior_key,
-                    alpha_Q_post,
+                    action_alpha_post,
                     legal_action_mask,
                     config.policy_mc_samples,
                 )
                 beta_Q_target, beta_V_target = (
-                    posterior_targets(alpha_v, alpha_q, q_evidence_sum, policy_target)
+                    posterior_targets(
+                        alpha_v,
+                        action_value_prior,
+                        q_evidence_sum,
+                        policy_target,
+                    )
                 )
                 q_evidence_mass = jnp.sum(q_evidence_sum, axis=-1)
                 action_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))

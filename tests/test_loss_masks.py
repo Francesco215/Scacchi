@@ -176,7 +176,7 @@ def test_dirichlet_kl_is_zero_for_identical_parameters_and_positive_otherwise():
     assert different[0] > 0.0
 
 
-def test_dirichlet_kl_losses_use_value_and_policy_masks():
+def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
     data = Sample(
         obs=jnp.zeros((2, 1)),
         policy_tgt=jnp.array(
@@ -221,17 +221,10 @@ def test_dirichlet_kl_losses_use_value_and_policy_masks():
 
     _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
 
-    expected_q = jnp.mean(
-        jnp.array(
-            [
-                _dirichlet_kl(data.beta_Q_target[0, 0], alpha_q[0, 0]),
-                _dirichlet_kl(data.beta_Q_target[0, 2], alpha_q[0, 2]),
-            ]
-        )
-    )
+    expected_q = _dirichlet_kl(data.beta_Q_target[0, 2], alpha_q[0, 2])
     assert jnp.allclose(metrics.value_dir_kl_loss, 0.0, atol=1e-6)
     assert jnp.allclose(metrics.q_dir_kl_loss, expected_q, atol=1e-6)
-    assert jnp.allclose(metrics.q_evidence_mass_mean, 1.0)
+    assert jnp.allclose(metrics.q_evidence_mass_mean, 2.0)
 
 
 def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():

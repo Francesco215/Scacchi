@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +13,18 @@ from scacchi.dirichlet_q_search import (
     q_evidence_sum_from_tree,
     terminal_outcome_from_reward,
 )
+from scacchi.play import _root_action_value_priors
+
+
+class _TinyState(NamedTuple):
+    observation: jax.Array
+    legal_action_mask: jax.Array
+
+
+class _TinyEnv:
+    def step(self, state: _TinyState, action: jax.Array) -> _TinyState:
+        observation = jnp.stack([action.astype(jnp.float32) + 1.0, state.observation[0]])
+        return _TinyState(observation, state.legal_action_mask)
 
 
 def _fake_tree(embedding: NodeEmbedding, node_visits: jax.Array, num_actions: int):
@@ -84,19 +97,34 @@ def test_posterior_best_policy_target_masks_invalid_actions():
     assert jnp.allclose(policy_target.sum(axis=-1), 1.0)
 
 
-def test_posterior_targets_add_q_evidence_and_weight_value_evidence():
+def test_root_action_value_priors_use_next_state_alpha_v_in_root_perspective():
+    env_state = _TinyState(jnp.array([[7.0, 0.0]]), jnp.array([[True, False, True]]))
+
+    def predict_fn(observation):
+        alpha_v = jnp.stack([observation[:, 0] + 1.0, observation[:, 0] + 10.0], axis=-1)
+        return jnp.zeros((observation.shape[0], 3)), alpha_v, jnp.ones((observation.shape[0], 3, 2))
+
+    action_value_prior = _root_action_value_priors(_TinyEnv(), predict_fn, env_state)
+
+    assert jnp.allclose(
+        action_value_prior,
+        jnp.array([[[11.0, 2.0], [11.0, 2.0], [13.0, 4.0]]]),
+    )
+
+
+def test_posterior_targets_add_q_evidence_to_action_value_prior_and_weight_value_evidence():
     alpha_V_prior = jnp.array([[1.0, 1.0]])
-    alpha_Q_prior = jnp.ones((1, 3, 2))
+    action_value_prior = jnp.array([[[1.0, 2.0], [2.0, 1.0], [1.0, 2.0]]])
     q_evidence_sum = jnp.array([[[2.0, 0.0], [0.0, 0.0], [0.5, 1.5]]])
     policy_target = jnp.array([[0.25, 0.0, 0.75]])
 
     beta_Q_target, beta_V_target = posterior_targets(
         alpha_V_prior,
-        alpha_Q_prior,
+        action_value_prior,
         q_evidence_sum,
         policy_target,
     )
 
-    assert jnp.allclose(beta_Q_target, alpha_Q_prior + q_evidence_sum)
+    assert jnp.allclose(beta_Q_target, action_value_prior + q_evidence_sum)
     expected_v_evidence = 0.25 * jnp.array([2.0, 0.0]) + 0.75 * jnp.array([0.5, 1.5])
     assert jnp.allclose(beta_V_target, alpha_V_prior + expected_v_evidence)

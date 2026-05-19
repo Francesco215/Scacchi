@@ -28,7 +28,7 @@ import jax
 import optax
 import pgx
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm import tqdm
 
 from .checkpoint import build_checkpoint_manager, maybe_save, restore, from_pretrained
@@ -91,6 +91,30 @@ class Config(BaseModel):
     ckpt_save_interval_steps: int = 50
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def require_dirichlet_network_for_dirichlet_losses(self, info: ValidationInfo):
+        if isinstance(info.context, dict) and info.context.get("model_construction_only"):
+            return self
+        dirichlet_loss_weights = (
+            "value_dir_kl_weight",
+            "q_dir_kl_weight",
+            "value_outcome_weight",
+            "q_outcome_weight",
+        )
+        active_weights = [
+            f"{name}={getattr(self, name)}"
+            for name in dirichlet_loss_weights
+            if getattr(self, name) != 0.0
+        ]
+        if self.network != "boardlaw_dirichlet" and active_weights:
+            weights = ", ".join(active_weights)
+            raise ValueError(
+                "Dirichlet loss weights require network='boardlaw_dirichlet'; "
+                f"got network={self.network!r} with {weights}. Set these "
+                "weights to 0.0 or use network='boardlaw_dirichlet'."
+            )
+        return self
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="hex")

@@ -24,7 +24,7 @@ def dirichlet_from_logits(
             -concentration_clip,
             concentration_clip,
         )
-    concentration = jax.nn.softplus(concentration_logit)
+    concentration = jax.nn.softplus(concentration_logit)**2
     return concentration[..., None] * jax.nn.softmax(mean_logits, axis=-1)
 
 

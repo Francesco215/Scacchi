@@ -104,11 +104,11 @@ def posterior_best_policy_target(
 
 def posterior_targets(
     alpha_V_prior: jax.Array,
-    alpha_Q_prior: jax.Array,
+    action_value_prior: jax.Array,
     q_evidence_sum: jax.Array,
     policy_target: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    beta_Q_target = alpha_Q_prior + q_evidence_sum
+    beta_Q_target = action_value_prior + q_evidence_sum
     v_evidence_sum = jnp.sum(policy_target[..., None] * q_evidence_sum, axis=-2)
     beta_V_target = alpha_V_prior + v_evidence_sum
     return beta_Q_target, beta_V_target

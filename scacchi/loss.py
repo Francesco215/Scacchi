@@ -142,7 +142,7 @@ def _compute_dirichlet_losses(
     value_dir_kl_loss = _masked_mean(value_dir_kl, data.value_mask)
 
     q_dir_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
-    q_loss_mask = data.policy_mask & data.value_mask[..., None]
+    q_loss_mask = data.policy_mask & data.value_mask[..., None] & (data.q_evidence_mass > 0)
     q_dir_kl_loss = _masked_mean(q_dir_kl, q_loss_mask)
 
     outcome_tgt = _outcome_target(data.value_tgt, alpha_v.shape[-1])
