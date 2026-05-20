@@ -11,7 +11,7 @@ from .dirichlet_q_search import (
     outcome_utility,
 )
 from .network import policy_value_from_output
-from .play import make_dirichlet_recurrent_fn, make_recurrent_fn, _root_action_value_priors
+from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
 
 
 def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations):
@@ -46,6 +46,7 @@ def _make_model_mcts_policy(env, config, model, rng_key, env_state, num_simulati
         root_embedding = NodeEmbedding(
             state=env_state,
             outcome_dist=root_outcome,
+            alpha_V_prior=alpha_v,
             evidence_weight=jnp.zeros_like(value),
             root_action=jnp.full_like(env_state.current_player, NO_PARENT),
             depth_parity=jnp.zeros_like(env_state.current_player),
@@ -56,15 +57,16 @@ def _make_model_mcts_policy(env, config, model, rng_key, env_state, num_simulati
             value=value,
             embedding=root_embedding,
         )
-        action_value_prior = _root_action_value_priors(env, predict, env_state)
+        action_value_prior = alpha_q
         return dirichlet_q_policy(
             params=(),
             rng_key=rng_key,
             root=root,
             recurrent_fn=make_dirichlet_recurrent_fn(env, predict, config),
-            action_alpha_prior=action_value_prior,
+            action_value_prior=action_value_prior,
             num_simulations=num_simulations,
             invalid_actions=~env_state.legal_action_mask,
+            num_search_blocks=getattr(config, "num_search_blocks", 1),
         )
     return _make_mcts_policy(
         predict,

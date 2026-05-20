@@ -12,13 +12,13 @@ from scacchi.network import (
 )
 
 
-def test_dirichlet_from_logits_uses_softplus_concentration():
+def test_dirichlet_from_logits_uses_squared_softplus_concentration():
     mean_logits = jnp.array([[0.0, 0.0]])
     concentration_logit = jnp.array([0.0])
 
     alpha = dirichlet_from_logits(mean_logits, concentration_logit)
 
-    assert jnp.allclose(alpha.sum(axis=-1), jax.nn.softplus(concentration_logit))
+    assert jnp.allclose(alpha.sum(axis=-1), jax.nn.softplus(concentration_logit) ** 2)
     assert jnp.allclose(outcome_mean(alpha), jnp.array([[0.5, 0.5]]))
 
 

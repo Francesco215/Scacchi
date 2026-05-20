@@ -33,6 +33,11 @@ def test_dirichlet_network_allows_dirichlet_loss_weights():
     assert config.network == "boardlaw_dirichlet"
 
 
+def test_num_search_blocks_must_be_positive():
+    with pytest.raises(ValidationError):
+        Config(network="boardlaw_dirichlet", num_search_blocks=0)
+
+
 def test_model_construction_context_allows_legacy_checkpoint_loss_weights():
     config = Config.model_validate(
         {

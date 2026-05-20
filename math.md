@@ -64,10 +64,10 @@ $$
 \pi_{\mathrm{search}}(a \mid s).
 $$
 
-The value head is used to evaluate non-terminal search leaves and to provide
-the one-ply child priors for action-level posterior targets. The Q head is
-trained to predict these action-level posteriors, but it is not used as the
-base prior for the current policy or Q targets. Both Dirichlet heads are
+The value head is used to evaluate non-terminal search leaves and to replace
+the Q fallback once a one-ply child state has been explored. The Q head supplies
+the action-level prior for unexplored actions and is trained to predict the
+action-level posteriors produced for explored actions. Both Dirichlet heads are
 trained by KL divergence toward posterior Dirichlet targets produced by
 Bayesian-style evidence updates.
 
@@ -293,7 +293,7 @@ Define the Dirichlet concentration as
 
 $$
 \alpha_{\theta,0} =
-\operatorname{softplus}(t_\theta) > 0.
+\operatorname{softplus}(t_\theta)^2 > 0.
 $$
 
 Then define the Dirichlet parameters as
@@ -307,7 +307,7 @@ Equivalently, component-wise:
 
 $$
 \alpha_{\theta,z} =
-\operatorname{softplus}(t_\theta)\bar{\phi}_{\theta,z},
+\operatorname{softplus}(t_\theta)^2\bar{\phi}_{\theta,z},
 \qquad
 z \in \{L,D,W\}.
 $$
@@ -341,7 +341,7 @@ $$
 \operatorname{softmax}(r_\theta^V(s)),
 \qquad
 \alpha_{\theta,0}^V(s) =
-\operatorname{softplus}(t_\theta^V(s)),
+\operatorname{softplus}(t_\theta^V(s))^2,
 $$
 
 and
@@ -359,7 +359,7 @@ $$
 \operatorname{softmax}(r_\theta^Q(s,a)),
 \qquad
 \alpha_{\theta,0}^Q(s,a) =
-\operatorname{softplus}(t_\theta^Q(s,a)),
+\operatorname{softplus}(t_\theta^Q(s,a))^2,
 $$
 
 and
@@ -593,17 +593,20 @@ $$
 
 ## 7. Root posterior search
 
-At root state $s$, define the one-ply child state for each legal action:
+At root state $s$, the Q head supplies the fallback action prior:
 
 $$
-s_a = \operatorname{Step}(s,a).
+\alpha_{\mathrm{fallback}}^Q(s,a)
+=
+\alpha_{\theta^-}^Q(s,a).
 $$
 
-The value head on $s_a$ predicts the value from the next player-to-move
-perspective. Align it back to the root player's perspective:
+If search expands action $a$, define the one-ply child state
+$s_a=\operatorname{Step}(s,a)$. The value head on $s_a$ predicts the value from
+the next player-to-move perspective. Align it back to the root player's
+perspective:
 
 $$
-\alpha_a^{(0)} =
 \alpha_{\theta^-}^{V \rightarrow Q}(s,a)
 =
 \operatorname{flip}
@@ -614,18 +617,33 @@ $$
 a \in \mathcal{A}(s).
 $$
 
-This action prior is a value-head Dirichlet over the next state, reinterpreted
-as the prior for the root action's outcome. The Q head still predicts
-$\alpha_\theta^Q(s,a)$, but in this target construction it is trained toward
-the posterior generated from the child value prior plus search evidence.
+For each root action, use the Q prior only while the child state has not been
+explored. Once the child state has been expanded, use the aligned value-head
+Dirichlet because the state-value prediction is more precise than the
+state-action prediction:
+
+$$
+\alpha_{\mathrm{base}}(s,a;\mathrm{tree})
+=
+\begin{cases}
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a),
+& \text{if } \operatorname{Step}(s,a) \text{ has been expanded in the tree},\\
+\alpha_{\theta^-}^Q(s,a),
+& \text{otherwise}.
+\end{cases}
+$$
+
+The Q head is still trained toward the posterior target for explored actions;
+unexplored actions have zero Q-evidence mass and are masked out of the Q KL
+loss.
 
 Using the stable value parameterization:
 
 $$
-\alpha_a^{(0)} =
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a) =
 \operatorname{flip}
 \left[
-\operatorname{softplus}(t_{\theta^-}^V(s_a))
+\operatorname{softplus}(t_{\theta^-}^V(s_a))^2
 \operatorname{softmax}
 \left(
 r_{\theta^-}^V(s_a)
@@ -719,7 +737,8 @@ $$
 
 In the current MCTX implementation, search traversal itself may use MCTX's
 root selection rule, but the posterior used for policy targets is reconstructed
-from the accumulated root-action evidence and this child value prior.
+from the accumulated root-action evidence and the mixed Q-fallback/value-prior
+base described above.
 
 ---
 
@@ -898,8 +917,16 @@ $$
 \alpha_{\theta^-}^V(s).
 $$
 
-For a state-action pair $(s,a)$, the action-level prior used for policy and Q
-targets is the child value prior aligned to the root perspective:
+For a state-action pair $(s,a)$, the action-level fallback prior is the root
+Q-head prediction:
+
+$$
+\alpha_{\mathrm{prior}}^Q(s,a) =
+\alpha_{\theta^-}^Q(s,a).
+$$
+
+If search expands action $a$, the action-level prior used for policy and Q
+targets is replaced by the child value prior aligned to the root perspective:
 
 $$
 \alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a) =
@@ -908,6 +935,11 @@ $$
 \alpha_{\theta^-}^V(\operatorname{Step}(s,a))
 \right).
 $$
+
+Thus unexplored actions use $\alpha_{\mathrm{prior}}^Q(s,a)$, while explored
+actions use $\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a)$.
+
+Denote this mixed base by $\alpha_{\mathrm{base}}(s,a;\mathrm{tree})$.
 
 After evidence is collected, construct posterior targets:
 
@@ -922,7 +954,7 @@ and
 
 $$
 \beta_Q(s,a) =
-\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a)
+\alpha_{\mathrm{base}}(s,a;\mathrm{tree})
 +
 \lambda_Q d_Q(s,a).
 $$
@@ -1135,17 +1167,15 @@ $$
 i \in \mathcal{I}(a).
 $$
 
-The initial action prior is the child value prior:
+The initial action prior is the Q-head fallback:
 
 $$
 \alpha_a^{(0)} =
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
-=
-\operatorname{flip}
-\left(
-\alpha_{\theta^-}^V(\operatorname{Step}(s,a))
-\right).
+\alpha_{\theta^-}^Q(s,a).
 $$
+
+If action $a$ is explored, replace that fallback with
+$\alpha_{\theta^-}^{V \rightarrow Q}(s,a)$ before adding accumulated evidence.
 
 The final posterior after all evidence for action $a$ is
 
@@ -1196,7 +1226,7 @@ D_{\mathrm{KL}}
 $$
 
 This trains the Q head to predict the posterior that search produced from the
-child value prior plus evidence. The loss is applied only when
+mixed Q-fallback/value-prior base plus evidence. The loss is applied only when
 $\mathcal{I}(a)$ is non-empty, equivalently when the accumulated evidence mass
 for action $a$ is positive.
 
@@ -1359,32 +1389,32 @@ Here $\Gamma$ is the gamma function and $\psi$ is the digamma function.
 
 ## 17. Core algorithm summary
 
-At a root state $s$, step each legal action once and evaluate the value head at
-the child state. This gives one positive Dirichlet prior per legal action:
+At a root state $s$, initialize each legal action with the Q-head Dirichlet:
 
 $$
 \alpha_a^{(0)} =
-\alpha_\theta^{V \rightarrow Q}(s,a)
-=
-\operatorname{flip}
-\left(
-\alpha_\theta^V(\operatorname{Step}(s,a))
-\right).
+\alpha_\theta^Q(s,a).
 $$
 
-Using the stable value-head parameterization:
+When search expands action $a$ and reaches
+$s_a=\operatorname{Step}(s,a)$, replace the root action's Q fallback with the
+value-head Dirichlet aligned to the root perspective:
 
 $$
 \alpha_\theta^{V \rightarrow Q}(s,a) =
 \operatorname{flip}
 \left[
-\operatorname{softplus}(t_\theta^V(\operatorname{Step}(s,a)))
+\operatorname{softplus}(t_\theta^V(\operatorname{Step}(s,a)))^2
 \operatorname{softmax}
 \left(
 r_\theta^V(\operatorname{Step}(s,a))
 \right)
 \right]
 $$
+
+Thereafter the live root posterior for action $a$ is this aligned value prior
+plus all accumulated evidence for that root action. Actions whose child states
+have not been expanded keep $\alpha_\theta^Q(s,a)$.
 
 Search repeatedly samples from these posteriors:
 
@@ -1496,7 +1526,7 @@ The central network parameterization is always the same mean-concentration form:
 
 $$
 \alpha_\theta =
-\operatorname{softplus}(t_\theta)
+\operatorname{softplus}(t_\theta)^2
 \operatorname{softmax}(r_\theta).
 $$
 
