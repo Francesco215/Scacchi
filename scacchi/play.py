@@ -14,6 +14,7 @@ from .dirichlet_q_search import (
     flip_outcome,
     outcome_mean,
     outcome_utility,
+    dirichlet_q_policy,
     posterior_best_policy_target,
     posterior_targets,
     q_evidence_sum_from_tree,
@@ -231,18 +232,29 @@ def make_selfplay(env, config):
                     value=value,
                     embedding=root_embedding,
                 )
-                policy_output = mctx.gumbel_muzero_policy(
-                    params=(),
-                    rng_key=search_key,
-                    root=root,
-                    recurrent_fn=dirichlet_recurrent_fn,
-                    num_simulations=config.num_simulations,
-                    invalid_actions=~env_state.legal_action_mask,
-                    qtransform=mctx.qtransform_completed_by_mix_value,
-                    gumbel_scale=1.0,
-                )
-                q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
                 action_value_prior = _root_action_value_priors(env, predict_fn, env_state)
+                if config.search_policy == "dirichlet_thompson":
+                    policy_output = dirichlet_q_policy(
+                        params=(),
+                        rng_key=search_key,
+                        root=root,
+                        recurrent_fn=dirichlet_recurrent_fn,
+                        action_alpha_prior=action_value_prior,
+                        num_simulations=config.num_simulations,
+                        invalid_actions=~env_state.legal_action_mask,
+                    )
+                else:
+                    policy_output = mctx.gumbel_muzero_policy(
+                        params=(),
+                        rng_key=search_key,
+                        root=root,
+                        recurrent_fn=dirichlet_recurrent_fn,
+                        num_simulations=config.num_simulations,
+                        invalid_actions=~env_state.legal_action_mask,
+                        qtransform=mctx.qtransform_completed_by_mix_value,
+                        gumbel_scale=1.0,
+                    )
+                q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
                 action_alpha_post = action_value_prior + q_evidence_sum
                 policy_target = posterior_best_policy_target(
                     posterior_key,

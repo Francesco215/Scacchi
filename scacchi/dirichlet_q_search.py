@@ -5,6 +5,9 @@ from typing import Any, NamedTuple
 import chex
 import jax
 import jax.numpy as jnp
+from mctx._src import action_selection
+from mctx._src import base
+from mctx._src import search as mctx_search
 import pgx
 
 
@@ -73,6 +76,98 @@ def q_evidence_sum_from_tree(tree: Any) -> jax.Array:
         dtype=outcome_dist.dtype,
     )
     return evidence_sum.at[batch_ix, safe_action].add(weight[..., None] * aligned_outcome)
+
+
+@chex.dataclass(frozen=True)
+class DirichletRootExtraData:
+    action_alpha_prior: jax.Array
+
+
+def _q_evidence_sum_from_unbatched_tree(tree: Any) -> jax.Array:
+    embeddings = tree.embeddings
+    aligned_outcome = jnp.where(
+        embeddings.depth_parity[..., None] == 1,
+        flip_outcome(embeddings.outcome_dist),
+        embeddings.outcome_dist,
+    )
+    valid = (embeddings.root_action != NO_PARENT) & (tree.node_visits > 0)
+    weight = jnp.where(valid, embeddings.evidence_weight, 0.0)
+    safe_action = jnp.where(valid, embeddings.root_action, 0)
+
+    evidence_sum = jnp.zeros(
+        (tree.num_actions, embeddings.outcome_dist.shape[-1]),
+        dtype=embeddings.outcome_dist.dtype,
+    )
+    return evidence_sum.at[safe_action].add(weight[..., None] * aligned_outcome)
+
+
+def dirichlet_root_action_selection(
+    rng_key: chex.PRNGKey,
+    tree: Any,
+    node_index: chex.Numeric,
+) -> jax.Array:
+    del node_index
+    q_evidence = _q_evidence_sum_from_unbatched_tree(tree)
+    alpha_post = tree.extra_data.action_alpha_prior + q_evidence
+    phi = jax.random.dirichlet(rng_key, alpha_post)
+    score = outcome_utility(phi)
+    return action_selection.masked_argmax(score, tree.root_invalid_actions)
+
+
+def policy_prior_interior_action_selection(
+    rng_key: chex.PRNGKey,
+    tree: Any,
+    node_index: chex.Numeric,
+    depth: chex.Numeric,
+) -> jax.Array:
+    del rng_key, depth
+    visit_counts = tree.children_visits[node_index]
+    prior_probs = jax.nn.softmax(tree.children_prior_logits[node_index])
+    to_argmax = prior_probs - visit_counts / (1 + jnp.sum(visit_counts, keepdims=True))
+    return jnp.argmax(to_argmax, axis=-1).astype(jnp.int32)
+
+
+def dirichlet_q_policy(
+    params: base.Params,
+    rng_key: chex.PRNGKey,
+    root: base.RootFnOutput,
+    recurrent_fn: base.RecurrentFn,
+    *,
+    action_alpha_prior: jax.Array,
+    num_simulations: int,
+    invalid_actions: chex.Array,
+    max_depth: int | None = None,
+    loop_fn=jax.lax.fori_loop,
+) -> base.PolicyOutput[DirichletRootExtraData]:
+    root = root.replace(
+        prior_logits=jnp.where(
+            invalid_actions,
+            jnp.finfo(root.prior_logits.dtype).min,
+            root.prior_logits,
+        )
+    )
+    search_tree = mctx_search.search(
+        params=params,
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        root_action_selection_fn=dirichlet_root_action_selection,
+        interior_action_selection_fn=policy_prior_interior_action_selection,
+        num_simulations=num_simulations,
+        max_depth=max_depth,
+        invalid_actions=invalid_actions,
+        extra_data=DirichletRootExtraData(action_alpha_prior=action_alpha_prior),
+        loop_fn=loop_fn,
+    )
+    q_evidence = q_evidence_sum_from_tree(search_tree)
+    alpha_post = action_alpha_prior + q_evidence
+    score = outcome_utility(outcome_mean(alpha_post))
+    action = action_selection.masked_argmax(score, invalid_actions)
+    return base.PolicyOutput(
+        action=action,
+        action_weights=search_tree.summary().visit_probs,
+        search_tree=search_tree,
+    )
 
 
 def posterior_best_policy_target(

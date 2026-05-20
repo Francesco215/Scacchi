@@ -70,6 +70,7 @@ class Config(BaseModel):
     c_leaf: float = 1.0
     c_terminal: float = 8.0
     selfplay_action_source: str = "posterior_best"
+    search_policy: str = "gumbel"
     # training params
     training_batch_size: int = 4096
     learning_rate: float = 0.001
