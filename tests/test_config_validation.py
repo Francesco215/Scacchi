@@ -33,6 +33,25 @@ def test_dirichlet_network_allows_dirichlet_loss_weights():
     assert config.network == "boardlaw_dirichlet"
 
 
+def test_num_search_blocks_must_be_positive():
+    with pytest.raises(ValidationError):
+        Config(network="boardlaw_dirichlet", num_search_blocks=0)
+
+
+def test_posterior_sample_action_source_is_valid():
+    config = Config(
+        network="boardlaw_dirichlet",
+        selfplay_action_source="posterior_sample",
+    )
+
+    assert config.selfplay_action_source == "posterior_sample"
+
+
+def test_selfplay_action_source_must_be_known():
+    with pytest.raises(ValidationError, match="selfplay_action_source"):
+        Config(network="boardlaw_dirichlet", selfplay_action_source="unknown")
+
+
 def test_model_construction_context_allows_legacy_checkpoint_loss_weights():
     config = Config.model_validate(
         {

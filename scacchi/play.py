@@ -14,9 +14,13 @@ from .dirichlet_q_search import (
     flip_outcome,
     outcome_mean,
     outcome_utility,
+    dirichlet_q_policy,
+    posterior_best_action,
     posterior_best_policy_target,
+    posterior_sample_action,
     posterior_targets,
     q_evidence_sum_from_tree,
+    root_action_value_priors_from_tree,
     terminal_outcome_from_reward,
 )
 from .network import policy_value_from_output
@@ -129,6 +133,7 @@ def make_dirichlet_recurrent_fn(env, predict_fn, config):
         next_embedding = NodeEmbedding(
             state=env_state,
             outcome_dist=outcome_dist,
+            alpha_V_prior=alpha_v,
             evidence_weight=evidence_weight,
             root_action=root_action,
             depth_parity=depth_parity,
@@ -159,17 +164,6 @@ def _empty_posterior_targets(
     beta_v = jnp.zeros((batch_size, num_outcomes), dtype=policy_target.dtype)
     q_evidence_mass = jnp.zeros((batch_size, num_actions), dtype=policy_target.dtype)
     return beta_q, beta_v, q_evidence_mass
-
-
-def _root_action_value_priors(env, predict_fn, env_state: pgx.State) -> jax.Array:
-    batch_size, num_actions = env_state.legal_action_mask.shape
-    actions = jnp.broadcast_to(jnp.arange(num_actions), (batch_size, num_actions))
-    fallback = jnp.argmax(env_state.legal_action_mask, axis=-1, keepdims=True)
-    actions = jnp.where(env_state.legal_action_mask, actions, fallback)
-    flat_state = jax.tree_util.tree_map(lambda x: jnp.repeat(x, num_actions, axis=0), env_state)
-    next_state = jax.vmap(env.step)(flat_state, actions.reshape(-1))
-    _, alpha_v, _ = predict_fn(next_state.observation)
-    return flip_outcome(alpha_v.reshape(batch_size, num_actions, alpha_v.shape[-1]))
 
 
 def make_selfplay(env, config):
@@ -221,6 +215,7 @@ def make_selfplay(env, config):
                 root_embedding = NodeEmbedding(
                     state=env_state,
                     outcome_dist=root_outcome,
+                    alpha_V_prior=alpha_v,
                     evidence_weight=jnp.zeros_like(value),
                     root_action=jnp.full_like(env_state.current_player, NO_PARENT),
                     depth_parity=jnp.zeros_like(env_state.current_player),
@@ -231,19 +226,38 @@ def make_selfplay(env, config):
                     value=value,
                     embedding=root_embedding,
                 )
-                policy_output = mctx.gumbel_muzero_policy(
-                    params=(),
-                    rng_key=search_key,
-                    root=root,
-                    recurrent_fn=dirichlet_recurrent_fn,
-                    num_simulations=config.num_simulations,
-                    invalid_actions=~env_state.legal_action_mask,
-                    qtransform=mctx.qtransform_completed_by_mix_value,
-                    gumbel_scale=1.0,
-                )
-                q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
-                action_value_prior = _root_action_value_priors(env, predict_fn, env_state)
-                action_alpha_post = action_value_prior + q_evidence_sum
+                action_value_prior = alpha_q
+                if config.search_policy == "dirichlet_thompson":
+                    policy_output = dirichlet_q_policy(
+                        params=(),
+                        rng_key=search_key,
+                        root=root,
+                        recurrent_fn=dirichlet_recurrent_fn,
+                        action_value_prior=action_value_prior,
+                        num_simulations=config.num_simulations,
+                        invalid_actions=~env_state.legal_action_mask,
+                        num_search_blocks=getattr(config, "num_search_blocks", 1),
+                    )
+                    q_evidence_sum = policy_output.q_evidence_sum
+                    action_alpha_post = policy_output.alpha_search
+                    action_value_target_prior = action_alpha_post - q_evidence_sum
+                else:
+                    policy_output = mctx.gumbel_muzero_policy(
+                        params=(),
+                        rng_key=search_key,
+                        root=root,
+                        recurrent_fn=dirichlet_recurrent_fn,
+                        num_simulations=config.num_simulations,
+                        invalid_actions=~env_state.legal_action_mask,
+                        qtransform=mctx.qtransform_completed_by_mix_value,
+                        gumbel_scale=1.0,
+                    )
+                    q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
+                    action_value_target_prior = root_action_value_priors_from_tree(
+                        policy_output.search_tree,
+                        action_value_prior,
+                    )
+                    action_alpha_post = action_value_target_prior + q_evidence_sum
                 policy_target = posterior_best_policy_target(
                     posterior_key,
                     action_alpha_post,
@@ -253,20 +267,24 @@ def make_selfplay(env, config):
                 beta_Q_target, beta_V_target = (
                     posterior_targets(
                         alpha_v,
-                        action_value_prior,
+                        action_value_target_prior,
                         q_evidence_sum,
                         policy_target,
                     )
                 )
                 q_evidence_mass = jnp.sum(q_evidence_sum, axis=-1)
-                action_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
-                action_logits = jnp.where(
-                    legal_action_mask,
-                    action_logits,
-                    jnp.finfo(action_logits.dtype).min,
-                )
-                posterior_action = jax.random.categorical(action_key, action_logits)
-                if config.selfplay_action_source == "posterior_best":
+                if config.selfplay_action_source in ("posterior_best", "posterior_argmax"):
+                    posterior_action = posterior_best_action(
+                        policy_target,
+                        legal_action_mask,
+                    )
+                    played_action = posterior_action
+                elif config.selfplay_action_source == "posterior_sample":
+                    posterior_action = posterior_sample_action(
+                        action_key,
+                        policy_target,
+                        legal_action_mask,
+                    )
                     played_action = posterior_action
                 else:
                     played_action = policy_output.action

@@ -5,6 +5,9 @@ from typing import Any, NamedTuple
 import chex
 import jax
 import jax.numpy as jnp
+from mctx._src import action_selection
+from mctx._src import base
+from mctx._src import search as mctx_search
 import pgx
 
 
@@ -14,6 +17,7 @@ NO_PARENT = -1
 class NodeEmbedding(NamedTuple):
     state: pgx.State
     outcome_dist: jax.Array
+    alpha_V_prior: jax.Array
     evidence_weight: jax.Array
     root_action: jax.Array
     depth_parity: jax.Array
@@ -75,6 +79,271 @@ def q_evidence_sum_from_tree(tree: Any) -> jax.Array:
     return evidence_sum.at[batch_ix, safe_action].add(weight[..., None] * aligned_outcome)
 
 
+@chex.dataclass(frozen=True)
+class DirichletRootExtraData:
+    action_value_prior: jax.Array
+    explored_action_mask: jax.Array
+
+    @property
+    def action_alpha_prior(self) -> jax.Array:
+        return self.action_value_prior
+
+
+@chex.dataclass(frozen=True)
+class DirichletQSearchOutput:
+    action: chex.Array
+    action_weights: chex.Array
+    search_tree: Any
+    q_evidence_sum: jax.Array
+    alpha_search: jax.Array
+    explored_action_mask: jax.Array
+
+
+def _q_evidence_sum_from_unbatched_tree(tree: Any) -> jax.Array:
+    embeddings = tree.embeddings
+    aligned_outcome = jnp.where(
+        embeddings.depth_parity[..., None] == 1,
+        flip_outcome(embeddings.outcome_dist),
+        embeddings.outcome_dist,
+    )
+    valid = (embeddings.root_action != NO_PARENT) & (tree.node_visits > 0)
+    weight = jnp.where(valid, embeddings.evidence_weight, 0.0)
+    safe_action = jnp.where(valid, embeddings.root_action, 0)
+
+    evidence_sum = jnp.zeros(
+        (tree.num_actions, embeddings.outcome_dist.shape[-1]),
+        dtype=embeddings.outcome_dist.dtype,
+    )
+    return evidence_sum.at[safe_action].add(weight[..., None] * aligned_outcome)
+
+
+def _root_child_value_priors_from_unbatched_tree(tree: Any) -> tuple[jax.Array, jax.Array]:
+    root_children = tree.children_index[0]
+    child_exists = root_children != NO_PARENT
+    safe_child = jnp.where(child_exists, root_children, 0)
+    child_visits = tree.node_visits[safe_child]
+    explored = child_exists & (child_visits > 0)
+    child_prior = tree.embeddings.alpha_V_prior[safe_child]
+    child_parity = tree.embeddings.depth_parity[safe_child]
+    aligned_child_prior = jnp.where(
+        child_parity[..., None] == 1,
+        flip_outcome(child_prior),
+        child_prior,
+    )
+    return aligned_child_prior, explored
+
+
+def _root_action_value_priors_from_unbatched_tree(tree: Any) -> jax.Array:
+    child_prior, explored = _root_child_value_priors_from_unbatched_tree(tree)
+    newly_explored = explored & ~tree.extra_data.explored_action_mask
+    return jnp.where(
+        newly_explored[..., None],
+        child_prior,
+        tree.extra_data.action_value_prior,
+    )
+
+
+def root_explored_actions_from_tree(tree: Any) -> jax.Array:
+    root_children = tree.children_index[:, 0, :]
+    child_exists = root_children != NO_PARENT
+    safe_child = jnp.where(child_exists, root_children, 0)
+    child_visits = jnp.take_along_axis(tree.node_visits, safe_child, axis=1)
+    return child_exists & (child_visits > 0)
+
+
+def root_action_value_priors_from_tree(
+    tree: Any,
+    action_value_prior: jax.Array,
+    explored_action_mask: jax.Array | None = None,
+) -> jax.Array:
+    if explored_action_mask is None:
+        explored_action_mask = jnp.zeros(action_value_prior.shape[:-1], dtype=bool)
+    root_children = tree.children_index[:, 0, :]
+    child_exists = root_children != NO_PARENT
+    safe_child = jnp.where(child_exists, root_children, 0)
+    child_visits = jnp.take_along_axis(tree.node_visits, safe_child, axis=1)
+    explored = child_exists & (child_visits > 0)
+    child_prior_index = jnp.broadcast_to(
+        safe_child[..., None],
+        safe_child.shape + (tree.embeddings.alpha_V_prior.shape[-1],),
+    )
+    child_prior = jnp.take_along_axis(
+        tree.embeddings.alpha_V_prior,
+        child_prior_index,
+        axis=1,
+    )
+    child_parity = jnp.take_along_axis(
+        tree.embeddings.depth_parity,
+        safe_child,
+        axis=1,
+    )
+    aligned_child_prior = jnp.where(
+        child_parity[..., None] == 1,
+        flip_outcome(child_prior),
+        child_prior,
+    )
+    newly_explored = explored & ~explored_action_mask
+    return jnp.where(newly_explored[..., None], aligned_child_prior, action_value_prior)
+
+
+def dirichlet_root_action_selection(
+    rng_key: chex.PRNGKey,
+    tree: Any,
+    node_index: chex.Numeric,
+) -> jax.Array:
+    del node_index
+    q_evidence = _q_evidence_sum_from_unbatched_tree(tree)
+    action_value_prior = _root_action_value_priors_from_unbatched_tree(tree)
+    alpha_post = action_value_prior + q_evidence
+    phi = jax.random.dirichlet(rng_key, alpha_post)
+    score = outcome_utility(phi)
+    return action_selection.masked_argmax(score, tree.root_invalid_actions)
+
+
+def policy_prior_interior_action_selection(
+    rng_key: chex.PRNGKey,
+    tree: Any,
+    node_index: chex.Numeric,
+    depth: chex.Numeric,
+) -> jax.Array:
+    del rng_key, depth
+    visit_counts = tree.children_visits[node_index]
+    prior_probs = jax.nn.softmax(tree.children_prior_logits[node_index])
+    to_argmax = prior_probs - visit_counts / (1 + jnp.sum(visit_counts, keepdims=True))
+    return jnp.argmax(to_argmax, axis=-1).astype(jnp.int32)
+
+
+def _dirichlet_q_search_block(
+    params: base.Params,
+    rng_key: chex.PRNGKey,
+    root: base.RootFnOutput,
+    recurrent_fn: base.RecurrentFn,
+    *,
+    action_value_prior: jax.Array,
+    explored_action_mask: jax.Array,
+    num_simulations: int,
+    invalid_actions: chex.Array,
+    max_depth: int | None = None,
+    loop_fn=jax.lax.fori_loop,
+) -> DirichletQSearchOutput:
+    root = root.replace(
+        prior_logits=jnp.where(
+            invalid_actions,
+            jnp.finfo(root.prior_logits.dtype).min,
+            root.prior_logits,
+        )
+    )
+    search_tree = mctx_search.search(
+        params=params,
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        root_action_selection_fn=dirichlet_root_action_selection,
+        interior_action_selection_fn=policy_prior_interior_action_selection,
+        num_simulations=num_simulations,
+        max_depth=max_depth,
+        invalid_actions=invalid_actions,
+        extra_data=DirichletRootExtraData(
+            action_value_prior=action_value_prior,
+            explored_action_mask=explored_action_mask,
+        ),
+        loop_fn=loop_fn,
+    )
+    q_evidence = q_evidence_sum_from_tree(search_tree)
+    block_action_value_prior = root_action_value_priors_from_tree(
+        search_tree,
+        action_value_prior,
+        explored_action_mask,
+    )
+    alpha_post = block_action_value_prior + q_evidence
+    explored_actions = explored_action_mask | root_explored_actions_from_tree(search_tree)
+    score = outcome_utility(outcome_mean(alpha_post))
+    action = action_selection.masked_argmax(score, invalid_actions)
+    return DirichletQSearchOutput(
+        action=action,
+        action_weights=search_tree.summary().visit_probs,
+        search_tree=search_tree,
+        q_evidence_sum=q_evidence,
+        alpha_search=alpha_post,
+        explored_action_mask=explored_actions,
+    )
+
+
+def dirichlet_q_policy(
+    params: base.Params,
+    rng_key: chex.PRNGKey,
+    root: base.RootFnOutput,
+    recurrent_fn: base.RecurrentFn,
+    *,
+    action_value_prior: jax.Array | None = None,
+    action_alpha_prior: jax.Array | None = None,
+    num_simulations: int,
+    invalid_actions: chex.Array,
+    num_search_blocks: int = 1,
+    max_depth: int | None = None,
+    loop_fn=jax.lax.fori_loop,
+) -> DirichletQSearchOutput:
+    if num_search_blocks < 1:
+        raise ValueError(f"num_search_blocks must be >= 1, got {num_search_blocks}")
+    if action_value_prior is None:
+        if action_alpha_prior is None:
+            raise ValueError("action_value_prior is required")
+        action_value_prior = action_alpha_prior
+    elif action_alpha_prior is not None:
+        raise ValueError("pass only one of action_value_prior or action_alpha_prior")
+
+    block_keys = (
+        rng_key[None, ...]
+        if num_search_blocks == 1
+        else jax.random.split(rng_key, num_search_blocks)
+    )
+    explored_action_mask = jnp.zeros(action_value_prior.shape[:-1], dtype=bool)
+    block_output = _dirichlet_q_search_block(
+        params=params,
+        rng_key=block_keys[0],
+        root=root,
+        recurrent_fn=recurrent_fn,
+        action_value_prior=action_value_prior,
+        explored_action_mask=explored_action_mask,
+        num_simulations=num_simulations,
+        invalid_actions=invalid_actions,
+        max_depth=max_depth,
+        loop_fn=loop_fn,
+    )
+    q_evidence_total = block_output.q_evidence_sum
+    alpha_base = block_output.alpha_search
+    explored_action_mask = block_output.explored_action_mask
+
+    for block_index in range(1, num_search_blocks):
+        block_output = _dirichlet_q_search_block(
+            params=params,
+            rng_key=block_keys[block_index],
+            root=root,
+            recurrent_fn=recurrent_fn,
+            action_value_prior=alpha_base,
+            explored_action_mask=explored_action_mask,
+            num_simulations=num_simulations,
+            invalid_actions=invalid_actions,
+            max_depth=max_depth,
+            loop_fn=loop_fn,
+        )
+        q_evidence_total = q_evidence_total + block_output.q_evidence_sum
+        alpha_base = block_output.alpha_search
+        explored_action_mask = block_output.explored_action_mask
+
+    alpha_search = alpha_base
+    score = outcome_utility(outcome_mean(alpha_search))
+    action = action_selection.masked_argmax(score, invalid_actions)
+    return DirichletQSearchOutput(
+        action=action,
+        action_weights=block_output.action_weights,
+        search_tree=block_output.search_tree,
+        q_evidence_sum=q_evidence_total,
+        alpha_search=alpha_search,
+        explored_action_mask=explored_action_mask,
+    )
+
+
 def posterior_best_policy_target(
     rng_key: chex.PRNGKey,
     alpha_Q_post: jax.Array,
@@ -100,6 +369,26 @@ def posterior_best_policy_target(
     legal_fallback = legal_action_mask.astype(alpha_Q_post.dtype) / jnp.maximum(legal_count, 1)
     normalized = target / jnp.maximum(target_sum, 1.0)
     return jnp.where(target_sum > 0, normalized, legal_fallback)
+
+
+def posterior_best_action(
+    policy_target: jax.Array,
+    legal_action_mask: jax.Array,
+) -> jax.Array:
+    return jnp.argmax(
+        jnp.where(legal_action_mask, policy_target, -jnp.inf),
+        axis=-1,
+    ).astype(jnp.int32)
+
+
+def posterior_sample_action(
+    rng_key: chex.PRNGKey,
+    policy_target: jax.Array,
+    legal_action_mask: jax.Array,
+) -> jax.Array:
+    logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
+    logits = jnp.where(legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    return jax.random.categorical(rng_key, logits).astype(jnp.int32)
 
 
 def posterior_targets(

@@ -28,7 +28,7 @@ import jax
 import optax
 import pgx
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 from tqdm import tqdm
 
 from .checkpoint import build_checkpoint_manager, maybe_save, restore, from_pretrained
@@ -65,11 +65,13 @@ class Config(BaseModel):
     # selfplay params
     selfplay_batch_size: int = 1024
     num_simulations: int = 32
+    num_search_blocks: int = Field(default=1, ge=1)
     max_num_steps: int = 256
     policy_mc_samples: int = 32
     c_leaf: float = 1.0
     c_terminal: float = 8.0
     selfplay_action_source: str = "posterior_best"
+    search_policy: str = "gumbel"
     # training params
     training_batch_size: int = 4096
     learning_rate: float = 0.001
@@ -111,8 +113,20 @@ class Config(BaseModel):
             weights = ", ".join(active_weights)
             raise ValueError(
                 "Dirichlet loss weights require network='boardlaw_dirichlet'; "
-                f"got network={self.network!r} with {weghts}. Set these "
-                "weights to 0.0 or use network='boardlsaw_dirichlet'."
+                f"got network={self.network!r} with {weights}. Set these "
+                "weights to 0.0 or use network='boardlaw_dirichlet'."
+            )
+        valid_action_sources = {
+            "posterior_best",
+            "posterior_argmax",
+            "posterior_sample",
+            "search_action",
+        }
+        if self.selfplay_action_source not in valid_action_sources:
+            allowed = ", ".join(sorted(valid_action_sources))
+            raise ValueError(
+                "selfplay_action_source must be one of "
+                f"{allowed}; got {self.selfplay_action_source!r}."
             )
         return self
 
