@@ -56,12 +56,14 @@ U(\phi) = \phi_W - \phi_L.
 
 \section*{Generic Batched Thompson Root Search}
 
-\begin{algorithmblock}{Algorithm 1: Dirichlet Q-head parameters}
-\textbf{Input:} state $s$, action $a$, network parameters $\theta$\\
-$\bar{\phi}_\theta^Q(s,a) \gets \softmax(r_\theta^Q(s,a))$\\
-$\alpha_{\theta,0}^Q(s,a) \gets \softplus(t_\theta^Q(s,a))$\\
-$\alpha_\theta^Q(s,a) \gets \alpha_{\theta,0}^Q(s,a)\bar{\phi}_\theta^Q(s,a)$\\
-\textbf{return} $\alpha_\theta^Q(s,a)$
+\begin{algorithmblock}{Algorithm 1: RootActionValuePriors$(s,\theta)$}
+\textbf{Input:} root state batch $s$, network parameters $\theta$\\
+\textbf{for each} legal root action $a$ \textbf{do}\\
+\> $s_a \gets \Step(s,a)$\\
+\> $\alpha_{\mathrm{child}}(s,a) \gets \alpha_\theta^V(s_a)$\\
+\> $\alpha_{\mathrm{base}}(s,a) \gets \fliproot(\alpha_{\mathrm{child}}(s,a))$\\
+\textbf{end for}\\
+\textbf{return} $\alpha_{\mathrm{base}}(s,\cdot)$
 \end{algorithmblock}
 
 \begin{algorithmblock}{Algorithm 2: ThompsonSampleActions$(\alpha,K,\legal)$}
@@ -113,7 +115,7 @@ $\Delta\alpha_{b,k} \gets \lambda_{b,k}d_{b,k}$\\
 
 \begin{algorithmblock}{Algorithm 6: BatchedThompsonRootSearch$(s,\theta,R,K,H)$}
 \textbf{Input:} root state batch $s$, network parameters $\theta$, rounds $R$, samples $K$, horizon $H$\\
-$\alpha \gets \alpha_\theta^Q(s,\cdot)$\\
+$\alpha \gets \operatorname{RootActionValuePriors}(s,\theta)$\\
 $\legal \gets \LegalActions(s)$\\
 \textbf{for} $r=1,\ldots,R$ \textbf{do}\\
 \> $a \gets \operatorname{ThompsonSampleActions}(\alpha,K,\legal)$\\
@@ -195,7 +197,8 @@ where $s_n$ is the environment state at the node, $d_n$ is the WDL
 distribution in the node-local player-to-move perspective, $w_n$ is the
 Dirichlet evidence weight, $a^{\mathrm{root}}_n$ is the first action taken from
 the root on the path to $n$, and $p_n \in \{0,1\}$ is the depth parity relative
-to the root.
+to the root. The local Q prior may be stored with the embedding, but it is not
+the base prior for the current policy or Q targets.
 
 When MCTX expands a child by action $a$ from a parent node, \texttt{play.py}
 applies the environment step and evaluates the resulting observation:
@@ -258,7 +261,7 @@ state with the network, and writes a child node into the tree. The stored child
 embedding contains the new environment state, the WDL evidence $d_n$, the
 evidence weight $w_n$, the inherited root action $a_n^{\mathrm{root}}$, the
 flipped depth parity $p_n$, and the local Q prior
-$\alpha_\theta^Q(s_n,\cdot)$. This step also records the tree topology:
+$\alpha_\theta^Q(s_n,\cdot)$ for model state bookkeeping. This step also records the tree topology:
 parent pointer, action-from-parent, child index, prior logits, reward, and
 discount.
 
@@ -271,16 +274,32 @@ selection, but the Dirichlet-Q root posterior is reconstructed from the stored
 WDL evidence through $\RootEvidenceSum(\mathrm{tree})$.
 \end{itemize}
 
-The final policy target does not use MCTX visit counts directly. It uses the
-Dirichlet posterior
+The final policy target does not use MCTX visit counts directly. It uses a
+Dirichlet posterior whose base is the one-ply child value prior
+\[
+\alpha_{\mathrm{base}}(s,a)
+=
+\fliproot\left(\alpha_\theta^V(\Step(s,a))\right),
+\]
+and whose evidence is reconstructed from the tree:
 \[
 \alpha_{\mathrm{search}}
 =
-\alpha_\theta^Q(s,\cdot)
+\alpha_{\mathrm{base}}(s,\cdot)
 +
 \RootEvidenceSum(\mathrm{tree})
 \]
 and then applies Algorithm 7.
+The same posterior is stored as the Q-head target:
+\[
+\beta_Q(s,a)
+=
+\alpha_{\mathrm{base}}(s,a)
++
+\RootEvidenceSum(\mathrm{tree})_{s,a}.
+\]
+The Q KL loss is evaluated only for actions whose accumulated evidence mass is
+positive.
 Equivalently, after simulation $t$ inside one MCTX block, the live root
 posterior is
 $\alpha_{\mathrm{block}}^{(t)}
@@ -298,7 +317,7 @@ Each pass through the loop is one Thompson root selection. The call to
 $\alpha^{(t-1)}$ accumulated from all previous expanded evidence.
 
 \begin{algorithmblock}{Algorithm 8: MCTXRootThompsonSelect$(\mathrm{tree})$}
-$\alpha_{\mathrm{base}} \gets \mathrm{tree.extra\_data.alpha\_Q\_prior}$\\
+$\alpha_{\mathrm{base}} \gets \mathrm{tree.extra\_data.action\_value\_prior}$\\
 $E \gets \RootEvidenceSum(\mathrm{tree})$\\
 $\alpha_{\mathrm{post}} \gets \alpha_{\mathrm{base}} + E$\\
 Sample $\phi \sim \Dirichlet(\alpha_{\mathrm{post}})$\\
@@ -310,7 +329,7 @@ $a \gets \arg\max_{\mathrm{action}} u$\\
 
 \begin{algorithmblock}{Algorithm 9: MCTXDirichletRootSearch$(s,\theta,T,\alpha_{\mathrm{base}})$}
 \textbf{Input:} root state $s$, network parameters $\theta$, simulations $T$, starting posterior $\alpha_{\mathrm{base}}$\\
-\textbf{if} $\alpha_{\mathrm{base}}$ is omitted \textbf{then} $\alpha_{\mathrm{base}} \gets \alpha_\theta^Q(s,\cdot)$ \textbf{end if}\\
+\textbf{if} $\alpha_{\mathrm{base}}$ is omitted \textbf{then} $\alpha_{\mathrm{base}} \gets \operatorname{RootActionValuePriors}(s,\theta)$ \textbf{end if}\\
 $\mathrm{tree} \gets \operatorname{InstantiateTreeFromRoot}(s,\theta,N=T+1,\alpha_{\mathrm{base}})$\\
 $E_0 \gets 0$\\
 $\alpha_{\mathrm{block}}^{(0)} \gets \alpha_{\mathrm{base}}$\\
@@ -333,7 +352,7 @@ $\alpha_{\mathrm{search}} \gets \alpha_{\mathrm{block}}^{(T)} = \alpha_{\mathrm{
 
 \begin{algorithmblock}{Algorithm 10: RepeatedMCTXDirichletRootSearch$(s,\theta,G,T)$}
 \textbf{Input:} root state $s$, network parameters $\theta$, outer rounds $G$, simulations per round $T$\\
-$\alpha^{(0)} \gets \alpha_\theta^Q(s,\cdot)$\\
+$\alpha^{(0)} \gets \operatorname{RootActionValuePriors}(s,\theta)$\\
 $E_{\mathrm{total}} \gets 0$\\
 \textbf{for} $g=1,\ldots,G$ \textbf{do}\\
 \> $(\mathrm{tree}_g,E_g,\alpha^{(g)})
@@ -342,7 +361,7 @@ $E_{\mathrm{total}} \gets 0$\\
 \> $E_{\mathrm{total}} \gets E_{\mathrm{total}} + E_g$\\
 \textbf{end for}\\
 $\alpha_{\mathrm{search}} \gets \alpha^{(G)}
-  = \alpha_\theta^Q(s,\cdot) + E_{\mathrm{total}}$\\
+  = \operatorname{RootActionValuePriors}(s,\theta) + E_{\mathrm{total}}$\\
 \textbf{return} $(\{\mathrm{tree}_g\}_{g=1}^{G},E_{\mathrm{total}},\alpha_{\mathrm{search}})$
 \end{algorithmblock}
 

@@ -20,10 +20,30 @@ $$
 \alpha_\theta^Q(s,a) \Longrightarrow p(\phi_{s,a}^Q \mid s,a).
 $$
 
-Search starts from the Q-head prior, evaluates actions, and updates root action posteriors with WDL evidence:
+Search evaluates actions and accumulates WDL evidence by the first root action.
+For policy improvement and Q-target construction, each action uses the
+next-state value Dirichlet as its prior, aligned back to the root player's
+perspective:
 
 $$
-\alpha_a \longrightarrow \alpha_a + \lambda d_a.
+\alpha_a^{\mathrm{child}}(s)
+=
+\operatorname{flip}
+\left(
+\alpha_{\theta^-}^V(s_a)
+\right),
+\qquad
+s_a = \operatorname{Step}(s,a).
+$$
+
+The action posterior used for the search-improved policy and Q target is
+
+$$
+\alpha_a^{\mathrm{post}}(s)
+=
+\alpha_a^{\mathrm{child}}(s)
++
+E_Q(s,a),
 $$
 
 The policy target after search is the posterior probability that each action is optimal:
@@ -44,7 +64,12 @@ $$
 \pi_{\mathrm{search}}(a \mid s).
 $$
 
-The value head is used to evaluate non-terminal search leaves. The Q head is used to initialize action-level posterior beliefs. Both Dirichlet heads are trained by KL divergence toward posterior Dirichlet targets produced by Bayesian-style evidence updates.
+The value head is used to evaluate non-terminal search leaves and to provide
+the one-ply child priors for action-level posterior targets. The Q head is
+trained to predict these action-level posteriors, but it is not used as the
+base prior for the current policy or Q targets. Both Dirichlet heads are
+trained by KL divergence toward posterior Dirichlet targets produced by
+Bayesian-style evidence updates.
 
 ---
 
@@ -568,24 +593,44 @@ $$
 
 ## 7. Root posterior search
 
-At root state $s$, initialize the per-action posterior from the Q head:
+At root state $s$, define the one-ply child state for each legal action:
+
+$$
+s_a = \operatorname{Step}(s,a).
+$$
+
+The value head on $s_a$ predicts the value from the next player-to-move
+perspective. Align it back to the root player's perspective:
 
 $$
 \alpha_a^{(0)} =
-\alpha_\theta^Q(s,a),
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
+=
+\operatorname{flip}
+\left(
+\alpha_{\theta^-}^V(s_a)
+\right),
 \qquad
 a \in \mathcal{A}(s).
 $$
 
-Using the stable Q parameterization:
+This action prior is a value-head Dirichlet over the next state, reinterpreted
+as the prior for the root action's outcome. The Q head still predicts
+$\alpha_\theta^Q(s,a)$, but in this target construction it is trained toward
+the posterior generated from the child value prior plus search evidence.
+
+Using the stable value parameterization:
 
 $$
 \alpha_a^{(0)} =
-\operatorname{softplus}(t_\theta^Q(s,a))
+\operatorname{flip}
+\left[
+\operatorname{softplus}(t_{\theta^-}^V(s_a))
 \operatorname{softmax}
 \left(
-r_\theta^Q(s,a)
-\right).
+r_{\theta^-}^V(s_a)
+\right)
+\right]
 $$
 
 At simulation $t$, sample one WDL distribution per legal action:
@@ -672,11 +717,28 @@ $$
 a \in \mathcal{A}(s).
 $$
 
+In the current MCTX implementation, search traversal itself may use MCTX's
+root selection rule, but the posterior used for policy targets is reconstructed
+from the accumulated root-action evidence and this child value prior.
+
 ---
 
 ## 8. Search-improved policy target
 
 After search, define the search-improved policy as the posterior probability that each action is optimal under utility.
+
+The posterior used here is the child-value-prior posterior:
+
+$$
+\alpha_b^{(T)}
+=
+\alpha_{\theta^-}^{V \rightarrow Q}(s,b)
++
+E_Q(s,b),
+$$
+
+where $E_Q(s,b)$ is the accumulated root-player-perspective evidence for
+action $b$.
 
 For each legal action $a$:
 
@@ -836,11 +898,15 @@ $$
 \alpha_{\theta^-}^V(s).
 $$
 
-For a state-action pair $(s,a)$, the Q prior at data-generation time is
+For a state-action pair $(s,a)$, the action-level prior used for policy and Q
+targets is the child value prior aligned to the root perspective:
 
 $$
-\alpha_{\mathrm{prior}}^Q(s,a) =
-\alpha_{\theta^-}^Q(s,a).
+\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a) =
+\operatorname{flip}
+\left(
+\alpha_{\theta^-}^V(\operatorname{Step}(s,a))
+\right).
 $$
 
 After evidence is collected, construct posterior targets:
@@ -856,7 +922,7 @@ and
 
 $$
 \beta_Q(s,a) =
-\alpha_{\mathrm{prior}}^Q(s,a)
+\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a)
 +
 \lambda_Q d_Q(s,a).
 $$
@@ -977,18 +1043,25 @@ $$
 \lambda_Q > 0.
 $$
 
-The Q prior from the data-generation network is
+The prior for the Q target is not the old Q-head prediction. It is the
+one-ply child value Dirichlet from the data-generation network, aligned to the
+root player's perspective:
 
 $$
-\alpha_{\mathrm{prior}}^Q(s,a) =
-\alpha_{\theta^-}^Q(s,a).
+\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a) =
+\operatorname{flip}
+\left(
+\alpha_{\theta^-}^V(s_a)
+\right),
+\qquad
+s_a = \operatorname{Step}(s,a).
 $$
 
 The posterior Q target is
 
 $$
 \beta_Q(s,a) =
-\alpha_{\mathrm{prior}}^Q(s,a)
+\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a)
 +
 \lambda_Q d_Q(s,a).
 $$
@@ -1014,22 +1087,31 @@ D_{\mathrm{KL}}
 \right).
 $$
 
-Average this over the sampled or visited actions being trained:
+Average this only over explored actions, i.e. actions with positive
+accumulated tree evidence:
 
 $$
 \mathcal{L}_Q(s) =
-\operatorname{mean}_{a \in \mathcal{A}_{\mathrm{sampled}}(s)}
+\operatorname{mean}_{a \in \mathcal{A}_{\mathrm{explored}}(s)}
 \mathcal{L}_Q(s,a).
 $$
 
-Unvisited actions may be excluded. If an unvisited action is included, its posterior target equals its prior:
+where $\mathcal{A}_{\mathrm{explored}}(s)$ is
 
 $$
-\beta_Q(s,a) =
-\alpha_{\theta^-}^Q(s,a).
+\mathcal{A}_{\mathrm{explored}}(s)
+=
+\left\{
+a \in \mathcal{A}(s)
+:
+\sum_{i \in \mathcal{I}(a)}
+\lambda_i
+> 0
+\right\}.
 $$
 
-This gives little direct learning signal beyond distilling the old prior, so the cleaner version is to train Q only on sampled or visited actions.
+Unexplored legal actions are excluded from the Q KL. They are not trained
+toward an unchanged prior.
 
 ---
 
@@ -1053,18 +1135,23 @@ $$
 i \in \mathcal{I}(a).
 $$
 
-The initial Q prior is
+The initial action prior is the child value prior:
 
 $$
 \alpha_a^{(0)} =
-\alpha_{\theta^-}^Q(s,a).
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
+=
+\operatorname{flip}
+\left(
+\alpha_{\theta^-}^V(\operatorname{Step}(s,a))
+\right).
 $$
 
 The final posterior after all evidence for action $a$ is
 
 $$
 \alpha_a^{(T)} =
-\alpha_{\theta^-}^Q(s,a)
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
 +
 \sum_{i \in \mathcal{I}(a)}
 \lambda_i d_i.
@@ -1081,7 +1168,7 @@ Equivalently:
 
 $$
 \beta_Q(s,a) =
-\alpha_{\theta^-}^Q(s,a)
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
 +
 \sum_{i \in \mathcal{I}(a)}
 \lambda_i d_i.
@@ -1108,7 +1195,10 @@ D_{\mathrm{KL}}
 \right).
 $$
 
-This trains the Q head to predict the posterior that search produced from its prior plus evidence.
+This trains the Q head to predict the posterior that search produced from the
+child value prior plus evidence. The loss is applied only when
+$\mathcal{I}(a)$ is non-empty, equivalently when the accumulated evidence mass
+for action $a$ is positive.
 
 ---
 
@@ -1162,7 +1252,7 @@ The Q loss is
 
 $$
 \mathcal{L}_Q(s) =
-\operatorname{mean}_{a \in \mathcal{A}_{\mathrm{sampled}}(s)}
+\operatorname{mean}_{a \in \mathcal{A}_{\mathrm{explored}}(s)}
 D_{\mathrm{KL}}
 \left(
 \operatorname{Dirichlet}
@@ -1193,7 +1283,7 @@ and
 
 $$
 \beta_Q(s,a) =
-\alpha_{\theta^-}^Q(s,a)
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
 +
 \sum_{i \in \mathcal{I}(a)}
 \lambda_i d_i.
@@ -1269,22 +1359,31 @@ Here $\Gamma$ is the gamma function and $\psi$ is the digamma function.
 
 ## 17. Core algorithm summary
 
-At a root state $s$, the Q head gives one positive Dirichlet prior per legal action:
+At a root state $s$, step each legal action once and evaluate the value head at
+the child state. This gives one positive Dirichlet prior per legal action:
 
 $$
 \alpha_a^{(0)} =
-\alpha_\theta^Q(s,a).
+\alpha_\theta^{V \rightarrow Q}(s,a)
+=
+\operatorname{flip}
+\left(
+\alpha_\theta^V(\operatorname{Step}(s,a))
+\right).
 $$
 
-Using the stable parameterization:
+Using the stable value-head parameterization:
 
 $$
-\alpha_\theta^Q(s,a) =
-\operatorname{softplus}(t_\theta^Q(s,a))
+\alpha_\theta^{V \rightarrow Q}(s,a) =
+\operatorname{flip}
+\left[
+\operatorname{softplus}(t_\theta^V(\operatorname{Step}(s,a)))
 \operatorname{softmax}
 \left(
-r_\theta^Q(s,a)
-\right).
+r_\theta^V(\operatorname{Step}(s,a))
+\right)
+\right]
 $$
 
 Search repeatedly samples from these posteriors:
@@ -1374,11 +1473,14 @@ The Q head learns posterior action-level WDL beliefs:
 
 $$
 \beta_Q(s,a) =
-\alpha_{\theta^-}^Q(s,a)
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
 +
 \sum_{i \in \mathcal{I}(a)}
 \lambda_i d_i.
 $$
+
+The Q KL is averaged only over explored actions with positive accumulated
+evidence mass.
 
 The central search primitive is always the same Dirichlet evidence update:
 

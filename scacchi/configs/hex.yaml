@@ -3,7 +3,7 @@ board_size: 6
 network: boardlaw_dirichlet
 num_outcomes: null
 seed: 0
-max_num_iters: 300
+max_num_iters: 150
 num_channels: 128
 num_layers: 8
 resnet_v2: true
@@ -27,3 +27,4 @@ eval_interval: 1
 eval_batch_size: 256
 wandb_enabled: true
 wandb_project: scacchi-az
+ckpt_max_to_keep: 0

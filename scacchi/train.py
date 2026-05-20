@@ -111,8 +111,8 @@ class Config(BaseModel):
             weights = ", ".join(active_weights)
             raise ValueError(
                 "Dirichlet loss weights require network='boardlaw_dirichlet'; "
-                f"got network={self.network!r} with {weights}. Set these "
-                "weights to 0.0 or use network='boardlaw_dirichlet'."
+                f"got network={self.network!r} with {weghts}. Set these "
+                "weights to 0.0 or use network='boardlsaw_dirichlet'."
             )
         return self
 
