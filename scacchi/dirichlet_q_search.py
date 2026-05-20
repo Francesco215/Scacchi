@@ -371,6 +371,26 @@ def posterior_best_policy_target(
     return jnp.where(target_sum > 0, normalized, legal_fallback)
 
 
+def posterior_best_action(
+    policy_target: jax.Array,
+    legal_action_mask: jax.Array,
+) -> jax.Array:
+    return jnp.argmax(
+        jnp.where(legal_action_mask, policy_target, -jnp.inf),
+        axis=-1,
+    ).astype(jnp.int32)
+
+
+def posterior_sample_action(
+    rng_key: chex.PRNGKey,
+    policy_target: jax.Array,
+    legal_action_mask: jax.Array,
+) -> jax.Array:
+    logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
+    logits = jnp.where(legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    return jax.random.categorical(rng_key, logits).astype(jnp.int32)
+
+
 def posterior_targets(
     alpha_V_prior: jax.Array,
     action_value_prior: jax.Array,

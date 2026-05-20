@@ -15,7 +15,9 @@ from .dirichlet_q_search import (
     outcome_mean,
     outcome_utility,
     dirichlet_q_policy,
+    posterior_best_action,
     posterior_best_policy_target,
+    posterior_sample_action,
     posterior_targets,
     q_evidence_sum_from_tree,
     root_action_value_priors_from_tree,
@@ -271,14 +273,18 @@ def make_selfplay(env, config):
                     )
                 )
                 q_evidence_mass = jnp.sum(q_evidence_sum, axis=-1)
-                action_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
-                action_logits = jnp.where(
-                    legal_action_mask,
-                    action_logits,
-                    jnp.finfo(action_logits.dtype).min,
-                )
-                posterior_action = jax.random.categorical(action_key, action_logits)
-                if config.selfplay_action_source == "posterior_best":
+                if config.selfplay_action_source in ("posterior_best", "posterior_argmax"):
+                    posterior_action = posterior_best_action(
+                        policy_target,
+                        legal_action_mask,
+                    )
+                    played_action = posterior_action
+                elif config.selfplay_action_source == "posterior_sample":
+                    posterior_action = posterior_sample_action(
+                        action_key,
+                        policy_target,
+                        legal_action_mask,
+                    )
                     played_action = posterior_action
                 else:
                     played_action = policy_output.action

@@ -4,11 +4,14 @@ import jax.numpy as jnp
 import mctx
 
 from .dirichlet_q_search import (
+    DirichletQSearchOutput,
     NO_PARENT,
     NodeEmbedding,
     dirichlet_q_policy,
     outcome_mean,
     outcome_utility,
+    posterior_best_action,
+    posterior_best_policy_target,
 )
 from .network import policy_value_from_output
 from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
@@ -40,6 +43,7 @@ def _make_model_mcts_policy(env, config, model, rng_key, env_state, num_simulati
         len(model_output) == 3
         and getattr(config, "search_policy", "gumbel") == "dirichlet_thompson"
     ):
+        search_key, posterior_key = jax.random.split(rng_key)
         logits, alpha_v, alpha_q = model_output
         root_outcome = outcome_mean(alpha_v)
         value = outcome_utility(root_outcome)
@@ -58,15 +62,29 @@ def _make_model_mcts_policy(env, config, model, rng_key, env_state, num_simulati
             embedding=root_embedding,
         )
         action_value_prior = alpha_q
-        return dirichlet_q_policy(
+        policy = dirichlet_q_policy(
             params=(),
-            rng_key=rng_key,
+            rng_key=search_key,
             root=root,
             recurrent_fn=make_dirichlet_recurrent_fn(env, predict, config),
             action_value_prior=action_value_prior,
             num_simulations=num_simulations,
             invalid_actions=~env_state.legal_action_mask,
             num_search_blocks=getattr(config, "num_search_blocks", 1),
+        )
+        policy_target = posterior_best_policy_target(
+            posterior_key,
+            policy.alpha_search,
+            env_state.legal_action_mask,
+            config.policy_mc_samples,
+        )
+        return DirichletQSearchOutput(
+            action=posterior_best_action(policy_target, env_state.legal_action_mask),
+            action_weights=policy_target,
+            search_tree=policy.search_tree,
+            q_evidence_sum=policy.q_evidence_sum,
+            alpha_search=policy.alpha_search,
+            explored_action_mask=policy.explored_action_mask,
         )
     return _make_mcts_policy(
         predict,

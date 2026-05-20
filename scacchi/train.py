@@ -116,6 +116,18 @@ class Config(BaseModel):
                 f"got network={self.network!r} with {weights}. Set these "
                 "weights to 0.0 or use network='boardlaw_dirichlet'."
             )
+        valid_action_sources = {
+            "posterior_best",
+            "posterior_argmax",
+            "posterior_sample",
+            "search_action",
+        }
+        if self.selfplay_action_source not in valid_action_sources:
+            allowed = ", ".join(sorted(valid_action_sources))
+            raise ValueError(
+                "selfplay_action_source must be one of "
+                f"{allowed}; got {self.selfplay_action_source!r}."
+            )
         return self
 
 

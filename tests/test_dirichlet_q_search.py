@@ -13,7 +13,9 @@ from scacchi.dirichlet_q_search import (
     dirichlet_root_action_selection,
     flip_outcome,
     outcome_utility,
+    posterior_best_action,
     posterior_best_policy_target,
+    posterior_sample_action,
     posterior_targets,
     q_evidence_sum_from_tree,
     root_action_value_priors_from_tree,
@@ -398,6 +400,29 @@ def test_posterior_best_policy_target_masks_invalid_actions():
     assert policy_target.shape == (1, 3)
     assert jnp.allclose(policy_target[0, 1], 0.0)
     assert jnp.allclose(policy_target.sum(axis=-1), 1.0)
+
+
+def test_posterior_best_action_is_argmax_policy_target_and_masks_invalid():
+    policy_target = jnp.array([[0.2, 0.7, 0.1], [0.6, 0.4, 0.0]])
+    legal_action_mask = jnp.array([[True, False, True], [True, True, False]])
+
+    action = posterior_best_action(policy_target, legal_action_mask)
+
+    assert jnp.array_equal(action, jnp.array([0, 0], dtype=jnp.int32))
+
+
+def test_posterior_sample_action_samples_policy_target_and_masks_invalid():
+    policy_target = jnp.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    legal_action_mask = jnp.array([[True, False, True], [False, True, False]])
+
+    action = posterior_sample_action(
+        jax.random.PRNGKey(0),
+        policy_target,
+        legal_action_mask,
+    )
+
+    assert bool(legal_action_mask[0, action[0]])
+    assert int(action[1]) == 1
 
 
 def test_posterior_targets_add_q_evidence_to_action_value_prior_and_weight_value_evidence():

@@ -8,13 +8,13 @@ num_channels: 128
 num_layers: 8
 resnet_v2: true
 selfplay_batch_size: 4096
-num_simulations: 32
+num_simulations: 4
 max_num_steps: 64
 num_search_blocks: 4
 policy_mc_samples: 32
 c_leaf: 1.0
 c_terminal: 8.0
-selfplay_action_source: posterior_best
+selfplay_action_source: posterior_sample
 search_policy: dirichlet_thompson
 training_batch_size: 1024
 learning_rate: 1e-3
