@@ -1531,3 +1531,164 @@ $$
 $$
 
 There is no additive $\alpha_{\mathrm{base}}$ and no smoothing term.
+
+---
+
+## Appendix A. Policy improvement and committed-action modes
+
+Search separates three objects:
+
+1. the proposal/search mechanism that decides which actions receive evidence,
+2. the posterior after search, $\alpha_{\mathrm{search}}$,
+3. the committed move used to advance the self-play game.
+
+For Dirichlet-Q search, root traversal can use Thompson sampling while the
+training target remains the posterior-best distribution
+
+$$
+\pi_{\mathrm{search}}(a \mid s)
+=
+\mathbb{P}
+\left(
+a =
+\arg\max_b U(\phi_b)
+\right),
+\qquad
+\phi_b \sim
+\operatorname{Dirichlet}
+\left(
+\alpha_{\mathrm{search}}(s,b)
+\right).
+$$
+
+This is estimated by Monte Carlo as
+$\hat{\pi}_{\mathrm{search}}$. The policy head is trained toward
+$\hat{\pi}_{\mathrm{search}}$ regardless of which committed-action mode is
+used.
+
+### A.1 Committed-action modes
+
+The deterministic posterior-best mode commits
+
+$$
+A_{\mathrm{argmax}}
+=
+\arg\max_{a \in \mathcal{A}(s)}
+\hat{\pi}_{\mathrm{search}}(a \mid s).
+$$
+
+In config this is `selfplay_action_source: posterior_best` or
+`selfplay_action_source: posterior_argmax`.
+
+The stochastic posterior-sample mode commits
+
+$$
+A_{\mathrm{sample}}
+\sim
+\operatorname{Categorical}
+\left(
+\hat{\pi}_{\mathrm{search}}(\cdot \mid s)
+\right).
+$$
+
+In config this is `selfplay_action_source: posterior_sample`. This mode keeps
+the old stochastic committed-move behavior: sample the played move from the
+Monte Carlo posterior-best target. It changes only the action used to step the
+environment; it does not change the target used for the policy loss.
+
+### A.2 Improvement in posterior optimality probability
+
+Let
+
+$$
+p_T(a) = \hat{\pi}_{\mathrm{search}}(a \mid s).
+$$
+
+The posterior-argmax committed action satisfies the pointwise inequality
+
+$$
+p_T(A_{\mathrm{argmax}})
+\ge
+p_T(a),
+\qquad
+\forall a \in \mathcal{A}(s).
+$$
+
+Therefore, for any proposal distribution $\nu$ over legal actions and
+$A_0 \sim \nu$,
+
+$$
+\mathbb{E}
+\left[
+p_T(A_{\mathrm{argmax}})
+\right]
+\ge
+\mathbb{E}_{A_0 \sim \nu}
+\left[
+p_T(A_0)
+\right]
+=
+\sum_a
+\nu(a)p_T(a).
+$$
+
+Thus `posterior_argmax` is greedy-improving with respect to the search
+posterior's own optimal-action probability score. In particular, it is at least
+as good under $p_T$ as committing a move drawn from the pre-search proposal,
+the search-time Thompson proposal, or the posterior-sample distribution.
+
+The posterior-sample mode does not take this greedy step. Instead it performs
+posterior probability matching after search:
+
+$$
+\mathbb{P}
+\left(
+A_{\mathrm{sample}}=a
+\right)
+=
+\hat{\pi}_{\mathrm{search}}(a \mid s).
+$$
+
+This preserves stochastic exploration in self-play while still training the
+policy head on the same search-improved posterior-best target.
+
+### A.3 Relation to scalar-Q policy-improvement guarantees
+
+The Gumbel-style deterministic bandit guarantee is a scalar-estimate guarantee.
+Let search produce a scalar estimate $\hat{q}_T(a)$ for each action in a
+candidate set $C$, and let the baseline proposal action $A_0$ belong to $C$.
+If the committed action is
+
+$$
+A_+
+=
+\arg\max_{a \in C}
+\hat{q}_T(a),
+$$
+
+then
+
+$$
+\hat{q}_T(A_+) \ge \hat{q}_T(A_0)
+$$
+
+pointwise, and therefore also in expectation.
+
+In Dirichlet-Q, a natural scalar estimate is the posterior mean utility
+
+$$
+\hat{q}_T(a)
+=
+U
+\left(
+\frac{\alpha_{\mathrm{search}}(s,a)}
+{\sum_z \alpha_{\mathrm{search},z}(s,a)}
+\right).
+$$
+
+The above scalar-Q guarantee applies directly if the committed move is chosen
+greedily by this scalar estimate. The implemented posterior-best mode instead
+chooses greedily by $p_T(a)=\hat{\pi}_{\mathrm{search}}(a \mid s)$. This is a
+Bayesian posterior-optimality decision rule. It coincides with the scalar-Q
+greedy rule only when the posterior-optimality probabilities and posterior mean
+utilities induce the same action ranking.

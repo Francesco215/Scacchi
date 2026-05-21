@@ -367,10 +367,11 @@ $\alpha_{\mathrm{search}} \gets \alpha_{\mathrm{block}}^{(T)}$\\
 \textbf{return} $(\mathrm{tree},E_T,\alpha_{\mathrm{search}})$
 \end{algorithmblock}
 
-\begin{algorithmblock}{Algorithm 10: RepeatedMCTXDirichletRootSearch$(s,\theta,G,T)$}
-\textbf{Input:} root state $s$, network parameters $\theta$, outer rounds $G$, simulations per round $T$\\
+\begin{algorithmblock}{Algorithm 10: RepeatedMCTXDirichletRootSearch$(s,\theta,G,T,M,\mathrm{commit})$}
+\textbf{Input:} root state $s$, network parameters $\theta$, outer rounds $G$, simulations per round $T$, posterior-best samples $M$, committed-action mode $\mathrm{commit}$\\
 $\alpha^{(0)} \gets \alpha_\theta^Q(s,\cdot)$\\
 $E_{\mathrm{total}} \gets 0$\\
+$\legal \gets \LegalActions(s)$\\
 \textbf{for} $g=1,\ldots,G$ \textbf{do}\\
 \> $(\mathrm{tree}_g,E_g,\alpha^{(g)})
    \gets
@@ -378,17 +379,37 @@ $E_{\mathrm{total}} \gets 0$\\
 \> $E_{\mathrm{total}} \gets E_{\mathrm{total}} + E_g$\\
 \textbf{end for}\\
 $\alpha_{\mathrm{search}} \gets \alpha^{(G)}$\\
-\textbf{return} $(\{\mathrm{tree}_g\}_{g=1}^{G},E_{\mathrm{total}},\alpha_{\mathrm{search}})$
+$\hat{\pi}_{\mathrm{search}}
+   \gets
+   \operatorname{PosteriorBestPolicyTarget}(\alpha_{\mathrm{search}},M,\legal)$\\
+\textbf{if} $\mathrm{commit}=\text{\texttt{posterior\_sample}}$ \textbf{then}\\
+\> $a_{\mathrm{play}}
+   \sim
+   \operatorname{Categorical}
+   \left(\hat{\pi}_{\mathrm{search}}(\cdot \mid s)\right)$\\
+\textbf{else}\\
+\> $a_{\mathrm{play}}
+   \gets
+   \arg\max_{a \in \mathcal{A}(s)}
+   \hat{\pi}_{\mathrm{search}}(a \mid s)$\\
+\textbf{end if}\\
+\textbf{return} $(\{\mathrm{tree}_g\}_{g=1}^{G},E_{\mathrm{total}},\alpha_{\mathrm{search}},\hat{\pi}_{\mathrm{search}},a_{\mathrm{play}})$
 \end{algorithmblock}
 
-For the planned implementation,
+For the implementation,
 \[
 T = \texttt{num\_simulations},
 \qquad
+G = \texttt{num\_search\_blocks},
+\qquad
 M = \texttt{policy\_mc\_samples},
 \]
-and the current \texttt{play.py} search shape is closest to $G=1$. Algorithm
-10 is the planned outer wrapper for repeated MCTX blocks; it performs $G$ calls
-to Algorithm 9 and carries the posterior $\alpha^{(g)}$ into the next call.
+and $\mathrm{commit}$ is controlled by \texttt{selfplay\_action\_source}. The
+policy target is always $\hat{\pi}_{\mathrm{search}}$. The
+\texttt{posterior\_sample} mode samples the played move from this target, while
+\texttt{posterior\_best} and \texttt{posterior\_argmax} play
+$\arg\max_a \hat{\pi}_{\mathrm{search}}(a \mid s)$. Algorithm 10 performs $G$
+calls to Algorithm 9 and carries the posterior $\alpha^{(g)}$ into the next
+call.
 
 \end{document}
