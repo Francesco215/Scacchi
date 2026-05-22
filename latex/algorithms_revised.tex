@@ -1,0 +1,1891 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, mathtools}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+% -----------------------------------------------------------------------------
+% Basic notation
+% -----------------------------------------------------------------------------
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\one}{\mathbf{1}}
+
+\newcommand{\Dir}{\operatorname{Dirichlet}}
+\newcommand{\Cat}{\operatorname{Categorical}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\mean}{\operatorname{mean}}
+\newcommand{\stopgrad}{\operatorname{stopgrad}}
+
+\newcommand{\Tree}{\mathcal{T}}
+\newcommand{\Path}{\mathcal{P}}
+\newcommand{\States}{\mathcal{S}}
+\newcommand{\Actions}{\mathcal{A}}
+\newcommand{\Legal}{\mathcal{A}_{\mathrm{legal}}}
+\newcommand{\Z}{\mathcal{Z}}
+
+\newcommand{\Step}{\operatorname{Step}}
+\newcommand{\Eval}{\operatorname{Eval}}
+\newcommand{\Flip}{\operatorname{flip}}
+\newcommand{\Align}{\operatorname{align}}
+\newcommand{\Utility}{U}
+
+\newcommand{\ThompsonSelect}{\operatorname{ThompsonSelect}}
+\newcommand{\EdgeBase}{\operatorname{EdgeBase}}
+\newcommand{\EdgePosterior}{\operatorname{EdgePosterior}}
+\newcommand{\StateSearchPosterior}{\operatorname{StateSearchPosterior}}
+\newcommand{\BackupPath}{\operatorname{BackupPath}}
+\newcommand{\NextRequest}{\operatorname{NextRequest}}
+\newcommand{\ConsumeResult}{\operatorname{ConsumeResult}}
+\newcommand{\BuildEvalBatch}{\operatorname{BuildEvalBatch}}
+\newcommand{\GpuEvaluate}{\operatorname{GpuEvaluate}}
+\newcommand{\PosteriorBestPolicyTarget}{\operatorname{PosteriorBestPolicyTarget}}
+\newcommand{\FinishSearch}{\operatorname{FinishSearch}}
+\newcommand{\MakeTargets}{\operatorname{MakeTargets}}
+
+% -----------------------------------------------------------------------------
+% Lightweight algorithm box
+% -----------------------------------------------------------------------------
+
+\newenvironment{algorithmblock}[1]
+{
+  \par\medskip
+  \noindent\hrule\par\smallskip
+  \noindent\textbf{#1}
+  \par\smallskip
+}
+{
+  \par\smallskip\noindent\hrule\par\medskip
+}
+
+\newcommand{\Input}{\textbf{Input: }}
+\newcommand{\Output}{\textbf{Output: }}
+\newcommand{\Require}{\textbf{Require: }}
+\newcommand{\Return}{\textbf{return }}
+\newcommand{\If}{\textbf{if }}
+\newcommand{\Then}{\textbf{ then }}
+\newcommand{\Else}{\textbf{else }}
+\newcommand{\EndIf}{\textbf{end if}}
+\newcommand{\For}{\textbf{for }}
+\newcommand{\EndFor}{\textbf{end for}}
+\newcommand{\While}{\textbf{while }}
+\newcommand{\EndWhile}{\textbf{end while}}
+\newcommand{\Do}{\textbf{ do }}
+\newcommand{\Break}{\textbf{break}}
+\newcommand{\Continue}{\textbf{continue}}
+
+\title{Dirichlet-Q AlphaZero: Posterior Tree Search Algorithms}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section*{1. Purpose of this file}
+
+This document defines the search-side algorithms for Dirichlet-Q AlphaZero.
+
+The central change from standard AlphaZero-style MCTS is that the tree does not
+store scalar action values as its main memory. Instead, each tree edge stores a
+WDL Dirichlet posterior. Search is therefore a posterior-refinement process.
+
+The CPU owns a mutable posterior tree. The GPU only evaluates batches of leaf
+states. The search interface is:
+
+\[
+\NextRequest(\Tree),
+\qquad
+\ConsumeResult(\Tree,r),
+\qquad
+\FinishSearch(\Tree).
+\]
+
+The CPU repeatedly selects paths through the current posterior tree, creates
+leaf-evaluation requests, sends leaf states to the GPU in batches, and then backs
+up WDL evidence when GPU results return.
+
+This version deliberately does \emph{not} include temporary reservation mass or
+virtual-loss-style in-flight Dirichlet mass. In-flight leaves may still be tracked
+for scheduling, but they do not alter any edge posterior.
+
+\section*{2. Outcome space and utility}
+
+For a two-player zero-sum game, define the WDL outcome space
+
+\[
+\Z = \{L,D,W\}.
+\]
+
+A WDL distribution is
+
+\[
+\phi = (\phi_L,\phi_D,\phi_W) \in \Delta^2.
+\]
+
+The scalar utility used everywhere is
+
+\[
+\Utility(\phi) = \phi_W - \phi_L.
+\]
+
+For a Dirichlet parameter vector
+
+\[
+\alpha = (\alpha_L,\alpha_D,\alpha_W),
+\]
+
+define its mean as
+
+\[
+\mean(\alpha)
+=
+\frac{\alpha}{\alpha_0},
+\qquad
+\alpha_0 = \sum_{z \in \{L,D,W\}} \alpha_z.
+\]
+
+When the intended action rule is greedy with respect to a posterior mean, define
+
+\[
+\bar\phi_{v,a}
+=
+\mean
+\left(
+\alpha^{\mathrm{post}}_{v,a}
+\right).
+\]
+
+Then the greedy mean action is
+
+\[
+a^{\star}_{\mathrm{mean}}
+=
+\argmax_{a\in\Legal(s_v)}
+\left(
+\bar\phi_{v,a,W}-\bar\phi_{v,a,L}
+\right).
+\]
+
+This is different from Thompson selection, where the maximization is over a
+fresh posterior sample rather than over the posterior mean.
+
+The opponent-perspective flip is
+
+\[
+\Flip(d_L,d_D,d_W)
+=
+(d_W,d_D,d_L).
+\]
+
+The same flip applies to Dirichlet parameters:
+
+\[
+\Flip(\alpha_L,\alpha_D,\alpha_W)
+=
+(\alpha_W,\alpha_D,\alpha_L).
+\]
+
+For zero-sum alternating-turn games,
+
+\[
+\Utility(\Flip(d)) = -\Utility(d).
+\]
+
+\section*{3. Network outputs}
+
+At state \(s\), the network predicts:
+
+\[
+\ell_\theta(s,a),
+\qquad
+\alpha_\theta^V(s),
+\qquad
+\alpha_\theta^Q(s,a).
+\]
+
+The policy head is
+
+\[
+\pi_\theta(a \mid s)
+=
+\softmax(\ell_\theta(s,\cdot))_a.
+\]
+
+The value head represents a WDL belief over the state value:
+
+\[
+\phi_s^V
+\sim
+\Dir(\alpha_\theta^V(s)).
+\]
+
+The Q head represents a WDL belief over each state-action value:
+
+\[
+\phi_{s,a}^Q
+\sim
+\Dir(\alpha_\theta^Q(s,a)).
+\]
+
+Both Dirichlet heads use the stable mean-concentration parameterization:
+
+\[
+\alpha_\theta
+=
+\alpha_{\theta,0}\bar{\phi}_\theta,
+\]
+
+where
+
+\[
+\bar{\phi}_\theta = \softmax(r_\theta),
+\qquad
+\alpha_{\theta,0} = \softplus(t_\theta)^2.
+\]
+
+\section*{4. Posterior tree state}
+
+A posterior tree is denoted by
+
+\[
+\Tree.
+\]
+
+Each node \(v\) stores:
+
+\[
+s_v,
+\qquad
+\texttt{expanded}(v),
+\qquad
+\alpha_\theta^V(s_v),
+\qquad
+\alpha_\theta^Q(s_v,\cdot),
+\qquad
+\ell_\theta(s_v,\cdot).
+\]
+
+Each edge \((v,a)\) stores:
+
+\[
+\texttt{child}(v,a),
+\qquad
+E_{v,a} \in \R_{\ge 0}^{3},
+\qquad
+N_{v,a} \in \mathbb{N}.
+\]
+
+Here
+
+\[
+E_{v,a}
+=
+\text{completed WDL pseudo-evidence accumulated on edge } (v,a).
+\]
+
+The posterior used for both selection and targets is
+
+\[
+\alpha^{\mathrm{post}}_{v,a}
+=
+\alpha^{\mathrm{base}}_{v,a}
++
+E_{v,a}.
+\]
+
+No separate selection posterior is used. In-flight scheduling state may exist in
+an implementation, but it is not part of the Bayesian tree state and it is not
+added to any Dirichlet posterior.
+
+\section*{5. Edge base prior}
+
+For an edge \((v,a)\), the base Dirichlet prior depends on whether the child
+state has already been expanded.
+
+If the child is not expanded, use the Q-head prediction at the parent node:
+
+\[
+\alpha^{\mathrm{base}}_{v,a}
+=
+\alpha_\theta^Q(s_v,a).
+\]
+
+If the child \(u=\texttt{child}(v,a)\) is expanded, use the child value head,
+aligned back to the perspective of the player to move at node \(v\):
+
+\[
+\alpha^{\mathrm{base}}_{v,a}
+=
+\Align_{v \leftarrow u}
+\left(
+\alpha_\theta^V(s_u)
+\right).
+\]
+
+For ordinary alternating-turn two-player games, this is usually
+
+\[
+\alpha^{\mathrm{base}}_{v,a}
+=
+\Flip
+\left(
+\alpha_\theta^V(s_u)
+\right).
+\]
+
+The general alignment notation is used because some environments may include
+passes, chance transitions, or non-alternating turns.
+
+\begin{algorithmblock}{Algorithm 1: EdgeBase\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), expanded node \(v\), legal action \(a\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item If edge \((v,a)\) has an expanded child \(u\), set
+  \[
+  \alpha^{\mathrm{base}}_{v,a}
+  \gets
+  \Align_{v \leftarrow u}
+  \left(
+  \alpha_\theta^V(s_u)
+  \right).
+  \]
+
+  \item Otherwise set
+  \[
+  \alpha^{\mathrm{base}}_{v,a}
+  \gets
+  \alpha_\theta^Q(s_v,a).
+  \]
+
+  \item \Return \(\alpha^{\mathrm{base}}_{v,a}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 2: EdgePosterior\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), expanded node \(v\), legal action \(a\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Compute
+  \[
+  \alpha^{\mathrm{base}}_{v,a}
+  \gets
+  \EdgeBase(\Tree,v,a).
+  \]
+
+  \item Compute
+  \[
+  \alpha^{\mathrm{post}}_{v,a}
+  \gets
+  \alpha^{\mathrm{base}}_{v,a}
+  +
+  E_{v,a}.
+  \]
+
+  \item \Return \(\alpha^{\mathrm{post}}_{v,a}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{6. Thompson action selection at a node}
+
+At an expanded node \(v\), selection samples one WDL distribution per legal
+action:
+
+\[
+\phi_{v,a}
+\sim
+\Dir
+\left(
+\alpha^{\mathrm{post}}_{v,a}
+\right),
+\qquad
+ a \in \Legal(s_v).
+\]
+
+The selected action is
+
+\[
+a^\star
+=
+\argmax_{a \in \Legal(s_v)}
+\Utility(\phi_{v,a})
+=
+\argmax_{a \in \Legal(s_v)}
+\left(
+\phi_{v,a,W}-\phi_{v,a,L}
+\right).
+\]
+
+This is Thompson sampling over WDL action-value beliefs. It is not the same as
+choosing the action with largest posterior mean utility, which would use
+\(\bar\phi_{v,a}=\mean(\alpha^{\mathrm{post}}_{v,a})\).
+
+\begin{algorithmblock}{Algorithm 3: ThompsonSelect\((\Tree,v)\)}
+
+\Input posterior tree \(\Tree\), expanded node \(v\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each legal action \(a \in \Legal(s_v)\), compute
+  \[
+  \alpha_{v,a}
+  \gets
+  \EdgePosterior(\Tree,v,a).
+  \]
+
+  \item Sample
+  \[
+  \phi_{v,a}
+  \sim
+  \Dir(\alpha_{v,a})
+  \qquad
+  \text{for each } a \in \Legal(s_v).
+  \]
+
+  \item Compute
+  \[
+  u_a
+  \gets
+  \Utility(\phi_{v,a})
+  =
+  \phi_{v,a,W}-\phi_{v,a,L}
+  \qquad
+  \text{for each } a \in \Legal(s_v).
+  \]
+
+  \item Select
+  \[
+  a^\star
+  \gets
+  \argmax_{a \in \Legal(s_v)} u_a.
+  \]
+
+  \item \Return \(a^\star\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{7. Leaf evaluation}
+
+Search stops at either terminal or non-terminal leaves.
+
+If the leaf is terminal with outcome \(z\), the evidence is one-hot:
+
+\[
+d_\ell = e_z,
+\qquad
+\lambda_\ell = c_{\mathrm{terminal}}.
+\]
+
+If the leaf is non-terminal, the GPU evaluates the leaf state and returns
+\(\alpha_\theta^V(s_\ell)\). The WDL evidence is the value-head mean:
+
+\[
+d_\ell
+=
+\mean
+\left(
+\alpha_\theta^V(s_\ell)
+\right),
+\qquad
+\lambda_\ell = c_{\mathrm{leaf}}.
+\]
+
+Usually,
+
+\[
+c_{\mathrm{terminal}} > c_{\mathrm{leaf}}.
+\]
+
+Terminal evidence is more reliable than bootstrapped neural evidence.
+
+\section*{8. Search-weighted state posterior for backup}
+
+A simple path backup propagates only the leaf evidence \(\lambda_\ell d_\ell\)
+to every traversed edge. That is easy, but it ignores the search information
+already accumulated below intermediate nodes on the path.
+
+For a more precise backup, define the search-improved state posterior at an
+expanded non-terminal node \(u\) by weighting outgoing action posteriors by the
+local posterior-best policy:
+
+\[
+\beta^V_u
+=
+\sum_{b\in\Legal(s_u)}
+\hat\pi_{\mathrm{search}}^u(b)
+\alpha^{\mathrm{post}}_{u,b}.
+\]
+
+Equivalently,
+
+\[
+\beta^V_u
+=
+\sum_{b\in\Legal(s_u)}
+\hat\pi_{\mathrm{search}}^u(b)
+\left(
+\alpha^{\mathrm{base}}_{u,b}+E_{u,b}
+\right).
+\]
+
+This is the precise form of the idea ``propagate \(E+\alpha\), weighted by
+\(\pi_{\mathrm{search}}\).'' The object \(\beta^V_u\) is a Dirichlet-parameter
+proxy for the value of state \(u\) under its search-improved policy.
+
+The policy \(\hat\pi_{\mathrm{search}}^u\) is computed from the outgoing action
+posteriors:
+
+\[
+\hat\pi_{\mathrm{search}}^u
+=
+\PosteriorBestPolicyTarget
+\left(
+\left\{\alpha^{\mathrm{post}}_{u,b}\right\}_{b\in\Legal(s_u)},
+M_{\mathrm{backup}},
+\Legal(s_u)
+\right).
+\]
+
+To add this state posterior to an incoming edge, convert it into pseudo-evidence
+with a calibration coefficient \(c_{\mathrm{state}}>0\):
+
+\[
+\Delta E_{p,a}^{\mathrm{state}}
+=
+ c_{\mathrm{state}}
+\Align_{p\leftarrow u}
+\left(
+\beta^V_u
+\right).
+\]
+
+Using \(c_{\mathrm{state}}=1\) copies the full child state posterior as evidence.
+In neural search this may be too confident because subtree evaluations are
+correlated and bootstrapped. A safer first setting is to treat
+\(c_{\mathrm{state}}\) as a small calibration knob.
+
+\begin{algorithmblock}{Algorithm 4: StateSearchPosterior\((\Tree,u,M_{\mathrm{backup}})\)}
+
+\Input posterior tree \(\Tree\), expanded non-terminal node \(u\), posterior-best sample count \(M_{\mathrm{backup}}\)
+
+\Output search-weighted state posterior \(\beta^V_u\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each legal action \(b\in\Legal(s_u)\), compute
+  \[
+  \alpha^{\mathrm{post}}_{u,b}
+  \gets
+  \EdgePosterior(\Tree,u,b).
+  \]
+
+  \item Compute the local posterior-best policy:
+  \[
+  \hat\pi_{\mathrm{search}}^u
+  \gets
+  \PosteriorBestPolicyTarget
+  \left(
+  \left\{\alpha^{\mathrm{post}}_{u,b}\right\}_{b\in\Legal(s_u)},
+  M_{\mathrm{backup}},
+  \Legal(s_u)
+  \right).
+  \]
+
+  \item Compute
+  \[
+  \beta^V_u
+  \gets
+  \sum_{b\in\Legal(s_u)}
+  \hat\pi_{\mathrm{search}}^u(b)
+  \alpha^{\mathrm{post}}_{u,b}.
+  \]
+
+  \item \Return \(\beta^V_u\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{9. Backup}
+
+Given a path
+
+\[
+\Path=((v_0,a_0),\ldots,(v_{\ell-1},a_{\ell-1})),
+\]
+
+leaf WDL evidence \(d_\ell\), and evidence strength \(\lambda_\ell\), backup
+updates the final edge using the leaf evidence, then propagates search-weighted
+state posteriors through the remaining ancestors.
+
+The final edge receives the direct leaf evidence:
+
+\[
+E_{v_{\ell-1},a_{\ell-1}}
+\gets
+E_{v_{\ell-1},a_{\ell-1}}
++
+\lambda_\ell
+\Align_{v_{\ell-1}\leftarrow \ell}(d_\ell).
+\]
+
+For an ancestor edge \((v_i,a_i)\) with expanded child \(u_i=\texttt{child}(v_i,a_i)\),
+use the child's search-weighted state posterior:
+
+\[
+E_{v_i,a_i}
+\gets
+E_{v_i,a_i}
++
+ c_{\mathrm{state}}
+\Align_{v_i\leftarrow u_i}
+\left(
+\beta^V_{u_i}
+\right),
+\qquad
+\beta^V_{u_i}=\StateSearchPosterior(\Tree,u_i,M_{\mathrm{backup}}).
+\]
+
+In ordinary alternating-turn zero-sum games, each alignment is repeated
+application of \(\Flip\) depending on the player-to-move perspective.
+
+\begin{algorithmblock}{Algorithm 5: BackupPath\((\Tree,\Path,d_\ell,\lambda_\ell,M_{\mathrm{backup}},c_{\mathrm{state}})\)}
+
+\Input posterior tree \(\Tree\), path \(\Path\), leaf evidence \(d_\ell\), leaf evidence strength \(\lambda_\ell\), posterior-best sample count \(M_{\mathrm{backup}}\), state-backup scale \(c_{\mathrm{state}}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item If \(\Path\) is empty, \Return \(\Tree\).
+
+  \item Let \((v_{\ell-1},a_{\ell-1})\) be the final edge in \(\Path\).
+
+  \item Align the leaf evidence to the final parent:
+  \[
+  d_{\ell-1}
+  \gets
+  \Align_{v_{\ell-1}\leftarrow \ell}(d_\ell).
+  \]
+
+  \item Add direct leaf evidence to the final edge:
+  \[
+  E_{v_{\ell-1},a_{\ell-1}}
+  \gets
+  E_{v_{\ell-1},a_{\ell-1}}
+  +
+  \lambda_\ell d_{\ell-1}.
+  \]
+
+  \item Increment the final edge visit counter:
+  \[
+  N_{v_{\ell-1},a_{\ell-1}}
+  \gets
+  N_{v_{\ell-1},a_{\ell-1}}+1.
+  \]
+
+  \item For \(i=\ell-2,\ldots,0\):
+  \begin{enumerate}[leftmargin=2em]
+    \item Let
+    \[
+    u_i \gets \texttt{child}(v_i,a_i).
+    \]
+
+    \item Compute the child search-weighted state posterior:
+    \[
+    \beta^V_{u_i}
+    \gets
+    \StateSearchPosterior(\Tree,u_i,M_{\mathrm{backup}}).
+    \]
+
+    \item Add calibrated, aligned state posterior evidence:
+    \[
+    E_{v_i,a_i}
+    \gets
+    E_{v_i,a_i}
+    +
+    c_{\mathrm{state}}
+    \Align_{v_i\leftarrow u_i}
+    \left(
+    \beta^V_{u_i}
+    \right).
+    \]
+
+    \item Increment the edge visit counter:
+    \[
+    N_{v_i,a_i}
+    \gets
+    N_{v_i,a_i}+1.
+    \]
+  \end{enumerate}
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{10. Initializing a posterior tree}
+
+The root node must be evaluated before search begins, because Thompson selection
+requires root priors.
+
+\begin{algorithmblock}{Algorithm 6: InitializePosteriorTree\((s,\theta)\)}
+
+\Input root state \(s\), network parameters \(\theta\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Run the network on the root state:
+  \[
+  \left(
+  \ell_\theta(s,\cdot),
+  \alpha_\theta^V(s),
+  \alpha_\theta^Q(s,\cdot)
+  \right)
+  \gets
+  f_\theta(s).
+  \]
+
+  \item Create root node \(v_{\mathrm{root}}\) with state \(s\).
+
+  \item Store
+  \[
+  \ell_\theta(s,\cdot),
+  \qquad
+  \alpha_\theta^V(s),
+  \qquad
+  \alpha_\theta^Q(s,\cdot)
+  \]
+  in the root node.
+
+  \item Mark the root node as expanded.
+
+  \item Initialize all edge evidence to zero:
+  \[
+  E_{v,a} \gets 0.
+  \]
+
+  \item Initialize counters:
+  \[
+  T_{\mathrm{done}}(\Tree) \gets 0,
+  \qquad
+  T_{\mathrm{inflight}}(\Tree) \gets 0.
+  \]
+
+  \item \Return posterior tree \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{11. CPU iterator: producing one leaf-evaluation request}
+
+The CPU tree exposes an iterator-like method:
+
+\[
+\NextRequest(\Tree).
+\]
+
+It walks down the current posterior tree by Thompson sampling until it finds
+either a terminal leaf or a non-terminal leaf that requires GPU evaluation.
+
+If it reaches a terminal leaf, it immediately backs up terminal evidence and
+does not emit a GPU request.
+
+If it reaches a non-terminal unexpanded leaf, it returns an evaluation request.
+No reservation mass is added to any traversed edge.
+
+An evaluation request contains:
+
+\[
+\texttt{tree\_id},
+\qquad
+\texttt{leaf\_id},
+\qquad
+\Path,
+\qquad
+s_\ell.
+\]
+
+Here \(\Path\) is the selected path. The leaf node itself can be marked as
+in-flight so that the same unevaluated child is not submitted twice.
+
+\begin{algorithmblock}{Algorithm 7: NextRequest\((\Tree,M_{\mathrm{backup}},c_{\mathrm{state}})\)}
+
+\Input posterior tree \(\Tree\), backup posterior-best sample count \(M_{\mathrm{backup}}\), state-backup scale \(c_{\mathrm{state}}\)
+
+\Output either no GPU request, or an evaluation request
+
+\begin{enumerate}[leftmargin=2em]
+  \item Set
+  \[
+  v \gets v_{\mathrm{root}},
+  \qquad
+  \Path \gets ().
+  \]
+
+  \item \While true \Do
+
+  \begin{enumerate}[leftmargin=2em]
+    \item \If \(s_v\) is terminal with outcome \(z\) \Then
+
+    \[
+    d_\ell \gets e_z,
+    \qquad
+    \lambda_\ell \gets c_{\mathrm{terminal}}.
+    \]
+
+    Run
+
+    \[
+    \Tree \gets
+    \BackupPath(\Tree,\Path,d_\ell,\lambda_\ell,M_{\mathrm{backup}},c_{\mathrm{state}}).
+    \]
+
+    Increment
+
+    \[
+    T_{\mathrm{done}}(\Tree)
+    \gets
+    T_{\mathrm{done}}(\Tree)+1.
+    \]
+
+    \Return no GPU request.
+
+    \EndIf
+
+    \item \If node \(v\) is not expanded \Then
+
+    This node is already in flight. The implementation may restart from the
+    root, try another active tree, or return no request.
+
+    \Return no GPU request.
+
+    \EndIf
+
+    \item Select an action by Thompson sampling:
+    \[
+    a
+    \gets
+    \ThompsonSelect(\Tree,v).
+    \]
+
+    \item Append the edge to the path:
+    \[
+    \Path
+    \gets
+    \Path \mathbin{\Vert} ((v,a)).
+    \]
+
+    \item \If edge \((v,a)\) has an expanded child \(u\) \Then
+    \[
+    v \gets u.
+    \]
+    \Continue.
+    \EndIf
+
+    \item \If edge \((v,a)\) has a child \(u\) that exists but is not expanded \Then
+
+    The leaf is already in flight. Return no request or restart from the root.
+    No posterior mass is changed.
+
+    \Return no GPU request.
+
+    \EndIf
+
+    \item Otherwise create a new child state:
+    \[
+    s_u \gets \Step(s_v,a).
+    \]
+
+    \item Create a child node \(u\) with state \(s_u\), mark it as not expanded,
+    and store it as
+    \[
+    \texttt{child}(v,a)\gets u.
+    \]
+
+    \item \If \(s_u\) is terminal with outcome \(z\) \Then
+
+    \[
+    d_\ell \gets e_z,
+    \qquad
+    \lambda_\ell \gets c_{\mathrm{terminal}}.
+    \]
+
+    Run
+
+    \[
+    \Tree \gets
+    \BackupPath(\Tree,\Path,d_\ell,\lambda_\ell,M_{\mathrm{backup}},c_{\mathrm{state}}).
+    \]
+
+    Increment
+
+    \[
+    T_{\mathrm{done}}(\Tree)
+    \gets
+    T_{\mathrm{done}}(\Tree)+1.
+    \]
+
+    \Return no GPU request.
+
+    \EndIf
+
+    \item Mark \(u\) as in flight and increment
+    \[
+    T_{\mathrm{inflight}}(\Tree)
+    \gets
+    T_{\mathrm{inflight}}(\Tree)+1.
+    \]
+
+    \item \Return
+    \[
+    \operatorname{EvalRequest}
+    \left(
+    \texttt{tree\_id},
+    u,
+    \Path,
+    s_u
+    \right).
+    \]
+
+  \end{enumerate}
+
+  \item \EndWhile
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{12. Consuming a GPU result}
+
+A GPU result for leaf \(u\) contains
+
+\[
+\ell_\theta(s_u,\cdot),
+\qquad
+\alpha_\theta^V(s_u),
+\qquad
+\alpha_\theta^Q(s_u,\cdot).
+\]
+
+The CPU stores these outputs in the leaf node, marks the node as expanded, and
+backs up neural value evidence.
+
+\begin{algorithmblock}{Algorithm 8: ConsumeResult\((\Tree,r,M_{\mathrm{backup}},c_{\mathrm{state}})\)}
+
+\Input posterior tree \(\Tree\), GPU result \(r\), backup posterior-best sample count \(M_{\mathrm{backup}}\), state-backup scale \(c_{\mathrm{state}}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Extract from \(r\):
+  \[
+  u,
+  \qquad
+  \Path,
+  \qquad
+  \ell_\theta(s_u,\cdot),
+  \qquad
+  \alpha_\theta^V(s_u),
+  \qquad
+  \alpha_\theta^Q(s_u,\cdot).
+  \]
+
+  \item Store the network outputs in node \(u\).
+
+  \item Mark node \(u\) as expanded and no longer in flight.
+
+  \item Convert the leaf value Dirichlet into WDL evidence:
+  \[
+  d_\ell
+  \gets
+  \mean
+  \left(
+  \alpha_\theta^V(s_u)
+  \right).
+  \]
+
+  \item Set neural leaf evidence strength:
+  \[
+  \lambda_\ell
+  \gets
+  c_{\mathrm{leaf}}.
+  \]
+
+  \item Back up the neural evidence:
+  \[
+  \Tree
+  \gets
+  \BackupPath(\Tree,\Path,d_\ell,\lambda_\ell,M_{\mathrm{backup}},c_{\mathrm{state}}).
+  \]
+
+  \item Update counters:
+  \[
+  T_{\mathrm{inflight}}(\Tree)
+  \gets
+  T_{\mathrm{inflight}}(\Tree)-1,
+  \]
+  \[
+  T_{\mathrm{done}}(\Tree)
+  \gets
+  T_{\mathrm{done}}(\Tree)+1.
+  \]
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{13. Batched CPU/GPU search driver}
+
+The driver maintains many active posterior trees. This gives game-parallelism.
+Each tree may also have several in-flight leaves. This gives leaf-parallelism
+without adding reservation mass to the posterior.
+
+Let
+
+\[
+G = \text{number of active root trees},
+\]
+
+\[
+L = \text{maximum in-flight leaves per tree},
+\]
+
+\[
+F = \text{GPU inference batch size},
+\]
+
+and
+
+\[
+T = \text{completed simulations per root}.
+\]
+
+The available inference batch size is approximately
+
+\[
+\min(GL,F).
+\]
+
+The GPU evaluator is the compilation boundary. It receives a preallocated batch
+of observations and returns a preallocated batch of network outputs.
+
+\begin{algorithmblock}{Algorithm 9: BuildEvalBatch\((\{\Tree_b\}_{b=1}^{G},F,L,M_{\mathrm{backup}},c_{\mathrm{state}})\)}
+
+\Input active trees \(\{\Tree_b\}_{b=1}^{G}\), GPU batch size \(F\), in-flight limit \(L\), backup posterior-best sample count \(M_{\mathrm{backup}}\), state-backup scale \(c_{\mathrm{state}}\)
+
+\Output evaluation request batch \(\mathcal{Q}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Initialize
+  \[
+  \mathcal{Q} \gets ().
+  \]
+
+  \item \While \(|\mathcal{Q}| < F\) and some tree has remaining budget \Do
+
+  \begin{enumerate}[leftmargin=2em]
+    \item Choose an active tree \(\Tree_b\).
+
+    \item \If
+    \[
+    T_{\mathrm{done}}(\Tree_b) \ge T
+    \]
+    \Then skip this tree. \EndIf
+
+    \item \If
+    \[
+    T_{\mathrm{inflight}}(\Tree_b) \ge L
+    \]
+    \Then skip this tree. \EndIf
+
+    \item Run
+    \[
+    q
+    \gets
+    \NextRequest(\Tree_b,M_{\mathrm{backup}},c_{\mathrm{state}}).
+    \]
+
+    \item \If \(q\) is a GPU evaluation request \Then append \(q\) to \(\mathcal{Q}\). \EndIf
+
+    \item If no tree can produce more requests, \Break.
+
+  \end{enumerate}
+
+  \item \EndWhile
+
+  \item \Return \(\mathcal{Q}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 10: RunPosteriorTreeSearch\((\{s_b\}_{b=1}^{G},\theta,T,F,L,M_{\mathrm{backup}},c_{\mathrm{state}})\)}
+
+\Input root states \(\{s_b\}_{b=1}^{G}\), network parameters \(\theta\), completed simulations \(T\), GPU batch size \(F\), in-flight limit \(L\), backup posterior-best sample count \(M_{\mathrm{backup}}\), state-backup scale \(c_{\mathrm{state}}\)
+
+\Output completed posterior trees \(\{\Tree_b\}_{b=1}^{G}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each root state \(s_b\), initialize
+  \[
+  \Tree_b
+  \gets
+  \operatorname{InitializePosteriorTree}(s_b,\theta).
+  \]
+
+  \item \While some tree satisfies
+  \[
+  T_{\mathrm{done}}(\Tree_b) < T
+  \]
+  \Do
+
+  \begin{enumerate}[leftmargin=2em]
+    \item Build a GPU evaluation batch:
+    \[
+    \mathcal{Q}
+    \gets
+    \BuildEvalBatch
+    \left(
+    \{\Tree_b\}_{b=1}^{G},
+    F,
+    L,
+    M_{\mathrm{backup}},
+    c_{\mathrm{state}}
+    \right).
+    \]
+
+    \item \If \(\mathcal{Q}\) is empty \Then \Continue. \EndIf
+
+    \item Evaluate all requested leaves on the GPU:
+    \[
+    \mathcal{R}
+    \gets
+    \GpuEvaluate(\mathcal{Q},\theta).
+    \]
+
+    \item For each result \(r\in\mathcal{R}\), send it back to its owning CPU tree:
+    \[
+    \Tree_{r}
+    \gets
+    \ConsumeResult(\Tree_{r},r,M_{\mathrm{backup}},c_{\mathrm{state}}).
+    \]
+
+  \end{enumerate}
+
+  \item \EndWhile
+
+  \item \Return \(\{\Tree_b\}_{b=1}^{G}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{14. Posterior-best policy target}
+
+After search, the root action posterior is
+
+\[
+\alpha_{\mathrm{root}}(a)
+=
+\EdgePosterior(\Tree,v_{\mathrm{root}},a).
+\]
+
+The search-improved policy target is the posterior probability that each action
+is optimal:
+
+\[
+\pi_{\mathrm{search}}(a\mid s)
+=
+\Prob
+\left(
+a
+=
+\argmax_{b\in\Legal(s)}
+\Utility(\phi_b)
+\right),
+\]
+
+where
+
+\[
+\phi_b
+\sim
+\Dir(\alpha_{\mathrm{root}}(b)).
+\]
+
+Estimate this by Monte Carlo. For \(m=1,\ldots,M\), sample
+
+\[
+\phi_b^{(m)}
+\sim
+\Dir(\alpha_{\mathrm{root}}(b)),
+\qquad
+b\in\Legal(s),
+\]
+
+then compute
+
+\[
+a_m^\star
+=
+\argmax_{b\in\Legal(s)}
+\Utility(\phi_b^{(m)}).
+\]
+
+The estimator is
+
+\[
+\hat{\pi}_{\mathrm{search}}(a\mid s)
+=
+\frac{1}{M}
+\sum_{m=1}^{M}
+\one[a_m^\star=a].
+\]
+
+\begin{algorithmblock}{Algorithm 11: PosteriorBestPolicyTarget\((\alpha,M,\Legal(s))\)}
+
+\Input action posteriors \(\alpha(a)\), number of samples \(M\), legal action set \(\Legal(s)\)
+
+\Output Monte Carlo posterior-best policy target \(\hat{\pi}_{\mathrm{search}}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Initialize counts:
+  \[
+  C(a)\gets 0
+  \qquad
+  \text{for all } a\in\Legal(s).
+  \]
+
+  \item For \(m=1,\ldots,M\):
+
+  \begin{enumerate}[leftmargin=2em]
+    \item For each legal action \(b\), sample
+    \[
+    \phi_b^{(m)}
+    \sim
+    \Dir(\alpha(b)).
+    \]
+
+    \item Compute
+    \[
+    a_m^\star
+    \gets
+    \argmax_{b\in\Legal(s)}
+    \Utility(\phi_b^{(m)}).
+    \]
+
+    \item Increment
+    \[
+    C(a_m^\star)
+    \gets
+    C(a_m^\star)+1.
+    \]
+  \end{enumerate}
+
+  \item Return
+  \[
+  \hat{\pi}_{\mathrm{search}}(a\mid s)
+  =
+  \frac{C(a)}{M}.
+  \]
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{15. Final action selection}
+
+Search produces a posterior-best policy target, but the committed action can be
+selected in several ways.
+
+First define the posterior mean scalar Q estimate:
+
+\[
+\hat{q}_T(a)
+=
+\Utility
+\left(
+\mean
+\left(
+\alpha_{\mathrm{root}}(a)
+\right)
+\right).
+\]
+
+Equivalently,
+
+\[
+\hat{q}_T(a)
+=
+\frac{
+\alpha_{\mathrm{root},W}(a)
+-
+\alpha_{\mathrm{root},L}(a)
+}{
+\sum_z \alpha_{\mathrm{root},z}(a)
+}.
+\]
+
+The supported committed-action modes are:
+
+\[
+\texttt{posterior\_sample},
+\qquad
+\texttt{posterior\_argmax},
+\qquad
+\texttt{scalar\_q\_argmax}.
+\]
+
+Posterior sampling chooses
+
+\[
+a_{\mathrm{play}}
+\sim
+\Cat
+\left(
+\hat{\pi}_{\mathrm{search}}(\cdot\mid s)
+\right).
+\]
+
+Posterior argmax chooses
+
+\[
+a_{\mathrm{play}}
+=
+\argmax_a
+\hat{\pi}_{\mathrm{search}}(a\mid s).
+\]
+
+Scalar-Q argmax chooses
+
+\[
+a_{\mathrm{play}}
+=
+\argmax_a
+\hat{q}_T(a)
+=
+\argmax_a
+\left(
+\bar\phi_{a,W}-\bar\phi_{a,L}
+\right),
+\qquad
+\bar\phi_a=\mean(\alpha_{\mathrm{root}}(a)).
+\]
+
+The posterior-best policy target is used for policy training regardless of which
+committed-action mode is used.
+
+\begin{algorithmblock}{Algorithm 12: FinishSearch\((\Tree,M,\texttt{commit})\)}
+
+\Input completed posterior tree \(\Tree\), posterior-best samples \(M\), committed-action mode \(\texttt{commit}\)
+
+\Output root posteriors, policy target, committed action
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each legal root action \(a\), compute
+  \[
+  \alpha_{\mathrm{root}}(a)
+  \gets
+  \EdgePosterior(\Tree,v_{\mathrm{root}},a).
+  \]
+
+  \item Compute the posterior-best policy target:
+  \[
+  \hat{\pi}_{\mathrm{search}}
+  \gets
+  \PosteriorBestPolicyTarget
+  \left(
+  \alpha_{\mathrm{root}},
+  M,
+  \Legal(s_{\mathrm{root}})
+  \right).
+  \]
+
+  \item If
+  \[
+  \texttt{commit}=\texttt{posterior\_sample},
+  \]
+  sample
+  \[
+  a_{\mathrm{play}}
+  \sim
+  \Cat
+  \left(
+  \hat{\pi}_{\mathrm{search}}
+  \right).
+  \]
+
+  \item Else if
+  \[
+  \texttt{commit}=\texttt{posterior\_argmax},
+  \]
+  choose
+  \[
+  a_{\mathrm{play}}
+  \gets
+  \argmax_a
+  \hat{\pi}_{\mathrm{search}}(a\mid s_{\mathrm{root}}).
+  \]
+
+  \item Else if
+  \[
+  \texttt{commit}=\texttt{scalar\_q\_argmax},
+  \]
+  choose
+  \[
+  a_{\mathrm{play}}
+  \gets
+  \argmax_a
+  \Utility
+  \left(
+  \mean
+  \left(
+  \alpha_{\mathrm{root}}(a)
+  \right)
+  \right).
+  \]
+
+  \item \Return
+  \[
+  \left(
+  \alpha_{\mathrm{root}},
+  \hat{\pi}_{\mathrm{search}},
+  a_{\mathrm{play}}
+  \right).
+  \]
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{16. Estimated-Q improvement view}
+
+Let \(A_0\) be a Thompson-proposed root action from the initial posterior and
+let \(C\) be a candidate set generated by Thompson search such that
+
+\[
+A_0 \in C.
+\]
+
+After search, define
+
+\[
+\hat{q}_T(a)
+=
+\Utility
+\left(
+\mean
+\left(
+\alpha_{\mathrm{root}}(a)
+\right)
+\right).
+\]
+
+If the committed action is
+
+\[
+A_+
+=
+\argmax_{a\in C}
+\hat{q}_T(a),
+\]
+
+then the estimated-Q improvement is pointwise:
+
+\[
+\hat{q}_T(A_+)
+\ge
+\hat{q}_T(A_0).
+\]
+
+Taking expectation over Thompson proposal randomness gives
+
+\[
+\E
+\left[
+\hat{q}_T(A_+)
+\right]
+\ge
+\E_{A_0}
+\left[
+\hat{q}_T(A_0)
+\right].
+\]
+
+This is an estimated-value improvement statement. It becomes a true value
+improvement only to the extent that \(\hat{q}_T\) is an accurate estimate of the
+true action value.
+
+\section*{17. Training targets}
+
+For each searched root state \(s\), the stored training record should contain:
+
+\[
+s,
+\qquad
+\hat{\pi}_{\mathrm{search}}(\cdot\mid s),
+\qquad
+\alpha_{\mathrm{root}}(a)
+\text{ for explored root actions},
+\qquad
+a_{\mathrm{play}},
+\qquad
+z \text{ when eventually known}.
+\]
+
+\subsection*{17.1 Policy target}
+
+The policy target is
+
+\[
+\hat{\pi}_{\mathrm{search}}(\cdot\mid s).
+\]
+
+The policy loss is
+
+\[
+\mathcal{L}_\pi(s)
+=
+-
+\sum_{a\in\Legal(s)}
+\stopgrad
+\left(
+\hat{\pi}_{\mathrm{search}}(a\mid s)
+\right)
+\log
+\pi_\theta(a\mid s).
+\]
+
+Equivalently, up to an additive constant independent of \(\theta\),
+
+\[
+\mathcal{L}_\pi(s)
+=
+D_{\mathrm{KL}}
+\left(
+\stopgrad
+\left(
+\hat{\pi}_{\mathrm{search}}(\cdot\mid s)
+\right)
+\,\|\,
+\pi_\theta(\cdot\mid s)
+\right).
+\]
+
+\subsection*{17.2 Q targets}
+
+For an explored root action \(a\), the Q target is the completed root posterior:
+
+\[
+\beta_Q(s,a)
+=
+\alpha_{\mathrm{root}}(a).
+\]
+
+The Q loss is applied only to actions with positive completed evidence mass:
+
+\[
+\sum_z E_{v_{\mathrm{root}},a,z} > 0.
+\]
+
+Unexplored legal actions are masked out of the Q KL loss. This prevents the
+network from being trained to reproduce its own unchanged prior as if it were a
+search-improved target.
+
+The Q loss is
+
+\[
+\mathcal{L}_Q(s)
+=
+\frac{
+\sum_{a\in\Legal(s)}
+m_Q(s,a)
+D_{\mathrm{KL}}
+\left(
+\Dir
+\left(
+\stopgrad(\beta_Q(s,a))
+\right)
+\,\|\,
+\Dir
+\left(
+\alpha_\theta^Q(s,a)
+\right)
+\right)
+}{
+\sum_{a\in\Legal(s)} m_Q(s,a)
++
+\varepsilon
+},
+\]
+
+where
+
+\[
+m_Q(s,a)
+=
+\one
+\left[
+\sum_z E_{v_{\mathrm{root}},a,z} > 0
+\right].
+\]
+
+\subsection*{17.3 Value targets}
+
+The value target may be constructed from eventual game outcome evidence or from
+search/bootstrap evidence.
+
+A search-based root value posterior proxy is
+
+\[
+\beta_{\mathrm{search}}^V(s)
+=
+\sum_{a\in\Legal(s)}
+\hat\pi_{\mathrm{search}}(a\mid s)
+\alpha_{\mathrm{root}}(a).
+\]
+
+This is the root-level analogue of the state posterior used during backup. It
+uses \(E+\alpha^{\mathrm{base}}\) for each action, not only the raw evidence
+\(E\).
+
+If this proxy is used as bootstrap evidence, set
+
+\[
+d_V(s)
+=
+\mean
+\left(
+\beta_{\mathrm{search}}^V(s)
+\right),
+\qquad
+\lambda_V
+=
+ c_V
+\sum_z \beta_{\mathrm{search},z}^V(s),
+\]
+
+where \(c_V>0\) is a calibration coefficient. Then the posterior value target is
+
+\[
+\beta_V(s)
+=
+\alpha_{\theta^-}^V(s)
++
+\lambda_V d_V(s).
+\]
+
+For a terminal outcome \(z\), use
+
+\[
+d_V(s)=e_z.
+\]
+
+The value loss is
+
+\[
+\mathcal{L}_V(s)
+=
+D_{\mathrm{KL}}
+\left(
+\Dir
+\left(
+\stopgrad(\beta_V(s))
+\right)
+\,\|\,
+\Dir
+\left(
+\alpha_\theta^V(s)
+\right)
+\right).
+\]
+
+\begin{algorithmblock}{Algorithm 13: MakeTargets\((\Tree,\theta^-,M,\texttt{commit})\)}
+
+\Input completed posterior tree \(\Tree\), data-generation parameters \(\theta^-\), posterior-best samples \(M\), committed-action mode \(\texttt{commit}\)
+
+\Output training targets for the root state
+
+\begin{enumerate}[leftmargin=2em]
+  \item Run
+  \[
+  \left(
+  \alpha_{\mathrm{root}},
+  \hat{\pi}_{\mathrm{search}},
+  a_{\mathrm{play}}
+  \right)
+  \gets
+  \FinishSearch(\Tree,M,\texttt{commit}).
+  \]
+
+  \item Store policy target:
+  \[
+  \pi_{\mathrm{target}}(\cdot\mid s)
+  \gets
+  \hat{\pi}_{\mathrm{search}}(\cdot\mid s).
+  \]
+
+  \item For each legal root action \(a\), define Q mask
+  \[
+  m_Q(s,a)
+  \gets
+  \one
+  \left[
+  \sum_z E_{v_{\mathrm{root}},a,z} > 0
+  \right].
+  \]
+
+  \item For each explored root action, store
+  \[
+  \beta_Q(s,a)
+  \gets
+  \alpha_{\mathrm{root}}(a).
+  \]
+
+  \item Optionally store the search-weighted value posterior proxy:
+  \[
+  \beta_{\mathrm{search}}^V(s)
+  \gets
+  \sum_{a\in\Legal(s)}
+  \hat\pi_{\mathrm{search}}(a\mid s)
+  \alpha_{\mathrm{root}}(a).
+  \]
+
+  \item Store
+  \[
+  a_{\mathrm{play}}
+  \]
+  for self-play.
+
+  \item Store enough information to construct the eventual value target once
+  outcome or bootstrap evidence is available.
+
+  \item \Return training targets.
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{18. Practical implementation notes}
+
+\subsection*{18.1 CPU tree layout}
+
+The CPU tree should be implemented as an arena of nodes and edges. Prefer
+integer indices over pointers:
+
+\[
+\texttt{node\_id},
+\qquad
+\texttt{edge\_id},
+\qquad
+\texttt{child\_id}.
+\]
+
+For small or medium action spaces such as Hex, dense edge arrays are often
+reasonable:
+
+\[
+\texttt{nodes} \times |\Actions| \times 3.
+\]
+
+For large action spaces such as chess-style encodings, sparse edge storage may
+be required.
+
+\subsection*{18.2 Redis and tree storage}
+
+Redis can be useful around the tree, but it should not be the inner-loop tree
+store for selection and backup.
+
+Use an in-process arena for active trees because search repeatedly reads and
+writes adjacent node and edge statistics. Redis round trips are too expensive
+for per-edge Thompson selection, posterior updates, and bottom-up backup.
+
+Reasonable Redis uses are:
+
+\begin{enumerate}[leftmargin=2em]
+  \item GPU work queues and result queues.
+  \item Self-play trajectory queues.
+  \item Root summaries after search.
+  \item Checkpoints or serialized trees when latency is not critical.
+  \item Optional transposition or opening caches, if treated as approximate and
+  not queried on every edge update.
+\end{enumerate}
+
+The practical split is:
+
+\[
+\text{active tree in RAM},
+\qquad
+\text{coordination and persistence in Redis}.
+\]
+
+\subsection*{18.3 GPU boundary}
+
+The GPU evaluator should be the compiled part:
+
+\[
+\GpuEvaluate(\mathcal{Q},\theta).
+\]
+
+It receives a preallocated batch of observations and legal masks, and returns
+preallocated arrays containing:
+
+\[
+\ell_\theta(s,\cdot),
+\qquad
+\alpha_\theta^V(s),
+\qquad
+\alpha_\theta^Q(s,\cdot).
+\]
+
+The CPU tree should not wait after every single descent. It should fill batches
+using both game-parallelism and leaf-parallelism.
+
+\subsection*{18.4 Recommended initial knobs}
+
+A reasonable initial setting is
+
+\[
+L \in \{4,8\},
+\]
+
+where \(L\) is the number of in-flight leaves allowed per root tree.
+
+For the search-weighted state backup, start conservatively:
+
+\[
+c_{\mathrm{state}} \in [0.01,0.25].
+\]
+
+If the backup is too weak, increase \(c_{\mathrm{state}}\). If the tree becomes
+overconfident or collapses too quickly to one line, decrease it.
+
+The terminal evidence strength should usually be larger than the neural leaf
+evidence strength:
+
+\[
+c_{\mathrm{terminal}} > c_{\mathrm{leaf}}.
+\]
+
+\subsection*{18.5 Completed evidence only}
+
+Only completed evidence \(E_{v,a}\) is used in posteriors and training targets:
+
+\[
+\alpha^{\mathrm{post}}_{v,a}
+=
+\alpha^{\mathrm{base}}_{v,a}
++
+E_{v,a}.
+\]
+
+In-flight scheduling state is not Bayesian evidence and is not included in
+\(\alpha^{\mathrm{post}}_{v,a}\).
+
+\end{document}
