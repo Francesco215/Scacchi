@@ -26,24 +26,20 @@ next-state value Dirichlet as its prior, aligned back to the root player's
 perspective:
 
 $$
-\alpha_a^{\mathrm{child}}(s)
-=
-\operatorname{flip}
+\alpha_a^{\mathrm{child}}(s)=
+\textrm{flip}
 \left(
 \alpha_{\theta^-}^V(s_a)
 \right),
 \qquad
-s_a = \operatorname{Step}(s,a).
+s_a = \textrm{Step}(s,a).
 $$
 
 The action posterior used for the search-improved policy and Q target is
 
 $$
-\alpha_a^{\mathrm{post}}(s)
-=
-\alpha_a^{\mathrm{child}}(s)
-+
-E_Q(s,a),
+\alpha_a^{\mathrm{post}}(s)=
+\alpha_a^{\mathrm{child}}(s)+E_Q(s,a),
 $$
 
 The policy target after search is the posterior probability that each action is optimal:
@@ -119,21 +115,21 @@ $$
 then the opponent-perspective WDL distribution is
 
 $$
-\operatorname{flip}(d) =
+\textrm{flip}(d) =
 (d_W,d_D,d_L).
 $$
 
 The utility changes sign under this flip:
 
 $$
-U(\operatorname{flip}(d)) =
+U(\textrm{flip}(d)) =
 -U(d).
 $$
 
 The same flip applies to Dirichlet parameters:
 
 $$
-\operatorname{flip}(\alpha_L,\alpha_D,\alpha_W) =
+\textrm{flip}(\alpha_L,\alpha_D,\alpha_W) =
 (\alpha_W,\alpha_D,\alpha_L).
 $$
 
@@ -159,7 +155,7 @@ The policy head is
 
 $$
 \pi_\theta(a \mid s) =
-\operatorname{softmax}(\ell_\theta(s,a)).
+\textrm{softmax}(\ell_\theta(s,a)).
 $$
 
 Its intended meaning is
@@ -198,7 +194,7 @@ The latent WDL value distribution is modeled as
 $$
 \phi_s^V
 \sim
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_\theta^V(s)
 \right).
@@ -245,7 +241,7 @@ The latent WDL distribution for action $a$ is modeled as
 $$
 \phi_{s,a}^Q
 \sim
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_\theta^Q(s,a)
 \right).
@@ -285,7 +281,7 @@ Define the predicted WDL mean as
 
 $$
 \bar{\phi}_\theta =
-\operatorname{softmax}(r_\theta)
+\textrm{softmax}(r_\theta)
 \in \Delta^2.
 $$
 
@@ -293,7 +289,7 @@ Define the Dirichlet concentration as
 
 $$
 \alpha_{\theta,0} =
-\operatorname{softplus}(t_\theta)^2 > 0.
+\textrm{softplus}(t_\theta)^2 > 0.
 $$
 
 Then define the Dirichlet parameters as
@@ -307,7 +303,7 @@ Equivalently, component-wise:
 
 $$
 \alpha_{\theta,z} =
-\operatorname{softplus}(t_\theta)^2\bar{\phi}_{\theta,z},
+\textrm{softplus}(t_\theta)^2\bar{\phi}_{\theta,z},
 \qquad
 z \in \{L,D,W\}.
 $$
@@ -317,18 +313,15 @@ There is no additive base Dirichlet prior in the network parameterization.
 The mean is
 
 $$
-\mathbb{E}[\phi_z]
-=
-\frac{\alpha_{\theta,z}}{\alpha_{\theta,0}}
-=
+\mathbb{E}[\phi_z]=
+\frac{\alpha_{\theta,z}}{\alpha_{\theta,0}}=
 \bar{\phi}_{\theta,z}.
 $$
 
 The concentration is
 
 $$
-\alpha_{\theta,0}
-=
+\alpha_{\theta,0}=
 \sum_z \alpha_{\theta,z}.
 $$
 
@@ -338,10 +331,10 @@ For the value head:
 
 $$
 \bar{\phi}_\theta^V(s) =
-\operatorname{softmax}(r_\theta^V(s)),
+\textrm{softmax}(r_\theta^V(s)),
 \qquad
 \alpha_{\theta,0}^V(s) =
-\operatorname{softplus}(t_\theta^V(s))^2,
+\textrm{softplus}(t_\theta^V(s))^2,
 $$
 
 and
@@ -356,10 +349,10 @@ For the Q head:
 
 $$
 \bar{\phi}_\theta^Q(s,a) =
-\operatorname{softmax}(r_\theta^Q(s,a)),
+\textrm{softmax}(r_\theta^Q(s,a)),
 \qquad
 \alpha_{\theta,0}^Q(s,a) =
-\operatorname{softplus}(t_\theta^Q(s,a))^2,
+\textrm{softplus}(t_\theta^Q(s,a))^2,
 $$
 
 and
@@ -379,7 +372,7 @@ Let
 $$
 \phi
 \sim
-\operatorname{Dirichlet}(\alpha)
+\textrm{Dirichlet}(\alpha)
 $$
 
 be a prior over WDL outcome probabilities.
@@ -402,7 +395,7 @@ Then the posterior is
 
 $$
 p(\phi \mid d,\lambda) =
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha + \lambda d
 \right).
@@ -428,7 +421,7 @@ Then the posterior is
 
 $$
 p(\phi \mid z^\star,\lambda) =
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha + \lambda e_{z^\star}
 \right).
@@ -447,7 +440,7 @@ the exact posterior is
 
 $$
 p(\phi \mid n) =
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha + n
 \right).
@@ -479,7 +472,7 @@ Search may stop at either terminal or non-terminal leaves.
 The role of leaf evaluation is to return WDL evidence:
 
 $$
-\operatorname{Eval}(s_\ell) =
+\textrm{Eval}(s_\ell) =
 (d_\ell,\lambda_\ell),
 \qquad
 d_\ell \in \Delta^2,
@@ -529,7 +522,7 @@ Using the stable parameterization, this is
 
 $$
 d_\ell =
-\operatorname{softmax}
+\textrm{softmax}
 \left(
 r_\theta^V(s_\ell)
 \right).
@@ -567,13 +560,13 @@ During backup, return the evidence to the state or action being trained.
 Whenever the player-to-move perspective changes, flip the WDL vector:
 
 $$
-d \leftarrow \operatorname{flip}(d).
+d \leftarrow \textrm{flip}(d).
 $$
 
 The backed-up evaluation for a root action $a$ has the form
 
 $$
-\operatorname{Eval}(s,a) =
+\textrm{Eval}(s,a) =
 (d_a,\lambda_a),
 \qquad
 d_a \in \Delta^2,
@@ -596,20 +589,18 @@ $$
 At root state $s$, the Q head supplies the fallback action prior:
 
 $$
-\alpha_{\mathrm{fallback}}^Q(s,a)
-=
+\alpha_{\mathrm{fallback}}^Q(s,a)=
 \alpha_{\theta^-}^Q(s,a).
 $$
 
 If search expands action $a$, define the one-ply child state
-$s_a=\operatorname{Step}(s,a)$. The value head on $s_a$ predicts the value from
+$s_a=\textrm{Step}(s,a)$. The value head on $s_a$ predicts the value from
 the next player-to-move perspective. Align it back to the root player's
 perspective:
 
 $$
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
-=
-\operatorname{flip}
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)=
+\textrm{flip}
 \left(
 \alpha_{\theta^-}^V(s_a)
 \right),
@@ -623,11 +614,10 @@ Dirichlet because the state-value prediction is more precise than the
 state-action prediction:
 
 $$
-\alpha_{\mathrm{base}}(s,a;\mathrm{tree})
-=
+\alpha_{\mathrm{base}}(s,a;\mathrm{tree})=
 \begin{cases}
 \alpha_{\theta^-}^{V \rightarrow Q}(s,a),
-& \text{if } \operatorname{Step}(s,a) \text{ has been expanded in the tree},\\
+& \text{if } \textrm{Step}(s,a) \text{ has been expanded in the tree},\\
 \alpha_{\theta^-}^Q(s,a),
 & \text{otherwise}.
 \end{cases}
@@ -641,10 +631,10 @@ Using the stable value parameterization:
 
 $$
 \alpha_{\theta^-}^{V \rightarrow Q}(s,a) =
-\operatorname{flip}
+\textrm{flip}
 \left[
-\operatorname{softplus}(t_{\theta^-}^V(s_a))^2
-\operatorname{softmax}
+\textrm{softplus}(t_{\theta^-}^V(s_a))^2
+\textrm{softmax}
 \left(
 r_{\theta^-}^V(s_a)
 \right)
@@ -656,7 +646,7 @@ At simulation $t$, sample one WDL distribution per legal action:
 $$
 \phi_a^{(t)}
 \sim
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_a^{(t)}
 \right),
@@ -675,7 +665,7 @@ $$
 After evaluating $a_t$ by search, suppose the backed-up evaluation gives
 
 $$
-\operatorname{Eval}(s,a_t) =
+\textrm{Eval}(s,a_t) =
 \left(
 d_{a_t}^{(t)},
 \lambda_{a_t}^{(t)}
@@ -690,9 +680,7 @@ Update the selected action posterior as
 
 $$
 \alpha_{a_t}^{(t+1)} =
-\alpha_{a_t}^{(t)}
-+
-\lambda_{a_t}^{(t)}
+\alpha_{a_t}^{(t)}+\lambda_{a_t}^{(t)}
 d_{a_t}^{(t)}.
 $$
 
@@ -714,13 +702,10 @@ p
 \mid
 d_{a_t}^{(t)},
 \lambda_{a_t}^{(t)}
-\right)
-=
-\operatorname{Dirichlet}
+\right)=
+\textrm{Dirichlet}
 \left(
-\alpha_{a_t}^{(t)}
-+
-\lambda_{a_t}^{(t)}
+\alpha_{a_t}^{(t)}+\lambda_{a_t}^{(t)}
 d_{a_t}^{(t)}
 \right).
 $$
@@ -749,10 +734,8 @@ After search, define the search-improved policy as the posterior probability tha
 The posterior used here is the child-value-prior posterior:
 
 $$
-\alpha_b^{(T)}
-=
-\alpha_{\theta^-}^{V \rightarrow Q}(s,b)
-+
+\alpha_b^{(T)}=
+\alpha_{\theta^-}^{V \rightarrow Q}(s,b)+
 E_Q(s,b),
 $$
 
@@ -772,7 +755,7 @@ U(\phi_b)
 \qquad
 \phi_b
 \sim
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_b^{(T)}
 \right).
@@ -785,7 +768,7 @@ For $m = 1,\dots,M$, sample
 $$
 \phi_b^{(m)}
 \sim
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_b^{(T)}
 \right),
@@ -826,7 +809,7 @@ Train the policy head toward the search-improved posterior-best policy:
 $$
 \mathcal{L}_\pi(s) =
 -\sum_{a \in \mathcal{A}(s)}
-\operatorname{stopgrad}
+\textrm{stopgrad}
 \left(
 \hat{\pi}_{\mathrm{search}}(a \mid s)
 \right)
@@ -839,7 +822,7 @@ $$
 \mathcal{L}_\pi(s) =
 D_{\mathrm{KL}}
 \left(
-\operatorname{stopgrad}
+\textrm{stopgrad}
 \left(
 \hat{\pi}_{\mathrm{search}}(\cdot \mid s)
 \right)
@@ -883,9 +866,7 @@ The actual target is
 
 $$
 \beta_z =
-\alpha_{\mathrm{prior},z}
-+
-\lambda d_z.
+\alpha_{\mathrm{prior},z}+\lambda d_z.
 $$
 
 Because
@@ -930,9 +911,9 @@ targets is replaced by the child value prior aligned to the root perspective:
 
 $$
 \alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a) =
-\operatorname{flip}
+\textrm{flip}
 \left(
-\alpha_{\theta^-}^V(\operatorname{Step}(s,a))
+\alpha_{\theta^-}^V(\textrm{Step}(s,a))
 \right).
 $$
 
@@ -945,18 +926,14 @@ After evidence is collected, construct posterior targets:
 
 $$
 \beta_V(s) =
-\alpha_{\mathrm{prior}}^V(s)
-+
-\lambda_V d_V(s),
+\alpha_{\mathrm{prior}}^V(s)+\lambda_V d_V(s),
 $$
 
 and
 
 $$
 \beta_Q(s,a) =
-\alpha_{\mathrm{base}}(s,a;\mathrm{tree})
-+
-\lambda_Q d_Q(s,a).
+\alpha_{\mathrm{base}}(s,a;\mathrm{tree})+\lambda_Q d_Q(s,a).
 $$
 
 These $\beta$ targets should be stored or treated as stop-gradient targets during training.
@@ -990,9 +967,7 @@ The posterior value target is
 
 $$
 \beta_V(s) =
-\alpha_{\mathrm{prior}}^V(s)
-+
-\lambda_V d_V(s).
+\alpha_{\mathrm{prior}}^V(s)+\lambda_V d_V(s).
 $$
 
 Then train the current value head by KL:
@@ -1001,15 +976,15 @@ $$
 \mathcal{L}_V(s) =
 D_{\mathrm{KL}}
 \left(
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
-\operatorname{stopgrad}
+\textrm{stopgrad}
 \left(
 \beta_V(s)
 \right)
 \right)
 \,\|\,
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_\theta^V(s)
 \right)
@@ -1027,9 +1002,7 @@ The target becomes
 
 $$
 \beta_V(s) =
-\alpha_{\theta^-}^V(s)
-+
-\lambda_V e_z.
+\alpha_{\theta^-}^V(s)+\lambda_V e_z.
 $$
 
 This is valid because $\alpha_{\theta^-}^V(s)$ is strictly positive.
@@ -1038,7 +1011,7 @@ If the value evidence comes from a non-terminal leaf, then
 
 $$
 d_V(s) =
-\operatorname{stopgrad}
+\textrm{stopgrad}
 \left(
 \bar{\phi}_{\theta^-}^V(s_\ell)
 \right),
@@ -1050,10 +1023,8 @@ Then
 
 $$
 \beta_V(s) =
-\alpha_{\theta^-}^V(s)
-+
-\lambda_V
-\operatorname{stopgrad}
+\alpha_{\theta^-}^V(s)+\lambda_V
+\textrm{stopgrad}
 \left(
 \bar{\phi}_{\theta^-}^V(s_\ell)
 \right).
@@ -1081,21 +1052,19 @@ root player's perspective:
 
 $$
 \alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a) =
-\operatorname{flip}
+\textrm{flip}
 \left(
 \alpha_{\theta^-}^V(s_a)
 \right),
 \qquad
-s_a = \operatorname{Step}(s,a).
+s_a = \textrm{Step}(s,a).
 $$
 
 The posterior Q target is
 
 $$
 \beta_Q(s,a) =
-\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a)
-+
-\lambda_Q d_Q(s,a).
+\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a)+\lambda_Q d_Q(s,a).
 $$
 
 Then train the current Q head by KL:
@@ -1104,15 +1073,15 @@ $$
 \mathcal{L}_Q(s,a) =
 D_{\mathrm{KL}}
 \left(
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
-\operatorname{stopgrad}
+\textrm{stopgrad}
 \left(
 \beta_Q(s,a)
 \right)
 \right)
 \,\|\,
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_\theta^Q(s,a)
 \right)
@@ -1124,22 +1093,19 @@ accumulated tree evidence:
 
 $$
 \mathcal{L}_Q(s) =
-\operatorname{mean}_{a \in \mathcal{A}_{\mathrm{explored}}(s)}
+\textrm{mean}_{a \in \mathcal{A}_{\mathrm{explored}}(s)}
 \mathcal{L}_Q(s,a).
 $$
 
 where $\mathcal{A}_{\mathrm{explored}}(s)$ is
 
 $$
-\mathcal{A}_{\mathrm{explored}}(s)
-=
-\left\{
-a \in \mathcal{A}(s)
-:
+\mathcal{A}_{\mathrm{explored}}(s)=
+\{
+a \in \mathcal{A}(s):
 \sum_{i \in \mathcal{I}(a)}
-\lambda_i
-> 0
-\right\}.
+\lambda_i > 0
+\}.
 $$
 
 Unexplored legal actions are excluded from the Q KL. They are not trained
@@ -1181,9 +1147,7 @@ The final posterior after all evidence for action $a$ is
 
 $$
 \alpha_a^{(T)} =
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
-+
-\sum_{i \in \mathcal{I}(a)}
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)+\sum_{i \in \mathcal{I}(a)}
 \lambda_i d_i.
 $$
 
@@ -1198,9 +1162,7 @@ Equivalently:
 
 $$
 \beta_Q(s,a) =
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
-+
-\sum_{i \in \mathcal{I}(a)}
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)+\sum_{i \in \mathcal{I}(a)}
 \lambda_i d_i.
 $$
 
@@ -1210,15 +1172,15 @@ $$
 \mathcal{L}_Q(s,a) =
 D_{\mathrm{KL}}
 \left(
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
-\operatorname{stopgrad}
+\textrm{stopgrad}
 \left(
 \alpha_a^{(T)}
 \right)
 \right)
 \,\|\,
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_\theta^Q(s,a)
 \right)
@@ -1238,11 +1200,7 @@ The full training objective is
 
 $$
 \mathcal{L} =
-\lambda_\pi \mathcal{L}_\pi
-+
-\lambda_V \mathcal{L}_V
-+
-\lambda_Q \mathcal{L}_Q.
+\lambda_\pi \mathcal{L}_\pi+\lambda_V \mathcal{L}_V+\lambda_Q \mathcal{L}_Q.
 $$
 
 The policy loss is
@@ -1250,7 +1208,7 @@ The policy loss is
 $$
 \mathcal{L}_\pi(s) =
 -\sum_{a \in \mathcal{A}(s)}
-\operatorname{stopgrad}
+\textrm{stopgrad}
 \left(
 \hat{\pi}_{\mathrm{search}}(a \mid s)
 \right)
@@ -1263,15 +1221,15 @@ $$
 \mathcal{L}_V(s) =
 D_{\mathrm{KL}}
 \left(
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
-\operatorname{stopgrad}
+\textrm{stopgrad}
 \left(
 \beta_V(s)
 \right)
 \right)
 \,\|\,
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_\theta^V(s)
 \right)
@@ -1282,18 +1240,18 @@ The Q loss is
 
 $$
 \mathcal{L}_Q(s) =
-\operatorname{mean}_{a \in \mathcal{A}_{\mathrm{explored}}(s)}
+\textrm{mean}_{a \in \mathcal{A}_{\mathrm{explored}}(s)}
 D_{\mathrm{KL}}
 \left(
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
-\operatorname{stopgrad}
+\textrm{stopgrad}
 \left(
 \beta_Q(s,a)
 \right)
 \right)
 \,\|\,
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_\theta^Q(s,a)
 \right)
@@ -1304,18 +1262,14 @@ The targets are posterior Dirichlets:
 
 $$
 \beta_V(s) =
-\alpha_{\theta^-}^V(s)
-+
-\lambda_V d_V(s),
+\alpha_{\theta^-}^V(s)+\lambda_V d_V(s),
 $$
 
 and
 
 $$
 \beta_Q(s,a) =
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
-+
-\sum_{i \in \mathcal{I}(a)}
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)+\sum_{i \in \mathcal{I}(a)}
 \lambda_i d_i.
 $$
 
@@ -1328,9 +1282,9 @@ No separate mean loss is required. The Dirichlet KL trains both the WDL mean and
 For
 
 $$
-\operatorname{Dirichlet}(\alpha_1)
+\textrm{Dirichlet}(\alpha_1)
 \quad\text{and}\quad
-\operatorname{Dirichlet}(\alpha_2),
+\textrm{Dirichlet}(\alpha_2),
 $$
 
 with
@@ -1350,25 +1304,19 @@ the KL divergence is
 $$
 D_{\mathrm{KL}}
 \left(
-\operatorname{Dirichlet}(\alpha_1)
+\textrm{Dirichlet}(\alpha_1)
 \,\|\,
-\operatorname{Dirichlet}(\alpha_2)
-\right)
-=
+\textrm{Dirichlet}(\alpha_2)
+\right)=
 \log
 \frac{\Gamma(\alpha_{10})}
-{\Gamma(\alpha_{20})}
-+
-\sum_{i=1}^{k}
+{\Gamma(\alpha_{20})}+\sum_{i=1}^{k}
 \log
 \frac{\Gamma(\alpha_{2i})}
-{\Gamma(\alpha_{1i})}
-+
-\sum_{i=1}^{k}
+{\Gamma(\alpha_{1i})}+\sum_{i=1}^{k}
 (\alpha_{1i}-\alpha_{2i})
 \left[
-\psi(\alpha_{1i})
--
+\psi(\alpha_{1i})-
 \psi(\alpha_{10})
 \right].
 $$
@@ -1377,7 +1325,7 @@ For training, use
 
 $$
 \alpha_1 =
-\operatorname{stopgrad}(\beta),
+\textrm{stopgrad}(\beta),
 \qquad
 \alpha_2 =
 \alpha_\theta.
@@ -1397,17 +1345,17 @@ $$
 $$
 
 When search expands action $a$ and reaches
-$s_a=\operatorname{Step}(s,a)$, replace the root action's Q fallback with the
+$s_a=\textrm{Step}(s,a)$, replace the root action's Q fallback with the
 value-head Dirichlet aligned to the root perspective:
 
 $$
 \alpha_\theta^{V \rightarrow Q}(s,a) =
-\operatorname{flip}
+\textrm{flip}
 \left[
-\operatorname{softplus}(t_\theta^V(\operatorname{Step}(s,a)))^2
-\operatorname{softmax}
+\textrm{softplus}(t_\theta^V(\textrm{Step}(s,a)))^2
+\textrm{softmax}
 \left(
-r_\theta^V(\operatorname{Step}(s,a))
+r_\theta^V(\textrm{Step}(s,a))
 \right)
 \right]
 $$
@@ -1421,7 +1369,7 @@ Search repeatedly samples from these posteriors:
 $$
 \phi_a^{(t)}
 \sim
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_a^{(t)}
 \right).
@@ -1444,9 +1392,7 @@ It updates the selected action posterior:
 
 $$
 \alpha_{a_t}^{(t+1)} =
-\alpha_{a_t}^{(t)}
-+
-\lambda_{a_t}^{(t)}
+\alpha_{a_t}^{(t)}+\lambda_{a_t}^{(t)}
 d_{a_t}^{(t)}.
 $$
 
@@ -1476,7 +1422,7 @@ a =
 \qquad
 \phi_b
 \sim
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_b^{(T)}
 \right).
@@ -1494,18 +1440,14 @@ The value head learns posterior state-level WDL beliefs:
 
 $$
 \beta_V(s) =
-\alpha_{\theta^-}^V(s)
-+
-\lambda_V d_V(s).
+\alpha_{\theta^-}^V(s)+\lambda_V d_V(s).
 $$
 
 The Q head learns posterior action-level WDL beliefs:
 
 $$
 \beta_Q(s,a) =
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)
-+
-\sum_{i \in \mathcal{I}(a)}
+\alpha_{\theta^-}^{V \rightarrow Q}(s,a)+\sum_{i \in \mathcal{I}(a)}
 \lambda_i d_i.
 $$
 
@@ -1516,7 +1458,7 @@ The central search primitive is always the same Dirichlet evidence update:
 
 $$
 p(\phi \mid d,\lambda) =
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha + \lambda d
 \right).
@@ -1526,8 +1468,8 @@ The central network parameterization is always the same mean-concentration form:
 
 $$
 \alpha_\theta =
-\operatorname{softplus}(t_\theta)^2
-\operatorname{softmax}(r_\theta).
+\textrm{softplus}(t_\theta)^2
+\textrm{softmax}(r_\theta).
 $$
 
 There is no additive $\alpha_{\mathrm{base}}$ and no smoothing term.
@@ -1546,8 +1488,7 @@ For Dirichlet-Q search, root traversal can use Thompson sampling while the
 training target remains the posterior-best distribution
 
 $$
-\pi_{\mathrm{search}}(a \mid s)
-=
+\pi_{\mathrm{search}}(a \mid s)=
 \mathbb{P}
 \left(
 a =
@@ -1555,7 +1496,7 @@ a =
 \right),
 \qquad
 \phi_b \sim
-\operatorname{Dirichlet}
+\textrm{Dirichlet}
 \left(
 \alpha_{\mathrm{search}}(s,b)
 \right).
@@ -1571,8 +1512,7 @@ used.
 The deterministic posterior-best mode commits
 
 $$
-A_{\mathrm{argmax}}
-=
+A_{\mathrm{argmax}}=
 \arg\max_{a \in \mathcal{A}(s)}
 \hat{\pi}_{\mathrm{search}}(a \mid s).
 $$
@@ -1585,7 +1525,7 @@ The stochastic posterior-sample mode commits
 $$
 A_{\mathrm{sample}}
 \sim
-\operatorname{Categorical}
+\textrm{Categorical}
 \left(
 \hat{\pi}_{\mathrm{search}}(\cdot \mid s)
 \right).
@@ -1626,8 +1566,7 @@ p_T(A_{\mathrm{argmax}})
 \mathbb{E}_{A_0 \sim \nu}
 \left[
 p_T(A_0)
-\right]
-=
+\right]=
 \sum_a
 \nu(a)p_T(a).
 $$
@@ -1644,8 +1583,7 @@ $$
 \mathbb{P}
 \left(
 A_{\mathrm{sample}}=a
-\right)
-=
+\right)=
 \hat{\pi}_{\mathrm{search}}(a \mid s).
 $$
 
@@ -1660,8 +1598,7 @@ candidate set $C$, and let the baseline proposal action $A_0$ belong to $C$.
 If the committed action is
 
 $$
-A_+
-=
+A_+=
 \arg\max_{a \in C}
 \hat{q}_T(a),
 $$
@@ -1677,8 +1614,7 @@ pointwise, and therefore also in expectation.
 In Dirichlet-Q, a natural scalar estimate is the posterior mean utility
 
 $$
-\hat{q}_T(a)
-=
+\hat{q}_T(a)=
 U
 \left(
 \frac{\alpha_{\mathrm{search}}(s,a)}
