@@ -38,6 +38,17 @@ def test_num_search_blocks_must_be_positive():
         Config(network="boardlaw_dirichlet", num_search_blocks=0)
 
 
+def test_grad_clip_norm_must_be_positive_when_set():
+    with pytest.raises(ValidationError):
+        Config(network="boardlaw_dirichlet", grad_clip_norm=0.0)
+
+
+def test_grad_clip_norm_can_be_disabled():
+    config = Config(network="boardlaw_dirichlet", grad_clip_norm=None)
+
+    assert config.grad_clip_norm is None
+
+
 def test_posterior_sample_action_source_is_valid():
     config = Config(
         network="boardlaw_dirichlet",

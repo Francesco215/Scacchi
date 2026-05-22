@@ -75,6 +75,7 @@ class Config(BaseModel):
     # training params
     training_batch_size: int = 4096
     learning_rate: float = 0.001
+    grad_clip_norm: float | None = Field(default=None, gt=0)
     policy_loss_weight: float = 1.0
     value_dir_kl_weight: float = 1.0
     q_dir_kl_weight: float = 1.0
@@ -147,9 +148,13 @@ def main(cfg: DictConfig) -> None:
         observation_shape=env.observation_shape,
         rngs=nnx.Rngs(config.seed),
     )
+    optimizer_transforms: list[optax.GradientTransformation] = []
+    if config.grad_clip_norm is not None:
+        optimizer_transforms.append(optax.clip_by_global_norm(config.grad_clip_norm))
+    optimizer_transforms.append(optax.adam(learning_rate=config.learning_rate))
     optimizer = nnx.Optimizer(
         model,
-        optax.adam(learning_rate=config.learning_rate),
+        optax.chain(*optimizer_transforms),
         wrt=nnx.Param,
     )
 
