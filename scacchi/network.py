@@ -157,7 +157,11 @@ class ReZeroResidual(nnx.Module):
         self.linear = nnx.Linear(
             width,
             width,
-            kernel_init=jax.nn.initializers.orthogonal(scale=math.sqrt(2.0)),
+            kernel_init=jax.nn.initializers.variance_scaling(
+                scale=2.0,
+                mode="fan_in",
+                distribution="truncated_normal",
+            ),
             rngs=rngs,
         )
         self.alpha = nnx.Param(jnp.zeros(()))
@@ -287,7 +291,14 @@ def build_model(
     if config.network == "boardlaw_dirichlet":
         num_outcomes = config.num_outcomes
         if num_outcomes is None:
-            num_outcomes = 2 if config.env_id == "hex" else 3
+            posterior_tree_search = getattr(config, "search_policy", "gumbel") in (
+                "dirichlet_thompson",
+                "posterior_tree",
+            )
+            if posterior_tree_search:
+                num_outcomes = 3
+            else:
+                num_outcomes = 2 if config.env_id == "hex" else 3
         return BoardlawDirichletNet(
             num_actions=num_actions,
             observation_shape=observation_shape,

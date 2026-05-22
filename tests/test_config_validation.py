@@ -58,9 +58,41 @@ def test_posterior_sample_action_source_is_valid():
     assert config.selfplay_action_source == "posterior_sample"
 
 
+def test_scalar_q_argmax_action_source_is_valid():
+    config = Config(
+        network="boardlaw_dirichlet",
+        selfplay_action_source="scalar_q_argmax",
+    )
+
+    assert config.selfplay_action_source == "scalar_q_argmax"
+
+
 def test_selfplay_action_source_must_be_known():
     with pytest.raises(ValidationError, match="selfplay_action_source"):
         Config(network="boardlaw_dirichlet", selfplay_action_source="unknown")
+
+
+def test_search_policy_must_be_known():
+    with pytest.raises(ValidationError, match="search_policy"):
+        Config(network="boardlaw_dirichlet", search_policy="unknown")
+
+
+def test_posterior_tree_search_requires_dirichlet_network_and_wdl3():
+    with pytest.raises(ValidationError, match="boardlaw_dirichlet"):
+        Config(
+            network="boardlaw",
+            search_policy="posterior_tree",
+            value_dir_kl_weight=0.0,
+            q_dir_kl_weight=0.0,
+            value_outcome_weight=0.0,
+            q_outcome_weight=0.0,
+        )
+    with pytest.raises(ValidationError, match="WDL3"):
+        Config(
+            network="boardlaw_dirichlet",
+            search_policy="posterior_tree",
+            num_outcomes=2,
+        )
 
 
 def test_model_construction_context_allows_legacy_checkpoint_loss_weights():

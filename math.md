@@ -1,5 +1,12 @@
 # Dirichlet-Q AlphaZero: Math Reference
 
+Implementation note: the active search implementation follows
+`latex/algorithms_revised.tex`. In particular, Dirichlet-Q search is now a
+CPU-owned posterior tree with per-edge completed evidence and a leaf-only JAX
+network-evaluation boundary. Older passages that describe reconstructing only a
+root posterior from MCTX embeddings are retained as historical context for the
+previous implementation path.
+
 ## 1. Big picture
 
 The network predicts three objects at each state:

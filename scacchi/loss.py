@@ -83,7 +83,13 @@ def _compute_losses(logits: jax.Array, value: jax.Array, data: Sample) -> tuple[
 
 
 def _outcome_target(value_tgt: jax.Array, num_outcomes: int) -> jax.Array:
-    outcome_idx = (jnp.round(value_tgt).astype(jnp.int32) + 1) // 2
+    rounded = jnp.round(value_tgt).astype(jnp.int32)
+    if num_outcomes == 2:
+        outcome_idx = (rounded + 1) // 2
+    elif num_outcomes == 3:
+        outcome_idx = rounded + 1
+    else:
+        raise ValueError(f"unsupported outcome count: {num_outcomes}")
     return jax.nn.one_hot(outcome_idx, num_outcomes)
 
 

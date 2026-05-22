@@ -2,6 +2,7 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 import mctx
+import numpy as np
 
 from .dirichlet_q_search import (
     DirichletQSearchOutput,
@@ -15,6 +16,11 @@ from .dirichlet_q_search import (
 )
 from .network import policy_value_from_output
 from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
+from .posterior_tree import (
+    is_posterior_tree_policy,
+    run_posterior_tree_search,
+    split_batched_state,
+)
 
 
 def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations):
@@ -97,6 +103,59 @@ def _make_model_mcts_policy(env, config, model, rng_key, env_state, num_simulati
 
 def make_mcts_evaluate(env, config, baseline_model):
     eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
+
+    if is_posterior_tree_policy(getattr(config, "search_policy", "gumbel")):
+        @nnx.jit
+        def evaluate_leaves(model: nnx.Module, obs: jax.Array):
+            return model(obs, train=False)
+
+        @nnx.jit
+        def scalar_mcts_actions(model: nnx.Module, rng_key: jax.Array, env_state):
+            predict = lambda obs: model(obs, train=False)
+            return _make_mcts_policy(
+                predict,
+                make_recurrent_fn(env, predict),
+                rng_key,
+                env_state,
+                config.num_simulations,
+            ).action
+
+        def model_actions(model: nnx.Module, rng_key: jax.Array, env_state):
+            sample_output = evaluate_leaves(
+                model,
+                env_state.observation[:1],
+            )
+            if len(sample_output) != 3:
+                return scalar_mcts_actions(model, rng_key, env_state)
+
+            def leaf_evaluator(obs: jax.Array):
+                return evaluate_leaves(model, obs)
+
+            return run_posterior_tree_search(
+                env=env,
+                root_states=split_batched_state(env_state),
+                leaf_evaluator=leaf_evaluator,
+                rng_key=rng_key,
+                config=config,
+            ).action
+
+        def evaluate(rng_key: jax.Array, model: nnx.Module):
+            my_player = 0
+            key, init_key = jax.random.split(rng_key)
+            init_keys = jax.random.split(init_key, eval_batch_size)
+            env_state = jax.vmap(env.init)(init_keys)
+            returns = jnp.zeros(eval_batch_size)
+
+            while not bool(np.asarray(jax.device_get(env_state.terminated)).all()):
+                key, my_key, opp_key = jax.random.split(key, 3)
+                my_action = model_actions(model, my_key, env_state)
+                opp_action = model_actions(baseline_model, opp_key, env_state)
+                action = jnp.where(env_state.current_player == my_player, my_action, opp_action)
+                env_state = jax.vmap(env.step)(env_state, action)
+                returns = returns + env_state.rewards[jnp.arange(eval_batch_size), my_player]
+            return returns
+
+        return evaluate
 
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: nnx.Module):

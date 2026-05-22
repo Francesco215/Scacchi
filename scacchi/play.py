@@ -24,6 +24,11 @@ from .dirichlet_q_search import (
     terminal_outcome_from_reward,
 )
 from .network import policy_value_from_output
+from .posterior_tree import (
+    is_posterior_tree_policy,
+    run_posterior_tree_search,
+    split_batched_state,
+)
 
 
 class SelfplayOutput(NamedTuple):
@@ -166,7 +171,92 @@ def _empty_posterior_targets(
     return beta_q, beta_v, q_evidence_mass
 
 
+def make_posterior_tree_selfplay(env, config):
+    @nnx.jit
+    def evaluate_leaves(model: nnx.Module, obs: jax.Array):
+        return model(obs, train=False)
+
+    def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
+        def leaf_evaluator(obs: jax.Array):
+            output = evaluate_leaves(model, obs)
+            if len(output) != 3:
+                raise ValueError(
+                    "search_policy='posterior_tree' requires a Dirichlet model "
+                    "returning (logits, alpha_V, alpha_Q)."
+                )
+            return output
+
+        rng_key, init_key = jax.random.split(rng_key)
+        init_keys = jax.random.split(init_key, config.selfplay_batch_size)
+        env_state = jax.vmap(env.init)(init_keys)
+
+        obs_seq = []
+        reward_seq = []
+        terminated_seq = []
+        action_weights_seq = []
+        played_action_seq = []
+        legal_action_mask_seq = []
+        beta_q_seq = []
+        beta_v_seq = []
+        q_evidence_mass_seq = []
+        discount_seq = []
+
+        for _ in range(config.max_num_steps):
+            rng_key, search_key, reset_key = jax.random.split(rng_key, 3)
+            observation = env_state.observation
+            legal_action_mask = env_state.legal_action_mask
+            actor = env_state.current_player
+            root_states = split_batched_state(env_state)
+            search_output = run_posterior_tree_search(
+                env=env,
+                root_states=root_states,
+                leaf_evaluator=leaf_evaluator,
+                rng_key=search_key,
+                config=config,
+            )
+            played_action = search_output.action
+
+            reset_keys = jax.random.split(reset_key, config.selfplay_batch_size)
+            env_state = jax.vmap(auto_reset(env.step, env.init))(
+                env_state,
+                played_action,
+                reset_keys,
+            )
+            reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
+            discount = -jnp.ones((config.selfplay_batch_size,), dtype=reward.dtype)
+            discount = jnp.where(env_state.terminated, 0.0, discount)
+
+            obs_seq.append(observation)
+            action_weights_seq.append(search_output.action_weights)
+            played_action_seq.append(played_action)
+            legal_action_mask_seq.append(legal_action_mask)
+            beta_q_seq.append(search_output.beta_Q_target)
+            beta_v_seq.append(search_output.beta_V_target)
+            q_evidence_mass_seq.append(search_output.q_evidence_mass)
+            reward_seq.append(reward)
+            terminated_seq.append(env_state.terminated)
+            discount_seq.append(discount)
+
+        return SelfplayOutput(
+            obs=jnp.stack(obs_seq, axis=0),
+            reward=jnp.stack(reward_seq, axis=0),
+            terminated=jnp.stack(terminated_seq, axis=0),
+            action_weights=jnp.stack(action_weights_seq, axis=0),
+            played_action=jnp.stack(played_action_seq, axis=0),
+            legal_action_mask=jnp.stack(legal_action_mask_seq, axis=0),
+            beta_Q_target=jnp.stack(beta_q_seq, axis=0),
+            beta_V_target=jnp.stack(beta_v_seq, axis=0),
+            q_evidence_mass=jnp.stack(q_evidence_mass_seq, axis=0),
+            discount=jnp.stack(discount_seq, axis=0),
+        )
+
+    return selfplay
+
+
 def make_selfplay(env, config):
+    if is_posterior_tree_policy(config.search_policy):
+        return make_posterior_tree_selfplay(env, config)
+
     @nnx.jit
     def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
         predict_fn = lambda obs: model(obs, train=False)

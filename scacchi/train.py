@@ -20,6 +20,7 @@ from typing import Any, cast
 # Training is GPU-only by default. Override JAX_PLATFORMS deliberately for
 # diagnostics, and set SCACCHI_ALLOW_CPU=1 only when a CPU run is intentional.
 os.environ.setdefault("JAX_PLATFORMS", "cuda")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 from flax import nnx
 import hydra
@@ -68,8 +69,13 @@ class Config(BaseModel):
     num_search_blocks: int = Field(default=1, ge=1)
     max_num_steps: int = 256
     policy_mc_samples: int = 32
+    backup_mc_samples: int = Field(default=16, ge=1)
     c_leaf: float = 1.0
     c_terminal: float = 8.0
+    c_state: float = Field(default=0.1, ge=0.0)
+    c_value_search: float = Field(default=1.0, ge=0.0)
+    inflight_limit: int = Field(default=1, ge=1)
+    search_eval_batch_size: int | None = Field(default=None, ge=1)
     selfplay_action_source: str = "posterior_best"
     search_policy: str = "gumbel"
     # training params
@@ -122,6 +128,7 @@ class Config(BaseModel):
             "posterior_argmax",
             "posterior_sample",
             "search_action",
+            "scalar_q_argmax",
         }
         if self.selfplay_action_source not in valid_action_sources:
             allowed = ", ".join(sorted(valid_action_sources))
@@ -129,6 +136,27 @@ class Config(BaseModel):
                 "selfplay_action_source must be one of "
                 f"{allowed}; got {self.selfplay_action_source!r}."
             )
+        valid_search_policies = {
+            "gumbel",
+            "dirichlet_thompson",
+            "posterior_tree",
+        }
+        if self.search_policy not in valid_search_policies:
+            allowed = ", ".join(sorted(valid_search_policies))
+            raise ValueError(
+                f"search_policy must be one of {allowed}; got {self.search_policy!r}."
+            )
+        if self.search_policy in {"dirichlet_thompson", "posterior_tree"}:
+            if self.network != "boardlaw_dirichlet":
+                raise ValueError(
+                    "posterior-tree Dirichlet search requires "
+                    "network='boardlaw_dirichlet'."
+                )
+            if self.num_outcomes not in (None, 3):
+                raise ValueError(
+                    "posterior-tree Dirichlet search uses WDL3 targets; set "
+                    "num_outcomes to null or 3."
+                )
         return self
 
 

@@ -8,6 +8,7 @@ from scacchi.loss import (
     _compute_dirichlet_losses,
     _compute_losses,
     _dirichlet_kl,
+    _outcome_target,
     make_compute_loss_input,
 )
 from scacchi.play import SelfplayOutput
@@ -164,6 +165,21 @@ def test_dirichlet_outcome_losses_use_played_action():
 
     assert jnp.allclose(metrics.value_outcome_loss, -jnp.log(0.75))
     assert jnp.allclose(metrics.q_outcome_loss, -jnp.log(0.8))
+
+
+def test_wdl3_outcome_target_maps_loss_draw_win_to_three_slots():
+    target = _outcome_target(jnp.array([-1.0, 0.0, 1.0]), 3)
+
+    assert jnp.array_equal(
+        target,
+        jnp.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        ),
+    )
 
 
 def test_dirichlet_kl_is_zero_for_identical_parameters_and_positive_otherwise():
