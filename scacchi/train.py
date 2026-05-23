@@ -81,6 +81,9 @@ class Config(BaseModel):
     wavefront_num_lanes_per_root: int = Field(default=1, ge=1)
     wavefront_max_depth: int = Field(default=128, ge=1)
     wavefront_final_action_mode: str = "argmax_q_mean"
+    wavefront_pad_eval_batches: bool = True
+    wavefront_pad_jax_select: bool = False
+    wavefront_np_select_below: int = Field(default=1024, ge=0)
     wavefront_backend: str = "arena"
     # training params
     training_batch_size: int = 4096

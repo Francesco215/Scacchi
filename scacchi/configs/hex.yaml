@@ -24,6 +24,9 @@ search_policy: posterior_tree_wavefront
 wavefront_num_lanes_per_root: 1
 wavefront_max_depth: 128
 wavefront_final_action_mode: argmax_q_mean
+wavefront_pad_eval_batches: true
+wavefront_pad_jax_select: false
+wavefront_np_select_below: 256
 wavefront_backend: arena
 training_batch_size: 128
 learning_rate: 3e-3

@@ -114,6 +114,9 @@ def test_wavefront_knobs_are_validated():
     assert config.wavefront_num_lanes_per_root == 2
     assert config.wavefront_max_depth == 32
     assert config.wavefront_final_action_mode == "posterior_sample"
+    assert config.wavefront_pad_eval_batches is True
+    assert config.wavefront_pad_jax_select is False
+    assert config.wavefront_np_select_below == 1024
 
     with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
         Config(

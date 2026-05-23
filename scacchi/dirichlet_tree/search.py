@@ -490,6 +490,9 @@ def search_config_from_any(config: Any, *, num_roots: int = 1) -> SearchConfig:
         policy_mc_samples=int(getattr(config, "policy_mc_samples")),
         duplicate_leaf_mode=getattr(config, "duplicate_leaf_mode", "recycle_lane"),
         final_action_mode=getattr(config, "wavefront_final_action_mode", "argmax_q_mean"),
+        pad_eval_batches=bool(getattr(config, "wavefront_pad_eval_batches", True)),
+        pad_jax_select=bool(getattr(config, "wavefront_pad_jax_select", False)),
+        np_select_below=max(0, int(getattr(config, "wavefront_np_select_below", 1024))),
     )
 
 

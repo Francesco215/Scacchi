@@ -101,7 +101,7 @@ def test_wavefront_steps_multiple_roots_in_one_batched_call_and_finishes_targets
     )
 
     assert env.step_calls == 1
-    assert calls == [3, 3]
+    assert calls == [3, 16]
     assert output.action.shape == (3,)
     assert output.action_weights.shape == (3, 2)
     assert np.allclose(np.asarray(output.action_weights.sum(axis=-1)), 1.0)
@@ -152,7 +152,7 @@ def test_wavefront_duplicate_lanes_evaluate_unique_leaf_once():
         config=_config(wavefront_num_lanes_per_root=2),
     )
 
-    assert calls == [1, 1]
+    assert calls == [1, 16]
     assert output.action.shape == (1,)
     assert np.isclose(float(output.q_evidence_mass[0, 0]), 1.0)
 
@@ -178,6 +178,31 @@ def test_wavefront_state_batch_entrypoint_avoids_root_state_list():
     )
 
     assert env.step_calls == 1
+    assert calls == [3, 16]
+    assert output.action.shape == (3,)
+    assert np.all(np.asarray(output.q_evidence_mass[:, 0]) > 0.0)
+
+
+def test_wavefront_eval_padding_can_be_disabled():
+    env = CountingToyEnv()
+    calls = []
+
+    def leaf_evaluator(obs):
+        calls.append(int(obs.shape[0]))
+        batch = obs.shape[0]
+        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
+        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
+        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
+        return logits, alpha_v, alpha_q
+
+    output = run_wavefront_posterior_tree_search_state_batch(
+        env=env,
+        root_state_batch=_stack_states([_state(0.0), _state(10.0), _state(20.0)]),
+        leaf_evaluator=leaf_evaluator,
+        rng_key=jax.random.PRNGKey(33),
+        config=_config(wavefront_pad_eval_batches=False),
+    )
+
     assert calls == [3, 3]
     assert output.action.shape == (3,)
     assert np.all(np.asarray(output.q_evidence_mass[:, 0]) > 0.0)
@@ -203,7 +228,7 @@ def test_wavefront_state_batch_deduplicates_identical_roots():
         config=_config(),
     )
 
-    assert calls == [1, 1]
+    assert calls == [1, 16]
     assert output.action.shape == (3,)
     assert np.allclose(np.asarray(output.action_weights[0]), np.asarray(output.action_weights[1]))
     assert np.allclose(np.asarray(output.q_evidence_mass[:, 0]), 1.0)

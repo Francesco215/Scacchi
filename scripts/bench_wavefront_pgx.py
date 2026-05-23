@@ -29,6 +29,8 @@ def main() -> None:
     )
     parser.add_argument("--policy-mc-samples", type=int, default=1)
     parser.add_argument("--lanes-per-root", type=int, default=1)
+    parser.add_argument("--np-select-below", type=int, default=1024)
+    parser.add_argument("--pad-jax-select", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
 
     env = make_env("hex", args.board_size)
@@ -55,6 +57,8 @@ def main() -> None:
         wavefront_num_lanes_per_root=args.lanes_per_root,
         wavefront_max_depth=max(16, args.simulations + args.board_size * args.board_size + 2),
         wavefront_final_action_mode="argmax_q_mean",
+        wavefront_pad_jax_select=args.pad_jax_select,
+        wavefront_np_select_below=args.np_select_below,
     )
 
     modes = ["state_batch", "split_list"] if args.mode == "both" else [args.mode]
@@ -73,7 +77,9 @@ def main() -> None:
                 f"completed_evals_per_s={total / elapsed:.1f} "
                 f"batch={args.batch} simulations={args.simulations} "
                 f"board_size={args.board_size} prefill_steps={args.prefill_steps} "
-                f"lanes_per_root={args.lanes_per_root}",
+                f"lanes_per_root={args.lanes_per_root} "
+                f"np_select_below={args.np_select_below} "
+                f"pad_jax_select={args.pad_jax_select}",
                 flush=True,
             )
 

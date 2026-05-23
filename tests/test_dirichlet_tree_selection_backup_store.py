@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from scacchi.dirichlet_tree.backup import backup_path, update_edge_base_from_child
+from scacchi.dirichlet_tree.arena_search import PosteriorArena
 from scacchi.dirichlet_tree.selection import thompson_select_jax, thompson_select_np
 from scacchi.dirichlet_tree.store import InMemoryNodeStore, RedisNodeStore
 from scacchi.dirichlet_tree.types import NodeBlob, PathStep, StateKey, outcome_mean
@@ -102,6 +103,97 @@ def test_backup_updates_direct_evidence_and_normalized_ancestor_summary():
     child_summary = outcome_mean(child.state_summary_alpha)
     assert np.allclose(root.edge_evidence_E[0], 0.5 * child_summary[::-1])
     assert np.allclose(root.edge_post_alpha[0], root.edge_base_alpha[0] + root.edge_evidence_E[0])
+
+
+def test_arena_batch_expansion_preserves_variable_legal_action_order():
+    arena = PosteriorArena(max_nodes=4, max_edges=8, num_actions=4, num_outcomes=3)
+    q_alpha = np.arange(2 * 4 * 3, dtype=np.float32).reshape((2, 4, 3)) + 1.0
+    logits = np.arange(2 * 4, dtype=np.float32).reshape((2, 4))
+
+    node_ids = arena.add_expanded_nodes_batch(
+        keys=np.array([[1, 0, 0, 0], [2, 0, 0, 0]], dtype=np.uint32),
+        current_players=np.array([0, 1], dtype=np.int32),
+        legal_action_mask=np.array(
+            [[True, False, True, False], [False, True, False, True]],
+            dtype=bool,
+        ),
+        value_alpha=np.ones((2, 3), dtype=np.float32),
+        policy_logits=logits,
+        q_alpha=q_alpha,
+        assume_unique_new=True,
+    )
+
+    assert node_ids.tolist() == [0, 1]
+    assert arena.edge_action[:4].tolist() == [0, 2, 1, 3]
+    assert np.allclose(arena.edge_base_alpha[0], q_alpha[0, 0])
+    assert np.allclose(arena.edge_base_alpha[1], q_alpha[0, 2])
+    assert np.allclose(arena.edge_base_alpha[2], q_alpha[1, 1])
+    assert np.allclose(arena.edge_base_alpha[3], q_alpha[1, 3])
+    assert arena.edge_logit[:4].tolist() == [0.0, 2.0, 5.0, 7.0]
+
+
+def test_grouped_arena_expansion_preserves_original_row_order_across_legal_counts():
+    arena = PosteriorArena(max_nodes=8, max_edges=16, num_actions=4, num_outcomes=3)
+    q_alpha = np.arange(3 * 4 * 3, dtype=np.float32).reshape((3, 4, 3)) + 1.0
+    logits = np.arange(3 * 4, dtype=np.float32).reshape((3, 4))
+
+    node_ids = arena.add_expanded_nodes_batch(
+        keys=np.array([[1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0]], dtype=np.uint32),
+        current_players=np.array([0, 1, 0], dtype=np.int32),
+        legal_action_mask=np.array(
+            [
+                [True, False, False, False],
+                [False, True, True, False],
+                [False, False, False, True],
+            ],
+            dtype=bool,
+        ),
+        value_alpha=np.ones((3, 3), dtype=np.float32),
+        policy_logits=logits,
+        q_alpha=q_alpha,
+        assume_unique_new=True,
+    )
+
+    assert node_ids.shape == (3,)
+    assert arena.node_key[node_ids].tolist() == [[1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0]]
+    assert arena.edge_action[arena.node_first_edge[node_ids[0]] : arena.node_first_edge[node_ids[0]] + 1].tolist() == [0]
+    assert arena.edge_action[arena.node_first_edge[node_ids[1]] : arena.node_first_edge[node_ids[1]] + 2].tolist() == [1, 2]
+    assert arena.edge_action[arena.node_first_edge[node_ids[2]] : arena.node_first_edge[node_ids[2]] + 1].tolist() == [3]
+
+
+def test_refresh_summaries_groups_parents_with_different_legal_counts():
+    from scacchi.dirichlet_tree.arena_search import BatchedPosteriorArenaSearch
+
+    arena = PosteriorArena(max_nodes=8, max_edges=16, num_actions=4, num_outcomes=3)
+    node_ids = arena.add_expanded_nodes_batch(
+        keys=np.array([[1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0]], dtype=np.uint32),
+        current_players=np.array([0, 0, 0], dtype=np.int32),
+        legal_action_mask=np.array(
+            [
+                [True, False, False, False],
+                [False, True, True, False],
+                [False, False, False, True],
+            ],
+            dtype=bool,
+        ),
+        value_alpha=np.ones((3, 3), dtype=np.float32),
+        policy_logits=np.zeros((3, 4), dtype=np.float32),
+        q_alpha=np.ones((3, 4, 3), dtype=np.float32),
+        assume_unique_new=True,
+    )
+    arena.edge_E[arena.node_first_edge[node_ids[0]]] = np.array([0.0, 0.0, 3.0], dtype=np.float32)
+    arena.edge_E[arena.node_first_edge[node_ids[1]]] = np.array([3.0, 0.0, 0.0], dtype=np.float32)
+
+    search = BatchedPosteriorArenaSearch(env=object())
+    search.arena = arena
+    search._refresh_edges_and_summaries(
+        arena.node_first_edge[node_ids],
+        node_ids,
+    )
+
+    assert np.all(arena.node_summary_alpha[node_ids] > 0.0)
+    assert arena.node_summary_alpha[node_ids[0], 2] > arena.node_summary_alpha[node_ids[0], 0]
+    assert arena.node_summary_alpha[node_ids[1], 0] > 0.0
 
 
 def test_in_memory_claim_missing_once_and_reports_existing_status():

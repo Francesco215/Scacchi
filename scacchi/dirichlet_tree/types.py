@@ -203,6 +203,9 @@ class SearchConfig:
     tau_internal: float = 1.0
     duplicate_leaf_mode: DuplicateLeafMode = "recycle_lane"
     final_action_mode: FinalActionMode = "argmax_q_mean"
+    pad_eval_batches: bool = True
+    pad_jax_select: bool = False
+    np_select_below: int = 1024
     redis_inflight_ttl_ms: int = 30000
 
 
