@@ -19,6 +19,7 @@ from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
 from .posterior_tree import (
     is_posterior_tree_policy,
     run_posterior_tree_search,
+    run_posterior_tree_search_state_batch,
     split_batched_state,
 )
 
@@ -130,6 +131,15 @@ def make_mcts_evaluate(env, config, baseline_model):
 
             def leaf_evaluator(obs: jax.Array):
                 return evaluate_leaves(model, obs)
+
+            if getattr(config, "search_policy", "gumbel") == "posterior_tree_wavefront":
+                return run_posterior_tree_search_state_batch(
+                    env=env,
+                    root_state_batch=env_state,
+                    leaf_evaluator=leaf_evaluator,
+                    rng_key=rng_key,
+                    config=config,
+                ).action
 
             return run_posterior_tree_search(
                 env=env,

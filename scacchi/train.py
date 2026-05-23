@@ -17,9 +17,9 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-# Training is GPU-only by default. Override JAX_PLATFORMS deliberately for
-# diagnostics, and set SCACCHI_ALLOW_CPU=1 only when a CPU run is intentional.
-os.environ.setdefault("JAX_PLATFORMS", "cuda")
+# Training expects a GPU by default, but posterior_tree search keeps PGX env
+# stepping on CPU, so both platforms need to be visible.
+os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 from flax import nnx
@@ -78,6 +78,10 @@ class Config(BaseModel):
     search_eval_batch_size: int | None = Field(default=None, ge=1)
     selfplay_action_source: str = "posterior_best"
     search_policy: str = "gumbel"
+    wavefront_num_lanes_per_root: int = Field(default=1, ge=1)
+    wavefront_max_depth: int = Field(default=128, ge=1)
+    wavefront_final_action_mode: str = "argmax_q_mean"
+    wavefront_backend: str = "arena"
     # training params
     training_batch_size: int = 4096
     learning_rate: float = 0.001
@@ -140,13 +144,31 @@ class Config(BaseModel):
             "gumbel",
             "dirichlet_thompson",
             "posterior_tree",
+            "posterior_tree_wavefront",
         }
         if self.search_policy not in valid_search_policies:
             allowed = ", ".join(sorted(valid_search_policies))
             raise ValueError(
                 f"search_policy must be one of {allowed}; got {self.search_policy!r}."
             )
-        if self.search_policy in {"dirichlet_thompson", "posterior_tree"}:
+        valid_wavefront_action_modes = {
+            "argmax_q_mean",
+            "posterior_argmax",
+            "posterior_sample",
+        }
+        if self.wavefront_final_action_mode not in valid_wavefront_action_modes:
+            allowed = ", ".join(sorted(valid_wavefront_action_modes))
+            raise ValueError(
+                "wavefront_final_action_mode must be one of "
+                f"{allowed}; got {self.wavefront_final_action_mode!r}."
+            )
+        if self.wavefront_backend != "arena":
+            raise ValueError("wavefront_backend currently supports only 'arena'.")
+        if self.search_policy in {
+            "dirichlet_thompson",
+            "posterior_tree",
+            "posterior_tree_wavefront",
+        }:
             if self.network != "boardlaw_dirichlet":
                 raise ValueError(
                     "posterior-tree Dirichlet search requires "

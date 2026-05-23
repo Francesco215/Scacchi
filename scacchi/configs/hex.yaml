@@ -20,7 +20,11 @@ c_value_search: 1.0
 inflight_limit: 1
 search_eval_batch_size: null
 selfplay_action_source: posterior_sample
-search_policy: posterior_tree
+search_policy: posterior_tree_wavefront
+wavefront_num_lanes_per_root: 1
+wavefront_max_depth: 128
+wavefront_final_action_mode: argmax_q_mean
+wavefront_backend: arena
 training_batch_size: 128
 learning_rate: 3e-3
 grad_clip_norm: 1.0

@@ -1,4 +1,5 @@
-from typing import NamedTuple
+import weakref
+from typing import Any, Callable, NamedTuple
 
 import chex
 from flax import nnx
@@ -27,8 +28,16 @@ from .network import policy_value_from_output
 from .posterior_tree import (
     is_posterior_tree_policy,
     run_posterior_tree_search,
+    run_posterior_tree_search_state_batch,
     split_batched_state,
 )
+
+
+BatchedEnvInit = Callable[[jax.Array], Any]
+BatchedEnvStep = Callable[[Any, jax.Array, jax.Array], Any]
+
+_CPU_ENV_INIT_CACHE: dict[int, tuple[weakref.ReferenceType[Any] | None, BatchedEnvInit]] = {}
+_CPU_ENV_STEP_CACHE: dict[int, tuple[weakref.ReferenceType[Any] | None, BatchedEnvStep]] = {}
 
 
 class SelfplayOutput(NamedTuple):
@@ -42,6 +51,60 @@ class SelfplayOutput(NamedTuple):
     beta_V_target: jax.Array
     q_evidence_mass: jax.Array
     discount: jax.Array
+
+
+def _cpu_device() -> jax.Device:
+    try:
+        return jax.devices("cpu")[0]
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "posterior_tree selfplay requires the JAX CPU platform for PGX env "
+            "initialization and stepping. Use JAX_PLATFORMS=cuda,cpu when running "
+            "with a GPU."
+        ) from exc
+
+
+def _device_put_cpu(value: Any) -> Any:
+    return jax.device_put(value, _cpu_device())
+
+
+def _env_ref(env: Any) -> weakref.ReferenceType[Any] | None:
+    try:
+        return weakref.ref(env)
+    except TypeError:
+        return None
+
+
+def _cached_cpu_env_init(env: Any) -> BatchedEnvInit:
+    cache_key = id(env)
+    cached = _CPU_ENV_INIT_CACHE.get(cache_key)
+    if cached is not None:
+        env_ref, init_fn = cached
+        if env_ref is None or env_ref() is env:
+            return init_fn
+    init_fn = jax.jit(jax.vmap(env.init))
+    _CPU_ENV_INIT_CACHE[cache_key] = (_env_ref(env), init_fn)
+    return init_fn
+
+
+def _cached_cpu_env_step(env: Any) -> BatchedEnvStep:
+    cache_key = id(env)
+    cached = _CPU_ENV_STEP_CACHE.get(cache_key)
+    if cached is not None:
+        env_ref, step_fn = cached
+        if env_ref is None or env_ref() is env:
+            return step_fn
+    step_fn = jax.jit(jax.vmap(auto_reset(env.step, env.init)))
+    _CPU_ENV_STEP_CACHE[cache_key] = (_env_ref(env), step_fn)
+    return step_fn
+
+
+def _cached_default_env_init(env: Any) -> BatchedEnvInit:
+    return _cached_cpu_env_init(env)
+
+
+def _cached_default_env_step(env: Any) -> BatchedEnvStep:
+    return _cached_cpu_env_step(env)
 
 
 def make_recurrent_fn(env, predict_fn):
@@ -181,14 +244,22 @@ def make_posterior_tree_selfplay(env, config):
             output = evaluate_leaves(model, obs)
             if len(output) != 3:
                 raise ValueError(
-                    "search_policy='posterior_tree' requires a Dirichlet model "
+                    "posterior-tree search requires a Dirichlet model "
                     "returning (logits, alpha_V, alpha_Q)."
                 )
             return output
 
+        use_wavefront_arena = config.search_policy == "posterior_tree_wavefront"
         rng_key, init_key = jax.random.split(rng_key)
-        init_keys = jax.random.split(init_key, config.selfplay_batch_size)
-        env_state = jax.vmap(env.init)(init_keys)
+        if use_wavefront_arena:
+            init_keys = jax.random.split(init_key, config.selfplay_batch_size)
+            env_init = _cached_default_env_init(env)
+            env_step = _cached_default_env_step(env)
+        else:
+            init_keys = _device_put_cpu(jax.random.split(init_key, config.selfplay_batch_size))
+            env_init = _cached_cpu_env_init(env)
+            env_step = _cached_cpu_env_step(env)
+        env_state = env_init(init_keys)
 
         obs_seq = []
         reward_seq = []
@@ -206,22 +277,29 @@ def make_posterior_tree_selfplay(env, config):
             observation = env_state.observation
             legal_action_mask = env_state.legal_action_mask
             actor = env_state.current_player
-            root_states = split_batched_state(env_state)
-            search_output = run_posterior_tree_search(
-                env=env,
-                root_states=root_states,
-                leaf_evaluator=leaf_evaluator,
-                rng_key=search_key,
-                config=config,
-            )
-            played_action = search_output.action
+            if use_wavefront_arena:
+                search_output = run_posterior_tree_search_state_batch(
+                    env=env,
+                    root_state_batch=env_state,
+                    leaf_evaluator=leaf_evaluator,
+                    rng_key=search_key,
+                    config=config,
+                )
+            else:
+                root_states = split_batched_state(env_state)
+                search_output = run_posterior_tree_search(
+                    env=env,
+                    root_states=root_states,
+                    leaf_evaluator=leaf_evaluator,
+                    rng_key=search_key,
+                    config=config,
+                )
+            played_action = search_output.action if use_wavefront_arena else _device_put_cpu(search_output.action)
 
             reset_keys = jax.random.split(reset_key, config.selfplay_batch_size)
-            env_state = jax.vmap(auto_reset(env.step, env.init))(
-                env_state,
-                played_action,
-                reset_keys,
-            )
+            if not use_wavefront_arena:
+                reset_keys = _device_put_cpu(reset_keys)
+            env_state = env_step(env_state, played_action, reset_keys)
             reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
             discount = -jnp.ones((config.selfplay_batch_size,), dtype=reward.dtype)
             discount = jnp.where(env_state.terminated, 0.0, discount)

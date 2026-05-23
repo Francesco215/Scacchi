@@ -95,6 +95,34 @@ def test_posterior_tree_search_requires_dirichlet_network_and_wdl3():
         )
 
 
+def test_wavefront_posterior_tree_search_policy_is_valid():
+    config = Config(network="boardlaw_dirichlet", search_policy="posterior_tree_wavefront")
+
+    assert config.search_policy == "posterior_tree_wavefront"
+    assert config.wavefront_backend == "arena"
+
+
+def test_wavefront_knobs_are_validated():
+    config = Config(
+        network="boardlaw_dirichlet",
+        search_policy="posterior_tree_wavefront",
+        wavefront_num_lanes_per_root=2,
+        wavefront_max_depth=32,
+        wavefront_final_action_mode="posterior_sample",
+    )
+
+    assert config.wavefront_num_lanes_per_root == 2
+    assert config.wavefront_max_depth == 32
+    assert config.wavefront_final_action_mode == "posterior_sample"
+
+    with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
+        Config(
+            network="boardlaw_dirichlet",
+            search_policy="posterior_tree_wavefront",
+            wavefront_final_action_mode="unknown",
+        )
+
+
 def test_model_construction_context_allows_legacy_checkpoint_loss_weights():
     config = Config.model_validate(
         {

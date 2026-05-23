@@ -50,6 +50,15 @@ class TerminalToyEnv:
         )
 
 
+class CountingToyEnv(ToyEnv):
+    def __init__(self):
+        self.step_calls = 0
+
+    def step(self, state: ToyState, action: jax.Array) -> ToyState:
+        self.step_calls += 1
+        return super().step(state, action)
+
+
 def _state(
     *,
     player: int = 0,
@@ -188,7 +197,12 @@ def test_state_search_posterior_uses_only_legal_action_posteriors():
 
 def test_consume_result_marks_expanded_and_backs_up_leaf_mean_evidence():
     tree = _tree(root_state=_state(player=0, legal=(True, False)), c_leaf=2.0)
-    request = tree.next_request()
+    step_request = tree.next_step_request()
+    assert step_request is not None
+    request = tree.consume_step_result(
+        step_request,
+        tree.env.step(step_request.state, jnp.asarray(step_request.action, dtype=jnp.int32)),
+    )
     assert request is not None
 
     tree.consume_result(
@@ -207,16 +221,18 @@ def test_consume_result_marks_expanded_and_backs_up_leaf_mean_evidence():
     assert tree.nodes[0].visits[0] == 1
 
 
-def test_next_request_marks_inflight_without_adding_posterior_mass():
+def test_next_step_request_returns_action_without_stepping_or_adding_posterior_mass():
     tree = _tree(root_state=_state(player=0, legal=(True, False)))
 
-    request = tree.next_request()
+    request = tree.next_step_request()
 
     assert request is not None
-    assert tree.inflight == 1
+    assert request.parent_id == 0
+    assert request.action == 0
+    assert tree.inflight == 0
     assert tree.done == 0
     assert np.allclose(tree.nodes[0].evidence, 0.0)
-    assert tree.nodes[0].children[0] != NO_CHILD
+    assert tree.nodes[0].children[0] == NO_CHILD
 
 
 def test_terminal_leaf_is_backed_up_without_calling_leaf_evaluator():
@@ -226,7 +242,12 @@ def test_terminal_leaf_is_backed_up_without_calling_leaf_evaluator():
         c_terminal=8.0,
     )
 
-    request = tree.next_request()
+    step_request = tree.next_step_request()
+    assert step_request is not None
+    request = tree.consume_step_result(
+        step_request,
+        tree.env.step(step_request.state, jnp.asarray(step_request.action, dtype=jnp.int32)),
+    )
 
     assert request is None
     assert tree.done == 1
@@ -331,3 +352,64 @@ def test_run_search_batches_multiple_roots_and_keeps_targets_normalized():
     assert output.action_weights.shape == (3, 2)
     assert np.allclose(np.asarray(output.action_weights.sum(axis=-1)), 1.0)
     assert np.all(np.asarray(output.q_evidence_mass) >= 0.0)
+
+
+def test_run_search_steps_all_roots_with_one_batched_env_call_per_wave():
+    env = CountingToyEnv()
+
+    def leaf_evaluator(obs):
+        batch = obs.shape[0]
+        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
+        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
+        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
+        return logits, alpha_v, alpha_q
+
+    output = run_posterior_tree_search(
+        env=env,
+        root_states=[
+            _state(player=0, legal=(True, False), obs=0.0),
+            _state(player=0, legal=(True, False), obs=10.0),
+            _state(player=0, legal=(True, False), obs=20.0),
+        ],
+        leaf_evaluator=leaf_evaluator,
+        rng_key=jax.random.PRNGKey(6),
+        config=_config(num_simulations=1, search_eval_batch_size=8),
+    )
+
+    assert env.step_calls == 1
+    assert output.action.shape == (3,)
+
+
+def test_run_search_only_evaluates_active_leaf_states_after_batched_step():
+    env = CountingToyEnv()
+    calls = []
+
+    def leaf_evaluator(obs):
+        calls.append(np.asarray(obs).reshape((obs.shape[0], -1))[:, 0].tolist())
+        batch = obs.shape[0]
+        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
+        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
+        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
+        return logits, alpha_v, alpha_q
+
+    output = run_posterior_tree_search(
+        env=env,
+        root_states=[
+            _state(
+                player=0,
+                legal=(False, False),
+                terminal=True,
+                rewards=(1.0, -1.0),
+                obs=0.0,
+            ),
+            _state(player=0, legal=(True, False), obs=10.0),
+            _state(player=0, legal=(True, False), obs=20.0),
+        ],
+        leaf_evaluator=leaf_evaluator,
+        rng_key=jax.random.PRNGKey(7),
+        config=_config(num_simulations=1, search_eval_batch_size=8),
+    )
+
+    assert env.step_calls == 1
+    assert calls == [[0.0, 10.0, 20.0], [11.0, 21.0]]
+    assert output.action.shape == (3,)

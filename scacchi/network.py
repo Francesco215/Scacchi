@@ -294,6 +294,7 @@ def build_model(
             posterior_tree_search = getattr(config, "search_policy", "gumbel") in (
                 "dirichlet_thompson",
                 "posterior_tree",
+                "posterior_tree_wavefront",
             )
             if posterior_tree_search:
                 num_outcomes = 3

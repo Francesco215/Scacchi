@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import weakref
 from typing import Any, Callable, NamedTuple
 
 import jax
@@ -9,12 +10,20 @@ import numpy as np
 
 
 NO_CHILD = -1
-POSTERIOR_TREE_POLICIES = {"posterior_tree", "dirichlet_thompson"}
+POSTERIOR_TREE_POLICIES = {"posterior_tree", "posterior_tree_wavefront", "dirichlet_thompson"}
 
 
 class EvalRequest(NamedTuple):
     tree_index: int
     leaf_id: int
+    path: tuple[tuple[int, int], ...]
+    state: Any
+
+
+class StepRequest(NamedTuple):
+    tree_index: int
+    parent_id: int
+    action: int
     path: tuple[tuple[int, int], ...]
     state: Any
 
@@ -167,7 +176,7 @@ class PosteriorTree:
         )
         return _positive_alpha(np.sum(policy[:, None] * alpha, axis=0))
 
-    def next_request(self) -> EvalRequest | None:
+    def next_step_request(self) -> StepRequest | None:
         node_id = 0
         path: list[tuple[int, int]] = []
         while True:
@@ -188,31 +197,37 @@ class PosteriorTree:
                 if child.terminal or child.expanded:
                     node_id = child_id
                     continue
-                if child.in_flight:
-                    return None
-                child.in_flight = True
-                self.inflight += 1
-                return EvalRequest(self.tree_index, child_id, tuple(path), child.state)
-
-            child_state = self.env.step(node.state, jnp.asarray(action, dtype=jnp.int32))
-            child_id = self._add_node(
-                state=child_state,
-                parent=node_id,
-                action_from_parent=action,
-                expanded=False,
-                in_flight=False,
-            )
-            node.children[action] = child_id
-            child = self.nodes[child_id]
-            if child.terminal:
-                d_leaf = self._terminal_outcome(child_id)
-                self.backup_path(tuple(path), child_id, d_leaf, self.c_terminal)
-                self.done += 1
                 return None
 
-            child.in_flight = True
-            self.inflight += 1
-            return EvalRequest(self.tree_index, child_id, tuple(path), child_state)
+            return StepRequest(self.tree_index, node_id, action, tuple(path), node.state)
+
+    def consume_step_result(self, request: StepRequest, child_state: Any) -> EvalRequest | None:
+        parent = self.nodes[request.parent_id]
+        child_id = self._add_node(
+            state=child_state,
+            parent=request.parent_id,
+            action_from_parent=request.action,
+            expanded=False,
+            in_flight=False,
+        )
+        parent.children[request.action] = child_id
+        child = self.nodes[child_id]
+        if child.terminal:
+            d_leaf = self._terminal_outcome(child_id)
+            self.backup_path(request.path, child_id, d_leaf, self.c_terminal)
+            self.done += 1
+            return None
+
+        child.in_flight = True
+        self.inflight += 1
+        return EvalRequest(self.tree_index, child_id, request.path, child_state)
+
+    def next_request(self) -> EvalRequest | None:
+        request = self.next_step_request()
+        if request is None:
+            return None
+        child_state = self.env.step(request.state, jnp.asarray(request.action, dtype=jnp.int32))
+        return self.consume_step_result(request, child_state)
 
     def consume_result(
         self,
@@ -320,6 +335,10 @@ class PosteriorTree:
 
 
 LeafEvaluator = Callable[[jax.Array], tuple[jax.Array, jax.Array, jax.Array]]
+BatchedStep = Callable[[Any, jax.Array], Any]
+
+
+_BATCHED_STEP_CACHE: dict[int, tuple[weakref.ReferenceType[Any] | None, BatchedStep]] = {}
 
 
 def is_posterior_tree_policy(search_policy: str) -> bool:
@@ -334,6 +353,17 @@ def run_posterior_tree_search(
     rng_key: jax.Array,
     config: Any,
 ) -> PosteriorTreeBatchOutput:
+    if getattr(config, "search_policy", "posterior_tree") == "posterior_tree_wavefront":
+        from .dirichlet_tree.search import run_wavefront_posterior_tree_search
+
+        return run_wavefront_posterior_tree_search(
+            env=env,
+            root_states=root_states,
+            leaf_evaluator=leaf_evaluator,
+            rng_key=rng_key,
+            config=config,
+        )
+
     if not root_states:
         raise ValueError("root_states must not be empty")
 
@@ -370,6 +400,7 @@ def run_posterior_tree_search(
     )
 
     _run_search_loop(
+        env,
         trees,
         leaf_evaluator=leaf_evaluator,
         num_simulations=int(getattr(config, "num_simulations")),
@@ -380,17 +411,46 @@ def run_posterior_tree_search(
     finished = [tree.finish() for tree in trees]
     actions, policies, beta_q, beta_v, q_mass, alpha_root = zip(*finished, strict=True)
     return PosteriorTreeBatchOutput(
-        action=jnp.asarray(np.asarray(actions), dtype=jnp.int32),
-        action_weights=jnp.asarray(np.stack(policies, axis=0)),
-        beta_Q_target=jnp.asarray(np.stack(beta_q, axis=0)),
-        beta_V_target=jnp.asarray(np.stack(beta_v, axis=0)),
-        q_evidence_mass=jnp.asarray(np.stack(q_mass, axis=0)),
-        alpha_root=jnp.asarray(np.stack(alpha_root, axis=0)),
+        action=_device_put_cpu(jnp.asarray(np.asarray(actions), dtype=jnp.int32)),
+        action_weights=_device_put_cpu(jnp.asarray(np.stack(policies, axis=0))),
+        beta_Q_target=_device_put_cpu(jnp.asarray(np.stack(beta_q, axis=0))),
+        beta_V_target=_device_put_cpu(jnp.asarray(np.stack(beta_v, axis=0))),
+        q_evidence_mass=_device_put_cpu(jnp.asarray(np.stack(q_mass, axis=0))),
+        alpha_root=_device_put_cpu(jnp.asarray(np.stack(alpha_root, axis=0))),
         trees=trees,
     )
 
 
+def run_posterior_tree_search_state_batch(
+    *,
+    env: Any,
+    root_state_batch: Any,
+    leaf_evaluator: LeafEvaluator,
+    rng_key: jax.Array,
+    config: Any,
+) -> PosteriorTreeBatchOutput:
+    if getattr(config, "search_policy", "posterior_tree") == "posterior_tree_wavefront":
+        from .dirichlet_tree.search import run_wavefront_posterior_tree_search_state_batch
+
+        return run_wavefront_posterior_tree_search_state_batch(
+            env=env,
+            root_state_batch=root_state_batch,
+            leaf_evaluator=leaf_evaluator,
+            rng_key=rng_key,
+            config=config,
+        )
+
+    return run_posterior_tree_search(
+        env=env,
+        root_states=split_batched_state(root_state_batch),
+        leaf_evaluator=leaf_evaluator,
+        rng_key=rng_key,
+        config=config,
+    )
+
+
 def _run_search_loop(
+    env: Any,
     trees: tuple[PosteriorTree, ...],
     *,
     leaf_evaluator: LeafEvaluator,
@@ -399,22 +459,90 @@ def _run_search_loop(
     inflight_limit: int,
 ) -> None:
     while any(tree.done < num_simulations for tree in trees):
-        requests = _build_eval_batch(
+        step_requests, made_progress = _build_step_batch(
             trees,
             num_simulations=num_simulations,
-            eval_batch_size=eval_batch_size,
             inflight_limit=inflight_limit,
         )
-        if not requests:
+        if not any(request is not None for request in step_requests):
+            if made_progress:
+                continue
             if all(tree.done >= num_simulations for tree in trees):
                 break
             unfinished = [tree.tree_index for tree in trees if tree.done < num_simulations]
             raise RuntimeError(f"posterior tree search stalled for roots {unfinished}")
 
-        observations = jnp.stack([request.state.observation for request in requests], axis=0)
+        active_requests = [request for request in step_requests if request is not None]
+        fallback_request = active_requests[0]
+        states = [
+            request.state if request is not None else fallback_request.state
+            for request in step_requests
+        ]
+        actions = jnp.asarray(
+            [
+                request.action if request is not None else fallback_request.action
+                for request in step_requests
+            ],
+            dtype=jnp.int32,
+        )
+        active_mask = jnp.asarray([request is not None for request in step_requests], dtype=bool)
+        batched_states = _device_put_cpu(_stack_states(states))
+        actions = _device_put_cpu(actions)
+        active_mask = _device_put_cpu(active_mask)
+        stepped_batch = _batched_step(env)(batched_states, actions)
+        stepped_batch = _select_active_states(stepped_batch, batched_states, active_mask)
+        stepped_states = split_batched_state(stepped_batch)
+
+        eval_requests: list[EvalRequest] = []
+        for request, child_state in zip(step_requests, stepped_states, strict=True):
+            if request is None:
+                continue
+            eval_request = trees[request.tree_index].consume_step_result(request, child_state)
+            if eval_request is not None:
+                eval_requests.append(eval_request)
+
+        _consume_eval_requests(
+            trees,
+            eval_requests,
+            leaf_evaluator=leaf_evaluator,
+            eval_batch_size=eval_batch_size,
+        )
+
+
+def _build_step_batch(
+    trees: tuple[PosteriorTree, ...],
+    *,
+    num_simulations: int,
+    inflight_limit: int,
+) -> tuple[list[StepRequest | None], bool]:
+    requests: list[StepRequest | None] = []
+    made_progress = False
+    for tree in trees:
+        if tree.done >= num_simulations or tree.inflight >= inflight_limit:
+            requests.append(None)
+            continue
+        before = (tree.done, tree.inflight, len(tree.nodes))
+        request = tree.next_step_request()
+        after = (tree.done, tree.inflight, len(tree.nodes))
+        requests.append(request)
+        if request is not None or after != before:
+            made_progress = True
+    return requests, made_progress
+
+
+def _consume_eval_requests(
+    trees: tuple[PosteriorTree, ...],
+    requests: list[EvalRequest],
+    *,
+    leaf_evaluator: LeafEvaluator,
+    eval_batch_size: int,
+) -> None:
+    for start in range(0, len(requests), eval_batch_size):
+        batch = requests[start : start + eval_batch_size]
+        observations = jnp.stack([request.state.observation for request in batch], axis=0)
         logits, alpha_v, alpha_q = leaf_evaluator(observations)
         logits, alpha_v, alpha_q = jax.device_get((logits, alpha_v, alpha_q))
-        for ix, request in enumerate(requests):
+        for ix, request in enumerate(batch):
             trees[request.tree_index].consume_result(
                 request,
                 logits=logits[ix],
@@ -423,34 +551,20 @@ def _run_search_loop(
             )
 
 
-def _build_eval_batch(
-    trees: tuple[PosteriorTree, ...],
-    *,
-    num_simulations: int,
-    eval_batch_size: int,
-    inflight_limit: int,
-) -> list[EvalRequest]:
-    requests: list[EvalRequest] = []
-    while len(requests) < eval_batch_size:
-        made_progress = False
-        for tree in trees:
-            if len(requests) >= eval_batch_size:
-                break
-            if tree.done >= num_simulations or tree.inflight >= inflight_limit:
-                continue
-            before = (tree.done, tree.inflight)
-            request = tree.next_request()
-            after = (tree.done, tree.inflight)
-            if request is not None:
-                requests.append(request)
-                made_progress = True
-            elif after != before:
-                made_progress = True
-        if not made_progress:
-            break
-        if all(tree.done >= num_simulations for tree in trees):
-            break
-    return requests
+def _batched_step(env: Any) -> BatchedStep:
+    cache_key = id(env)
+    cached = _BATCHED_STEP_CACHE.get(cache_key)
+    if cached is not None:
+        env_ref, step = cached
+        if env_ref is None or env_ref() is env:
+            return step
+    try:
+        env_ref = weakref.ref(env)
+    except TypeError:
+        env_ref = None
+    step = jax.jit(jax.vmap(env.step))
+    _BATCHED_STEP_CACHE[cache_key] = (env_ref, step)
+    return step
 
 
 def posterior_best_policy_target_np(
@@ -506,6 +620,39 @@ def terminal_outcome_from_reward_np(reward: float, num_outcomes: int) -> np.ndar
     outcome = np.zeros((num_outcomes,), dtype=np.float32)
     outcome[index] = 1.0
     return outcome
+
+
+def _stack_states(states: list[Any]) -> Any:
+    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *states)
+
+
+def _cpu_device() -> jax.Device:
+    try:
+        return jax.devices("cpu")[0]
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "posterior_tree CPU env stepping requires the JAX CPU platform. "
+            "Use JAX_PLATFORMS=cuda,cpu when running with a GPU."
+        ) from exc
+
+
+def _device_put_cpu(value: Any) -> Any:
+    return jax.device_put(value, _cpu_device())
+
+
+def _select_active_states(
+    stepped_state: Any,
+    original_state: Any,
+    active_mask: jax.Array,
+) -> Any:
+    def select_leaf(stepped_leaf: jax.Array, original_leaf: jax.Array) -> jax.Array:
+        mask = jnp.reshape(
+            active_mask,
+            active_mask.shape + (1,) * (stepped_leaf.ndim - 1),
+        )
+        return jnp.where(mask, stepped_leaf, original_leaf)
+
+    return jax.tree_util.tree_map(select_leaf, stepped_state, original_state)
 
 
 def split_batched_state(state: Any) -> list[Any]:
