@@ -49,6 +49,11 @@ def test_grad_clip_norm_can_be_disabled():
     assert config.grad_clip_norm is None
 
 
+def test_dirichlet_kl_loss_cutoff_must_be_positive():
+    with pytest.raises(ValidationError):
+        Config(network="boardlaw_dirichlet", dirichlet_kl_loss_cutoff=0.0)
+
+
 def test_posterior_sample_action_source_is_valid():
     config = Config(
         network="boardlaw_dirichlet",

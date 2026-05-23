@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import optax
 
 from scacchi.loss import (
+    DIRICHLET_KL_LOSS_CUTOFF,
     Sample,
     _compute_dirichlet_losses,
     _compute_losses,
@@ -217,6 +218,7 @@ def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
         q_dir_kl_weight=1.0,
         value_outcome_weight=0.0,
         q_outcome_weight=0.0,
+        dirichlet_kl_loss_cutoff=DIRICHLET_KL_LOSS_CUTOFF,
     )
 
     _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
@@ -225,6 +227,106 @@ def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
     assert jnp.allclose(metrics.value_dir_kl_loss, 0.0, atol=1e-6)
     assert jnp.allclose(metrics.q_dir_kl_loss, expected_q, atol=1e-6)
     assert jnp.allclose(metrics.q_evidence_mass_mean, 2.0)
+
+
+def test_dirichlet_kl_losses_ignore_huge_and_nonfinite_terms():
+    data = Sample(
+        obs=jnp.zeros((3, 1)),
+        policy_tgt=jnp.array(
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ]
+        ),
+        value_tgt=jnp.array([1.0, 1.0, 1.0]),
+        played_action=jnp.array([0, 0, 0]),
+        policy_mask=jnp.ones((3, 3), dtype=jnp.bool_),
+        value_mask=jnp.ones((3,), dtype=jnp.bool_),
+        beta_Q_target=jnp.array(
+            [
+                [[2.0, 3.0], [1e6, 1.0], [jnp.nan, 1.0]],
+                [[1e6, 1.0], [1e6, 1.0], [1e6, 1.0]],
+                [[jnp.nan, 1.0], [jnp.nan, 1.0], [jnp.nan, 1.0]],
+            ]
+        ),
+        beta_V_target=jnp.array(
+            [
+                [2.0, 3.0],
+                [1e6, 1.0],
+                [jnp.nan, 1.0],
+            ]
+        ),
+        q_evidence_mass=jnp.ones((3, 3)),
+    )
+    logits = jnp.zeros((3, 3))
+    alpha_v = jnp.array([[2.0, 3.0], [1.0, 1e6], [1.0, 1.0]])
+    alpha_q = jnp.array(
+        [
+            [[2.0, 3.0], [1.0, 1e6], [1.0, 1.0]],
+            [[1.0, 1e6], [1.0, 1e6], [1.0, 1e6]],
+            [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+        ]
+    )
+    config = SimpleNamespace(
+        policy_loss_weight=0.0,
+        value_dir_kl_weight=1.0,
+        q_dir_kl_weight=1.0,
+        value_outcome_weight=0.0,
+        q_outcome_weight=0.0,
+    )
+
+    raw_value_kl = _dirichlet_kl(data.beta_V_target, alpha_v)
+    raw_q_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
+    _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
+
+    assert raw_value_kl[1] > DIRICHLET_KL_LOSS_CUTOFF
+    assert not bool(jnp.isfinite(raw_value_kl[2]))
+    assert raw_q_kl[0, 1] > DIRICHLET_KL_LOSS_CUTOFF
+    assert not bool(jnp.isfinite(raw_q_kl[0, 2]))
+    assert jnp.allclose(metrics.value_dir_kl_loss, 0.0, atol=1e-6)
+    assert jnp.allclose(metrics.q_dir_kl_loss, 0.0, atol=1e-6)
+
+
+def test_dirichlet_kl_loss_cutoff_comes_from_config():
+    data = Sample(
+        obs=jnp.zeros((1, 1)),
+        policy_tgt=jnp.array([[1.0]]),
+        value_tgt=jnp.array([1.0]),
+        played_action=jnp.array([0]),
+        policy_mask=jnp.array([[True]]),
+        value_mask=jnp.array([True]),
+        beta_Q_target=jnp.array([[[2.0, 3.0]]]),
+        beta_V_target=jnp.array([[2.0, 3.0]]),
+        q_evidence_mass=jnp.array([[1.0]]),
+    )
+    logits = jnp.zeros((1, 1))
+    alpha_v = jnp.array([[3.0, 2.0]])
+    alpha_q = jnp.array([[[3.0, 2.0]]])
+    raw_kl = _dirichlet_kl(data.beta_V_target, alpha_v)[0]
+
+    keep_config = SimpleNamespace(
+        policy_loss_weight=0.0,
+        value_dir_kl_weight=1.0,
+        q_dir_kl_weight=1.0,
+        value_outcome_weight=0.0,
+        q_outcome_weight=0.0,
+        dirichlet_kl_loss_cutoff=raw_kl + 1e-3,
+    )
+    drop_config = SimpleNamespace(
+        policy_loss_weight=0.0,
+        value_dir_kl_weight=1.0,
+        q_dir_kl_weight=1.0,
+        value_outcome_weight=0.0,
+        q_outcome_weight=0.0,
+        dirichlet_kl_loss_cutoff=raw_kl - 1e-3,
+    )
+
+    _, keep_metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, keep_config)
+    _, drop_metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, drop_config)
+
+    assert jnp.allclose(keep_metrics.value_dir_kl_loss, raw_kl)
+    assert jnp.allclose(drop_metrics.value_dir_kl_loss, 0.0)
 
 
 def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():

@@ -11,6 +11,9 @@ from .network import outcome_mean
 from .play import SelfplayOutput
 
 
+DIRICHLET_KL_LOSS_CUTOFF = 1000.0
+
+
 class Sample(NamedTuple):
     obs: jax.Array
     policy_tgt: chex.Array
@@ -70,8 +73,19 @@ def make_compute_loss_input(config):
 
 
 def _masked_mean(loss: jax.Array, mask: jax.Array) -> jax.Array:
-    mask = mask.astype(loss.dtype)
-    return jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1)
+    mask_bool = mask.astype(jnp.bool_)
+    mask_float = mask_bool.astype(loss.dtype)
+    safe_loss = jnp.where(mask_bool, jnp.nan_to_num(loss), jnp.zeros_like(loss))
+    return jnp.sum(safe_loss) / jnp.maximum(jnp.sum(mask_float), 1)
+
+
+def _bounded_loss_mask(
+    loss: jax.Array,
+    mask: jax.Array,
+    *,
+    cutoff: float = DIRICHLET_KL_LOSS_CUTOFF,
+) -> jax.Array:
+    return mask.astype(jnp.bool_) & jnp.isfinite(loss) & (loss <= cutoff)
 
 
 def _compute_losses(logits: jax.Array, value: jax.Array, data: Sample) -> tuple[jax.Array, jax.Array]:
@@ -137,13 +151,20 @@ def _compute_dirichlet_losses(
     policy_target_entropy = _categorical_entropy_from_probs(data.policy_tgt, data.policy_mask)
     policy_target_entropy = _masked_mean(policy_target_entropy, data.value_mask)
     policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
+    kl_loss_cutoff = getattr(config, "dirichlet_kl_loss_cutoff", DIRICHLET_KL_LOSS_CUTOFF)
 
     value_dir_kl = _dirichlet_kl(data.beta_V_target, alpha_v)
-    value_dir_kl_loss = _masked_mean(value_dir_kl, data.value_mask)
+    value_dir_kl_mask = _bounded_loss_mask(
+        value_dir_kl,
+        data.value_mask,
+        cutoff=kl_loss_cutoff,
+    )
+    value_dir_kl_loss = _masked_mean(value_dir_kl, value_dir_kl_mask)
 
     q_dir_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
     q_loss_mask = data.policy_mask & data.value_mask[..., None] & (data.q_evidence_mass > 0)
-    q_dir_kl_loss = _masked_mean(q_dir_kl, q_loss_mask)
+    q_dir_kl_mask = _bounded_loss_mask(q_dir_kl, q_loss_mask, cutoff=kl_loss_cutoff)
+    q_dir_kl_loss = _masked_mean(q_dir_kl, q_dir_kl_mask)
 
     outcome_tgt = _outcome_target(data.value_tgt, alpha_v.shape[-1])
     value_outcome_loss = _categorical_ce_from_probs(outcome_mean(alpha_v), outcome_tgt)

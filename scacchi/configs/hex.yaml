@@ -1,10 +1,10 @@
 env_id: hex
-board_size: 6
+board_size: 8
 network: boardlaw_dirichlet
 num_outcomes: null
 seed: 0
-max_num_iters: 300
-num_channels: 128
+max_num_iters: 2000
+num_channels: 1024
 num_layers: 8
 resnet_v2: true
 selfplay_batch_size: 4096
@@ -17,7 +17,7 @@ c_terminal: 8.0
 selfplay_action_source: posterior_sample
 search_policy: dirichlet_thompson
 training_batch_size: 1024
-learning_rate: 3e-3
+learning_rate: 1e-3
 grad_clip_norm: 1.0
 policy_loss_weight: 1.0
 value_dir_kl_weight: 1.0
@@ -25,6 +25,7 @@ q_dir_kl_weight: 1.0
 value_outcome_weight: 0.25
 q_outcome_weight: 0.10
 dirichlet_concentration_clip: 100.0
+dirichlet_kl_loss_cutoff: 1000.0
 log_interval: 1
 eval_interval: 1
 eval_batch_size: 256

@@ -82,6 +82,7 @@ class Config(BaseModel):
     value_outcome_weight: float = 0.0
     q_outcome_weight: float = 0.0
     dirichlet_concentration_clip: float | None = 8.0
+    dirichlet_kl_loss_cutoff: float = Field(default=1000.0, gt=0)
     log_interval: int = 1
     # eval params
     eval_interval: int = 5
