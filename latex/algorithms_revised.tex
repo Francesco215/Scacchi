@@ -1772,6 +1772,129 @@ D_{\mathrm{KL}}
 
 \end{algorithmblock}
 
+\subsection*{17.4 Flattening searched tree nodes}
+
+The root trajectory record above is not the only possible source of training
+signal. After search has completed for a self-play root, the completed posterior
+tree may also be flattened into additional per-state training records.
+
+For a tree node \(v\), let \(s_v\) be the represented game state. A flattened
+tree-node record has the same shape as a root record:
+
+\[
+s_v,
+\qquad
+\hat{\pi}_{\mathrm{search}}(\cdot\mid s_v),
+\qquad
+\beta_Q(s_v,a),
+\qquad
+\beta_V(s_v),
+\qquad
+m_\pi(s_v),
+\qquad
+m_V(s_v),
+\qquad
+m_{\mathrm{out}}(s_v).
+\]
+
+For an expanded non-terminal node with completed child evidence, define
+
+\[
+\beta_Q(s_v,a)
+=
+\alpha^{\mathrm{post}}_{v,a}
+=
+\alpha^{\mathrm{base}}_{v,a}
++
+E_{v,a}.
+\]
+
+The node is eligible for policy and Q training only if it has positive completed
+evidence:
+
+\[
+\sum_{a\in\Legal(s_v)}
+\sum_z E_{v,a,z}
+>
+\epsilon_{\mathrm{tree}}.
+\]
+
+This excludes non-terminal leaves that were merely evaluated by the network but
+never received completed child evidence. Such leaves mostly reproduce the
+network's own prior and are therefore weak self-distillation rather than
+search-improved supervision.
+
+For eligible expanded nodes, the local policy target is computed in the same way
+as at the root:
+
+\[
+\hat{\pi}_{\mathrm{search}}(\cdot\mid s_v)
+=
+\PosteriorBestPolicyTarget
+\left(
+\left\{
+\alpha^{\mathrm{post}}_{v,a}
+\right\}_{a\in\Legal(s_v)},
+M
+\right).
+\]
+
+The value posterior proxy for the same node is
+
+\[
+\beta_V(s_v)
+=
+\alpha_{\theta^-}^V(s_v)
++
+c_V
+\sum_{a\in\Legal(s_v)}
+\hat{\pi}_{\mathrm{search}}(a\mid s_v)
+\beta_Q(s_v,a).
+\]
+
+These internal expanded-node rows use
+
+\[
+m_\pi(s_v)=1,
+\qquad
+m_V(s_v)=1,
+\qquad
+m_{\mathrm{out}}(s_v)=0,
+\]
+
+so that policy, Q-Dirichlet, and value-Dirichlet losses apply, but hard
+eventual-outcome losses do not. They do not lie on the played trajectory, so a
+final game result is not generally available for them.
+
+Terminal tree leaves may also be stored. For a terminal leaf with outcome \(z\),
+use a value-only record:
+
+\[
+\beta_V(s_v)=e_z,
+\qquad
+m_\pi(s_v)=0,
+\qquad
+m_V(s_v)=1,
+\qquad
+m_{\mathrm{out}}(s_v)=1.
+\]
+
+The root node itself is usually not duplicated in the flattened tree records,
+because the played self-play trajectory already stores the root record. It may be
+included explicitly if a particular implementation wants to make the flattened
+tree batch self-contained.
+
+In a batched implementation, each self-play move can export a fixed-capacity
+tree-node array. Unused slots are padded with zero data and false masks:
+
+\[
+m_\pi=m_V=m_{\mathrm{out}}=0.
+\]
+
+After this export, the tree structure is discarded for training purposes. The
+learner sees only a flat collection of rows with observations, targets, legal
+masks, and loss masks.
+
 \section*{18. Practical implementation notes}
 
 \subsection*{18.1 CPU tree layout}
@@ -1847,7 +1970,61 @@ preallocated arrays containing:
 The CPU tree should not wait after every single descent. It should fill batches
 using both game-parallelism and leaf-parallelism.
 
-\subsection*{18.4 Recommended initial knobs}
+\subsection*{18.4 Flattened training batch boundary}
+
+The mutable posterior tree is a search-side data structure. It is not sent to the
+training step as a tree. Instead, after a search finishes, the CPU or host-side
+search code materializes dense training arrays:
+
+\[
+\texttt{obs},
+\qquad
+\texttt{policy\_target},
+\qquad
+\texttt{legal\_mask},
+\qquad
+\texttt{beta\_Q},
+\qquad
+\texttt{beta\_V},
+\qquad
+\texttt{loss\_masks}.
+\]
+
+The root trajectory rows and flattened tree rows are then concatenated, shuffled,
+trimmed to a multiple of the training batch size, and reshaped into minibatches.
+At that point there is no parent/child structure left in the learner input.
+
+For a self-play batch size \(B\), game horizon \(T\), and per-root simulation
+count \(N\), the root-only data volume is
+
+\[
+B\,T.
+\]
+
+If all tree nodes were retained, the rough upper bound would be
+
+\[
+B\,T\,(N+1),
+\]
+
+because each completed simulation can add at most one new node in addition to the
+root. In practice, filtering non-terminal leaves without completed evidence and
+deduplicating transpositions reduces this count.
+
+\subsection*{18.5 Tree lifetime and reuse}
+
+In the arena implementation, each posterior tree is temporary. For each self-play
+move, search builds a fresh arena from the current batch of root states, runs the
+configured number of simulations, extracts root targets and optional flattened
+tree-node rows, commits one action per root, and then drops the arena.
+
+Thus the active tree is not reused across self-play moves or training
+iterations. Only the neural network parameters, optimizer state, and checkpointed
+training state persist. A separate store-backed implementation may cache
+serialized nodes or root summaries, but that is a search-system optimization, not
+part of the basic training-data contract.
+
+\subsection*{18.6 Recommended initial knobs}
 
 A reasonable initial setting is
 
@@ -1873,7 +2050,7 @@ evidence strength:
 c_{\mathrm{terminal}} > c_{\mathrm{leaf}}.
 \]
 
-\subsection*{18.5 Completed evidence only}
+\subsection*{18.7 Completed evidence only}
 
 Only completed evidence \(E_{v,a}\) is used in posteriors and training targets:
 

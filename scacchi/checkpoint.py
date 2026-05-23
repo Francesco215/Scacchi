@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,19 @@ if TYPE_CHECKING:
     from .train import Config
 
 
+def _suppress_orbax_logs() -> None:
+    """Keep Orbax checkpoint internals from spamming INFO logs."""
+    logging.getLogger("absl").setLevel(logging.WARNING)
+    logging.getLogger("orbax").setLevel(logging.WARNING)
+
+    try:
+        from absl import logging as absl_logging
+    except ImportError:
+        return
+
+    absl_logging.set_verbosity(absl_logging.WARNING)
+
+
 class NoOpCheckpointManager(ocp.CheckpointManager):
     """Drops all saves — returned when max_to_keep == 0."""
 
@@ -27,6 +41,7 @@ def build_checkpoint_manager(
     config: Config,
     ckpt_dir: Path,
 ) -> ocp.CheckpointManager:
+    _suppress_orbax_logs()
     options = ocp.CheckpointManagerOptions(
         max_to_keep=config.ckpt_max_to_keep,
         save_interval_steps=config.ckpt_save_interval_steps,
@@ -101,6 +116,7 @@ def from_pretrained(
     rngs: nnx.Rngs | None = None,
 ) -> nnx.Module:
     """Load a model from a checkpoint directory (no optimizer required)."""
+    _suppress_orbax_logs()
     if rngs is None:
         rngs = nnx.Rngs(0)
     checkpoint_path = str(Path(checkpoint_path).resolve())

@@ -80,7 +80,7 @@ class Config(BaseModel):
     search_policy: str = "gumbel"
     wavefront_num_lanes_per_root: int = Field(default=1, ge=1)
     wavefront_max_depth: int = Field(default=128, ge=1)
-    wavefront_final_action_mode: str = "argmax_q_mean"
+    wavefront_final_action_mode: str = "scalar_q_argmax"
     wavefront_pad_eval_batches: bool = True
     wavefront_pad_jax_select: bool = False
     wavefront_np_select_below: int = Field(default=1024, ge=0)
@@ -89,6 +89,11 @@ class Config(BaseModel):
     wavefront_stable_lane_batch: bool = True
     wavefront_pad_pending_observation_gather: bool = True
     wavefront_backend: str = "arena"
+    train_tree_nodes: bool = False
+    train_tree_include_root: bool = False
+    train_tree_include_terminal: bool = True
+    train_tree_min_q_evidence: float = Field(default=0.0, ge=0.0)
+    train_tree_max_nodes_per_step: int | None = Field(default=None, ge=1)
     # training params
     training_batch_size: int = 4096
     learning_rate: float = 0.001
@@ -159,6 +164,7 @@ class Config(BaseModel):
                 f"search_policy must be one of {allowed}; got {self.search_policy!r}."
             )
         valid_wavefront_action_modes = {
+            "scalar_q_argmax",
             "argmax_q_mean",
             "posterior_argmax",
             "posterior_sample",
@@ -171,6 +177,11 @@ class Config(BaseModel):
             )
         if self.wavefront_backend != "arena":
             raise ValueError("wavefront_backend currently supports only 'arena'.")
+        if self.train_tree_nodes and self.search_policy != "posterior_tree_wavefront":
+            raise ValueError(
+                "train_tree_nodes currently supports only "
+                "search_policy='posterior_tree_wavefront'."
+            )
         if self.search_policy in {
             "dirichlet_thompson",
             "posterior_tree",

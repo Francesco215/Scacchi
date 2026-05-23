@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -22,6 +24,16 @@ from .posterior_tree import (
     run_posterior_tree_search_state_batch,
     split_batched_state,
 )
+
+
+def _without_tree_training(config):
+    if not getattr(config, "train_tree_nodes", False):
+        return config
+    if hasattr(config, "model_copy"):
+        return config.model_copy(update={"train_tree_nodes": False})
+    values = dict(vars(config))
+    values["train_tree_nodes"] = False
+    return SimpleNamespace(**values)
 
 
 def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations):
@@ -103,6 +115,7 @@ def _make_model_mcts_policy(env, config, model, rng_key, env_state, num_simulati
 
 
 def make_mcts_evaluate(env, config, baseline_model):
+    search_config = _without_tree_training(config)
     eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
 
     if is_posterior_tree_policy(getattr(config, "search_policy", "gumbel")):
@@ -132,13 +145,13 @@ def make_mcts_evaluate(env, config, baseline_model):
             def leaf_evaluator(obs: jax.Array):
                 return evaluate_leaves(model, obs)
 
-            if getattr(config, "search_policy", "gumbel") == "posterior_tree_wavefront":
+            if getattr(search_config, "search_policy", "gumbel") == "posterior_tree_wavefront":
                 return run_posterior_tree_search_state_batch(
                     env=env,
                     root_state_batch=env_state,
                     leaf_evaluator=leaf_evaluator,
                     rng_key=rng_key,
-                    config=config,
+                    config=search_config,
                 ).action
 
             return run_posterior_tree_search(
@@ -146,7 +159,7 @@ def make_mcts_evaluate(env, config, baseline_model):
                 root_states=split_batched_state(env_state),
                 leaf_evaluator=leaf_evaluator,
                 rng_key=rng_key,
-                config=config,
+                config=search_config,
             ).action
 
         def evaluate(rng_key: jax.Array, model: nnx.Module):

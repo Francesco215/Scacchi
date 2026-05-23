@@ -153,6 +153,7 @@ The latest pass focused on host-side overhead and JAX shape churn:
 - Added a direct full-source eval path for pending leaves whose source observation batch already matches `search_eval_batch_size`; the model still runs one full padded batch, but expansion and backup select outputs only for the real missing leaves.
 - Merged multiple already-padded pending leaf groups with a fixed-size gather instead of slicing them back to dynamic real sizes and padding again. This keeps late-wave eval preparation shape-stable when root de-dup shrinks active lanes.
 - Switched NumPy Thompson selection and batched posterior-best target sampling to `Generator.standard_gamma(..., dtype=np.float32)`. This preserves exact Dirichlet sampling while avoiding float64 gamma draws followed by a cast.
+- Made node summary refresh use the maintained `edge_post_alpha` array directly instead of recomputing `edge_base_alpha + edge_E` across every edge of touched parents. Added an exact equal-utility shortcut: if all legal edge posterior mean utilities are equal, the internal policy is uniform and the state summary is the mean edge posterior.
 
 ## Benchmark Results
 
@@ -334,14 +335,16 @@ after:  warmed leaf observation gather mostly ~= 6 ms to 8 ms, with one 37 ms ru
 The post-change Hex 5x5 summary was:
 
 ```text
-best=52626.0/s, median=31120.4/s, p10=11038.6/s, cold-start-excluded mean=36473.7/s
+best=56468.0/s, median=31007.7/s, p10=11816.7/s, cold-start-excluded mean=37501.9/s
 ```
 
 Hex 9x9 remained stable after the pending-merge change:
 
 ```text
-best=29521.0/s, median=28271.4/s, p10=10147.4/s, cold-start-excluded mean=28896.2/s
+best=32864.6/s, median=31975.8/s, p10=15575.9/s, cold-start-excluded mean=32089.3/s
 ```
+
+On Hex 9x9, the maintained-posterior summary refresh reduced warmed backup from roughly `29 ms` to `20 ms` and expansion from roughly `42 ms` to `32-33 ms` in the matrix runner.
 
 ## Verification
 
@@ -361,13 +364,13 @@ JAX_PLATFORMS=cpu uv run pytest \
 Latest result:
 
 ```text
-57 passed in 11.90s
+57 passed in 12.09s
 ```
 
 Focused smoke check after the fixed-size pending merge:
 
 ```text
-33 passed in 4.15s
+33 passed in 4.11s
 ```
 
 Benchmark smoke checks:

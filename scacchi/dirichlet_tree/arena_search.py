@@ -17,7 +17,15 @@ from .selection import (
     thompson_select_np,
 )
 from .state_hash import canonical_state_key
-from .types import LeafEvaluator, SearchConfig, SearchResult, outcome_mean, terminal_outcome_from_reward
+from .types import (
+    LeafEvaluator,
+    SearchConfig,
+    SearchResult,
+    TreeTrainingData,
+    outcome_mean,
+    outcome_utility,
+    terminal_outcome_from_reward,
+)
 
 
 UNKNOWN = -1
@@ -76,6 +84,8 @@ class PosteriorArena:
         max_edges: int,
         num_actions: int,
         num_outcomes: int,
+        observation_shape: tuple[int, ...] | None = None,
+        observation_dtype: np.dtype | type | None = None,
     ) -> None:
         self.max_nodes = int(max_nodes)
         self.max_edges = int(max_edges)
@@ -92,6 +102,13 @@ class PosteriorArena:
         self.node_value_alpha = np.ones((self.max_nodes, self.num_outcomes), dtype=np.float32)
         self.node_summary_alpha = np.ones((self.max_nodes, self.num_outcomes), dtype=np.float32)
         self.node_terminal_outcome = np.full((self.max_nodes,), -1, dtype=np.int8)
+        self.node_observation = None
+        if observation_shape is not None:
+            dtype = np.dtype(np.float32 if observation_dtype is None else observation_dtype)
+            self.node_observation = np.zeros(
+                (self.max_nodes, *tuple(int(x) for x in observation_shape)),
+                dtype=dtype,
+            )
 
         self.edge_parent_node = np.full((self.max_edges,), UNKNOWN, dtype=np.int32)
         self.edge_action = np.zeros((self.max_edges,), dtype=np.int32)
@@ -116,11 +133,13 @@ class PosteriorArena:
         value_alpha: np.ndarray,
         policy_logits: np.ndarray,
         q_alpha: np.ndarray,
+        observation: np.ndarray | None = None,
     ) -> int:
         self.ensure_key_index()
         key_id = _key_id(key)
         existing = self.key_to_node.get(key_id)
         if existing is not None and self.node_status[existing] != STATUS_INFLIGHT:
+            self._set_node_observation(existing, observation)
             return existing
 
         legal_actions = np.flatnonzero(np.asarray(legal_action_mask, dtype=bool)).astype(np.int32)
@@ -137,6 +156,7 @@ class PosteriorArena:
         self.node_num_edges[node_id] = np.int16(edge_count)
         self.node_value_alpha[node_id] = _positive(value_alpha)
         self.node_terminal_outcome[node_id] = np.int8(-1)
+        self._set_node_observation(node_id, observation)
 
         end_edge = first_edge + edge_count
         self.edge_parent_node[first_edge:end_edge] = node_id
@@ -162,6 +182,7 @@ class PosteriorArena:
         value_alpha: np.ndarray,
         policy_logits: np.ndarray,
         q_alpha: np.ndarray,
+        observations: np.ndarray | None = None,
         assume_unique_new: bool = False,
         allow_grouped: bool = True,
     ) -> np.ndarray:
@@ -181,6 +202,7 @@ class PosteriorArena:
                         value_alpha=value_alpha[ix],
                         policy_logits=policy_logits[ix],
                         q_alpha=q_alpha[ix],
+                        observation=None if observations is None else observations[ix],
                     )
                     for ix in range(count)
                 ],
@@ -207,6 +229,7 @@ class PosteriorArena:
                     value_alpha=np.asarray(value_alpha)[group],
                     policy_logits=np.asarray(policy_logits)[group],
                     q_alpha=np.asarray(q_alpha)[group],
+                    observations=None if observations is None else np.asarray(observations)[group],
                     assume_unique_new=True,
                     allow_grouped=True,
                 )
@@ -231,6 +254,7 @@ class PosteriorArena:
                         value_alpha=value_alpha[ix],
                         policy_logits=policy_logits[ix],
                         q_alpha=q_alpha[ix],
+                        observation=None if observations is None else observations[ix],
                     )
                     for ix in range(count)
                 ],
@@ -257,6 +281,7 @@ class PosteriorArena:
         self.node_num_edges[node_ids] = np.int16(edges_per_node)
         self.node_value_alpha[node_ids] = _positive(value_alpha)
         self.node_terminal_outcome[node_ids] = np.int8(-1)
+        self._set_node_observations(node_ids, observations)
         if self._key_index_complete and count < 4096:
             self.key_to_node.update((keys[ix].tobytes(), int(node_ids[ix])) for ix in range(count))
         else:
@@ -299,11 +324,13 @@ class PosteriorArena:
         key: np.ndarray,
         current_player: int,
         terminal_outcome: int,
+        observation: np.ndarray | None = None,
     ) -> int:
         self.ensure_key_index()
         key_id = _key_id(key)
         existing = self.key_to_node.get(key_id)
         if existing is not None and self.node_status[existing] != STATUS_INFLIGHT:
+            self._set_node_observation(existing, observation)
             return existing
         node_id = existing if existing is not None else self._alloc_node(key_id)
         self.sorted_key_view = None
@@ -316,7 +343,28 @@ class PosteriorArena:
         self.node_value_alpha[node_id, int(terminal_outcome)] = 1.0
         self.node_summary_alpha[node_id] = self.node_value_alpha[node_id]
         self.node_terminal_outcome[node_id] = np.int8(terminal_outcome)
+        self._set_node_observation(node_id, observation)
         return node_id
+
+    def _set_node_observation(self, node_id: int, observation: np.ndarray | None) -> None:
+        if self.node_observation is None or observation is None:
+            return
+        self.node_observation[int(node_id)] = np.asarray(
+            observation,
+            dtype=self.node_observation.dtype,
+        )
+
+    def _set_node_observations(
+        self,
+        node_ids: np.ndarray,
+        observations: np.ndarray | None,
+    ) -> None:
+        if self.node_observation is None or observations is None:
+            return
+        self.node_observation[np.asarray(node_ids, dtype=np.int32)] = np.asarray(
+            observations,
+            dtype=self.node_observation.dtype,
+        )
 
     def recompute_summary(self, node_id: int) -> None:
         start = int(self.node_first_edge[node_id])
@@ -325,9 +373,11 @@ class PosteriorArena:
             self.node_summary_alpha[node_id] = self.node_value_alpha[node_id]
             return
         edge_slice = slice(start, start + count)
-        post = _positive(self.edge_base_alpha[edge_slice] + self.edge_E[edge_slice])
-        self.edge_post_alpha[edge_slice] = post
+        post = self.edge_post_alpha[edge_slice]
         q_mean = (post[:, -1] - post[:, 0]) / np.sum(post, axis=-1)
+        if np.all(q_mean == q_mean[0]):
+            self.node_summary_alpha[node_id] = _positive(np.mean(post, axis=0))
+            return
         q_mean = q_mean - np.max(q_mean)
         pi = np.exp(q_mean)
         pi = pi / np.sum(pi)
@@ -339,9 +389,11 @@ class PosteriorArena:
             return
         first_edges = self.node_first_edge[node_ids].astype(np.int32)
         edge_ids = first_edges[:, None] + np.arange(edges_per_node, dtype=np.int32)[None, :]
-        post = _positive(self.edge_base_alpha[edge_ids] + self.edge_E[edge_ids])
-        self.edge_post_alpha[edge_ids.reshape((-1,))] = post.reshape((-1, self.num_outcomes))
+        post = self.edge_post_alpha[edge_ids]
         q_mean = (post[..., -1] - post[..., 0]) / np.sum(post, axis=-1)
+        if np.all(q_mean == q_mean[:, :1]):
+            self.node_summary_alpha[node_ids] = _positive(np.mean(post, axis=1))
+            return
         q_mean = q_mean - np.max(q_mean, axis=-1, keepdims=True)
         pi = np.exp(q_mean)
         pi = pi / np.sum(pi, axis=-1, keepdims=True)
@@ -391,6 +443,7 @@ class BatchedPosteriorArenaSearch:
         self.arena: PosteriorArena | None = None
         self.root_node_ids: np.ndarray | None = None
         self.root_keys: np.ndarray | None = None
+        self.tree_sample_capacity: int | None = None
         self.timing_enabled = False
         self.timing_sync = False
         self.timing = {bucket: 0.0 for bucket in TIMING_BUCKETS}
@@ -479,16 +532,30 @@ class BatchedPosteriorArenaSearch:
         root_legal = np.asarray(root_legal, dtype=bool)
         root_term = np.asarray(root_term, dtype=bool)
         root_rewards = np.asarray(root_rewards, dtype=np.float32)
+        store_tree_nodes = bool(config.train_tree_nodes)
+        root_observations_np = (
+            np.asarray(jax.device_get(root_observations))
+            if store_tree_nodes
+            else None
+        )
 
         if max_nodes is None:
-            max_nodes = _default_max_nodes(num_roots, config)
+            capacity_roots = original_num_roots if store_tree_nodes else num_roots
+            max_nodes = _default_max_nodes(capacity_roots, config)
         if max_edges is None:
             max_edges = max_nodes * max(1, num_actions)
+        self.tree_sample_capacity = (
+            _tree_sample_capacity(original_num_roots, max_nodes, config)
+            if store_tree_nodes
+            else None
+        )
         arena = PosteriorArena(
             max_nodes=max_nodes,
             max_edges=max_edges,
             num_actions=num_actions,
             num_outcomes=num_outcomes,
+            observation_shape=None if root_observations_np is None else root_observations_np.shape[1:],
+            observation_dtype=None if root_observations_np is None else root_observations_np.dtype,
         )
         if not np.any(root_term):
             with self._timed("node_packing"):
@@ -499,6 +566,7 @@ class BatchedPosteriorArenaSearch:
                     value_alpha=root_value_alpha,
                     policy_logits=root_logits,
                     q_alpha=root_q_alpha,
+                    observations=root_observations_np,
                     assume_unique_new=True,
                     allow_grouped=config.grouped_expansion,
                 )
@@ -512,6 +580,7 @@ class BatchedPosteriorArenaSearch:
                             key=root_keys[ix],
                             current_player=int(root_players[ix]),
                             terminal_outcome=outcome,
+                            observation=None if root_observations_np is None else root_observations_np[ix],
                         )
                     else:
                         root_node_ids[ix] = arena.add_expanded_node(
@@ -521,6 +590,7 @@ class BatchedPosteriorArenaSearch:
                             value_alpha=root_value_alpha[ix],
                             policy_logits=root_logits[ix],
                             q_alpha=root_q_alpha[ix],
+                            observation=None if root_observations_np is None else root_observations_np[ix],
                         )
 
         arena.sorted_key_view = sorted_root_key_view
@@ -540,6 +610,7 @@ class BatchedPosteriorArenaSearch:
         with self._timed("posterior_target_generation"):
             dense_result = self._finish_search_dense(config)
             if dense_result is not None:
+                dense_result = self._attach_tree_data(dense_result, config)
                 self._block_if_timing(dense_result)
                 return dense_result
 
@@ -580,8 +651,14 @@ class BatchedPosteriorArenaSearch:
                 q_evidence_mass=jnp.asarray(q_mass, dtype=jnp.float32),
                 alpha_root=jnp.asarray(alpha_root, dtype=jnp.float32),
             )
+            result = self._attach_tree_data(result, config)
             self._block_if_timing(result)
             return result
+
+    def _attach_tree_data(self, result: SearchResult, config: SearchConfig) -> SearchResult:
+        if not config.train_tree_nodes:
+            return result
+        return result._replace(tree_data=self._build_tree_training_data(config))
 
     def _finish_search_dense(self, config: SearchConfig) -> SearchResult | None:
         if self.arena is None or self.root_node_ids is None:
@@ -634,6 +711,107 @@ class BatchedPosteriorArenaSearch:
             beta_V_target=jnp.asarray(beta_v, dtype=jnp.float32),
             q_evidence_mass=jnp.asarray(q_mass, dtype=jnp.float32),
             alpha_root=jnp.asarray(alpha_root, dtype=jnp.float32),
+        )
+
+    def _build_tree_training_data(self, config: SearchConfig) -> TreeTrainingData:
+        if self.arena is None or self.root_node_ids is None:
+            raise ValueError("search has not been initialized")
+        arena = self.arena
+        if arena.node_observation is None:
+            raise ValueError("tree-node training requires arena observation storage")
+
+        capacity = self.tree_sample_capacity
+        if capacity is None:
+            capacity = _tree_sample_capacity(self.root_node_ids.shape[0], arena.max_nodes, config)
+        obs = np.zeros((capacity, *arena.node_observation.shape[1:]), dtype=arena.node_observation.dtype)
+        action_weights = np.zeros((capacity, arena.num_actions), dtype=np.float32)
+        played_action = np.zeros((capacity,), dtype=np.int32)
+        legal_mask = np.zeros((capacity, arena.num_actions), dtype=bool)
+        beta_q = np.zeros((capacity, arena.num_actions, arena.num_outcomes), dtype=np.float32)
+        beta_v = np.ones((capacity, arena.num_outcomes), dtype=np.float32)
+        q_mass = np.zeros((capacity, arena.num_actions), dtype=np.float32)
+        value_tgt = np.zeros((capacity,), dtype=np.float32)
+        policy_loss_mask = np.zeros((capacity,), dtype=bool)
+        value_loss_mask = np.zeros((capacity,), dtype=bool)
+        outcome_mask = np.zeros((capacity,), dtype=bool)
+
+        root_nodes = set(int(x) for x in np.asarray(self.root_node_ids, dtype=np.int32))
+        expanded_rows: list[int] = []
+        expanded_node_ids: list[int] = []
+        min_q_evidence = float(config.train_tree_min_q_evidence)
+        row = 0
+        for node_id in range(int(arena.num_nodes)):
+            if row >= capacity:
+                break
+            if not config.train_tree_include_root and node_id in root_nodes:
+                continue
+            status = arena.node_status[node_id]
+            if status == STATUS_EXPANDED:
+                start = int(arena.node_first_edge[node_id])
+                count = int(arena.node_num_edges[node_id])
+                if count <= 0:
+                    continue
+                edge_ids = np.arange(start, start + count, dtype=np.int32)
+                actions = arena.edge_action[edge_ids].astype(np.int32)
+                edge_q_mass = np.sum(arena.edge_E[edge_ids], axis=-1)
+                if float(np.sum(edge_q_mass)) <= min_q_evidence:
+                    continue
+                obs[row] = arena.node_observation[node_id]
+                legal_mask[row, actions] = True
+                beta_q[row, actions] = arena.edge_post_alpha[edge_ids]
+                q_mass[row, actions] = edge_q_mass
+                beta_v[row] = arena.node_value_alpha[node_id]
+                policy_loss_mask[row] = True
+                value_loss_mask[row] = True
+                expanded_rows.append(row)
+                expanded_node_ids.append(node_id)
+                row += 1
+                continue
+
+            if status == STATUS_TERMINAL and config.train_tree_include_terminal:
+                obs[row] = arena.node_observation[node_id]
+                beta_v[row] = arena.node_value_alpha[node_id]
+                value_tgt[row] = outcome_utility(outcome_mean(beta_v[row]))
+                value_loss_mask[row] = True
+                outcome_mask[row] = True
+                row += 1
+
+        if expanded_rows:
+            row_ix = np.asarray(expanded_rows, dtype=np.int32)
+            node_ix = np.asarray(expanded_node_ids, dtype=np.int32)
+            policies = _posterior_best_policy_target_batch_np(
+                self.rng,
+                beta_q[row_ix],
+                legal_mask[row_ix],
+                config.policy_mc_samples,
+            )
+            action_weights[row_ix] = policies
+            beta_v[row_ix] = (
+                arena.node_value_alpha[node_ix]
+                + np.asarray(config.c_value_search, dtype=np.float32)
+                * np.sum(policies[:, :, None] * beta_q[row_ix], axis=1)
+            )
+            value_tgt[row_ix] = outcome_utility(outcome_mean(beta_v[row_ix]))
+            played_action[row_ix] = _commit_actions_batch(
+                self.rng,
+                config,
+                policies,
+                beta_q[row_ix],
+                legal_mask[row_ix],
+            )
+
+        return TreeTrainingData(
+            obs=jnp.asarray(obs),
+            action_weights=jnp.asarray(action_weights, dtype=jnp.float32),
+            played_action=jnp.asarray(played_action, dtype=jnp.int32),
+            legal_action_mask=jnp.asarray(legal_mask),
+            beta_Q_target=jnp.asarray(beta_q, dtype=jnp.float32),
+            beta_V_target=jnp.asarray(beta_v, dtype=jnp.float32),
+            q_evidence_mass=jnp.asarray(q_mass, dtype=jnp.float32),
+            value_tgt=jnp.asarray(value_tgt, dtype=jnp.float32),
+            policy_loss_mask=jnp.asarray(policy_loss_mask),
+            value_loss_mask=jnp.asarray(value_loss_mask),
+            outcome_mask=jnp.asarray(outcome_mask),
         )
 
     def _run_wavefront(
@@ -721,21 +899,23 @@ class BatchedPosteriorArenaSearch:
             terminal_rows = active_rows[status == STATUS_TERMINAL]
             with self._timed("backup"):
                 for row in terminal_rows:
-                    if path_len[row] <= 0 or done[lane_root_ids[row]] >= config.num_simulations:
+                    if done[lane_root_ids[row]] >= config.num_simulations:
                         continue
                     node_id = int(current_node_ids[row])
-                    outcome = int(arena.node_terminal_outcome[node_id])
-                    value = np.zeros((arena.num_outcomes,), dtype=np.float32)
-                    value[outcome] = 1.0
-                    self._backup_path(
-                        path_nodes[row],
-                        path_edges[row],
-                        int(path_len[row]),
-                        leaf_node_id=node_id,
-                        leaf_value=value,
-                        leaf_weight=config.c_terminal,
-                        c_state=config.c_state,
-                    )
+                    if path_len[row] > 0:
+                        outcome = int(arena.node_terminal_outcome[node_id])
+                        value = np.zeros((arena.num_outcomes,), dtype=np.float32)
+                        value[outcome] = 1.0
+                        self._backup_path(
+                            path_nodes[row],
+                            path_edges[row],
+                            int(path_len[row]),
+                            leaf_node_id=node_id,
+                            leaf_value=value,
+                            leaf_weight=config.c_terminal,
+                            c_state=config.c_state,
+                            backup_mc_samples=config.backup_mc_samples,
+                        )
                     done[lane_root_ids[row]] += 1
 
             selectable_mask = (status == STATUS_EXPANDED) & (arena.node_num_edges[node_ids] > 0)
@@ -896,10 +1076,15 @@ class BatchedPosteriorArenaSearch:
                                 key=key_words[data_ix],
                                 current_player=int(players[data_ix]),
                                 terminal_outcome=outcome,
+                                observation=(
+                                    None
+                                    if arena.node_observation is None
+                                    else np.asarray(
+                                        jax.device_get(next_state_batch.observation[data_ix])
+                                    )
+                                ),
                             )
                             arena.edge_child_node[edge_id] = child_node_id
-                        base_update_edges.append(edge_id)
-                        base_update_children.append(child_node_id)
                         terminal_backup_rows.append(int(row))
                         terminal_backup_children.append(child_node_id)
                         continue
@@ -912,12 +1097,12 @@ class BatchedPosteriorArenaSearch:
                     child_status = arena.node_status[child_node_id]
                     if child_status == STATUS_INFLIGHT:
                         continue
-                    base_update_edges.append(edge_id)
-                    base_update_children.append(child_node_id)
                     if child_status == STATUS_TERMINAL:
                         terminal_backup_rows.append(int(row))
                         terminal_backup_children.append(child_node_id)
                     else:
+                        base_update_edges.append(edge_id)
+                        base_update_children.append(child_node_id)
                         next_rows.append(int(row))
                         next_state_indices.append(data_ix)
                         current_node_ids[row] = child_node_id
@@ -944,6 +1129,7 @@ class BatchedPosteriorArenaSearch:
                         leaf_value=value,
                         leaf_weight=config.c_terminal,
                         c_state=config.c_state,
+                        backup_mc_samples=config.backup_mc_samples,
                     )
                     done[lane_root_ids[row]] += 1
 
@@ -1028,6 +1214,11 @@ class BatchedPosteriorArenaSearch:
             value_alpha = value_alpha[eval_indices]
             q_alpha = q_alpha[eval_indices]
             with self._timed("expansion"):
+                node_observations = (
+                    None
+                    if arena.node_observation is None
+                    else np.asarray(jax.device_get(_pending_selected_observations(pending_batch)))
+                )
                 child_node_ids = arena.add_expanded_nodes_batch(
                     keys=pending_batch.key_words,
                     current_players=pending_batch.players,
@@ -1035,6 +1226,7 @@ class BatchedPosteriorArenaSearch:
                     value_alpha=value_alpha,
                     policy_logits=logits,
                     q_alpha=q_alpha,
+                    observations=node_observations,
                     assume_unique_new=True,
                     allow_grouped=config.grouped_expansion,
                 )
@@ -1048,6 +1240,7 @@ class BatchedPosteriorArenaSearch:
                     done=done,
                     leaf_weight=config.c_leaf,
                     c_state=config.c_state,
+                    backup_mc_samples=config.backup_mc_samples,
                     num_simulations=config.num_simulations,
                 )
             return
@@ -1075,6 +1268,13 @@ class BatchedPosteriorArenaSearch:
                 logits, value_alpha, q_alpha = jax.device_get((logits, value_alpha, q_alpha))
             request_slice = slice(start, end)
             with self._timed("expansion"):
+                node_observations = (
+                    None
+                    if arena.node_observation is None
+                    else np.asarray(
+                        jax.device_get(_pending_selected_observations(pending_batch)[request_slice])
+                    )
+                )
                 child_node_ids = arena.add_expanded_nodes_batch(
                     keys=pending_batch.key_words[request_slice],
                     current_players=pending_batch.players[request_slice],
@@ -1082,6 +1282,7 @@ class BatchedPosteriorArenaSearch:
                     value_alpha=value_alpha,
                     policy_logits=logits,
                     q_alpha=q_alpha,
+                    observations=node_observations,
                     assume_unique_new=True,
                     allow_grouped=config.grouped_expansion,
                 )
@@ -1095,6 +1296,7 @@ class BatchedPosteriorArenaSearch:
                     done=done,
                     leaf_weight=config.c_leaf,
                     c_state=config.c_state,
+                    backup_mc_samples=config.backup_mc_samples,
                     num_simulations=config.num_simulations,
                 )
 
@@ -1109,6 +1311,7 @@ class BatchedPosteriorArenaSearch:
         done: np.ndarray,
         leaf_weight: float,
         c_state: float,
+        backup_mc_samples: int,
         num_simulations: int,
     ) -> None:
         assert self.arena is not None
@@ -1153,7 +1356,7 @@ class BatchedPosteriorArenaSearch:
             edge_ids = edge_ids[valid]
             parent_ids = parent_ids[valid]
             child_ids = child_ids[valid]
-            summary = outcome_mean(arena.node_summary_alpha[child_ids])
+            summary = self._state_search_posterior_batch(child_ids, backup_mc_samples)
             parent_players = arena.node_current_player[parent_ids]
             child_players = arena.node_current_player[child_ids]
             aligned_summary = _align_rows(summary, parent_players != child_players)
@@ -1161,9 +1364,44 @@ class BatchedPosteriorArenaSearch:
             np.add.at(arena.edge_visits, edge_ids, np.uint32(1))
             self._refresh_edges_and_summaries(edge_ids, parent_ids)
 
+    def _state_search_posterior_batch(
+        self,
+        node_ids: np.ndarray,
+        backup_mc_samples: int,
+    ) -> np.ndarray:
+        assert self.arena is not None
+        arena = self.arena
+        node_ids = np.asarray(node_ids, dtype=np.int32)
+        beta = np.zeros((node_ids.shape[0], arena.num_outcomes), dtype=np.float32)
+        if node_ids.size == 0:
+            return beta
+
+        edge_counts = arena.node_num_edges[node_ids].astype(np.int32)
+        no_edges = edge_counts <= 0
+        if np.any(no_edges):
+            beta[no_edges] = arena.node_value_alpha[node_ids[no_edges]]
+
+        for edge_count in np.unique(edge_counts[~no_edges]):
+            positions = np.flatnonzero(edge_counts == edge_count).astype(np.int32)
+            group_ids = node_ids[positions]
+            first_edges = arena.node_first_edge[group_ids].astype(np.int32)
+            edge_ids = first_edges[:, None] + np.arange(int(edge_count), dtype=np.int32)[None, :]
+            alpha = arena.edge_post_alpha[edge_ids]
+            legal = np.ones((group_ids.shape[0], int(edge_count)), dtype=bool)
+            pi_search = _posterior_best_policy_target_batch_np(
+                self.rng,
+                alpha,
+                legal,
+                int(backup_mc_samples),
+            )
+            beta[positions] = np.sum(pi_search[..., None] * alpha, axis=1)
+        return _positive(beta)
+
     def _update_edge_base_from_child(self, edge_id: int, child_node_id: int) -> None:
         assert self.arena is not None
         arena = self.arena
+        if arena.node_status[int(child_node_id)] == STATUS_TERMINAL:
+            return
         parent_node_id = int(arena.edge_parent_node[edge_id])
         parent_player = int(arena.node_current_player[parent_node_id])
         child_player = int(arena.node_current_player[child_node_id])
@@ -1177,6 +1415,11 @@ class BatchedPosteriorArenaSearch:
         arena = self.arena
         edge_ids = np.asarray(edge_ids, dtype=np.int32)
         child_node_ids = np.asarray(child_node_ids, dtype=np.int32)
+        keep = arena.node_status[child_node_ids] != STATUS_TERMINAL
+        if not np.any(keep):
+            return
+        edge_ids = edge_ids[keep]
+        child_node_ids = child_node_ids[keep]
         parent_node_ids = arena.edge_parent_node[edge_ids].astype(np.int32)
         parent_players = arena.node_current_player[parent_node_ids]
         child_players = arena.node_current_player[child_node_ids]
@@ -1211,6 +1454,7 @@ class BatchedPosteriorArenaSearch:
         leaf_value: np.ndarray,
         leaf_weight: float,
         c_state: float,
+        backup_mc_samples: int,
     ) -> None:
         if path_nodes is None or path_edges is None or path_len <= 0:
             return
@@ -1234,7 +1478,10 @@ class BatchedPosteriorArenaSearch:
             child_id = int(arena.edge_child_node[edge_id])
             if child_id == UNKNOWN:
                 continue
-            summary = outcome_mean(arena.node_summary_alpha[child_id])
+            summary = self._state_search_posterior_batch(
+                np.asarray([child_id], dtype=np.int32),
+                backup_mc_samples,
+            )[0]
             parent_player = int(arena.node_current_player[parent_id])
             child_player = int(arena.node_current_player[child_id])
             aligned_summary = summary[::-1] if parent_player != child_player else summary
@@ -1269,6 +1516,14 @@ def run_arena_posterior_tree_search(
 def _default_max_nodes(num_roots: int, config: SearchConfig) -> int:
     lanes = max(1, int(config.num_lanes_per_root))
     return max(16, int(num_roots) * (int(config.num_simulations) + 2) * lanes * 2)
+
+
+def _tree_sample_capacity(num_roots: int, max_nodes: int, config: SearchConfig) -> int:
+    configured = config.train_tree_max_nodes_per_step
+    if configured is not None:
+        return max(1, min(int(configured), int(max_nodes)))
+    expected_nodes = int(num_roots) * (int(config.num_simulations) + 1)
+    return max(1, min(expected_nodes, int(max_nodes)))
 
 
 def _make_pending_batch(
@@ -1470,6 +1725,7 @@ def _broadcast_search_result(result: SearchResult, inverse: np.ndarray) -> Searc
         beta_V_target=result.beta_V_target[inverse_jax],
         q_evidence_mass=result.q_evidence_mass[inverse_jax],
         alpha_root=result.alpha_root[inverse_jax],
+        tree_data=result.tree_data,
     )
 
 
@@ -1599,7 +1855,9 @@ def _commit_action(
         return int(rng.choice(alpha.shape[0], p=probs / total))
     if config.final_action_mode == "posterior_argmax":
         return int(np.argmax(np.where(legal, policy, -np.inf)))
-    return greedy_q_action(alpha, legal)
+    if config.final_action_mode in {"scalar_q_argmax", "argmax_q_mean"}:
+        return greedy_q_action(alpha, legal)
+    raise ValueError(f"unknown final_action_mode: {config.final_action_mode!r}")
 
 
 def _commit_actions_batch(
@@ -1616,8 +1874,10 @@ def _commit_actions_batch(
         return actions
     if config.final_action_mode == "posterior_argmax":
         return np.argmax(np.where(legal, policies, -np.inf), axis=-1).astype(np.int32)
-    scores = outcome_mean(alpha)[..., -1] - outcome_mean(alpha)[..., 0]
-    return np.argmax(np.where(legal, scores, -np.inf), axis=-1).astype(np.int32)
+    if config.final_action_mode in {"scalar_q_argmax", "argmax_q_mean"}:
+        scores = outcome_mean(alpha)[..., -1] - outcome_mean(alpha)[..., 0]
+        return np.argmax(np.where(legal, scores, -np.inf), axis=-1).astype(np.int32)
+    raise ValueError(f"unknown final_action_mode: {config.final_action_mode!r}")
 
 
 def _posterior_best_policy_target_batch_np(

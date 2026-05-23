@@ -102,6 +102,23 @@ def test_wavefront_posterior_tree_search_policy_is_valid():
     assert config.wavefront_backend == "arena"
 
 
+def test_tree_node_training_requires_wavefront_policy():
+    config = Config(
+        network="boardlaw_dirichlet",
+        search_policy="posterior_tree_wavefront",
+        train_tree_nodes=True,
+    )
+
+    assert config.train_tree_nodes is True
+
+    with pytest.raises(ValidationError, match="train_tree_nodes"):
+        Config(
+            network="boardlaw_dirichlet",
+            search_policy="gumbel",
+            train_tree_nodes=True,
+        )
+
+
 def test_wavefront_knobs_are_validated():
     config = Config(
         network="boardlaw_dirichlet",
@@ -121,6 +138,23 @@ def test_wavefront_knobs_are_validated():
     assert config.wavefront_lane_indexed_step is True
     assert config.wavefront_stable_lane_batch is True
     assert config.wavefront_pad_pending_observation_gather is True
+
+    assert (
+        Config(
+            network="boardlaw_dirichlet",
+            search_policy="posterior_tree_wavefront",
+            wavefront_final_action_mode="scalar_q_argmax",
+        ).wavefront_final_action_mode
+        == "scalar_q_argmax"
+    )
+    assert (
+        Config(
+            network="boardlaw_dirichlet",
+            search_policy="posterior_tree_wavefront",
+            wavefront_final_action_mode="argmax_q_mean",
+        ).wavefront_final_action_mode
+        == "argmax_q_mean"
+    )
 
     with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
         Config(

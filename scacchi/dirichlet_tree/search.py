@@ -25,6 +25,7 @@ from .types import (
     SearchConfig,
     SearchResult,
     StateKey,
+    TreeTrainingData,
     outcome_mean,
     terminal_outcome_from_reward,
 )
@@ -38,6 +39,7 @@ class WavefrontPosteriorTreeBatchOutput(NamedTuple):
     q_evidence_mass: jax.Array
     alpha_root: jax.Array
     trees: tuple[Any, ...]
+    tree_data: TreeTrainingData | None = None
 
 
 @dataclass(slots=True)
@@ -233,6 +235,8 @@ class BatchedPosteriorSearch:
                 if node is None or node.status == 0:
                     continue
                 if node.terminal:
+                    if done[lane.root_id] >= config.num_simulations:
+                        continue
                     if lane.path:
                         backup_path(
                             self.store,
@@ -241,8 +245,10 @@ class BatchedPosteriorSearch:
                             leaf_value=terminal_one_hot(node.terminal_outcome, self.num_outcomes or 3),
                             leaf_weight=config.c_terminal,
                             c_state=config.c_state,
+                            rng=self.rng,
+                            backup_mc_samples=config.backup_mc_samples,
                         )
-                        done[lane.root_id] += 1
+                    done[lane.root_id] += 1
                     continue
                 if node.legal_actions.shape[0] == 0:
                     continue
@@ -300,6 +306,8 @@ class BatchedPosteriorSearch:
                         leaf_value=terminal_one_hot(terminal_node.terminal_outcome, self.num_outcomes or 3),
                         leaf_weight=config.c_terminal,
                         c_state=config.c_state,
+                        rng=self.rng,
+                        backup_mc_samples=config.backup_mc_samples,
                     )
                     done[lane.root_id] += 1
                     continue
@@ -324,6 +332,8 @@ class BatchedPosteriorSearch:
                         leaf_value=terminal_one_hot(child.terminal_outcome, self.num_outcomes or 3),
                         leaf_weight=config.c_terminal,
                         c_state=config.c_state,
+                        rng=self.rng,
+                        backup_mc_samples=config.backup_mc_samples,
                     )
                     done[lane.root_id] += 1
                 else:
@@ -385,6 +395,8 @@ class BatchedPosteriorSearch:
                     leaf_value=outcome_mean(node.value_alpha),
                     leaf_weight=config.c_leaf,
                     c_state=config.c_state,
+                    rng=self.rng,
+                    backup_mc_samples=config.backup_mc_samples,
                 )
                 done[request.root_id] += 1
 
@@ -416,6 +428,7 @@ def run_wavefront_posterior_tree_search(
             q_evidence_mass=result.q_evidence_mass,
             alpha_root=result.alpha_root,
             trees=(),
+            tree_data=result.tree_data,
         )
 
     search_config = search_config_from_any(config, num_roots=len(root_states))
@@ -429,6 +442,7 @@ def run_wavefront_posterior_tree_search(
         q_evidence_mass=result.q_evidence_mass,
         alpha_root=result.alpha_root,
         trees=(),
+        tree_data=result.tree_data,
     )
 
 
@@ -462,6 +476,7 @@ def run_wavefront_posterior_tree_search_state_batch(
             q_evidence_mass=result.q_evidence_mass,
             alpha_root=result.alpha_root,
             trees=(),
+            tree_data=result.tree_data,
         )
 
     return run_wavefront_posterior_tree_search(
@@ -488,8 +503,9 @@ def search_config_from_any(config: Any, *, num_roots: int = 1) -> SearchConfig:
         c_state=float(getattr(config, "c_state", 0.1)),
         c_value_search=float(getattr(config, "c_value_search", 1.0)),
         policy_mc_samples=int(getattr(config, "policy_mc_samples")),
+        backup_mc_samples=int(getattr(config, "backup_mc_samples", getattr(config, "policy_mc_samples"))),
         duplicate_leaf_mode=getattr(config, "duplicate_leaf_mode", "recycle_lane"),
-        final_action_mode=getattr(config, "wavefront_final_action_mode", "argmax_q_mean"),
+        final_action_mode=getattr(config, "wavefront_final_action_mode", "scalar_q_argmax"),
         pad_eval_batches=bool(getattr(config, "wavefront_pad_eval_batches", True)),
         pad_jax_select=bool(getattr(config, "wavefront_pad_jax_select", False)),
         np_select_below=max(0, int(getattr(config, "wavefront_np_select_below", 1024))),
@@ -499,6 +515,11 @@ def search_config_from_any(config: Any, *, num_roots: int = 1) -> SearchConfig:
         pad_pending_observation_gather=bool(
             getattr(config, "wavefront_pad_pending_observation_gather", True)
         ),
+        train_tree_nodes=bool(getattr(config, "train_tree_nodes", False)),
+        train_tree_include_root=bool(getattr(config, "train_tree_include_root", False)),
+        train_tree_include_terminal=bool(getattr(config, "train_tree_include_terminal", True)),
+        train_tree_min_q_evidence=float(getattr(config, "train_tree_min_q_evidence", 0.0)),
+        train_tree_max_nodes_per_step=getattr(config, "train_tree_max_nodes_per_step", None),
     )
 
 
@@ -520,7 +541,9 @@ def _commit_action(
         return int(rng.choice(alpha.shape[0], p=probs / total))
     if config.final_action_mode == "posterior_argmax":
         return int(np.argmax(np.where(legal, policy, -np.inf)))
-    return greedy_q_action(alpha, legal)
+    if config.final_action_mode in {"scalar_q_argmax", "argmax_q_mean"}:
+        return greedy_q_action(alpha, legal)
+    raise ValueError(f"unknown final_action_mode: {config.final_action_mode!r}")
 
 
 def _batched_step(env: Any):

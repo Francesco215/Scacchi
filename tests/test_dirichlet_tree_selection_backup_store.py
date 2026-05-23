@@ -59,7 +59,7 @@ def test_thompson_selection_prefers_higher_wdl_utility_statistically():
     assert np.mean(np_actions == 0) > 0.95
 
 
-def test_backup_updates_direct_evidence_and_normalized_ancestor_summary():
+def test_backup_updates_direct_evidence_and_state_posterior_ancestor_summary():
     store = InMemoryNodeStore()
     root = NodeBlob.expanded_node(
         key=StateKey((1, 0, 0, 0)),
@@ -97,15 +97,17 @@ def test_backup_updates_direct_evidence_and_normalized_ancestor_summary():
         leaf_value=outcome_mean(leaf.value_alpha),
         leaf_weight=2.0,
         c_state=0.5,
+        rng=np.random.default_rng(0),
+        backup_mc_samples=8,
     )
 
     assert np.allclose(child.edge_evidence_E[0], 2.0 * np.array([0.6, 0.2, 0.2]))
-    child_summary = outcome_mean(child.state_summary_alpha)
-    assert np.allclose(root.edge_evidence_E[0], 0.5 * child_summary[::-1])
+    expected_child_beta = np.array([2.2, 1.4, 1.4], dtype=np.float32)
+    assert np.allclose(root.edge_evidence_E[0], 0.5 * expected_child_beta[::-1])
     assert np.allclose(root.edge_post_alpha[0], root.edge_base_alpha[0] + root.edge_evidence_E[0])
 
 
-def test_ancestor_backup_uses_child_state_summary_not_value_alpha():
+def test_ancestor_backup_uses_child_search_posterior_not_value_alpha():
     store = InMemoryNodeStore()
     root = NodeBlob.expanded_node(
         key=StateKey((11, 0, 0, 0)),
@@ -152,9 +154,13 @@ def test_ancestor_backup_uses_child_state_summary_not_value_alpha():
         leaf_value=outcome_mean(leaf.value_alpha),
         leaf_weight=1.0,
         c_state=0.25,
+        rng=np.random.default_rng(0),
+        backup_mc_samples=8,
     )
 
-    expected_root_evidence = 0.25 * outcome_mean(child.state_summary_alpha)[::-1]
+    grandchild_beta = np.array([1.0 + 5.0 / 7.0, 1.0 + 1.0 / 7.0, 1.0 + 1.0 / 7.0])
+    child_beta = np.ones((3,), dtype=np.float32) + 0.25 * grandchild_beta[::-1]
+    expected_root_evidence = 0.25 * child_beta[::-1]
     assert np.allclose(root.edge_evidence_E[0], expected_root_evidence)
     assert not np.allclose(root.edge_evidence_E[0], 0.25 * outcome_mean(child.value_alpha)[::-1])
 
@@ -206,6 +212,12 @@ def test_arena_terminal_backup_uses_terminal_node_perspective():
     arena.edge_child_node[edge_id] = terminal_id
     search = BatchedPosteriorArenaSearch(env=object())
     search.arena = arena
+    before_base = arena.edge_base_alpha[edge_id].copy()
+
+    search._update_edge_base_from_children(
+        np.array([edge_id], dtype=np.int32),
+        np.array([terminal_id], dtype=np.int32),
+    )
 
     search._backup_path(
         np.array([root_id], dtype=np.int32),
@@ -215,8 +227,10 @@ def test_arena_terminal_backup_uses_terminal_node_perspective():
         leaf_value=terminal_one_hot(2),
         leaf_weight=8.0,
         c_state=0.1,
+        backup_mc_samples=8,
     )
 
+    assert np.allclose(arena.edge_base_alpha[edge_id], before_base)
     assert np.allclose(arena.edge_E[edge_id], np.array([8.0, 0.0, 0.0], dtype=np.float32))
 
 

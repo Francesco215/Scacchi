@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, NamedTuple
 
@@ -10,7 +11,12 @@ import numpy as np
 KEY_WORDS = 4
 NO_CHILD_KEY = np.zeros((KEY_WORDS,), dtype=np.uint32)
 
-FinalActionMode = Literal["argmax_q_mean", "posterior_argmax", "posterior_sample"]
+FinalActionMode = Literal[
+    "scalar_q_argmax",
+    "argmax_q_mean",
+    "posterior_argmax",
+    "posterior_sample",
+]
 DuplicateLeafMode = Literal["recycle_lane", "park_lane"]
 
 
@@ -200,9 +206,10 @@ class SearchConfig:
     c_state: float = 0.1
     c_value_search: float = 1.0
     policy_mc_samples: int = 32
+    backup_mc_samples: int = 16
     tau_internal: float = 1.0
     duplicate_leaf_mode: DuplicateLeafMode = "recycle_lane"
-    final_action_mode: FinalActionMode = "argmax_q_mean"
+    final_action_mode: FinalActionMode = "scalar_q_argmax"
     pad_eval_batches: bool = True
     pad_jax_select: bool = False
     np_select_below: int = 1024
@@ -211,6 +218,11 @@ class SearchConfig:
     stable_lane_batch: bool = True
     pad_pending_observation_gather: bool = True
     redis_inflight_ttl_ms: int = 30000
+    train_tree_nodes: bool = False
+    train_tree_include_root: bool = False
+    train_tree_include_terminal: bool = True
+    train_tree_min_q_evidence: float = 0.0
+    train_tree_max_nodes_per_step: int | None = None
 
 
 class EvalBatch(NamedTuple):
@@ -227,6 +239,20 @@ class EvalResult(NamedTuple):
 LeafEvaluator = Callable[[jax.Array], tuple[jax.Array, jax.Array, jax.Array]]
 
 
+class TreeTrainingData(NamedTuple):
+    obs: jax.Array
+    action_weights: jax.Array
+    played_action: jax.Array
+    legal_action_mask: jax.Array
+    beta_Q_target: jax.Array
+    beta_V_target: jax.Array
+    q_evidence_mass: jax.Array
+    value_tgt: jax.Array
+    policy_loss_mask: jax.Array
+    value_loss_mask: jax.Array
+    outcome_mask: jax.Array
+
+
 class SearchResult(NamedTuple):
     action: jax.Array
     action_weights: jax.Array
@@ -234,6 +260,7 @@ class SearchResult(NamedTuple):
     beta_V_target: jax.Array
     q_evidence_mass: jax.Array
     alpha_root: jax.Array
+    tree_data: TreeTrainingData | None = None
 
 
 class PathStep(NamedTuple):

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from .selection import posterior_best_policy_target_np
 from .store import NodeStore
-from .types import KEY_WORDS, NodeBlob, PathStep, StateKey, align_wdl, outcome_mean
+from .types import KEY_WORDS, NodeBlob, PathStep, StateKey, align_wdl
 
 
 def update_parent_child_edge(
@@ -29,6 +30,8 @@ def update_edge_base_from_child(
     action: int,
     child: NodeBlob,
 ) -> None:
+    if child.terminal:
+        return
     parent = _require_node(store, parent_key)
     ix = _action_index(parent, action)
     aligned = align_wdl(child.value_alpha, child.current_player, parent.current_player)
@@ -46,8 +49,11 @@ def backup_path(
     leaf_value: np.ndarray,
     leaf_weight: float,
     c_state: float,
+    rng: np.random.Generator | None = None,
+    backup_mc_samples: int = 16,
     normalize_ancestor_summary: bool = True,
 ) -> None:
+    del normalize_ancestor_summary
     if not path:
         return
 
@@ -68,9 +74,11 @@ def backup_path(
         ix = _action_index(parent, step.action)
         child_key = StateKey(tuple(int(x) for x in parent.child_keys[ix].reshape((KEY_WORDS,))))
         child = _require_node(store, child_key)
-        summary = np.asarray(child.state_summary_alpha, dtype=np.float32)
-        if normalize_ancestor_summary:
-            summary = outcome_mean(summary)
+        summary = state_search_posterior(
+            child,
+            rng=rng,
+            num_samples=backup_mc_samples,
+        )
         parent.edge_evidence_E[ix] += np.asarray(c_state, dtype=np.float32) * align_wdl(
             summary,
             child.current_player,
@@ -85,6 +93,25 @@ def terminal_one_hot(outcome_index: int, num_outcomes: int = 3) -> np.ndarray:
     out = np.zeros((num_outcomes,), dtype=np.float32)
     out[int(outcome_index)] = 1.0
     return out
+
+
+def state_search_posterior(
+    node: NodeBlob,
+    *,
+    rng: np.random.Generator | None = None,
+    num_samples: int = 16,
+) -> np.ndarray:
+    if node.terminal or node.legal_actions.shape[0] == 0:
+        return np.maximum(np.asarray(node.value_alpha, dtype=np.float32), np.float32(1e-6))
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}")
+    if rng is None:
+        rng = np.random.default_rng(0)
+    alpha = node.edge_post_alpha
+    legal = np.ones((alpha.shape[0],), dtype=bool)
+    pi_search = posterior_best_policy_target_np(rng, alpha, legal, int(num_samples))
+    beta_v = np.sum(pi_search[:, None] * alpha, axis=0)
+    return np.maximum(np.asarray(beta_v, dtype=np.float32), np.float32(1e-6))
 
 
 def _require_node(store: NodeStore, key: StateKey) -> NodeBlob:

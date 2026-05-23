@@ -24,6 +24,7 @@ from .dirichlet_q_search import (
     root_action_value_priors_from_tree,
     terminal_outcome_from_reward,
 )
+from .dirichlet_tree.types import TreeTrainingData
 from .network import policy_value_from_output
 from .posterior_tree import (
     is_posterior_tree_policy,
@@ -51,6 +52,7 @@ class SelfplayOutput(NamedTuple):
     beta_V_target: jax.Array
     q_evidence_mass: jax.Array
     discount: jax.Array
+    tree_data: TreeTrainingData | None = None
 
 
 def _cpu_device() -> jax.Device:
@@ -271,6 +273,7 @@ def make_posterior_tree_selfplay(env, config):
         beta_v_seq = []
         q_evidence_mass_seq = []
         discount_seq = []
+        tree_data_seq = []
 
         for _ in range(config.max_num_steps):
             rng_key, search_key, reset_key = jax.random.split(rng_key, 3)
@@ -311,9 +314,18 @@ def make_posterior_tree_selfplay(env, config):
             beta_q_seq.append(search_output.beta_Q_target)
             beta_v_seq.append(search_output.beta_V_target)
             q_evidence_mass_seq.append(search_output.q_evidence_mass)
+            if search_output.tree_data is not None:
+                tree_data_seq.append(search_output.tree_data)
             reward_seq.append(reward)
             terminated_seq.append(env_state.terminated)
             discount_seq.append(discount)
+
+        tree_data = None
+        if tree_data_seq:
+            tree_data = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs, axis=0),
+                *tree_data_seq,
+            )
 
         return SelfplayOutput(
             obs=jnp.stack(obs_seq, axis=0),
@@ -326,6 +338,7 @@ def make_posterior_tree_selfplay(env, config):
             beta_V_target=jnp.stack(beta_v_seq, axis=0),
             q_evidence_mass=jnp.stack(q_evidence_mass_seq, axis=0),
             discount=jnp.stack(discount_seq, axis=0),
+            tree_data=tree_data,
         )
 
     return selfplay

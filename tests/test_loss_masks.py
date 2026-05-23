@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import optax
 
+from scacchi.dirichlet_tree.types import TreeTrainingData
 from scacchi.loss import (
     Sample,
     _compute_dirichlet_losses,
@@ -78,6 +79,43 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
             ]
         ),
     )
+
+
+def test_compute_loss_input_appends_tree_rows_with_separate_loss_masks():
+    tree_data = TreeTrainingData(
+        obs=jnp.array([[[10.0], [20.0]]]),
+        action_weights=jnp.array([[[1.0, 0.0], [0.0, 0.0]]]),
+        played_action=jnp.array([[0, 0]]),
+        legal_action_mask=jnp.array([[[True, False], [False, False]]]),
+        beta_Q_target=jnp.ones((1, 2, 2, 2)),
+        beta_V_target=jnp.ones((1, 2, 2)),
+        q_evidence_mass=jnp.array([[[2.0, 0.0], [0.0, 0.0]]]),
+        value_tgt=jnp.array([[0.5, 1.0]]),
+        policy_loss_mask=jnp.array([[True, False]]),
+        value_loss_mask=jnp.array([[True, True]]),
+        outcome_mask=jnp.array([[False, True]]),
+    )
+    data = SelfplayOutput(
+        obs=jnp.array([[[1.0]]]),
+        reward=jnp.array([[1.0]]),
+        terminated=jnp.array([[True]]),
+        action_weights=jnp.array([[[0.0, 1.0]]]),
+        played_action=jnp.array([[1]]),
+        legal_action_mask=jnp.array([[[True, True]]]),
+        beta_Q_target=jnp.ones((1, 1, 2, 2)),
+        beta_V_target=jnp.ones((1, 1, 2)),
+        q_evidence_mass=jnp.zeros((1, 1, 2)),
+        discount=jnp.zeros((1, 1)),
+        tree_data=tree_data,
+    )
+    config = SimpleNamespace(max_num_steps=1, selfplay_batch_size=1)
+
+    sample = make_compute_loss_input(config)(data)
+
+    assert sample.obs.shape == (1, 3, 1)
+    assert jnp.array_equal(sample.policy_loss_mask, jnp.array([[True, True, False]]))
+    assert jnp.array_equal(sample.value_loss_mask, jnp.array([[True, True, True]]))
+    assert jnp.array_equal(sample.outcome_mask, jnp.array([[True, False, True]]))
 
 
 def test_policy_loss_ignores_illegal_logits():

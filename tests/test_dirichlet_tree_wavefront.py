@@ -9,6 +9,7 @@ from scacchi.dirichlet_tree.search import (
     run_wavefront_posterior_tree_search,
     run_wavefront_posterior_tree_search_state_batch,
 )
+from scacchi.dirichlet_tree.store import InMemoryNodeStore
 
 
 class ToyState(NamedTuple):
@@ -55,6 +56,16 @@ def _state(obs=0.0):
         current_player=jnp.array(0, dtype=jnp.int32),
         terminated=jnp.array(False),
         rewards=jnp.array([0.0, 0.0], dtype=jnp.float32),
+    )
+
+
+def _terminal_state(obs=0.0):
+    return ToyState(
+        observation=jnp.array([obs], dtype=jnp.float32),
+        legal_action_mask=jnp.array([False, False]),
+        current_player=jnp.array(0, dtype=jnp.int32),
+        terminated=jnp.array(True),
+        rewards=jnp.array([1.0, -1.0], dtype=jnp.float32),
     )
 
 
@@ -131,6 +142,59 @@ def test_wavefront_terminal_lanes_skip_leaf_evaluator_after_root_eval():
 
     assert calls == [2]
     assert np.allclose(np.asarray(output.q_evidence_mass[:, 0]), 8.0)
+
+
+def test_wavefront_terminal_root_lanes_finish_without_stalling():
+    env = CountingToyEnv()
+    calls = []
+
+    def leaf_evaluator(obs):
+        calls.append(int(obs.shape[0]))
+        batch = obs.shape[0]
+        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
+        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
+        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
+        return logits, alpha_v, alpha_q
+
+    output = run_wavefront_posterior_tree_search_state_batch(
+        env=env,
+        root_state_batch=_stack_states([_terminal_state(99.0), _state(0.0)]),
+        leaf_evaluator=leaf_evaluator,
+        rng_key=jax.random.PRNGKey(11),
+        config=_config(),
+    )
+
+    assert calls == [2, 16]
+    assert output.action.shape == (2,)
+    assert np.isclose(float(output.q_evidence_mass[0, 0]), 0.0)
+    assert float(output.q_evidence_mass[1, 0]) > 0.0
+
+
+def test_store_wavefront_terminal_root_lanes_finish_without_stalling():
+    env = CountingToyEnv()
+    calls = []
+
+    def leaf_evaluator(obs):
+        calls.append(int(obs.shape[0]))
+        batch = obs.shape[0]
+        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
+        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
+        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
+        return logits, alpha_v, alpha_q
+
+    output = run_wavefront_posterior_tree_search(
+        env=env,
+        root_states=[_terminal_state(99.0), _state(0.0)],
+        leaf_evaluator=leaf_evaluator,
+        rng_key=jax.random.PRNGKey(12),
+        config=_config(),
+        store=InMemoryNodeStore(),
+    )
+
+    assert calls == [2, 1]
+    assert output.action.shape == (2,)
+    assert np.isclose(float(output.q_evidence_mass[0, 0]), 0.0)
+    assert float(output.q_evidence_mass[1, 0]) > 0.0
 
 
 def test_wavefront_duplicate_lanes_evaluate_unique_leaf_once():
@@ -235,3 +299,67 @@ def test_wavefront_state_batch_deduplicates_identical_roots():
     assert output.action.shape == (3,)
     assert np.allclose(np.asarray(output.action_weights[0]), np.asarray(output.action_weights[1]))
     assert np.allclose(np.asarray(output.q_evidence_mass[:, 0]), 1.0)
+
+
+def test_wavefront_tree_training_exports_internal_nodes_with_evidence():
+    env = CountingToyEnv()
+
+    def leaf_evaluator(obs):
+        batch = obs.shape[0]
+        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
+        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
+        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
+        return logits, alpha_v, alpha_q
+
+    output = run_wavefront_posterior_tree_search_state_batch(
+        env=env,
+        root_state_batch=_stack_states([_state(0.0)]),
+        leaf_evaluator=leaf_evaluator,
+        rng_key=jax.random.PRNGKey(5),
+        config=_config(
+            num_simulations=2,
+            train_tree_nodes=True,
+            train_tree_include_root=False,
+            train_tree_include_terminal=True,
+            wavefront_pad_eval_batches=False,
+        ),
+    )
+
+    assert output.tree_data is not None
+    assert output.tree_data.obs.shape[0] == 3
+    assert int(np.sum(np.asarray(output.tree_data.policy_loss_mask))) == 1
+    assert int(np.sum(np.asarray(output.tree_data.value_loss_mask))) == 1
+    assert int(np.sum(np.asarray(output.tree_data.outcome_mask))) == 0
+    row = int(np.argmax(np.asarray(output.tree_data.policy_loss_mask)))
+    assert np.allclose(np.asarray(output.tree_data.obs[row]), np.array([1.0], dtype=np.float32))
+    assert np.asarray(output.tree_data.q_evidence_mass[row, 0]) > 0.0
+
+
+def test_wavefront_tree_training_exports_terminal_leaves_as_value_only_rows():
+    env = CountingToyEnv(terminal=True)
+
+    def leaf_evaluator(obs):
+        batch = obs.shape[0]
+        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
+        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
+        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
+        return logits, alpha_v, alpha_q
+
+    output = run_wavefront_posterior_tree_search_state_batch(
+        env=env,
+        root_state_batch=_stack_states([_state(0.0), _state(10.0)]),
+        leaf_evaluator=leaf_evaluator,
+        rng_key=jax.random.PRNGKey(6),
+        config=_config(
+            train_tree_nodes=True,
+            train_tree_include_root=False,
+            train_tree_include_terminal=True,
+            wavefront_pad_eval_batches=False,
+        ),
+    )
+
+    assert output.tree_data is not None
+    assert output.tree_data.obs.shape[0] == 4
+    assert int(np.sum(np.asarray(output.tree_data.policy_loss_mask))) == 0
+    assert int(np.sum(np.asarray(output.tree_data.value_loss_mask))) == 2
+    assert int(np.sum(np.asarray(output.tree_data.outcome_mask))) == 2

@@ -1,5 +1,5 @@
 env_id: hex
-board_size: 4
+board_size: 6
 network: boardlaw_dirichlet
 num_outcomes: 3
 seed: 0
@@ -23,7 +23,7 @@ selfplay_action_source: posterior_sample
 search_policy: posterior_tree_wavefront
 wavefront_num_lanes_per_root: 1
 wavefront_max_depth: 128
-wavefront_final_action_mode: argmax_q_mean
+wavefront_final_action_mode: scalar_q_argmax
 wavefront_pad_eval_batches: true
 wavefront_pad_jax_select: false
 wavefront_np_select_below: 1024
@@ -32,6 +32,11 @@ wavefront_lane_indexed_step: true
 wavefront_stable_lane_batch: true
 wavefront_pad_pending_observation_gather: true
 wavefront_backend: arena
+train_tree_nodes: true
+train_tree_include_root: false
+train_tree_include_terminal: true
+train_tree_min_q_evidence: 0.0
+train_tree_max_nodes_per_step: null
 training_batch_size: 128
 learning_rate: 3e-3
 grad_clip_norm: 1.0
@@ -44,7 +49,7 @@ dirichlet_concentration_clip: 100.0
 log_interval: 1
 eval_interval: 1
 eval_batch_size: 256
-wandb_enabled: true
+wandb_enabled: false
 wandb_project: scacchi-az
 ckpt_max_to_keep: 0
 ckpt_save_interval_steps: 50

@@ -8,6 +8,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .dirichlet_tree.types import TreeTrainingData
+
 
 NO_CHILD = -1
 POSTERIOR_TREE_POLICIES = {"posterior_tree", "posterior_tree_wavefront", "dirichlet_thompson"}
@@ -36,6 +38,7 @@ class PosteriorTreeBatchOutput(NamedTuple):
     q_evidence_mass: jax.Array
     alpha_root: jax.Array
     trees: tuple["PosteriorTree", ...]
+    tree_data: TreeTrainingData | None = None
 
 
 @dataclass
@@ -418,6 +421,7 @@ def run_posterior_tree_search(
         q_evidence_mass=_device_put_cpu(jnp.asarray(np.stack(q_mass, axis=0))),
         alpha_root=_device_put_cpu(jnp.asarray(np.stack(alpha_root, axis=0))),
         trees=trees,
+        tree_data=None,
     )
 
 

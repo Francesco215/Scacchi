@@ -21,6 +21,9 @@ class Sample(NamedTuple):
     beta_Q_target: jax.Array
     beta_V_target: jax.Array
     q_evidence_mass: jax.Array
+    policy_loss_mask: jax.Array | None = None
+    value_loss_mask: jax.Array | None = None
+    outcome_mask: jax.Array | None = None
 
 
 class TrainMetrics(NamedTuple):
@@ -54,7 +57,7 @@ def make_compute_loss_input(config):
         )
         value_tgt = value_tgt[::-1, :]
 
-        return Sample(
+        sample = Sample(
             obs=data.obs,
             policy_tgt=data.action_weights,
             value_tgt=value_tgt,
@@ -64,6 +67,61 @@ def make_compute_loss_input(config):
             beta_Q_target=data.beta_Q_target,
             beta_V_target=data.beta_V_target,
             q_evidence_mass=data.q_evidence_mass,
+            policy_loss_mask=value_mask,
+            value_loss_mask=value_mask,
+            outcome_mask=value_mask,
+        )
+        if data.tree_data is None:
+            return sample
+
+        tree = data.tree_data
+
+        def flatten_root(x: jax.Array) -> jax.Array:
+            return x.reshape((-1, *x.shape[2:]))
+
+        def wrap_rows(x: jax.Array) -> jax.Array:
+            return x[None, ...]
+
+        root_obs = flatten_root(sample.obs)
+        tree_obs = flatten_root(tree.obs)
+        root_policy_tgt = flatten_root(sample.policy_tgt)
+        tree_policy_tgt = flatten_root(tree.action_weights)
+        root_value_tgt = flatten_root(sample.value_tgt)
+        tree_value_tgt = flatten_root(tree.value_tgt)
+        root_played_action = flatten_root(sample.played_action)
+        tree_played_action = flatten_root(tree.played_action)
+        root_policy_mask = flatten_root(sample.policy_mask)
+        tree_policy_mask = flatten_root(tree.legal_action_mask)
+        root_beta_q = flatten_root(sample.beta_Q_target)
+        tree_beta_q = flatten_root(tree.beta_Q_target)
+        root_beta_v = flatten_root(sample.beta_V_target)
+        tree_beta_v = flatten_root(tree.beta_V_target)
+        root_q_evidence = flatten_root(sample.q_evidence_mass)
+        tree_q_evidence = flatten_root(tree.q_evidence_mass)
+        root_policy_loss_mask = flatten_root(sample.policy_loss_mask)
+        tree_policy_loss_mask = flatten_root(tree.policy_loss_mask)
+        root_value_loss_mask = flatten_root(sample.value_loss_mask)
+        tree_value_loss_mask = flatten_root(tree.value_loss_mask)
+        root_outcome_mask = flatten_root(sample.outcome_mask)
+        tree_outcome_mask = flatten_root(tree.outcome_mask)
+
+        return Sample(
+            obs=wrap_rows(jnp.concatenate([root_obs, tree_obs], axis=0)),
+            policy_tgt=wrap_rows(jnp.concatenate([root_policy_tgt, tree_policy_tgt], axis=0)),
+            value_tgt=wrap_rows(jnp.concatenate([root_value_tgt, tree_value_tgt], axis=0)),
+            played_action=wrap_rows(jnp.concatenate([root_played_action, tree_played_action], axis=0)),
+            policy_mask=wrap_rows(jnp.concatenate([root_policy_mask, tree_policy_mask], axis=0)),
+            value_mask=wrap_rows(jnp.concatenate([root_value_loss_mask, tree_value_loss_mask], axis=0)),
+            beta_Q_target=wrap_rows(jnp.concatenate([root_beta_q, tree_beta_q], axis=0)),
+            beta_V_target=wrap_rows(jnp.concatenate([root_beta_v, tree_beta_v], axis=0)),
+            q_evidence_mass=wrap_rows(jnp.concatenate([root_q_evidence, tree_q_evidence], axis=0)),
+            policy_loss_mask=wrap_rows(
+                jnp.concatenate([root_policy_loss_mask, tree_policy_loss_mask], axis=0)
+            ),
+            value_loss_mask=wrap_rows(
+                jnp.concatenate([root_value_loss_mask, tree_value_loss_mask], axis=0)
+            ),
+            outcome_mask=wrap_rows(jnp.concatenate([root_outcome_mask, tree_outcome_mask], axis=0)),
         )
 
     return compute_loss_input
@@ -74,11 +132,17 @@ def _masked_mean(loss: jax.Array, mask: jax.Array) -> jax.Array:
     return jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1)
 
 
+def _mask_or(mask: jax.Array | None, fallback: jax.Array) -> jax.Array:
+    return fallback if mask is None else mask
+
+
 def _compute_losses(logits: jax.Array, value: jax.Array, data: Sample) -> tuple[jax.Array, jax.Array]:
+    policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
+    value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
     policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt, where=data.policy_mask)
-    policy_loss = _masked_mean(policy_loss, data.value_mask)
+    policy_loss = _masked_mean(policy_loss, policy_loss_mask)
     value_loss = optax.l2_loss(value, data.value_tgt)
-    value_loss = _masked_mean(value_loss, data.value_mask)
+    value_loss = _masked_mean(value_loss, value_loss_mask)
     return policy_loss, value_loss
 
 
@@ -138,28 +202,31 @@ def _compute_dirichlet_losses(
     data: Sample,
     config,
 ) -> tuple[jax.Array, TrainMetrics]:
+    policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
+    value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
+    outcome_mask = _mask_or(data.outcome_mask, data.value_mask)
     policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt, where=data.policy_mask)
-    policy_loss = _masked_mean(policy_loss, data.value_mask)
+    policy_loss = _masked_mean(policy_loss, policy_loss_mask)
     policy_target_entropy = _categorical_entropy_from_probs(data.policy_tgt, data.policy_mask)
-    policy_target_entropy = _masked_mean(policy_target_entropy, data.value_mask)
+    policy_target_entropy = _masked_mean(policy_target_entropy, policy_loss_mask)
     policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
 
     value_dir_kl = _dirichlet_kl(data.beta_V_target, alpha_v)
-    value_dir_kl_loss = _masked_mean(value_dir_kl, data.value_mask)
+    value_dir_kl_loss = _masked_mean(value_dir_kl, value_loss_mask)
 
     q_dir_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
-    q_loss_mask = data.policy_mask & data.value_mask[..., None] & (data.q_evidence_mass > 0)
+    q_loss_mask = data.policy_mask & policy_loss_mask[..., None] & (data.q_evidence_mass > 0)
     q_dir_kl_loss = _masked_mean(q_dir_kl, q_loss_mask)
 
     outcome_tgt = _outcome_target(data.value_tgt, alpha_v.shape[-1])
     value_outcome_loss = _categorical_ce_from_probs(outcome_mean(alpha_v), outcome_tgt)
-    value_outcome_loss = _masked_mean(value_outcome_loss, data.value_mask)
+    value_outcome_loss = _masked_mean(value_outcome_loss, outcome_mask)
 
     played_alpha_q = _gather_played_action(alpha_q, data.played_action)
     q_outcome_loss = _categorical_ce_from_probs(outcome_mean(played_alpha_q), outcome_tgt)
-    q_outcome_loss = _masked_mean(q_outcome_loss, data.value_mask)
+    q_outcome_loss = _masked_mean(q_outcome_loss, outcome_mask)
 
-    alpha_v_concentration = _masked_mean(jnp.sum(alpha_v, axis=-1), data.value_mask)
+    alpha_v_concentration = _masked_mean(jnp.sum(alpha_v, axis=-1), value_loss_mask)
     alpha_q_concentration = _masked_mean(
         jnp.sum(alpha_q, axis=-1),
         q_loss_mask,
