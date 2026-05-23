@@ -12,6 +12,11 @@ if TYPE_CHECKING:
     from .train import Config
 
 
+def _unit_dirichlet_concentration_logit(num_outcomes: int) -> float:
+    """Logit whose squared softplus gives total concentration num_outcomes."""
+    return math.log(math.expm1(math.sqrt(num_outcomes)))
+
+
 def dirichlet_from_logits(
     mean_logits: jax.Array,
     concentration_logit: jax.Array,
@@ -109,7 +114,13 @@ class AZNet(nnx.Module):
 
         self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=1, padding="SAME", rngs=rngs)
         self.policy_bn = nnx.BatchNorm(2, momentum=0.9, rngs=rngs)
-        self.policy_linear = nnx.Linear(height * width * 2, num_actions, rngs=rngs)
+        self.policy_linear = nnx.Linear(
+            height * width * 2,
+            num_actions,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+            rngs=rngs,
+        )
 
         self.value_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", rngs=rngs)
         self.value_bn = nnx.BatchNorm(1, momentum=0.9, rngs=rngs)
@@ -190,7 +201,13 @@ class BoardlawNet(nnx.Module):
         input_dim = math.prod(observation_shape)
         self.intake = nnx.Linear(input_dim, width, rngs=rngs)
         self.blocks = nnx.List([ReZeroResidual(width, rngs=rngs) for _ in range(depth)])
-        self.policy_head = nnx.Linear(width, num_actions, rngs=rngs)
+        self.policy_head = nnx.Linear(
+            width,
+            num_actions,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+            rngs=rngs,
+        )
         self.value_head = nnx.Linear(width, 1, rngs=rngs)
 
     def __call__(self, x: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array]:
@@ -228,11 +245,44 @@ class BoardlawDirichletNet(nnx.Module):
         input_dim = math.prod(observation_shape)
         self.intake = nnx.Linear(input_dim, width, rngs=rngs)
         self.blocks = nnx.List([ReZeroResidual(width, rngs=rngs) for _ in range(depth)])
-        self.policy_head = nnx.Linear(width, num_actions, rngs=rngs)
-        self.value_dir_head = nnx.Linear(width, num_outcomes, rngs=rngs)
-        self.value_conc_head = nnx.Linear(width, 1, rngs=rngs)
-        self.q_dir_head = nnx.Linear(width, num_actions * num_outcomes, rngs=rngs)
-        self.q_conc_head = nnx.Linear(width, num_actions, rngs=rngs)
+        self.policy_head = nnx.Linear(
+            width,
+            num_actions,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+            rngs=rngs,
+        )
+        self.value_dir_head = nnx.Linear(
+            width,
+            num_outcomes,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+            rngs=rngs,
+        )
+        concentration_bias_init = jax.nn.initializers.constant(
+            _unit_dirichlet_concentration_logit(num_outcomes)
+        )
+        self.value_conc_head = nnx.Linear(
+            width,
+            1,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=concentration_bias_init,
+            rngs=rngs,
+        )
+        self.q_dir_head = nnx.Linear(
+            width,
+            num_actions * num_outcomes,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+            rngs=rngs,
+        )
+        self.q_conc_head = nnx.Linear(
+            width,
+            num_actions,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=concentration_bias_init,
+            rngs=rngs,
+        )
 
     def __call__(self, x: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array, jax.Array]:
         del train
