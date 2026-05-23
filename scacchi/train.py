@@ -84,6 +84,10 @@ class Config(BaseModel):
     wavefront_pad_eval_batches: bool = True
     wavefront_pad_jax_select: bool = False
     wavefront_np_select_below: int = Field(default=1024, ge=0)
+    wavefront_grouped_expansion: bool = True
+    wavefront_lane_indexed_step: bool = True
+    wavefront_stable_lane_batch: bool = True
+    wavefront_pad_pending_observation_gather: bool = True
     wavefront_backend: str = "arena"
     # training params
     training_batch_size: int = 4096

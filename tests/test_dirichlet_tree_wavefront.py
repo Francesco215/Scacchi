@@ -105,6 +105,7 @@ def test_wavefront_steps_multiple_roots_in_one_batched_call_and_finishes_targets
     assert output.action.shape == (3,)
     assert output.action_weights.shape == (3, 2)
     assert np.allclose(np.asarray(output.action_weights.sum(axis=-1)), 1.0)
+    assert np.allclose(np.asarray(output.action_weights[:, 1]), 0.0)
     assert np.all(np.asarray(output.q_evidence_mass[:, 0]) > 0.0)
 
 
@@ -180,6 +181,8 @@ def test_wavefront_state_batch_entrypoint_avoids_root_state_list():
     assert env.step_calls == 1
     assert calls == [3, 16]
     assert output.action.shape == (3,)
+    assert np.allclose(np.asarray(output.action_weights.sum(axis=-1)), 1.0)
+    assert np.allclose(np.asarray(output.action_weights[:, 1]), 0.0)
     assert np.all(np.asarray(output.q_evidence_mass[:, 0]) > 0.0)
 
 

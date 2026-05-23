@@ -206,6 +206,10 @@ class SearchConfig:
     pad_eval_batches: bool = True
     pad_jax_select: bool = False
     np_select_below: int = 1024
+    grouped_expansion: bool = True
+    lane_indexed_step: bool = True
+    stable_lane_batch: bool = True
+    pad_pending_observation_gather: bool = True
     redis_inflight_ttl_ms: int = 30000
 
 

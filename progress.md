@@ -56,6 +56,9 @@ The wavefront arena path is intended to follow the revised algorithm:
 - `scripts/bench_wavefront_pgx.py`
   Measures the real PGX Hex wavefront path.
 
+- `scripts/bench_wavefront_matrix.py`
+  Runs the benchmark matrix and ablation variants with timing buckets, JSONL output, and summary statistics.
+
 ## Arena Representation
 
 The hot path stores nodes and edges as arrays, not Python objects:
@@ -140,9 +143,13 @@ The latest pass focused on host-side overhead and JAX shape churn:
 - Batched parent edge-base refreshes when known expanded children are reached, so the search refreshes affected edge statistics once per wave instead of per lane.
 - Grouped node-summary recomputation by legal-edge count, preserving sparse legal-action layouts while avoiding thousands of scalar parent recomputes.
 - Kept PGX states lane-indexed during traversal and stepped the full lane batch with inactive actions filled by zero. This avoids dynamic per-depth state compaction gathers while preserving selected actions and path records for active lanes.
+- Added a stable lane-batch mode that keeps the same root/lane shape across waves, filters completed roots inside traversal, and avoids JAX churn from unevenly shrinking unfinished-root batches.
 - Padded pending-observation gathers to the evaluation batch size when eval padding is enabled, reducing JAX shape churn before model calls.
 - Raised the NumPy Thompson-selection threshold from 256 to 1024 after CPU benchmarks showed this is faster for the current `batch=512`, `simulations=8` PGX workload.
 - Reduced the stepped-lane host transfer by returning only the scalar terminal reward needed for terminal backup instead of the full per-player reward vector.
+- Added optional arena timing buckets for root hashing, root eval, node packing, Thompson selection, PGX step/hash, device transfer, child classification, leaf observation gather, NN eval, expansion, backup, posterior target generation, and store flush.
+- Added ablation flags for grouped expansion, lane-indexed stepping, and padded pending-observation gathers, plus the existing hybrid-selector threshold toggle.
+- Added benchmark summaries that report median, p10, p90, best, and cold-start-excluded mean instead of only best warmed samples.
 
 ## Benchmark Results
 
@@ -196,17 +203,17 @@ JAX_PLATFORMS=cpu uv run python scripts/bench_wavefront_pgx.py \
   --no-pad-jax-select
 ```
 
-Recent result after hybrid small-batch selection, grouped variable-mask expansion, pending-batch coalescing, lane-indexed full-batch stepping, padded pending-observation gathers, scalar terminal-reward transfer, batched edge-base refresh, grouped summary refresh, and the `np_select_below=1024` default:
+Recent result after hybrid small-batch selection, grouped variable-mask expansion, pending-batch coalescing, lane-indexed full-batch stepping, stable lane batches, padded pending-observation gathers, scalar terminal-reward transfer, batched edge-base refresh, grouped summary refresh, and the `np_select_below=1024` default:
 
 ```text
-repeat=1 completed_evals_per_s=1443.2
-repeat=2 completed_evals_per_s=11877.7
-repeat=3 completed_evals_per_s=5457.5
-repeat=4 completed_evals_per_s=24376.3
-repeat=5 completed_evals_per_s=4947.4
-repeat=6 completed_evals_per_s=22568.4
-repeat=7 completed_evals_per_s=28729.0
-repeat=8 completed_evals_per_s=40180.5
+repeat=1 completed_evals_per_s=1884.1
+repeat=2 completed_evals_per_s=11943.6
+repeat=3 completed_evals_per_s=21131.6
+repeat=4 completed_evals_per_s=24151.5
+repeat=5 completed_evals_per_s=14301.2
+repeat=6 completed_evals_per_s=27307.5
+repeat=7 completed_evals_per_s=28052.0
+repeat=8 completed_evals_per_s=39755.2
 ```
 
 Pure JAX selection on the same benchmark with `--np-select-below 0` was:
@@ -220,7 +227,7 @@ repeat=5 completed_evals_per_s=2250.7
 repeat=6 completed_evals_per_s=10737.8
 ```
 
-The hybrid selector improves the cold and mid-run cases while preserving the fast warmed cases. Variable-mask batch expansion removes a large Python per-node expansion cost, and the later lane-indexed stepping plus padded observation gathers reduce dynamic JAX gather overhead. The best warmed samples are now around 40k to 41k completed evals/s. The benchmark is still visibly bimodal because stochastic traversal creates different path and JAX selector-shape patterns.
+The hybrid selector improves the cold and mid-run cases while preserving the fast warmed cases. Variable-mask batch expansion removes a large Python per-node expansion cost, and the later lane-indexed stepping, stable lane batches, and padded observation gathers reduce dynamic JAX gather overhead. The best warmed samples are still around 40k completed evals/s in this direct benchmark. The benchmark remains variable, but the stable-lane ablation below materially improves p10 and median in the timing-enabled matrix runner.
 
 Earlier comparison points:
 
@@ -240,6 +247,67 @@ improvement:                                        ~35x
 
 The multi-simulation PGX benchmark is much more variable because stochastic traversal still creates changing selector shapes and changing path patterns. It is improved, but it is not yet a clean, broad 100x proof.
 
+### Matrix and Ablation Runner
+
+The current benchmark matrix runner is:
+
+```bash
+JAX_PLATFORMS=cpu uv run python scripts/bench_wavefront_matrix.py \
+  --require-backend cpu \
+  --output cpu_wavefront_matrix.jsonl
+```
+
+Run the same script on the target GPU/default backend without `JAX_PLATFORMS=cpu`, optionally with `--require-backend gpu` if JAX reports the backend as `gpu`.
+
+Default matrix dimensions:
+
+```text
+batch:             128, 512, 2048
+simulations:       1, 4, 8, 16, 32
+board size:        5, 9, 11
+root mode:         initial, prefilled
+policy_mc_samples: 1, 16, 64
+```
+
+The ablation runner is the same script:
+
+```bash
+JAX_PLATFORMS=cpu uv run python scripts/bench_wavefront_matrix.py \
+  --benchmark ablation \
+  --require-backend cpu \
+  --output cpu_wavefront_ablation.jsonl
+```
+
+Ablation variants:
+
+```text
+object_tree
+arena_no_hybrid_selector
+arena_hybrid_selector
+arena_no_grouped_expansion
+arena_grouped_expansion
+arena_no_lane_indexed_step
+arena_lane_indexed_step
+arena_no_stable_lane_batch
+arena_stable_lane_batch
+arena_no_padded_eval_gathers
+arena_padded_eval_gathers
+```
+
+Each JSON summary includes elapsed-time stats, completed-evals/sec stats, and per-bucket timing stats. A CPU smoke run passed with `--quick --repeats 2`; the full CPU/GPU matrix is intentionally not checked into this file because it is large and should be run as a benchmark artifact.
+
+Stable lane-batch ablation on CPU, Hex 5x5, `simulations=8`, prefilled roots, `policy_mc_samples=1`:
+
+```text
+batch=128, arena_no_stable_lane_batch: best=23334.7/s, median=20382.8/s, p10=6335.4/s, cold-start-excluded mean=20299.2/s
+batch=128, arena_stable_lane_batch:    best=24231.0/s, median=23090.8/s, p10=10601.2/s, cold-start-excluded mean=23396.6/s
+
+batch=512, arena_no_stable_lane_batch: best=26360.9/s, median=5823.1/s,  p10=3029.1/s,  cold-start-excluded mean=12437.4/s
+batch=512, arena_stable_lane_batch:    best=50483.8/s, median=47410.2/s, p10=24234.8/s, cold-start-excluded mean=48153.4/s
+```
+
+The `batch=512` case is the clearest result: keeping the lane shape stable removes a large source of timing collapse in the arena path and roughly doubles the best observed throughput in the matrix benchmark.
+
 ## Verification
 
 Focused test command:
@@ -257,13 +325,32 @@ JAX_PLATFORMS=cpu uv run pytest \
 Latest result:
 
 ```text
-47 passed in 5.87s
+52 passed in 5.84s
 ```
 
-Latest focused check after the scalar terminal-reward transfer:
+Focused smoke check after the stable-lane optimization:
 
 ```text
-28 passed in 4.34s
+33 passed in 4.31s
+```
+
+Benchmark smoke checks:
+
+```bash
+JAX_PLATFORMS=cpu uv run python scripts/bench_wavefront_matrix.py \
+  --quick --repeats 2 --print-runs --require-backend cpu
+
+JAX_PLATFORMS=cpu uv run python scripts/bench_wavefront_matrix.py \
+  --benchmark ablation --quick --repeats 2 --require-backend cpu
+```
+
+Both commands completed and emitted JSON summaries with timing buckets.
+
+After tightening synchronization inside the leaf-observation gather timing bucket, this smoke command also completed:
+
+```bash
+JAX_PLATFORMS=cpu uv run python scripts/bench_wavefront_matrix.py \
+  --quick --repeats 1 --require-backend cpu
 ```
 
 ## Current Bottleneck
@@ -287,7 +374,7 @@ _evaluate_pending cumulative time=0.122 s
 device_get cumulative time=0.141 s
 ```
 
-The hybrid NumPy/JAX selector, batched expansion, grouped summary refresh, lane-indexed stepping, padded observation gathers, and scalar terminal-reward transfer mitigated the previous compile/expansion hot spots. The next high-value target is reducing remaining host/device transfers and pending-batch concatenation, or moving the dynamic tree core into compiled code.
+The hybrid NumPy/JAX selector, batched expansion, grouped summary refresh, lane-indexed stepping, stable lane batches, padded observation gathers, and scalar terminal-reward transfer mitigated the previous compile/expansion hot spots. The next high-value target is reducing remaining host/device transfers and pending-batch concatenation. If the full matrix still shows low p10 relative to median after this stable-shape work, the selector/classification/backup core is the likely part to move into compiled code.
 
 ## Recommended Next Steps
 
@@ -295,7 +382,7 @@ The hybrid NumPy/JAX selector, batched expansion, grouped summary refresh, lane-
 2. Consider a compiled arena core for selection, child classification, and backup using C++ or Rust if the Python loop remains dominant.
 3. Keep Redis outside the hot loop until local arena throughput is proven. Use Redis later for checkpointing, persistence, or coarse distributed coordination.
 4. Benchmark on the actual target accelerator, since the chosen design keeps PGX stepping and model batches on the default JAX device.
-5. Add a benchmark report script that compares object tree, wavefront list mode, and wavefront state-batch mode across initial and prefilled roots.
+5. Run the full CPU and GPU benchmark matrix and inspect p10/median gaps. If p10 remains much lower than median for target settings, bucket selector/eval shapes more aggressively or move selection, classification, and backup into a compiled extension.
 
 ## Status
 
@@ -303,6 +390,7 @@ The implementation has made substantial progress:
 
 - The dedicated 262,144 batch-preparation benchmark is about 684x faster than the old object-shaped Redis path.
 - The arena wavefront path is integrated behind `posterior_tree_wavefront`.
-- The theory-sensitive focused suite passes.
+- The theory-sensitive focused suite passes, and the benchmark matrix/ablation tooling is now in place.
+- The latest optimization keeps lane batches stable across waves and substantially improves p10/median behavior in the `batch=512`, `simulations=8` ablation.
 
 The full objective is not yet proven complete because the real multi-simulation PGX search path has not demonstrated a stable 100x improvement across representative workloads.

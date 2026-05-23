@@ -117,6 +117,10 @@ def test_wavefront_knobs_are_validated():
     assert config.wavefront_pad_eval_batches is True
     assert config.wavefront_pad_jax_select is False
     assert config.wavefront_np_select_below == 1024
+    assert config.wavefront_grouped_expansion is True
+    assert config.wavefront_lane_indexed_step is True
+    assert config.wavefront_stable_lane_batch is True
+    assert config.wavefront_pad_pending_observation_gather is True
 
     with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
         Config(

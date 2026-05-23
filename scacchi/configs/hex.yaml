@@ -26,7 +26,11 @@ wavefront_max_depth: 128
 wavefront_final_action_mode: argmax_q_mean
 wavefront_pad_eval_batches: true
 wavefront_pad_jax_select: false
-wavefront_np_select_below: 256
+wavefront_np_select_below: 1024
+wavefront_grouped_expansion: true
+wavefront_lane_indexed_step: true
+wavefront_stable_lane_batch: true
+wavefront_pad_pending_observation_gather: true
 wavefront_backend: arena
 training_batch_size: 128
 learning_rate: 3e-3

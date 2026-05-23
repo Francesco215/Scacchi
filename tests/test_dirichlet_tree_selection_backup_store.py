@@ -3,8 +3,8 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from scacchi.dirichlet_tree.backup import backup_path, update_edge_base_from_child
-from scacchi.dirichlet_tree.arena_search import PosteriorArena
+from scacchi.dirichlet_tree.backup import backup_path, terminal_one_hot, update_edge_base_from_child
+from scacchi.dirichlet_tree.arena_search import BatchedPosteriorArenaSearch, PosteriorArena
 from scacchi.dirichlet_tree.selection import thompson_select_jax, thompson_select_np
 from scacchi.dirichlet_tree.store import InMemoryNodeStore, RedisNodeStore
 from scacchi.dirichlet_tree.types import NodeBlob, PathStep, StateKey, outcome_mean
@@ -103,6 +103,189 @@ def test_backup_updates_direct_evidence_and_normalized_ancestor_summary():
     child_summary = outcome_mean(child.state_summary_alpha)
     assert np.allclose(root.edge_evidence_E[0], 0.5 * child_summary[::-1])
     assert np.allclose(root.edge_post_alpha[0], root.edge_base_alpha[0] + root.edge_evidence_E[0])
+
+
+def test_ancestor_backup_uses_child_state_summary_not_value_alpha():
+    store = InMemoryNodeStore()
+    root = NodeBlob.expanded_node(
+        key=StateKey((11, 0, 0, 0)),
+        current_player=0,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.ones((3,), dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    child = NodeBlob.expanded_node(
+        key=StateKey((12, 0, 0, 0)),
+        current_player=1,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.array([100.0, 1.0, 1.0], dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    grandchild = NodeBlob.expanded_node(
+        key=StateKey((13, 0, 0, 0)),
+        current_player=0,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.ones((3,), dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    leaf = NodeBlob.expanded_node(
+        key=StateKey((14, 0, 0, 0)),
+        current_player=1,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.array([1.0, 1.0, 5.0], dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    child.state_summary_alpha = np.array([2.0, 3.0, 5.0], dtype=np.float32)
+    root.child_keys[0] = child.key.to_array()
+    child.child_keys[0] = grandchild.key.to_array()
+    grandchild.child_keys[0] = leaf.key.to_array()
+    store.put_many([root, child, grandchild, leaf])
+
+    backup_path(
+        store,
+        path=[PathStep(root.key, 0), PathStep(child.key, 0), PathStep(grandchild.key, 0)],
+        leaf_node=leaf,
+        leaf_value=outcome_mean(leaf.value_alpha),
+        leaf_weight=1.0,
+        c_state=0.25,
+    )
+
+    expected_root_evidence = 0.25 * outcome_mean(child.state_summary_alpha)[::-1]
+    assert np.allclose(root.edge_evidence_E[0], expected_root_evidence)
+    assert not np.allclose(root.edge_evidence_E[0], 0.25 * outcome_mean(child.value_alpha)[::-1])
+
+
+def test_arena_child_value_alpha_replaces_parent_edge_base_with_perspective_flip():
+    arena = PosteriorArena(max_nodes=4, max_edges=4, num_actions=1, num_outcomes=3)
+    root_id = arena.add_expanded_node(
+        key=np.array([1, 0, 0, 0], dtype=np.uint32),
+        current_player=0,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.ones((3,), dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    child_id = arena.add_expanded_node(
+        key=np.array([2, 0, 0, 0], dtype=np.uint32),
+        current_player=1,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.array([1.0, 2.0, 7.0], dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    edge_id = int(arena.node_first_edge[root_id])
+    search = BatchedPosteriorArenaSearch(env=object())
+    search.arena = arena
+
+    search._update_edge_base_from_children(np.array([edge_id], dtype=np.int32), np.array([child_id], dtype=np.int32))
+
+    assert np.allclose(arena.edge_base_alpha[edge_id], np.array([7.0, 2.0, 1.0], dtype=np.float32))
+    assert np.allclose(arena.edge_post_alpha[edge_id], arena.edge_base_alpha[edge_id] + arena.edge_E[edge_id])
+
+
+def test_arena_terminal_backup_uses_terminal_node_perspective():
+    arena = PosteriorArena(max_nodes=4, max_edges=4, num_actions=1, num_outcomes=3)
+    root_id = arena.add_expanded_node(
+        key=np.array([1, 0, 0, 0], dtype=np.uint32),
+        current_player=0,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.ones((3,), dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    terminal_id = arena.add_terminal_node(
+        key=np.array([2, 0, 0, 0], dtype=np.uint32),
+        current_player=1,
+        terminal_outcome=2,
+    )
+    edge_id = int(arena.node_first_edge[root_id])
+    arena.edge_child_node[edge_id] = terminal_id
+    search = BatchedPosteriorArenaSearch(env=object())
+    search.arena = arena
+
+    search._backup_path(
+        np.array([root_id], dtype=np.int32),
+        np.array([edge_id], dtype=np.int32),
+        1,
+        leaf_node_id=terminal_id,
+        leaf_value=terminal_one_hot(2),
+        leaf_weight=8.0,
+        c_state=0.1,
+    )
+
+    assert np.allclose(arena.edge_E[edge_id], np.array([8.0, 0.0, 0.0], dtype=np.float32))
+
+
+def test_inflight_and_duplicate_scheduling_do_not_change_posterior():
+    store = InMemoryNodeStore()
+    root = NodeBlob.expanded_node(
+        key=StateKey((21, 0, 0, 0)),
+        current_player=0,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.ones((3,), dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.array([[[1.0, 2.0, 3.0]]], dtype=np.float32).reshape((1, 3)),
+    )
+    store.put_many([root])
+    before_base = root.edge_base_alpha.copy()
+    before_evidence = root.edge_evidence_E.copy()
+    before_post = root.edge_post_alpha.copy()
+
+    child_key = StateKey((22, 0, 0, 0))
+    claim = store.claim_many_inflight([child_key, child_key])
+
+    assert claim.claimed == (child_key,)
+    assert np.allclose(root.edge_base_alpha, before_base)
+    assert np.allclose(root.edge_evidence_E, before_evidence)
+    assert np.allclose(root.edge_post_alpha, before_post)
+
+
+def test_transposition_two_parents_reference_same_canonical_child_node():
+    arena = PosteriorArena(max_nodes=8, max_edges=8, num_actions=1, num_outcomes=3)
+    parent_a = arena.add_expanded_node(
+        key=np.array([1, 0, 0, 0], dtype=np.uint32),
+        current_player=0,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.ones((3,), dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    parent_b = arena.add_expanded_node(
+        key=np.array([2, 0, 0, 0], dtype=np.uint32),
+        current_player=1,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.ones((3,), dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    child = arena.add_expanded_node(
+        key=np.array([3, 0, 0, 0], dtype=np.uint32),
+        current_player=0,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.array([1.0, 3.0, 9.0], dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    edge_a = int(arena.node_first_edge[parent_a])
+    edge_b = int(arena.node_first_edge[parent_b])
+    arena.edge_child_node[[edge_a, edge_b]] = child
+    arena.edge_child_key[[edge_a, edge_b]] = arena.node_key[child]
+    search = BatchedPosteriorArenaSearch(env=object())
+    search.arena = arena
+
+    search._update_edge_base_from_children(
+        np.array([edge_a, edge_b], dtype=np.int32),
+        np.array([child, child], dtype=np.int32),
+    )
+
+    assert int(arena.edge_child_node[edge_a]) == int(arena.edge_child_node[edge_b]) == child
+    assert np.array_equal(arena.edge_child_key[edge_a], arena.edge_child_key[edge_b])
+    assert np.allclose(arena.edge_base_alpha[edge_a], np.array([1.0, 3.0, 9.0], dtype=np.float32))
+    assert np.allclose(arena.edge_base_alpha[edge_b], np.array([9.0, 3.0, 1.0], dtype=np.float32))
 
 
 def test_arena_batch_expansion_preserves_variable_legal_action_order():

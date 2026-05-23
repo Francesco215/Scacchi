@@ -493,6 +493,12 @@ def search_config_from_any(config: Any, *, num_roots: int = 1) -> SearchConfig:
         pad_eval_batches=bool(getattr(config, "wavefront_pad_eval_batches", True)),
         pad_jax_select=bool(getattr(config, "wavefront_pad_jax_select", False)),
         np_select_below=max(0, int(getattr(config, "wavefront_np_select_below", 1024))),
+        grouped_expansion=bool(getattr(config, "wavefront_grouped_expansion", True)),
+        lane_indexed_step=bool(getattr(config, "wavefront_lane_indexed_step", True)),
+        stable_lane_batch=bool(getattr(config, "wavefront_stable_lane_batch", True)),
+        pad_pending_observation_gather=bool(
+            getattr(config, "wavefront_pad_pending_observation_gather", True)
+        ),
     )
 
 
