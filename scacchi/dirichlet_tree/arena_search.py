@@ -29,6 +29,11 @@ _STEP_CACHE: dict[int, tuple[weakref.ReferenceType[Any] | None, Any]] = {}
 _STEP_INFO_CACHE: dict[int, tuple[weakref.ReferenceType[Any] | None, Any]] = {}
 _KEY_CACHE: dict[type, Any] = {}
 
+
+@jax.jit
+def _take_rows_jit(array: jax.Array, rows: jax.Array) -> jax.Array:
+    return array[rows]
+
 TIMING_BUCKETS = (
     "root_hashing",
     "root_eval",
@@ -56,6 +61,7 @@ class _PendingBatch:
     path_nodes: np.ndarray
     path_edges: np.ndarray
     path_len: np.ndarray
+    eval_indices: np.ndarray | None = None
 
     @property
     def size(self) -> int:
@@ -1006,6 +1012,45 @@ class BatchedPosteriorArenaSearch:
         with self._timed("leaf_observation_gather"):
             pending_batch = _merge_pending_batches(pending)
             self._block_if_timing(pending_batch.observations)
+        if (
+            pending_batch.eval_indices is not None
+            and config.pad_eval_batches
+            and int(pending_batch.observations.shape[0]) == int(config.eval_batch_size)
+            and pending_batch.size <= int(config.eval_batch_size)
+        ):
+            with self._timed("nn_eval"):
+                eval_result = leaf_evaluator(pending_batch.observations)
+                self._block_if_timing(eval_result)
+            with self._timed("device_get"):
+                logits, value_alpha, q_alpha = jax.device_get(eval_result)
+            eval_indices = pending_batch.eval_indices
+            logits = logits[eval_indices]
+            value_alpha = value_alpha[eval_indices]
+            q_alpha = q_alpha[eval_indices]
+            with self._timed("expansion"):
+                child_node_ids = arena.add_expanded_nodes_batch(
+                    keys=pending_batch.key_words,
+                    current_players=pending_batch.players,
+                    legal_action_mask=pending_batch.legal,
+                    value_alpha=value_alpha,
+                    policy_logits=logits,
+                    q_alpha=q_alpha,
+                    assume_unique_new=True,
+                    allow_grouped=config.grouped_expansion,
+                )
+            with self._timed("backup"):
+                self._backup_pending_rows(
+                    child_node_ids=child_node_ids,
+                    root_ids=pending_batch.root_ids,
+                    path_nodes=pending_batch.path_nodes,
+                    path_edges=pending_batch.path_edges,
+                    path_len=pending_batch.path_len,
+                    done=done,
+                    leaf_weight=config.c_leaf,
+                    c_state=config.c_state,
+                    num_simulations=config.num_simulations,
+                )
+            return
         for start in range(0, pending_batch.size, config.eval_batch_size):
             end = min(start + config.eval_batch_size, pending_batch.size)
             real_count = end - start
@@ -1246,12 +1291,23 @@ def _make_pending_batch(
         missing_rows = missing_rows[keep]
         missing_state_indices = missing_state_indices[keep]
     max_path_len = int(np.max(path_len[missing_rows])) if missing_rows.size else 0
-    return _PendingBatch(
-        observations=_select_array_rows_padded(
-            next_state_batch.observation,
+    source_observations = next_state_batch.observation
+    eval_indices: np.ndarray | None = None
+    if (
+        observation_pad_size is not None
+        and int(source_observations.shape[0]) == int(observation_pad_size)
+        and missing_state_indices.shape[0] <= int(observation_pad_size)
+    ):
+        observations = source_observations
+        eval_indices = missing_state_indices.astype(np.int32, copy=True)
+    else:
+        observations = _select_array_rows_padded(
+            source_observations,
             missing_state_indices,
             target_size=observation_pad_size,
-        ),
+        )
+    return _PendingBatch(
+        observations=observations,
         key_words=key_words[missing_state_indices].copy(),
         players=players[missing_state_indices].astype(np.int32, copy=True),
         legal=legal[missing_state_indices].copy(),
@@ -1259,6 +1315,7 @@ def _make_pending_batch(
         path_nodes=path_nodes[missing_rows, :max_path_len].copy(),
         path_edges=path_edges[missing_rows, :max_path_len].copy(),
         path_len=path_len[missing_rows].astype(np.int16, copy=True),
+        eval_indices=eval_indices,
     )
 
 
@@ -1269,7 +1326,9 @@ def _merge_pending_batches(pending: list[_PendingBatch]) -> _PendingBatch:
     if total_size == 0:
         raise ValueError("cannot merge empty pending batches")
     max_path_width = max(batch.path_nodes.shape[1] for batch in pending)
-    observations = jnp.concatenate([batch.observations[: batch.size] for batch in pending], axis=0)
+    observations = _merge_padded_observations(pending, total_size)
+    if observations is None:
+        observations = jnp.concatenate([_pending_selected_observations(batch) for batch in pending], axis=0)
     key_words = np.concatenate([batch.key_words for batch in pending], axis=0)
     players = np.concatenate([batch.players for batch in pending], axis=0)
     legal = np.concatenate([batch.legal for batch in pending], axis=0)
@@ -1296,6 +1355,38 @@ def _merge_pending_batches(pending: list[_PendingBatch]) -> _PendingBatch:
     )
 
 
+def _merge_padded_observations(pending: list[_PendingBatch], total_size: int) -> jax.Array | None:
+    target_size = int(pending[0].observations.shape[0])
+    if target_size <= 0 or int(total_size) > target_size:
+        return None
+    if any(int(batch.observations.shape[0]) != target_size for batch in pending):
+        return None
+    if not any(batch.eval_indices is not None or batch.size < target_size for batch in pending):
+        return None
+
+    sources = jnp.concatenate([batch.observations for batch in pending], axis=0)
+    indices = np.empty((target_size,), dtype=np.int32)
+    offset = 0
+    source_offset = 0
+    for batch in pending:
+        if batch.eval_indices is None:
+            local_indices = np.arange(batch.size, dtype=np.int32)
+        else:
+            local_indices = np.asarray(batch.eval_indices, dtype=np.int32)
+        next_offset = offset + batch.size
+        indices[offset:next_offset] = source_offset + local_indices[: batch.size]
+        offset = next_offset
+        source_offset += target_size
+    indices[offset:] = indices[0] if offset else 0
+    return _take_rows_jit(sources, jnp.asarray(indices, dtype=jnp.int32))
+
+
+def _pending_selected_observations(batch: _PendingBatch) -> jax.Array:
+    if batch.eval_indices is None:
+        return batch.observations[: batch.size]
+    return _select_array_rows(batch.observations, batch.eval_indices)
+
+
 def _eval_observation_batch(
     observations: jax.Array,
     start: int,
@@ -1314,7 +1405,7 @@ def _eval_observation_batch(
     indices = np.empty((int(target_size),), dtype=np.int32)
     indices[:real_count] = np.arange(start, end, dtype=np.int32)
     indices[real_count:] = int(start)
-    return observations[jnp.asarray(indices, dtype=jnp.int32)]
+    return _take_rows_jit(observations, jnp.asarray(indices, dtype=jnp.int32))
 
 
 def _first_unique_indices(key_words: np.ndarray) -> np.ndarray:
@@ -1556,7 +1647,7 @@ def _posterior_best_policy_target_batch_np(
             chunk_alpha[None, :, :, :],
             (samples, end - start, num_actions, num_outcomes),
         )
-        gamma = rng.gamma(gamma_shape, 1.0).astype(np.float32, copy=False)
+        gamma = rng.standard_gamma(gamma_shape, dtype=np.float32)
         denom = np.maximum(np.sum(gamma, axis=-1, keepdims=True), np.float32(1e-12))
         phi = gamma / denom
         utility = phi[..., -1] - phi[..., 0]
@@ -1643,7 +1734,7 @@ def _select_array_rows(array: jax.Array, rows: np.ndarray) -> jax.Array:
         return array[:0]
     if _is_prefix_indices(rows):
         return array[: rows.shape[0]]
-    return array[jnp.asarray(rows, dtype=jnp.int32)]
+    return _take_rows_jit(array, jnp.asarray(rows, dtype=jnp.int32))
 
 
 def _select_array_rows_padded(
@@ -1660,7 +1751,7 @@ def _select_array_rows_padded(
     indices = np.empty((int(target_size),), dtype=np.int32)
     indices[: rows.shape[0]] = rows
     indices[rows.shape[0] :] = rows[0]
-    return array[jnp.asarray(indices, dtype=jnp.int32)]
+    return _take_rows_jit(array, jnp.asarray(indices, dtype=jnp.int32))
 
 
 def _state_batch_size(state: Any) -> int:

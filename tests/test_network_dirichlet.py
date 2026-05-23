@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 
 from scacchi.network import (
+    AZNet,
     BoardlawDirichletNet,
     BoardlawNet,
     dirichlet_from_logits,
@@ -42,6 +43,49 @@ def test_boardlaw_dirichlet_net_shapes_and_positive_alphas():
     assert jnp.all(alpha_q > 0)
     assert jnp.allclose(outcome_mean(alpha_v).sum(axis=-1), 1.0)
     assert jnp.allclose(outcome_mean(alpha_q).sum(axis=-1), 1.0)
+
+
+def test_boardlaw_dirichlet_heads_initialize_to_uniform_policy_and_unit_alphas():
+    model = BoardlawDirichletNet(
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        num_outcomes=3,
+        width=16,
+        depth=2,
+        rngs=nnx.Rngs(0),
+    )
+    obs = jnp.ones((4, 3, 3, 4))
+
+    logits, alpha_v, alpha_q = model(obs, train=False)
+
+    assert jnp.allclose(logits, jnp.zeros_like(logits))
+    assert jnp.allclose(jax.nn.softmax(logits, axis=-1), jnp.full_like(logits, 0.1))
+    assert jnp.allclose(alpha_v, jnp.ones_like(alpha_v))
+    assert jnp.allclose(alpha_q, jnp.ones_like(alpha_q))
+
+
+def test_scalar_policy_heads_initialize_to_uniform_logits():
+    obs = jnp.ones((2, 3, 3, 4))
+    az_model = AZNet(
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        num_channels=8,
+        num_blocks=1,
+        rngs=nnx.Rngs(0),
+    )
+    boardlaw_model = BoardlawNet(
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        width=16,
+        depth=1,
+        rngs=nnx.Rngs(1),
+    )
+
+    az_logits, _ = az_model(obs, train=False)
+    boardlaw_logits, _ = boardlaw_model(obs, train=False)
+
+    assert jnp.allclose(az_logits, jnp.zeros_like(az_logits))
+    assert jnp.allclose(boardlaw_logits, jnp.zeros_like(boardlaw_logits))
 
 
 def test_policy_value_adapter_supports_scalar_and_dirichlet_boardlaw():

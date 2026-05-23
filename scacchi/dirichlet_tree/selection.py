@@ -30,7 +30,7 @@ def thompson_select_np(
 ) -> tuple[np.ndarray, np.ndarray]:
     alpha = np.maximum(np.asarray(edge_post_alpha, dtype=np.float32), np.float32(1e-6))
     mask = np.asarray(action_mask, dtype=bool)
-    gamma = rng.gamma(alpha, 1.0).astype(np.float32, copy=False)
+    gamma = rng.standard_gamma(alpha, dtype=np.float32)
     phi = gamma / np.maximum(np.sum(gamma, axis=-1, keepdims=True), np.float32(1e-12))
     utility = np.where(mask, phi[..., -1] - phi[..., 0], -np.inf)
     idx = np.argmax(utility, axis=-1).astype(np.int32)

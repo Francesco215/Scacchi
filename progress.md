@@ -150,6 +150,9 @@ The latest pass focused on host-side overhead and JAX shape churn:
 - Added optional arena timing buckets for root hashing, root eval, node packing, Thompson selection, PGX step/hash, device transfer, child classification, leaf observation gather, NN eval, expansion, backup, posterior target generation, and store flush.
 - Added ablation flags for grouped expansion, lane-indexed stepping, and padded pending-observation gathers, plus the existing hybrid-selector threshold toggle.
 - Added benchmark summaries that report median, p10, p90, best, and cold-start-excluded mean instead of only best warmed samples.
+- Added a direct full-source eval path for pending leaves whose source observation batch already matches `search_eval_batch_size`; the model still runs one full padded batch, but expansion and backup select outputs only for the real missing leaves.
+- Merged multiple already-padded pending leaf groups with a fixed-size gather instead of slicing them back to dynamic real sizes and padding again. This keeps late-wave eval preparation shape-stable when root de-dup shrinks active lanes.
+- Switched NumPy Thompson selection and batched posterior-best target sampling to `Generator.standard_gamma(..., dtype=np.float32)`. This preserves exact Dirichlet sampling while avoiding float64 gamma draws followed by a cast.
 
 ## Benchmark Results
 
@@ -308,6 +311,38 @@ batch=512, arena_stable_lane_batch:    best=50483.8/s, median=47410.2/s, p10=242
 
 The `batch=512` case is the clearest result: keeping the lane shape stable removes a large source of timing collapse in the arena path and roughly doubles the best observed throughput in the matrix benchmark.
 
+Float32 gamma sampling improves the CPU selector bucket on larger boards without changing the sampling rule. On Hex 9x9, `batch=512`, `simulations=8`, prefilled roots, `policy_mc_samples=1`, the warmed hybrid-selector timing changed from roughly:
+
+```text
+before: Thompson selection ~= 28 ms to 29 ms
+after:  Thompson selection ~= 19 ms to 20 ms
+```
+
+The corresponding post-change summary was:
+
+```text
+best=29609.9/s, median=28219.1/s, p10=14465.4/s, cold-start-excluded mean=28873.2/s
+```
+
+On the same Hex 5x5 case, the Thompson bucket dropped from roughly 8 ms to 9 ms to roughly 6 ms in warmed runs. After fixed-size padded pending merges, the Hex 5x5 leaf-observation bucket also improved materially:
+
+```text
+before: warmed leaf observation gather often ~= 18 ms to 140+ ms
+after:  warmed leaf observation gather mostly ~= 6 ms to 8 ms, with one 37 ms run
+```
+
+The post-change Hex 5x5 summary was:
+
+```text
+best=52626.0/s, median=31120.4/s, p10=11038.6/s, cold-start-excluded mean=36473.7/s
+```
+
+Hex 9x9 remained stable after the pending-merge change:
+
+```text
+best=29521.0/s, median=28271.4/s, p10=10147.4/s, cold-start-excluded mean=28896.2/s
+```
+
 ## Verification
 
 Focused test command:
@@ -319,19 +354,20 @@ JAX_PLATFORMS=cpu uv run pytest \
   tests/test_dirichlet_tree_selection_backup_store.py \
   tests/test_dirichlet_tree_wavefront.py \
   tests/test_posterior_tree.py \
-  tests/test_config_validation.py
+  tests/test_config_validation.py \
+  tests/test_network_dirichlet.py
 ```
 
 Latest result:
 
 ```text
-52 passed in 5.84s
+57 passed in 11.90s
 ```
 
-Focused smoke check after the stable-lane optimization:
+Focused smoke check after the fixed-size pending merge:
 
 ```text
-33 passed in 4.31s
+33 passed in 4.15s
 ```
 
 Benchmark smoke checks:
