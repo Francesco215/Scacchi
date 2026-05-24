@@ -78,10 +78,9 @@ def _state(
 
 def _config(**overrides):
     values = dict(
-        c_leaf=1.0,
-        c_terminal=8.0,
-        c_state=0.5,
-        c_value_search=1.0,
+        kappa_leaf=1.0,
+        kappa_terminal=8.0,
+        state_posterior_kappa_n=1.0,
         policy_mc_samples=8,
         backup_mc_samples=1,
         selfplay_action_source="posterior_argmax",
@@ -104,10 +103,9 @@ def _tree(root_state=None, **overrides) -> PosteriorTree:
         root_alpha_q=np.ones((2, 3), dtype=np.float32),
         tree_index=0,
         rng=np.random.default_rng(0),
-        c_leaf=1.0,
-        c_terminal=8.0,
-        c_state=0.5,
-        c_value_search=1.0,
+        kappa_leaf=1.0,
+        kappa_terminal=8.0,
+        state_posterior_kappa_n=1.0,
         policy_mc_samples=8,
         backup_mc_samples=1,
         commit="posterior_argmax",
@@ -136,7 +134,7 @@ def test_edge_base_switches_to_expanded_child_value_prior_with_alignment():
     assert np.allclose(tree.edge_base(0, 1), np.array([4.0, 5.0, 6.0]))
 
 
-def test_backup_path_adds_direct_leaf_and_ancestor_state_posterior_evidence():
+def test_backup_path_publishes_leaf_snapshot_and_repairs_ancestor_cache():
     tree = _tree(root_state=_state(player=0, legal=(True, False)))
     child_id = tree._add_node(
         state=_state(player=1, legal=(False, True)),
@@ -168,35 +166,66 @@ def test_backup_path_adds_direct_leaf_and_ancestor_state_posterior_evidence():
         1.0,
     )
 
-    assert np.allclose(tree.nodes[child_id].evidence[1], np.array([1.0, 0.0, 0.0]))
-    expected_child_posterior = np.array([4.0, 1.0, 1.0])
-    assert np.allclose(tree.nodes[0].evidence[0], 0.5 * flip_outcome_np(expected_child_posterior))
+    assert tree.nodes[child_id].edge_has_post[1]
+    assert int(tree.nodes[child_id].edge_eval_count_R[1]) == 1
+    assert np.allclose(tree.nodes[child_id].edge_B[1], np.array([1.0, 1e-6, 1e-6]))
+    assert tree.nodes[child_id].value_cache_status == "clean"
+    assert tree.nodes[0].edge_has_post[0]
+    assert int(tree.nodes[0].edge_eval_count_R[0]) == 2
     assert tree.nodes[child_id].visits[1] == 1
     assert tree.nodes[0].visits[0] == 1
 
 
-def test_edge_posterior_is_base_plus_completed_evidence_only():
+def test_repeated_direct_leaf_backup_increments_count_without_accumulating_alpha():
+    tree = _tree(root_state=_state(player=0, legal=(True, False)))
+    leaf_id = tree._add_node(
+        state=_state(player=0, legal=(True, False)),
+        parent=0,
+        action_from_parent=0,
+        expanded=True,
+        in_flight=False,
+        prior_logits=np.zeros((2,), dtype=np.float32),
+        alpha_v=np.ones((3,), dtype=np.float32),
+        alpha_q=np.ones((2, 3), dtype=np.float32),
+    )
+    tree.nodes[0].children[0] = leaf_id
+
+    tree.backup_path(((0, 0),), leaf_id, np.array([1.0, 1.0, 3.0], dtype=np.float32))
+    tree.backup_path(((0, 0),), leaf_id, np.array([4.0, 1.0, 1.0], dtype=np.float32))
+
+    assert tree.nodes[0].edge_has_post[0]
+    assert int(tree.nodes[0].edge_eval_count_R[0]) == 2
+    assert np.allclose(tree.nodes[0].edge_B[0], np.array([4.0, 1.0, 1.0], dtype=np.float32))
+
+
+def test_edge_posterior_uses_completed_snapshot_or_base_prior():
     tree = _tree(
         root_alpha_q=np.array([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]], dtype=np.float32)
     )
-    tree.nodes[0].evidence[0] = np.array([0.5, 1.5, 2.5], dtype=np.float32)
+    tree.nodes[0].edge_B[0] = np.array([0.5, 1.5, 2.5], dtype=np.float32)
+    tree.nodes[0].edge_has_post[0] = True
 
-    assert np.allclose(tree.edge_posterior(0, 0), np.array([1.5, 3.5, 5.5]))
+    assert np.allclose(tree.edge_posterior(0, 0), np.array([0.5, 1.5, 2.5]))
     assert np.allclose(tree.edge_posterior(0, 1), np.array([10.0, 20.0, 30.0]))
 
 
-def test_state_search_posterior_uses_only_legal_action_posteriors():
-    tree = _tree(root_state=_state(player=0, legal=(False, True)))
-    tree.nodes[0].evidence[0] = np.array([100.0, 0.0, 0.0], dtype=np.float32)
-    tree.nodes[0].evidence[1] = np.array([0.0, 0.0, 5.0], dtype=np.float32)
+def test_state_search_posterior_blends_legal_posteriors_by_downstream_count():
+    tree = _tree(root_state=_state(player=0, legal=(False, True)), state_posterior_kappa_n=1.0)
+    tree.nodes[0].edge_B[0] = np.array([100.0, 1.0, 1.0], dtype=np.float32)
+    tree.nodes[0].edge_has_post[0] = True
+    tree.nodes[0].edge_eval_count_R[0] = 1
+    tree.nodes[0].edge_B[1] = np.array([1.0, 1.0, 5.0], dtype=np.float32)
+    tree.nodes[0].edge_has_post[1] = True
+    tree.nodes[0].edge_eval_count_R[1] = 1
 
     beta = tree.state_search_posterior(0)
 
-    assert np.allclose(beta, tree.edge_posterior(0, 1))
+    expected = 0.5 * tree.nodes[0].alpha_v + 0.5 * tree.edge_posterior(0, 1)
+    assert np.allclose(beta, expected)
 
 
-def test_consume_result_marks_expanded_and_backs_up_leaf_mean_evidence():
-    tree = _tree(root_state=_state(player=0, legal=(True, False)), c_leaf=2.0)
+def test_consume_result_marks_expanded_and_backs_up_leaf_alpha_snapshot():
+    tree = _tree(root_state=_state(player=0, legal=(True, False)))
     step_request = tree.next_step_request()
     assert step_request is not None
     request = tree.consume_step_result(
@@ -217,7 +246,9 @@ def test_consume_result_marks_expanded_and_backs_up_leaf_mean_evidence():
     assert not leaf.in_flight
     assert tree.inflight == 0
     assert tree.done == 1
-    assert np.allclose(tree.nodes[0].evidence[0], 2.0 * np.array([0.5, 0.25, 0.25]))
+    assert tree.nodes[0].edge_has_post[0]
+    assert int(tree.nodes[0].edge_eval_count_R[0]) == 1
+    assert np.allclose(tree.nodes[0].edge_B[0], np.array([2.0, 1.0, 1.0]))
     assert tree.nodes[0].visits[0] == 1
 
 
@@ -239,7 +270,7 @@ def test_terminal_leaf_is_backed_up_without_calling_leaf_evaluator():
     tree = _tree(
         env=TerminalToyEnv(),
         root_state=_state(player=0, legal=(True, False)),
-        c_terminal=8.0,
+        kappa_terminal=8.0,
     )
 
     step_request = tree.next_step_request()
@@ -252,7 +283,9 @@ def test_terminal_leaf_is_backed_up_without_calling_leaf_evaluator():
     assert request is None
     assert tree.done == 1
     assert tree.inflight == 0
-    assert np.allclose(tree.nodes[0].evidence[0], np.array([0.0, 0.0, 8.0]))
+    assert tree.nodes[0].edge_has_post[0]
+    assert int(tree.nodes[0].edge_eval_count_R[0]) == 1
+    assert np.allclose(tree.nodes[0].edge_B[0], np.array([1e-6, 1e-6, 8.000001]))
     assert tree.nodes[0].visits[0] == 1
 
 
@@ -261,21 +294,22 @@ def test_finish_search_returns_theory_targets_and_scalar_q_action():
         root_state=_state(player=0, legal=(True, True)),
         root_alpha_v=np.array([1.0, 1.0, 1.0], dtype=np.float32),
         root_alpha_q=np.array([[2.0, 2.0, 1.0], [1.0, 2.0, 2.0]], dtype=np.float32),
-        c_value_search=0.25,
         commit="scalar_q_argmax",
     )
-    tree.nodes[0].evidence[0] = np.array([0.0, 0.0, 2.0], dtype=np.float32)
-    tree.nodes[0].evidence[1] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    tree.nodes[0].edge_B[0] = np.array([2.0, 2.0, 3.0], dtype=np.float32)
+    tree.nodes[0].edge_B[1] = np.array([1.0, 3.0, 2.0], dtype=np.float32)
+    tree.nodes[0].edge_has_post[:] = True
+    tree.nodes[0].edge_eval_count_R[:] = 1
+    tree._mark_dirty(0)
 
-    action, policy, beta_q, beta_v, q_mass, alpha_root = tree.finish()
+    action, policy, beta_q, beta_v, q_weight, alpha_root = tree.finish()
 
     expected_alpha = np.array([[2.0, 2.0, 3.0], [1.0, 3.0, 2.0]], dtype=np.float32)
-    expected_value_proxy = np.sum(policy[:, None] * expected_alpha, axis=0)
     assert action == int(np.argmax(outcome_utility_np(outcome_mean_np(expected_alpha))))
     assert np.allclose(alpha_root, expected_alpha)
     assert np.allclose(beta_q, expected_alpha)
-    assert np.allclose(beta_v, np.array([1.0, 1.0, 1.0]) + 0.25 * expected_value_proxy)
-    assert np.allclose(q_mass, np.array([2.0, 1.0]))
+    assert np.allclose(beta_v, tree.nodes[0].value_cache_C)
+    assert np.allclose(q_weight, policy)
     assert np.allclose(policy.sum(), 1.0)
 
 
@@ -321,7 +355,7 @@ def test_run_search_uses_leaf_evaluator_for_root_and_leaf_batches():
     assert output.action_weights.shape == (1, 2)
     assert output.beta_Q_target.shape == (1, 2, 3)
     assert output.beta_V_target.shape == (1, 3)
-    assert np.allclose(np.asarray(output.q_evidence_mass[0, 0]), 1.0)
+    assert np.allclose(np.asarray(output.q_loss_weight[0].sum()), 1.0)
 
 
 def test_run_search_batches_multiple_roots_and_keeps_targets_normalized():
@@ -351,7 +385,7 @@ def test_run_search_batches_multiple_roots_and_keeps_targets_normalized():
     assert max(calls[1:]) <= 2
     assert output.action_weights.shape == (3, 2)
     assert np.allclose(np.asarray(output.action_weights.sum(axis=-1)), 1.0)
-    assert np.all(np.asarray(output.q_evidence_mass) >= 0.0)
+    assert np.all(np.asarray(output.q_loss_weight) >= 0.0)
 
 
 def test_run_search_steps_all_roots_with_one_batched_env_call_per_wave():

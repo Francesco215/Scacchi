@@ -3,7 +3,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from scacchi.dirichlet_tree.backup import backup_path, terminal_one_hot, update_edge_base_from_child
+from scacchi.dirichlet_tree.backup import backup_path, terminal_dirichlet, update_edge_base_from_child
 from scacchi.dirichlet_tree.arena_search import BatchedPosteriorArenaSearch, PosteriorArena
 from scacchi.dirichlet_tree.selection import thompson_select_jax, thompson_select_np
 from scacchi.dirichlet_tree.store import InMemoryNodeStore, RedisNodeStore
@@ -59,7 +59,7 @@ def test_thompson_selection_prefers_higher_wdl_utility_statistically():
     assert np.mean(np_actions == 0) > 0.95
 
 
-def test_backup_updates_direct_evidence_and_state_posterior_ancestor_summary():
+def test_backup_publishes_snapshot_and_gamma_state_cache_to_ancestor():
     store = InMemoryNodeStore()
     root = NodeBlob.expanded_node(
         key=StateKey((1, 0, 0, 0)),
@@ -96,18 +96,63 @@ def test_backup_updates_direct_evidence_and_state_posterior_ancestor_summary():
         leaf_node=leaf,
         leaf_value=outcome_mean(leaf.value_alpha),
         leaf_weight=2.0,
-        c_state=0.5,
         rng=np.random.default_rng(0),
         backup_mc_samples=8,
     )
 
-    assert np.allclose(child.edge_evidence_E[0], 2.0 * np.array([0.6, 0.2, 0.2]))
-    expected_child_beta = np.array([2.2, 1.4, 1.4], dtype=np.float32)
-    assert np.allclose(root.edge_evidence_E[0], 0.5 * expected_child_beta[::-1])
-    assert np.allclose(root.edge_post_alpha[0], root.edge_base_alpha[0] + root.edge_evidence_E[0])
+    assert child.edge_has_post[0]
+    assert int(child.edge_eval_count_R[0]) == 1
+    assert np.allclose(child.edge_B[0], 2.0 * np.array([0.6, 0.2, 0.2]))
+    expected_child_cache = 0.9 * child.value_alpha + 0.1 * child.edge_B[0]
+    assert np.allclose(child.value_cache_C, expected_child_cache)
+    assert root.edge_has_post[0]
+    assert int(root.edge_eval_count_R[0]) == 2
+    assert np.allclose(root.edge_B[0], expected_child_cache[::-1])
+    assert np.allclose(root.edge_post_alpha[0], root.edge_B[0])
 
 
-def test_ancestor_backup_uses_child_search_posterior_not_value_alpha():
+def test_direct_leaf_backup_replaces_snapshot_but_increments_eval_count_store():
+    store = InMemoryNodeStore()
+    root = NodeBlob.expanded_node(
+        key=StateKey((31, 0, 0, 0)),
+        current_player=0,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.ones((3,), dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    leaf = NodeBlob.expanded_node(
+        key=StateKey((32, 0, 0, 0)),
+        current_player=0,
+        legal_action_mask=np.array([True]),
+        value_alpha=np.ones((3,), dtype=np.float32),
+        policy_logits=np.zeros((1,), dtype=np.float32),
+        q_alpha=np.ones((1, 3), dtype=np.float32),
+    )
+    root.child_keys[0] = leaf.key.to_array()
+    store.put_many([root, leaf])
+
+    backup_path(
+        store,
+        path=[PathStep(root.key, 0)],
+        leaf_node=leaf,
+        leaf_value=np.array([1.0, 1.0, 3.0], dtype=np.float32),
+        rng=np.random.default_rng(0),
+    )
+    backup_path(
+        store,
+        path=[PathStep(root.key, 0)],
+        leaf_node=leaf,
+        leaf_value=np.array([4.0, 1.0, 1.0], dtype=np.float32),
+        rng=np.random.default_rng(1),
+    )
+
+    assert root.edge_has_post[0]
+    assert int(root.edge_eval_count_R[0]) == 2
+    assert np.allclose(root.edge_B[0], np.array([4.0, 1.0, 1.0], dtype=np.float32))
+
+
+def test_ancestor_refresh_uses_child_clean_cache_not_value_alpha():
     store = InMemoryNodeStore()
     root = NodeBlob.expanded_node(
         key=StateKey((11, 0, 0, 0)),
@@ -153,16 +198,15 @@ def test_ancestor_backup_uses_child_search_posterior_not_value_alpha():
         leaf_node=leaf,
         leaf_value=outcome_mean(leaf.value_alpha),
         leaf_weight=1.0,
-        c_state=0.25,
         rng=np.random.default_rng(0),
         backup_mc_samples=8,
     )
 
-    grandchild_beta = np.array([1.0 + 5.0 / 7.0, 1.0 + 1.0 / 7.0, 1.0 + 1.0 / 7.0])
-    child_beta = np.ones((3,), dtype=np.float32) + 0.25 * grandchild_beta[::-1]
-    expected_root_evidence = 0.25 * child_beta[::-1]
-    assert np.allclose(root.edge_evidence_E[0], expected_root_evidence)
-    assert not np.allclose(root.edge_evidence_E[0], 0.25 * outcome_mean(child.value_alpha)[::-1])
+    assert grandchild.edge_has_post[0]
+    assert child.edge_has_post[0]
+    assert root.edge_has_post[0]
+    assert int(root.edge_eval_count_R[0]) == 3
+    assert not np.allclose(root.edge_B[0], outcome_mean(child.value_alpha)[::-1])
 
 
 def test_arena_child_value_alpha_replaces_parent_edge_base_with_perspective_flip():
@@ -224,14 +268,26 @@ def test_arena_terminal_backup_uses_terminal_node_perspective():
         np.array([edge_id], dtype=np.int32),
         1,
         leaf_node_id=terminal_id,
-        leaf_value=terminal_one_hot(2),
-        leaf_weight=8.0,
-        c_state=0.1,
+        leaf_value=terminal_dirichlet(2, kappa_terminal=8.0),
         backup_mc_samples=8,
     )
 
     assert np.allclose(arena.edge_base_alpha[edge_id], before_base)
-    assert np.allclose(arena.edge_E[edge_id], np.array([8.0, 0.0, 0.0], dtype=np.float32))
+    assert arena.edge_has_post[edge_id]
+    assert int(arena.edge_eval_count_R[edge_id]) == 1
+    assert np.allclose(arena.edge_B[edge_id], np.array([8.000001, 1e-6, 1e-6], dtype=np.float32))
+
+    search._backup_path(
+        np.array([root_id], dtype=np.int32),
+        np.array([edge_id], dtype=np.int32),
+        1,
+        leaf_node_id=terminal_id,
+        leaf_value=terminal_dirichlet(0, kappa_terminal=8.0),
+        backup_mc_samples=8,
+    )
+
+    assert int(arena.edge_eval_count_R[edge_id]) == 2
+    assert np.allclose(arena.edge_B[edge_id], np.array([1e-6, 1e-6, 8.000001], dtype=np.float32))
 
 
 def test_inflight_and_duplicate_scheduling_do_not_change_posterior():
@@ -358,7 +414,7 @@ def test_grouped_arena_expansion_preserves_original_row_order_across_legal_count
     assert arena.edge_action[arena.node_first_edge[node_ids[2]] : arena.node_first_edge[node_ids[2]] + 1].tolist() == [3]
 
 
-def test_refresh_summaries_groups_parents_with_different_legal_counts():
+def test_repair_dirty_frontier_groups_parents_with_different_legal_counts():
     from scacchi.dirichlet_tree.arena_search import BatchedPosteriorArenaSearch
 
     arena = PosteriorArena(max_nodes=8, max_edges=16, num_actions=4, num_outcomes=3)
@@ -378,14 +434,19 @@ def test_refresh_summaries_groups_parents_with_different_legal_counts():
         q_alpha=np.ones((3, 4, 3), dtype=np.float32),
         assume_unique_new=True,
     )
-    arena.edge_E[arena.node_first_edge[node_ids[0]]] = np.array([0.0, 0.0, 3.0], dtype=np.float32)
-    arena.edge_E[arena.node_first_edge[node_ids[1]]] = np.array([3.0, 0.0, 0.0], dtype=np.float32)
+    edge0 = int(arena.node_first_edge[node_ids[0]])
+    edge1 = int(arena.node_first_edge[node_ids[1]])
+    arena.edge_B[edge0] = np.array([1.0, 1.0, 4.0], dtype=np.float32)
+    arena.edge_B[edge1] = np.array([4.0, 1.0, 1.0], dtype=np.float32)
+    arena.edge_post_alpha[[edge0, edge1]] = arena.edge_B[[edge0, edge1]]
+    arena.edge_has_post[[edge0, edge1]] = True
+    arena.edge_eval_count_R[[edge0, edge1]] = 1
+    arena.node_value_cache_status[node_ids[:2]] = 0
 
     search = BatchedPosteriorArenaSearch(env=object())
     search.arena = arena
-    search._refresh_edges_and_summaries(
-        arena.node_first_edge[node_ids],
-        node_ids,
+    search._repair_dirty_frontier(
+        type("Cfg", (), {"backup_mc_samples": 8, "state_posterior_kappa_n": 9.0})()
     )
 
     assert np.all(arena.node_summary_alpha[node_ids] > 0.0)

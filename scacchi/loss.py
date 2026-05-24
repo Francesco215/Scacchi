@@ -20,10 +20,15 @@ class Sample(NamedTuple):
     value_mask: jax.Array
     beta_Q_target: jax.Array
     beta_V_target: jax.Array
-    q_evidence_mass: jax.Array
+    q_loss_weight: jax.Array
     policy_loss_mask: jax.Array | None = None
     value_loss_mask: jax.Array | None = None
+    search_loss_mask: jax.Array | None = None
     outcome_mask: jax.Array | None = None
+
+    @property
+    def q_evidence_mass(self) -> jax.Array:
+        return self.q_loss_weight
 
 
 class TrainMetrics(NamedTuple):
@@ -38,7 +43,11 @@ class TrainMetrics(NamedTuple):
     q_outcome_loss: jax.Array
     alpha_V_concentration: jax.Array
     alpha_Q_concentration: jax.Array
-    q_evidence_mass_mean: jax.Array
+    q_loss_weight_mean: jax.Array
+
+    @property
+    def q_evidence_mass_mean(self) -> jax.Array:
+        return self.q_loss_weight_mean
 
 
 def make_compute_loss_input(config):
@@ -46,7 +55,11 @@ def make_compute_loss_input(config):
         value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
         legal_policy_mask = jnp.any(data.legal_action_mask, axis=-1)
         policy_target_mask = jnp.sum(data.action_weights, axis=-1) > 0
-        search_value_mask = jnp.sum(data.q_evidence_mass, axis=-1) > 0
+        search_loss_mask = (
+            data.search_loss_mask
+            if data.search_loss_mask is not None
+            else policy_target_mask
+        )
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
         def body_fn(carry: jax.Array, i: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -69,9 +82,10 @@ def make_compute_loss_input(config):
             value_mask=value_mask,
             beta_Q_target=data.beta_Q_target,
             beta_V_target=data.beta_V_target,
-            q_evidence_mass=data.q_evidence_mass,
-            policy_loss_mask=legal_policy_mask & policy_target_mask,
-            value_loss_mask=value_mask | search_value_mask,
+            q_loss_weight=data.q_loss_weight,
+            policy_loss_mask=legal_policy_mask & search_loss_mask,
+            value_loss_mask=search_loss_mask,
+            search_loss_mask=search_loss_mask,
             outcome_mask=value_mask,
         )
         if data.tree_data is None:
@@ -99,12 +113,14 @@ def make_compute_loss_input(config):
         tree_beta_q = flatten_root(tree.beta_Q_target)
         root_beta_v = flatten_root(sample.beta_V_target)
         tree_beta_v = flatten_root(tree.beta_V_target)
-        root_q_evidence = flatten_root(sample.q_evidence_mass)
-        tree_q_evidence = flatten_root(tree.q_evidence_mass)
+        root_q_weight = flatten_root(sample.q_loss_weight)
+        tree_q_weight = flatten_root(tree.q_loss_weight)
         root_policy_loss_mask = flatten_root(sample.policy_loss_mask)
         tree_policy_loss_mask = flatten_root(tree.policy_loss_mask)
         root_value_loss_mask = flatten_root(sample.value_loss_mask)
         tree_value_loss_mask = flatten_root(tree.value_loss_mask)
+        root_search_loss_mask = flatten_root(sample.search_loss_mask)
+        tree_search_loss_mask = flatten_root(tree.search_loss_mask)
         root_outcome_mask = flatten_root(sample.outcome_mask)
         tree_outcome_mask = flatten_root(tree.outcome_mask)
 
@@ -117,12 +133,15 @@ def make_compute_loss_input(config):
             value_mask=wrap_rows(jnp.concatenate([root_value_loss_mask, tree_value_loss_mask], axis=0)),
             beta_Q_target=wrap_rows(jnp.concatenate([root_beta_q, tree_beta_q], axis=0)),
             beta_V_target=wrap_rows(jnp.concatenate([root_beta_v, tree_beta_v], axis=0)),
-            q_evidence_mass=wrap_rows(jnp.concatenate([root_q_evidence, tree_q_evidence], axis=0)),
+            q_loss_weight=wrap_rows(jnp.concatenate([root_q_weight, tree_q_weight], axis=0)),
             policy_loss_mask=wrap_rows(
                 jnp.concatenate([root_policy_loss_mask, tree_policy_loss_mask], axis=0)
             ),
             value_loss_mask=wrap_rows(
                 jnp.concatenate([root_value_loss_mask, tree_value_loss_mask], axis=0)
+            ),
+            search_loss_mask=wrap_rows(
+                jnp.concatenate([root_search_loss_mask, tree_search_loss_mask], axis=0)
             ),
             outcome_mask=wrap_rows(jnp.concatenate([root_outcome_mask, tree_outcome_mask], axis=0)),
         )
@@ -207,6 +226,7 @@ def _compute_dirichlet_losses(
 ) -> tuple[jax.Array, TrainMetrics]:
     policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
     value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
+    search_loss_mask = _mask_or(data.search_loss_mask, policy_loss_mask)
     outcome_mask = _mask_or(data.outcome_mask, data.value_mask)
     policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt, where=data.policy_mask)
     policy_loss = _masked_mean(policy_loss, policy_loss_mask)
@@ -218,8 +238,13 @@ def _compute_dirichlet_losses(
     value_dir_kl_loss = _masked_mean(value_dir_kl, value_loss_mask)
 
     q_dir_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
-    q_loss_mask = data.policy_mask & policy_loss_mask[..., None] & (data.q_evidence_mass > 0)
-    q_dir_kl_loss = _masked_mean(q_dir_kl, q_loss_mask)
+    q_weights = jnp.where(
+        data.policy_mask & search_loss_mask[..., None],
+        data.q_loss_weight,
+        0.0,
+    )
+    q_eps = jnp.asarray(jnp.finfo(q_dir_kl.dtype).eps, dtype=q_dir_kl.dtype)
+    q_dir_kl_loss = jnp.sum(q_weights * q_dir_kl) / jnp.maximum(jnp.sum(q_weights), q_eps)
 
     outcome_tgt = _outcome_target(data.value_tgt, alpha_v.shape[-1])
     value_outcome_loss = _categorical_ce_from_probs(outcome_mean(alpha_v), outcome_tgt)
@@ -232,9 +257,9 @@ def _compute_dirichlet_losses(
     alpha_v_concentration = _masked_mean(jnp.sum(alpha_v, axis=-1), value_loss_mask)
     alpha_q_concentration = _masked_mean(
         jnp.sum(alpha_q, axis=-1),
-        q_loss_mask,
+        q_weights > 0,
     )
-    q_evidence_mass_mean = _masked_mean(data.q_evidence_mass, q_loss_mask)
+    q_loss_weight_mean = _masked_mean(data.q_loss_weight, q_weights > 0)
 
     total_loss = (
         config.policy_loss_weight * policy_loss
@@ -255,7 +280,7 @@ def _compute_dirichlet_losses(
         q_outcome_loss=q_outcome_loss,
         alpha_V_concentration=alpha_v_concentration,
         alpha_Q_concentration=alpha_q_concentration,
-        q_evidence_mass_mean=q_evidence_mass_mean,
+        q_loss_weight_mean=q_loss_weight_mean,
     )
     return total_loss, metrics
 
@@ -278,7 +303,7 @@ def train(model: nnx.Module, optimizer: nnx.Optimizer, data: Sample, config):
                 q_outcome_loss=jnp.zeros_like(value_loss),
                 alpha_V_concentration=jnp.zeros_like(value_loss),
                 alpha_Q_concentration=jnp.zeros_like(value_loss),
-                q_evidence_mass_mean=jnp.zeros_like(value_loss),
+                q_loss_weight_mean=jnp.zeros_like(value_loss),
             )
             return policy_loss + value_loss, metrics
 

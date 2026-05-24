@@ -4,7 +4,7 @@ run:
 
 env:
   id: hex
-  board_size: 6
+  board_size: 3
   num_outcomes: 3
 
 model:
@@ -14,8 +14,8 @@ model:
   resnet_v2: true
 
 selfplay:
-  batch_size: 2048
-  max_num_steps: 8
+  batch_size: 8
+  max_num_steps: 2048
   action_source: posterior_sample
 
 search:
@@ -29,11 +29,13 @@ search:
     policy_samples: 1
     backup_samples: 1
 
+  leaf_value_mode: alpha
+
   constants:
-    c_leaf: 1.0
-    c_terminal: 8.0
-    c_state: 0.1
-    c_value_search: 1.0
+    kappa_leaf: 1.0
+    kappa_terminal: 8.0
+    epsilon_terminal: 1e-6
+    state_posterior_kappa_n: 9.0
 
   wavefront:
     backend: arena

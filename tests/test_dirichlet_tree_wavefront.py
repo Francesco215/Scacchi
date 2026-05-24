@@ -80,10 +80,9 @@ def _config(**overrides):
         wavefront_num_lanes_per_root=1,
         wavefront_max_depth=8,
         search_eval_batch_size=16,
-        c_leaf=1.0,
-        c_terminal=8.0,
-        c_state=0.5,
-        c_value_search=0.25,
+        kappa_leaf=1.0,
+        kappa_terminal=8.0,
+        state_posterior_kappa_n=1.0,
         policy_mc_samples=8,
         wavefront_final_action_mode="argmax_q_mean",
     )
@@ -117,7 +116,7 @@ def test_wavefront_steps_multiple_roots_in_one_batched_call_and_finishes_targets
     assert output.action_weights.shape == (3, 2)
     assert np.allclose(np.asarray(output.action_weights.sum(axis=-1)), 1.0)
     assert np.allclose(np.asarray(output.action_weights[:, 1]), 0.0)
-    assert np.all(np.asarray(output.q_evidence_mass[:, 0]) > 0.0)
+    assert np.allclose(np.asarray(output.q_loss_weight.sum(axis=-1)), 1.0)
 
 
 def test_wavefront_terminal_lanes_skip_leaf_evaluator_after_root_eval():
@@ -141,7 +140,7 @@ def test_wavefront_terminal_lanes_skip_leaf_evaluator_after_root_eval():
     )
 
     assert calls == [2]
-    assert np.allclose(np.asarray(output.q_evidence_mass[:, 0]), 8.0)
+    assert np.allclose(np.asarray(output.q_loss_weight.sum(axis=-1)), 1.0)
 
 
 def test_wavefront_terminal_root_lanes_finish_without_stalling():
@@ -166,8 +165,8 @@ def test_wavefront_terminal_root_lanes_finish_without_stalling():
 
     assert calls == [2, 16]
     assert output.action.shape == (2,)
-    assert np.isclose(float(output.q_evidence_mass[0, 0]), 0.0)
-    assert float(output.q_evidence_mass[1, 0]) > 0.0
+    assert np.isclose(float(output.q_loss_weight[0, 0]), 0.0)
+    assert float(output.q_loss_weight[1, 0]) > 0.0
 
 
 def test_store_wavefront_terminal_root_lanes_finish_without_stalling():
@@ -193,8 +192,8 @@ def test_store_wavefront_terminal_root_lanes_finish_without_stalling():
 
     assert calls == [2, 1]
     assert output.action.shape == (2,)
-    assert np.isclose(float(output.q_evidence_mass[0, 0]), 0.0)
-    assert float(output.q_evidence_mass[1, 0]) > 0.0
+    assert np.isclose(float(output.q_loss_weight[0, 0]), 0.0)
+    assert float(output.q_loss_weight[1, 0]) > 0.0
 
 
 def test_wavefront_duplicate_lanes_evaluate_unique_leaf_once():
@@ -219,7 +218,7 @@ def test_wavefront_duplicate_lanes_evaluate_unique_leaf_once():
 
     assert calls == [1, 16]
     assert output.action.shape == (1,)
-    assert np.isclose(float(output.q_evidence_mass[0, 0]), 1.0)
+    assert np.isclose(float(output.q_loss_weight[0, 0]), 1.0)
 
 
 def test_wavefront_state_batch_entrypoint_avoids_root_state_list():
@@ -247,7 +246,7 @@ def test_wavefront_state_batch_entrypoint_avoids_root_state_list():
     assert output.action.shape == (3,)
     assert np.allclose(np.asarray(output.action_weights.sum(axis=-1)), 1.0)
     assert np.allclose(np.asarray(output.action_weights[:, 1]), 0.0)
-    assert np.all(np.asarray(output.q_evidence_mass[:, 0]) > 0.0)
+    assert np.all(np.asarray(output.q_loss_weight[:, 0]) > 0.0)
 
 
 def test_wavefront_eval_padding_can_be_disabled():
@@ -272,7 +271,7 @@ def test_wavefront_eval_padding_can_be_disabled():
 
     assert calls == [3, 3]
     assert output.action.shape == (3,)
-    assert np.all(np.asarray(output.q_evidence_mass[:, 0]) > 0.0)
+    assert np.all(np.asarray(output.q_loss_weight[:, 0]) > 0.0)
 
 
 def test_wavefront_state_batch_deduplicates_identical_roots():
@@ -298,7 +297,7 @@ def test_wavefront_state_batch_deduplicates_identical_roots():
     assert calls == [1, 16]
     assert output.action.shape == (3,)
     assert np.allclose(np.asarray(output.action_weights[0]), np.asarray(output.action_weights[1]))
-    assert np.allclose(np.asarray(output.q_evidence_mass[:, 0]), 1.0)
+    assert np.allclose(np.asarray(output.q_loss_weight[:, 0]), 1.0)
 
 
 def test_wavefront_tree_training_exports_internal_nodes_with_evidence():
@@ -332,10 +331,41 @@ def test_wavefront_tree_training_exports_internal_nodes_with_evidence():
     assert int(np.sum(np.asarray(output.tree_data.outcome_mask))) == 0
     row = int(np.argmax(np.asarray(output.tree_data.policy_loss_mask)))
     assert np.allclose(np.asarray(output.tree_data.obs[row]), np.array([1.0], dtype=np.float32))
-    assert np.asarray(output.tree_data.q_evidence_mass[row, 0]) > 0.0
+    assert np.asarray(output.tree_data.q_loss_weight[row, 0]) > 0.0
 
 
-def test_wavefront_tree_training_exports_terminal_leaves_as_value_only_rows():
+def test_wavefront_tree_training_includes_root_when_configured():
+    env = CountingToyEnv()
+
+    def leaf_evaluator(obs):
+        batch = obs.shape[0]
+        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
+        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
+        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
+        return logits, alpha_v, alpha_q
+
+    output = run_wavefront_posterior_tree_search_state_batch(
+        env=env,
+        root_state_batch=_stack_states([_state(0.0)]),
+        leaf_evaluator=leaf_evaluator,
+        rng_key=jax.random.PRNGKey(7),
+        config=_config(
+            num_simulations=1,
+            train_tree_nodes=True,
+            train_tree_include_root=True,
+            train_tree_include_terminal=True,
+            wavefront_pad_eval_batches=False,
+        ),
+    )
+
+    assert output.tree_data is not None
+    assert int(np.sum(np.asarray(output.tree_data.policy_loss_mask))) == 1
+    row = int(np.argmax(np.asarray(output.tree_data.policy_loss_mask)))
+    assert np.allclose(np.asarray(output.tree_data.obs[row]), np.array([0.0], dtype=np.float32))
+    assert np.asarray(output.tree_data.q_loss_weight[row, 0]) > 0.0
+
+
+def test_wavefront_tree_training_excludes_terminal_leaves():
     env = CountingToyEnv(terminal=True)
 
     def leaf_evaluator(obs):
@@ -361,5 +391,5 @@ def test_wavefront_tree_training_exports_terminal_leaves_as_value_only_rows():
     assert output.tree_data is not None
     assert output.tree_data.obs.shape[0] == 4
     assert int(np.sum(np.asarray(output.tree_data.policy_loss_mask))) == 0
-    assert int(np.sum(np.asarray(output.tree_data.value_loss_mask))) == 2
-    assert int(np.sum(np.asarray(output.tree_data.outcome_mask))) == 2
+    assert int(np.sum(np.asarray(output.tree_data.value_loss_mask))) == 0
+    assert int(np.sum(np.asarray(output.tree_data.outcome_mask))) == 0

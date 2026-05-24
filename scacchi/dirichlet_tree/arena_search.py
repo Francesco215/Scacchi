@@ -29,9 +29,15 @@ from .types import (
 
 
 UNKNOWN = -1
-STATUS_INFLIGHT = np.uint8(0)
-STATUS_EXPANDED = np.uint8(1)
-STATUS_TERMINAL = np.uint8(2)
+STATUS_UNEXPANDED = np.uint8(0)
+STATUS_INFLIGHT = np.uint8(1)
+STATUS_EXPANDING = np.uint8(2)
+STATUS_EXPANDED = np.uint8(3)
+STATUS_TERMINAL = np.uint8(4)
+
+VALUE_CACHE_DIRTY = np.uint8(0)
+VALUE_CACHE_CLEAN = np.uint8(1)
+VALUE_CACHE_UPDATING = np.uint8(2)
 
 _STEP_CACHE: dict[int, tuple[weakref.ReferenceType[Any] | None, Any]] = {}
 _STEP_INFO_CACHE: dict[int, tuple[weakref.ReferenceType[Any] | None, Any]] = {}
@@ -99,8 +105,20 @@ class PosteriorArena:
         self.node_current_player = np.zeros((self.max_nodes,), dtype=np.int8)
         self.node_first_edge = np.zeros((self.max_nodes,), dtype=np.int32)
         self.node_num_edges = np.zeros((self.max_nodes,), dtype=np.int16)
+        self.node_parent_node = np.full((self.max_nodes,), UNKNOWN, dtype=np.int32)
+        self.node_parent_action = np.full((self.max_nodes,), UNKNOWN, dtype=np.int32)
+        self.node_depth = np.zeros((self.max_nodes,), dtype=np.int16)
         self.node_value_alpha = np.ones((self.max_nodes, self.num_outcomes), dtype=np.float32)
         self.node_summary_alpha = np.ones((self.max_nodes, self.num_outcomes), dtype=np.float32)
+        self.node_value_cache_C = np.ones((self.max_nodes, self.num_outcomes), dtype=np.float32)
+        self.node_downstream_eval_count = np.zeros((self.max_nodes,), dtype=np.uint32)
+        self.node_value_cache_status = np.full(
+            (self.max_nodes,),
+            VALUE_CACHE_CLEAN,
+            dtype=np.uint8,
+        )
+        self.node_value_cache_version = np.zeros((self.max_nodes,), dtype=np.uint32)
+        self.node_edge_epoch = np.zeros((self.max_nodes,), dtype=np.uint32)
         self.node_terminal_outcome = np.full((self.max_nodes,), -1, dtype=np.int8)
         self.node_observation = None
         if observation_shape is not None:
@@ -115,6 +133,11 @@ class PosteriorArena:
         self.edge_child_node = np.full((self.max_edges,), UNKNOWN, dtype=np.int32)
         self.edge_child_key = np.zeros((self.max_edges, 4), dtype=np.uint32)
         self.edge_base_alpha = np.ones((self.max_edges, self.num_outcomes), dtype=np.float32)
+        self.edge_B = np.ones((self.max_edges, self.num_outcomes), dtype=np.float32)
+        self.edge_has_post = np.zeros((self.max_edges,), dtype=bool)
+        self.edge_eval_count_R = np.zeros((self.max_edges,), dtype=np.uint32)
+        self.edge_version = np.zeros((self.max_edges,), dtype=np.uint32)
+        self.edge_child_cache_version = np.full((self.max_edges,), -1, dtype=np.int64)
         self.edge_E = np.zeros((self.max_edges, self.num_outcomes), dtype=np.float32)
         self.edge_post_alpha = np.ones((self.max_edges, self.num_outcomes), dtype=np.float32)
         self.edge_logit = np.zeros((self.max_edges,), dtype=np.float32)
@@ -134,6 +157,9 @@ class PosteriorArena:
         policy_logits: np.ndarray,
         q_alpha: np.ndarray,
         observation: np.ndarray | None = None,
+        parent_node_id: int = UNKNOWN,
+        parent_action: int = UNKNOWN,
+        depth: int = 0,
     ) -> int:
         self.ensure_key_index()
         key_id = _key_id(key)
@@ -149,12 +175,20 @@ class PosteriorArena:
         if first_edge + edge_count > self.max_edges:
             raise MemoryError("posterior arena edge capacity exceeded")
         self.sorted_key_view = None
-        self.node_status[node_id] = STATUS_EXPANDED
+        self.node_status[node_id] = STATUS_EXPANDING
         self.node_key[node_id] = np.asarray(key, dtype=np.uint32)
         self.node_current_player[node_id] = np.int8(current_player)
         self.node_first_edge[node_id] = np.int32(first_edge)
         self.node_num_edges[node_id] = np.int16(edge_count)
+        self.node_parent_node[node_id] = np.int32(parent_node_id)
+        self.node_parent_action[node_id] = np.int32(parent_action)
+        self.node_depth[node_id] = np.int16(depth)
         self.node_value_alpha[node_id] = _positive(value_alpha)
+        self.node_value_cache_C[node_id] = self.node_value_alpha[node_id]
+        self.node_downstream_eval_count[node_id] = np.uint32(0)
+        self.node_value_cache_status[node_id] = VALUE_CACHE_CLEAN
+        self.node_value_cache_version[node_id] += np.uint32(1)
+        self.node_edge_epoch[node_id] = np.uint32(0)
         self.node_terminal_outcome[node_id] = np.int8(-1)
         self._set_node_observation(node_id, observation)
 
@@ -165,12 +199,18 @@ class PosteriorArena:
         self.edge_child_key[first_edge:end_edge] = 0
         sparse_q = _positive(np.asarray(q_alpha, dtype=np.float32)[legal_actions])
         self.edge_base_alpha[first_edge:end_edge] = sparse_q
+        self.edge_B[first_edge:end_edge] = sparse_q
+        self.edge_has_post[first_edge:end_edge] = False
+        self.edge_eval_count_R[first_edge:end_edge] = 0
+        self.edge_version[first_edge:end_edge] = 0
+        self.edge_child_cache_version[first_edge:end_edge] = -1
         self.edge_E[first_edge:end_edge] = 0.0
         self.edge_post_alpha[first_edge:end_edge] = sparse_q
         self.edge_logit[first_edge:end_edge] = np.asarray(policy_logits, dtype=np.float32)[legal_actions]
         self.edge_visits[first_edge:end_edge] = 0
         self.num_edges = end_edge
-        self.recompute_summary(node_id)
+        self.node_summary_alpha[node_id] = self.node_value_cache_C[node_id]
+        self.node_status[node_id] = STATUS_EXPANDED
         return node_id
 
     def add_expanded_nodes_batch(
@@ -185,6 +225,9 @@ class PosteriorArena:
         observations: np.ndarray | None = None,
         assume_unique_new: bool = False,
         allow_grouped: bool = True,
+        parent_node_ids: np.ndarray | None = None,
+        parent_actions: np.ndarray | None = None,
+        depths: np.ndarray | None = None,
     ) -> np.ndarray:
         keys = np.asarray(keys, dtype=np.uint32).reshape((-1, 4))
         count = int(keys.shape[0])
@@ -203,6 +246,11 @@ class PosteriorArena:
                         policy_logits=policy_logits[ix],
                         q_alpha=q_alpha[ix],
                         observation=None if observations is None else observations[ix],
+                        parent_node_id=(
+                            UNKNOWN if parent_node_ids is None else int(parent_node_ids[ix])
+                        ),
+                        parent_action=UNKNOWN if parent_actions is None else int(parent_actions[ix]),
+                        depth=0 if depths is None else int(depths[ix]),
                     )
                     for ix in range(count)
                 ],
@@ -232,6 +280,13 @@ class PosteriorArena:
                     observations=None if observations is None else np.asarray(observations)[group],
                     assume_unique_new=True,
                     allow_grouped=True,
+                    parent_node_ids=(
+                        None if parent_node_ids is None else np.asarray(parent_node_ids)[group]
+                    ),
+                    parent_actions=(
+                        None if parent_actions is None else np.asarray(parent_actions)[group]
+                    ),
+                    depths=None if depths is None else np.asarray(depths)[group],
                 )
             return node_ids
         if (
@@ -255,6 +310,11 @@ class PosteriorArena:
                         policy_logits=policy_logits[ix],
                         q_alpha=q_alpha[ix],
                         observation=None if observations is None else observations[ix],
+                        parent_node_id=(
+                            UNKNOWN if parent_node_ids is None else int(parent_node_ids[ix])
+                        ),
+                        parent_action=UNKNOWN if parent_actions is None else int(parent_actions[ix]),
+                        depth=0 if depths is None else int(depths[ix]),
                     )
                     for ix in range(count)
                 ],
@@ -274,12 +334,28 @@ class PosteriorArena:
         node_ids = np.arange(node_start, node_start + count, dtype=np.int32)
         self.num_nodes += count
         self.sorted_key_view = None
-        self.node_status[node_ids] = STATUS_EXPANDED
+        self.node_status[node_ids] = STATUS_EXPANDING
         self.node_key[node_ids] = keys
         self.node_current_player[node_ids] = np.asarray(current_players, dtype=np.int8)
         self.node_first_edge[node_ids] = edge_start + np.arange(count, dtype=np.int32) * edges_per_node
         self.node_num_edges[node_ids] = np.int16(edges_per_node)
+        self.node_parent_node[node_ids] = (
+            UNKNOWN
+            if parent_node_ids is None
+            else np.asarray(parent_node_ids, dtype=np.int32)
+        )
+        self.node_parent_action[node_ids] = (
+            UNKNOWN
+            if parent_actions is None
+            else np.asarray(parent_actions, dtype=np.int32)
+        )
+        self.node_depth[node_ids] = 0 if depths is None else np.asarray(depths, dtype=np.int16)
         self.node_value_alpha[node_ids] = _positive(value_alpha)
+        self.node_value_cache_C[node_ids] = self.node_value_alpha[node_ids]
+        self.node_downstream_eval_count[node_ids] = np.uint32(0)
+        self.node_value_cache_status[node_ids] = VALUE_CACHE_CLEAN
+        self.node_value_cache_version[node_ids] += np.uint32(1)
+        self.node_edge_epoch[node_ids] = np.uint32(0)
         self.node_terminal_outcome[node_ids] = np.int8(-1)
         self._set_node_observations(node_ids, observations)
         if self._key_index_complete and count < 4096:
@@ -288,7 +364,8 @@ class PosteriorArena:
             self._key_index_complete = False
 
         if edges_per_node == 0:
-            self.node_summary_alpha[node_ids] = self.node_value_alpha[node_ids]
+            self.node_summary_alpha[node_ids] = self.node_value_cache_C[node_ids]
+            self.node_status[node_ids] = STATUS_EXPANDED
             return node_ids
 
         edge_end = edge_start + edge_count
@@ -305,6 +382,11 @@ class PosteriorArena:
             )
         )
         self.edge_base_alpha[edge_start:edge_end] = sparse_q.reshape((edge_count, self.num_outcomes))
+        self.edge_B[edge_start:edge_end] = self.edge_base_alpha[edge_start:edge_end]
+        self.edge_has_post[edge_start:edge_end] = False
+        self.edge_eval_count_R[edge_start:edge_end] = 0
+        self.edge_version[edge_start:edge_end] = 0
+        self.edge_child_cache_version[edge_start:edge_end] = -1
         self.edge_E[edge_start:edge_end] = 0.0
         self.edge_post_alpha[edge_start:edge_end] = self.edge_base_alpha[edge_start:edge_end]
         sparse_logits = np.take_along_axis(
@@ -315,7 +397,8 @@ class PosteriorArena:
         self.edge_logit[edge_start:edge_end] = sparse_logits.reshape((edge_count,))
         self.edge_visits[edge_start:edge_end] = 0
         self.num_edges = edge_end
-        self._recompute_uniform_summaries(node_ids, edges_per_node)
+        self.node_summary_alpha[node_ids] = self.node_value_cache_C[node_ids]
+        self.node_status[node_ids] = STATUS_EXPANDED
         return node_ids
 
     def add_terminal_node(
@@ -325,6 +408,9 @@ class PosteriorArena:
         current_player: int,
         terminal_outcome: int,
         observation: np.ndarray | None = None,
+        parent_node_id: int = UNKNOWN,
+        parent_action: int = UNKNOWN,
+        depth: int = 0,
     ) -> int:
         self.ensure_key_index()
         key_id = _key_id(key)
@@ -339,10 +425,55 @@ class PosteriorArena:
         self.node_current_player[node_id] = np.int8(current_player)
         self.node_first_edge[node_id] = np.int32(self.num_edges)
         self.node_num_edges[node_id] = np.int16(0)
+        self.node_parent_node[node_id] = np.int32(parent_node_id)
+        self.node_parent_action[node_id] = np.int32(parent_action)
+        self.node_depth[node_id] = np.int16(depth)
         self.node_value_alpha[node_id] = 1e-6
         self.node_value_alpha[node_id, int(terminal_outcome)] = 1.0
-        self.node_summary_alpha[node_id] = self.node_value_alpha[node_id]
+        self.node_value_cache_C[node_id] = self.node_value_alpha[node_id]
+        self.node_downstream_eval_count[node_id] = np.uint32(0)
+        self.node_value_cache_status[node_id] = VALUE_CACHE_CLEAN
+        self.node_value_cache_version[node_id] += np.uint32(1)
+        self.node_edge_epoch[node_id] = np.uint32(0)
+        self.node_summary_alpha[node_id] = self.node_value_cache_C[node_id]
         self.node_terminal_outcome[node_id] = np.int8(terminal_outcome)
+        self._set_node_observation(node_id, observation)
+        return node_id
+
+    def add_inflight_node(
+        self,
+        *,
+        key: np.ndarray,
+        current_player: int,
+        parent_node_id: int,
+        parent_action: int,
+        depth: int,
+        observation: np.ndarray | None = None,
+    ) -> int:
+        self.ensure_key_index()
+        key_id = _key_id(key)
+        existing = self.key_to_node.get(key_id)
+        if existing is not None:
+            self._set_node_observation(existing, observation)
+            return existing
+        node_id = self._alloc_node(key_id)
+        self.sorted_key_view = None
+        self.node_status[node_id] = STATUS_INFLIGHT
+        self.node_key[node_id] = np.asarray(key, dtype=np.uint32)
+        self.node_current_player[node_id] = np.int8(current_player)
+        self.node_first_edge[node_id] = np.int32(self.num_edges)
+        self.node_num_edges[node_id] = np.int16(0)
+        self.node_parent_node[node_id] = np.int32(parent_node_id)
+        self.node_parent_action[node_id] = np.int32(parent_action)
+        self.node_depth[node_id] = np.int16(depth)
+        self.node_value_alpha[node_id] = 1.0
+        self.node_value_cache_C[node_id] = self.node_value_alpha[node_id]
+        self.node_downstream_eval_count[node_id] = np.uint32(0)
+        self.node_value_cache_status[node_id] = VALUE_CACHE_CLEAN
+        self.node_value_cache_version[node_id] = np.uint32(0)
+        self.node_edge_epoch[node_id] = np.uint32(0)
+        self.node_summary_alpha[node_id] = self.node_value_cache_C[node_id]
+        self.node_terminal_outcome[node_id] = np.int8(-1)
         self._set_node_observation(node_id, observation)
         return node_id
 
@@ -413,7 +544,7 @@ class PosteriorArena:
         self.ensure_key_index()
         for ix in range(keys.shape[0]):
             existing = self.key_to_node.get(keys[ix].tobytes())
-            if existing is not None and self.node_status[existing] != STATUS_INFLIGHT:
+            if existing is not None:
                 return False
         return True
 
@@ -608,6 +739,7 @@ class BatchedPosteriorArenaSearch:
             raise ValueError("search has not been initialized")
         arena = self.arena
         with self._timed("posterior_target_generation"):
+            self._repair_dirty_frontier(config)
             dense_result = self._finish_search_dense(config)
             if dense_result is not None:
                 dense_result = self._attach_tree_data(dense_result, config)
@@ -618,7 +750,7 @@ class BatchedPosteriorArenaSearch:
             policies = np.zeros((self.root_node_ids.shape[0], arena.num_actions), dtype=np.float32)
             beta_q = np.zeros((self.root_node_ids.shape[0], arena.num_actions, arena.num_outcomes), dtype=np.float32)
             beta_v = np.zeros((self.root_node_ids.shape[0], arena.num_outcomes), dtype=np.float32)
-            q_mass = np.zeros((self.root_node_ids.shape[0], arena.num_actions), dtype=np.float32)
+            q_weight = np.zeros((self.root_node_ids.shape[0], arena.num_actions), dtype=np.float32)
             alpha_root = np.zeros_like(beta_q)
             for out_ix, node_id in enumerate(self.root_node_ids):
                 start = int(arena.node_first_edge[node_id])
@@ -629,18 +761,14 @@ class BatchedPosteriorArenaSearch:
                     legal[action] = True
                     alpha_root[out_ix, action] = arena.edge_post_alpha[edge_id]
                     beta_q[out_ix, action] = arena.edge_post_alpha[edge_id]
-                    q_mass[out_ix, action] = np.sum(arena.edge_E[edge_id])
                 policies[out_ix] = posterior_best_policy_target_np(
                     self.rng,
                     alpha_root[out_ix],
                     legal,
                     config.policy_mc_samples,
                 )
-                value_proxy = np.sum(policies[out_ix, :, None] * alpha_root[out_ix], axis=0)
-                beta_v[out_ix] = (
-                    arena.node_value_alpha[node_id]
-                    + np.asarray(config.c_value_search, dtype=np.float32) * value_proxy
-                )
+                q_weight[out_ix] = policies[out_ix]
+                beta_v[out_ix] = arena.node_value_cache_C[node_id]
                 actions[out_ix] = _commit_action(self.rng, config, policies[out_ix], alpha_root[out_ix], legal)
 
             result = SearchResult(
@@ -648,8 +776,9 @@ class BatchedPosteriorArenaSearch:
                 action_weights=jnp.asarray(policies, dtype=jnp.float32),
                 beta_Q_target=jnp.asarray(beta_q, dtype=jnp.float32),
                 beta_V_target=jnp.asarray(beta_v, dtype=jnp.float32),
-                q_evidence_mass=jnp.asarray(q_mass, dtype=jnp.float32),
+                q_loss_weight=jnp.asarray(q_weight, dtype=jnp.float32),
                 alpha_root=jnp.asarray(alpha_root, dtype=jnp.float32),
+                search_loss_mask=jnp.asarray(np.sum(policies, axis=-1) > 0.0),
             )
             result = self._attach_tree_data(result, config)
             self._block_if_timing(result)
@@ -687,8 +816,6 @@ class BatchedPosteriorArenaSearch:
         alpha_root[row_ids, action_ids] = alpha_sparse
         beta_q = alpha_root.copy()
 
-        q_mass = np.zeros((root_ids.shape[0], arena.num_actions), dtype=np.float32)
-        q_mass[row_ids, action_ids] = np.sum(arena.edge_E[edge_ids], axis=-1)
         legal = np.zeros((root_ids.shape[0], arena.num_actions), dtype=bool)
         legal[row_ids, action_ids] = True
 
@@ -698,19 +825,17 @@ class BatchedPosteriorArenaSearch:
             legal,
             config.policy_mc_samples,
         )
-        value_proxy = np.sum(policies[:, :, None] * alpha_root, axis=1)
-        beta_v = (
-            arena.node_value_alpha[root_ids]
-            + np.asarray(config.c_value_search, dtype=np.float32) * value_proxy
-        )
+        q_weight = policies.copy()
+        beta_v = arena.node_value_cache_C[root_ids]
         actions = _commit_actions_batch(self.rng, config, policies, alpha_root, legal)
         return SearchResult(
             action=jnp.asarray(actions, dtype=jnp.int32),
             action_weights=jnp.asarray(policies, dtype=jnp.float32),
             beta_Q_target=jnp.asarray(beta_q, dtype=jnp.float32),
             beta_V_target=jnp.asarray(beta_v, dtype=jnp.float32),
-            q_evidence_mass=jnp.asarray(q_mass, dtype=jnp.float32),
+            q_loss_weight=jnp.asarray(q_weight, dtype=jnp.float32),
             alpha_root=jnp.asarray(alpha_root, dtype=jnp.float32),
+            search_loss_mask=jnp.asarray(np.sum(policies, axis=-1) > 0.0),
         )
 
     def _build_tree_training_data(self, config: SearchConfig) -> TreeTrainingData:
@@ -729,13 +854,15 @@ class BatchedPosteriorArenaSearch:
         legal_mask = np.zeros((capacity, arena.num_actions), dtype=bool)
         beta_q = np.zeros((capacity, arena.num_actions, arena.num_outcomes), dtype=np.float32)
         beta_v = np.ones((capacity, arena.num_outcomes), dtype=np.float32)
-        q_mass = np.zeros((capacity, arena.num_actions), dtype=np.float32)
+        q_weight = np.zeros((capacity, arena.num_actions), dtype=np.float32)
         value_tgt = np.zeros((capacity,), dtype=np.float32)
         policy_loss_mask = np.zeros((capacity,), dtype=bool)
         value_loss_mask = np.zeros((capacity,), dtype=bool)
+        search_loss_mask = np.zeros((capacity,), dtype=bool)
         outcome_mask = np.zeros((capacity,), dtype=bool)
 
         root_nodes = set(int(x) for x in np.asarray(self.root_node_ids, dtype=np.int32))
+        include_roots = bool(config.train_tree_include_root)
         expanded_rows: list[int] = []
         expanded_node_ids: list[int] = []
         min_q_evidence = float(config.train_tree_min_q_evidence)
@@ -743,38 +870,34 @@ class BatchedPosteriorArenaSearch:
         for node_id in range(int(arena.num_nodes)):
             if row >= capacity:
                 break
-            if not config.train_tree_include_root and node_id in root_nodes:
+            if node_id in root_nodes and not include_roots:
                 continue
             status = arena.node_status[node_id]
             if status == STATUS_EXPANDED:
+                if arena.node_value_cache_status[node_id] != VALUE_CACHE_CLEAN:
+                    continue
                 start = int(arena.node_first_edge[node_id])
                 count = int(arena.node_num_edges[node_id])
                 if count <= 0:
                     continue
                 edge_ids = np.arange(start, start + count, dtype=np.int32)
+                if not np.any(arena.edge_has_post[edge_ids]):
+                    continue
                 actions = arena.edge_action[edge_ids].astype(np.int32)
-                edge_q_mass = np.sum(arena.edge_E[edge_ids], axis=-1)
-                if float(np.sum(edge_q_mass)) <= min_q_evidence:
+                edge_counts = arena.edge_eval_count_R[edge_ids].astype(np.float32)
+                if float(np.sum(edge_counts)) <= min_q_evidence:
                     continue
                 obs[row] = arena.node_observation[node_id]
                 legal_mask[row, actions] = True
                 beta_q[row, actions] = arena.edge_post_alpha[edge_ids]
-                q_mass[row, actions] = edge_q_mass
-                beta_v[row] = arena.node_value_alpha[node_id]
+                beta_v[row] = arena.node_value_cache_C[node_id]
                 policy_loss_mask[row] = True
                 value_loss_mask[row] = True
+                search_loss_mask[row] = True
                 expanded_rows.append(row)
                 expanded_node_ids.append(node_id)
                 row += 1
                 continue
-
-            if status == STATUS_TERMINAL and config.train_tree_include_terminal:
-                obs[row] = arena.node_observation[node_id]
-                beta_v[row] = arena.node_value_alpha[node_id]
-                value_tgt[row] = outcome_utility(outcome_mean(beta_v[row]))
-                value_loss_mask[row] = True
-                outcome_mask[row] = True
-                row += 1
 
         if expanded_rows:
             row_ix = np.asarray(expanded_rows, dtype=np.int32)
@@ -786,11 +909,8 @@ class BatchedPosteriorArenaSearch:
                 config.policy_mc_samples,
             )
             action_weights[row_ix] = policies
-            beta_v[row_ix] = (
-                arena.node_value_alpha[node_ix]
-                + np.asarray(config.c_value_search, dtype=np.float32)
-                * np.sum(policies[:, :, None] * beta_q[row_ix], axis=1)
-            )
+            q_weight[row_ix] = policies
+            beta_v[row_ix] = arena.node_value_cache_C[node_ix]
             value_tgt[row_ix] = outcome_utility(outcome_mean(beta_v[row_ix]))
             played_action[row_ix] = _commit_actions_batch(
                 self.rng,
@@ -807,10 +927,11 @@ class BatchedPosteriorArenaSearch:
             legal_action_mask=jnp.asarray(legal_mask),
             beta_Q_target=jnp.asarray(beta_q, dtype=jnp.float32),
             beta_V_target=jnp.asarray(beta_v, dtype=jnp.float32),
-            q_evidence_mass=jnp.asarray(q_mass, dtype=jnp.float32),
+            q_loss_weight=jnp.asarray(q_weight, dtype=jnp.float32),
             value_tgt=jnp.asarray(value_tgt, dtype=jnp.float32),
             policy_loss_mask=jnp.asarray(policy_loss_mask),
             value_loss_mask=jnp.asarray(value_loss_mask),
+            search_loss_mask=jnp.asarray(search_loss_mask),
             outcome_mask=jnp.asarray(outcome_mask),
         )
 
@@ -904,17 +1025,15 @@ class BatchedPosteriorArenaSearch:
                     node_id = int(current_node_ids[row])
                     if path_len[row] > 0:
                         outcome = int(arena.node_terminal_outcome[node_id])
-                        value = np.zeros((arena.num_outcomes,), dtype=np.float32)
-                        value[outcome] = 1.0
+                        value = _terminal_beta(outcome, arena.num_outcomes, config)
                         self._backup_path(
                             path_nodes[row],
                             path_edges[row],
                             int(path_len[row]),
                             leaf_node_id=node_id,
                             leaf_value=value,
-                            leaf_weight=config.c_terminal,
-                            c_state=config.c_state,
                             backup_mc_samples=config.backup_mc_samples,
+                            config=config,
                         )
                     done[lane_root_ids[row]] += 1
 
@@ -928,60 +1047,73 @@ class BatchedPosteriorArenaSearch:
                 select_nodes = current_node_ids[selectable_rows]
                 first_edges = arena.node_first_edge[select_nodes].astype(np.int32)
                 edge_counts = arena.node_num_edges[select_nodes].astype(np.int32)
-            if np.all(edge_counts == 1):
+                max_edges = int(np.max(edge_counts))
+                offsets = np.arange(max_edges, dtype=np.int32)
+                edge_ids = first_edges[:, None] + offsets[None, :]
+                mask = offsets[None, :] < edge_counts[:, None]
+                safe_edge_ids = np.where(mask, edge_ids, 0)
+                child_ids = arena.edge_child_node[safe_edge_ids]
+                safe_child_ids = np.where(child_ids == UNKNOWN, 0, child_ids)
+                child_status = arena.node_status[safe_child_ids]
+                blocked = (child_ids != UNKNOWN) & (
+                    (child_status == STATUS_INFLIGHT) | (child_status == STATUS_EXPANDING)
+                )
+                mask = mask & ~blocked
+                has_available = np.any(mask, axis=1)
+                if not np.any(has_available):
+                    break
+                if not np.all(has_available):
+                    selectable_rows = selectable_rows[has_available]
+                    selectable_state_pos = selectable_state_pos[has_available]
+                    select_nodes = select_nodes[has_available]
+                    first_edges = first_edges[has_available]
+                    edge_counts = edge_counts[has_available]
+                    edge_ids = edge_ids[has_available]
+                    safe_edge_ids = safe_edge_ids[has_available]
+                    mask = mask[has_available]
+                alpha = np.where(
+                    mask[..., None],
+                    arena.edge_post_alpha[safe_edge_ids],
+                    np.ones((selectable_rows.shape[0], max_edges, arena.num_outcomes), dtype=np.float32),
+                )
+                actions_padded = np.where(mask, arena.edge_action[safe_edge_ids], 0).astype(np.int32)
+            if 0 < selectable_rows.shape[0] < config.np_select_below:
                 with self._timed("thompson_selection"):
-                    selected_edge_ids = first_edges
-                    actions = arena.edge_action[selected_edge_ids].astype(np.int32)
-            else:
-                with self._timed("node_packing"):
-                    max_edges = int(np.max(edge_counts))
-                    offsets = np.arange(max_edges, dtype=np.int32)
-                    edge_ids = first_edges[:, None] + offsets[None, :]
-                    mask = offsets[None, :] < edge_counts[:, None]
-                    safe_edge_ids = np.where(mask, edge_ids, 0)
-                    alpha = np.where(
-                        mask[..., None],
-                        arena.edge_post_alpha[safe_edge_ids],
-                        np.ones((selectable_rows.shape[0], max_edges, arena.num_outcomes), dtype=np.float32),
+                    actions, selected_pos = thompson_select_np(
+                        self.rng,
+                        alpha,
+                        actions_padded,
+                        mask,
                     )
-                    actions_padded = np.where(mask, arena.edge_action[safe_edge_ids], 0).astype(np.int32)
-                if 0 < selectable_rows.shape[0] < config.np_select_below:
-                    with self._timed("thompson_selection"):
-                        actions, selected_pos = thompson_select_np(
-                            self.rng,
-                            alpha,
-                            actions_padded,
-                            mask,
-                        )
-                else:
-                    select_alpha = alpha
-                    select_actions_padded = actions_padded
-                    select_mask = mask
-                    if config.pad_jax_select:
-                        select_alpha, select_actions_padded, select_mask = _pad_jax_selection_inputs(
-                            alpha,
-                            actions_padded,
-                            mask,
-                            target_rows=int(lane_root_ids.shape[0]),
-                            target_edges=arena.num_actions,
-                        )
-                    self.jax_key, select_key = jax.random.split(self.jax_key)
-                    with self._timed("thompson_selection"):
-                        selected_actions_result = thompson_select_jax(
-                            select_key,
-                            jnp.asarray(select_alpha),
-                            jnp.asarray(select_actions_padded),
-                            jnp.asarray(select_mask),
-                        )
-                        self._block_if_timing(selected_actions_result)
-                    with self._timed("device_get"):
-                        selected_actions = np.asarray(
-                            jax.device_get(selected_actions_result),
-                            dtype=np.int32,
-                        )
-                    actions = selected_actions[: selectable_rows.shape[0]]
-                    selected_pos = _selected_positions(actions_padded, actions, mask)
-                selected_edge_ids = edge_ids[np.arange(edge_ids.shape[0]), selected_pos].astype(np.int32)
+            else:
+                select_alpha = alpha
+                select_actions_padded = actions_padded
+                select_mask = mask
+                if config.pad_jax_select:
+                    select_alpha, select_actions_padded, select_mask = _pad_jax_selection_inputs(
+                        alpha,
+                        actions_padded,
+                        mask,
+                        target_rows=int(lane_root_ids.shape[0]),
+                        target_edges=arena.num_actions,
+                    )
+                self.jax_key, select_key = jax.random.split(self.jax_key)
+                with self._timed("thompson_selection"):
+                    selected_actions_result = thompson_select_jax(
+                        select_key,
+                        jnp.asarray(select_alpha),
+                        jnp.asarray(select_actions_padded),
+                        jnp.asarray(select_mask),
+                    )
+                    self._block_if_timing(selected_actions_result)
+                with self._timed("device_get"):
+                    selected_actions = np.asarray(
+                        jax.device_get(selected_actions_result),
+                        dtype=np.int32,
+                    )
+                actions = selected_actions[: selectable_rows.shape[0]]
+                selected_pos = _selected_positions(actions_padded, actions, mask)
+            selected_edge_ids = edge_ids[np.arange(edge_ids.shape[0]), selected_pos].astype(np.int32)
 
             depth_ix = path_len[selectable_rows].astype(np.int32)
             path_nodes[selectable_rows, depth_ix] = select_nodes
@@ -1076,6 +1208,9 @@ class BatchedPosteriorArenaSearch:
                                 key=key_words[data_ix],
                                 current_player=int(players[data_ix]),
                                 terminal_outcome=outcome,
+                                parent_node_id=int(arena.edge_parent_node[edge_id]),
+                                parent_action=int(arena.edge_action[edge_id]),
+                                depth=int(arena.node_depth[int(arena.edge_parent_node[edge_id])]) + 1,
                                 observation=(
                                     None
                                     if arena.node_observation is None
@@ -1090,12 +1225,20 @@ class BatchedPosteriorArenaSearch:
                         continue
 
                     if child_node_id == UNKNOWN:
+                        child_node_id = arena.add_inflight_node(
+                            key=key_words[data_ix],
+                            current_player=int(players[data_ix]),
+                            parent_node_id=int(arena.edge_parent_node[edge_id]),
+                            parent_action=int(arena.edge_action[edge_id]),
+                            depth=int(arena.node_depth[int(arena.edge_parent_node[edge_id])]) + 1,
+                        )
+                        arena.edge_child_node[edge_id] = child_node_id
                         missing_rows.append(int(row))
                         missing_state_indices.append(data_ix)
                         continue
 
                     child_status = arena.node_status[child_node_id]
-                    if child_status == STATUS_INFLIGHT:
+                    if child_status in (STATUS_INFLIGHT, STATUS_EXPANDING):
                         continue
                     if child_status == STATUS_TERMINAL:
                         terminal_backup_rows.append(int(row))
@@ -1112,24 +1255,22 @@ class BatchedPosteriorArenaSearch:
                     base_edge_ids = np.asarray(base_update_edges, dtype=np.int32)
                     base_child_ids = np.asarray(base_update_children, dtype=np.int32)
                     self._update_edge_base_from_children(base_edge_ids, base_child_ids)
-                    self._refresh_edges_and_summaries(base_edge_ids, arena.edge_parent_node[base_edge_ids])
+                    self._refresh_edges_from_children(base_edge_ids, base_child_ids, config)
 
             with self._timed("backup"):
                 for row, child_node_id in zip(terminal_backup_rows, terminal_backup_children, strict=True):
                     if done[lane_root_ids[row]] >= config.num_simulations:
                         continue
                     outcome = int(arena.node_terminal_outcome[child_node_id])
-                    value = np.zeros((arena.num_outcomes,), dtype=np.float32)
-                    value[outcome] = 1.0
+                    value = _terminal_beta(outcome, arena.num_outcomes, config)
                     self._backup_path(
                         path_nodes[row],
                         path_edges[row],
                         int(path_len[row]),
                         leaf_node_id=child_node_id,
                         leaf_value=value,
-                        leaf_weight=config.c_terminal,
-                        c_state=config.c_state,
                         backup_mc_samples=config.backup_mc_samples,
+                        config=config,
                     )
                     done[lane_root_ids[row]] += 1
 
@@ -1170,6 +1311,7 @@ class BatchedPosteriorArenaSearch:
         key_words: np.ndarray,
         terminated: np.ndarray,
     ) -> bool:
+        return False
         if self.arena is None or self.root_node_ids is None:
             return False
         if self.arena.num_nodes != int(self.root_node_ids.shape[0]):
@@ -1219,6 +1361,14 @@ class BatchedPosteriorArenaSearch:
                     if arena.node_observation is None
                     else np.asarray(jax.device_get(_pending_selected_observations(pending_batch)))
                 )
+                parent_edges = pending_batch.path_edges[
+                    np.arange(pending_batch.size, dtype=np.int32),
+                    pending_batch.path_len.astype(np.int32) - 1,
+                ].astype(np.int32)
+                parent_nodes = pending_batch.path_nodes[
+                    np.arange(pending_batch.size, dtype=np.int32),
+                    pending_batch.path_len.astype(np.int32) - 1,
+                ].astype(np.int32)
                 child_node_ids = arena.add_expanded_nodes_batch(
                     keys=pending_batch.key_words,
                     current_players=pending_batch.players,
@@ -1227,8 +1377,11 @@ class BatchedPosteriorArenaSearch:
                     policy_logits=logits,
                     q_alpha=q_alpha,
                     observations=node_observations,
-                    assume_unique_new=True,
+                    assume_unique_new=False,
                     allow_grouped=config.grouped_expansion,
+                    parent_node_ids=parent_nodes,
+                    parent_actions=arena.edge_action[parent_edges],
+                    depths=arena.node_depth[parent_nodes].astype(np.int32) + 1,
                 )
             with self._timed("backup"):
                 self._backup_pending_rows(
@@ -1238,10 +1391,9 @@ class BatchedPosteriorArenaSearch:
                     path_edges=pending_batch.path_edges,
                     path_len=pending_batch.path_len,
                     done=done,
-                    leaf_weight=config.c_leaf,
-                    c_state=config.c_state,
                     backup_mc_samples=config.backup_mc_samples,
                     num_simulations=config.num_simulations,
+                    config=config,
                 )
             return
         for start in range(0, pending_batch.size, config.eval_batch_size):
@@ -1275,6 +1427,16 @@ class BatchedPosteriorArenaSearch:
                         jax.device_get(_pending_selected_observations(pending_batch)[request_slice])
                     )
                 )
+                slice_path_len = pending_batch.path_len[request_slice].astype(np.int32)
+                slice_rows = np.arange(real_count, dtype=np.int32)
+                parent_edges = pending_batch.path_edges[request_slice][
+                    slice_rows,
+                    slice_path_len - 1,
+                ].astype(np.int32)
+                parent_nodes = pending_batch.path_nodes[request_slice][
+                    slice_rows,
+                    slice_path_len - 1,
+                ].astype(np.int32)
                 child_node_ids = arena.add_expanded_nodes_batch(
                     keys=pending_batch.key_words[request_slice],
                     current_players=pending_batch.players[request_slice],
@@ -1283,8 +1445,11 @@ class BatchedPosteriorArenaSearch:
                     policy_logits=logits,
                     q_alpha=q_alpha,
                     observations=node_observations,
-                    assume_unique_new=True,
+                    assume_unique_new=False,
                     allow_grouped=config.grouped_expansion,
+                    parent_node_ids=parent_nodes,
+                    parent_actions=arena.edge_action[parent_edges],
+                    depths=arena.node_depth[parent_nodes].astype(np.int32) + 1,
                 )
             with self._timed("backup"):
                 self._backup_pending_rows(
@@ -1294,10 +1459,9 @@ class BatchedPosteriorArenaSearch:
                     path_edges=pending_batch.path_edges[request_slice],
                     path_len=pending_batch.path_len[request_slice],
                     done=done,
-                    leaf_weight=config.c_leaf,
-                    c_state=config.c_state,
                     backup_mc_samples=config.backup_mc_samples,
                     num_simulations=config.num_simulations,
+                    config=config,
                 )
 
     def _backup_pending_rows(
@@ -1309,10 +1473,9 @@ class BatchedPosteriorArenaSearch:
         path_edges: np.ndarray,
         path_len: np.ndarray,
         done: np.ndarray,
-        leaf_weight: float,
-        c_state: float,
         backup_mc_samples: int,
         num_simulations: int,
+        config: SearchConfig,
     ) -> None:
         assert self.arena is not None
         arena = self.arena
@@ -1331,43 +1494,29 @@ class BatchedPosteriorArenaSearch:
         final_parents = path_nodes[active_ix, active_path_len - 1].astype(np.int32)
 
         arena.edge_child_node[final_edges] = active_child_ids
-        self._update_edge_base_from_children(final_edges, active_child_ids)
-        leaf_value = outcome_mean(arena.node_value_alpha[active_child_ids])
+        leaf_value = _leaf_beta(arena.node_value_alpha[active_child_ids], config)
         parent_players = arena.node_current_player[final_parents]
         child_players = arena.node_current_player[active_child_ids]
         aligned_leaf = _align_rows(leaf_value, parent_players != child_players)
-        np.add.at(arena.edge_E, final_edges, np.asarray(leaf_weight, dtype=np.float32) * aligned_leaf)
-        np.add.at(arena.edge_visits, final_edges, np.uint32(1))
-        self._refresh_edges_and_summaries(final_edges, final_parents)
+        self._publish_edge_posts(
+            final_edges,
+            aligned_leaf,
+            np.ones((final_edges.shape[0],), dtype=np.uint32),
+            increment_eval_count=True,
+        )
         np.add.at(done, active_root_ids, 1)
-
-        max_len = int(np.max(active_path_len))
-        for depth in range(max_len - 2, -1, -1):
-            depth_mask = active_path_len > depth + 1
-            if not np.any(depth_mask):
-                continue
-            row_ix = active_ix[depth_mask]
-            edge_ids = path_edges[row_ix, depth].astype(np.int32)
-            parent_ids = path_nodes[row_ix, depth].astype(np.int32)
-            child_ids = arena.edge_child_node[edge_ids].astype(np.int32)
-            valid = child_ids != UNKNOWN
-            if not np.any(valid):
-                continue
-            edge_ids = edge_ids[valid]
-            parent_ids = parent_ids[valid]
-            child_ids = child_ids[valid]
-            summary = self._state_search_posterior_batch(child_ids, backup_mc_samples)
-            parent_players = arena.node_current_player[parent_ids]
-            child_players = arena.node_current_player[child_ids]
-            aligned_summary = _align_rows(summary, parent_players != child_players)
-            np.add.at(arena.edge_E, edge_ids, np.asarray(c_state, dtype=np.float32) * aligned_summary)
-            np.add.at(arena.edge_visits, edge_ids, np.uint32(1))
-            self._refresh_edges_and_summaries(edge_ids, parent_ids)
+        for parent_id in np.unique(final_parents):
+            self._repair_path_to_root(
+                int(parent_id),
+                config,
+                backup_mc_samples=backup_mc_samples,
+            )
 
     def _state_search_posterior_batch(
         self,
         node_ids: np.ndarray,
         backup_mc_samples: int,
+        state_posterior_kappa_n: float = 9.0,
     ) -> np.ndarray:
         assert self.arena is not None
         arena = self.arena
@@ -1379,7 +1528,7 @@ class BatchedPosteriorArenaSearch:
         edge_counts = arena.node_num_edges[node_ids].astype(np.int32)
         no_edges = edge_counts <= 0
         if np.any(no_edges):
-            beta[no_edges] = arena.node_value_alpha[node_ids[no_edges]]
+            beta[no_edges] = arena.node_value_cache_C[node_ids[no_edges]]
 
         for edge_count in np.unique(edge_counts[~no_edges]):
             positions = np.flatnonzero(edge_counts == edge_count).astype(np.int32)
@@ -1394,7 +1543,13 @@ class BatchedPosteriorArenaSearch:
                 legal,
                 int(backup_mc_samples),
             )
-            beta[positions] = np.sum(pi_search[..., None] * alpha, axis=1)
+            e_v = np.sum(pi_search[..., None] * alpha, axis=1)
+            n_down = np.sum(arena.edge_eval_count_R[edge_ids], axis=1).astype(np.float32)
+            gamma = n_down / (float(state_posterior_kappa_n) + n_down)
+            beta[positions] = (
+                (1.0 - gamma[:, None]) * arena.node_value_alpha[group_ids]
+                + gamma[:, None] * e_v
+            )
         return _positive(beta)
 
     def _update_edge_base_from_child(self, edge_id: int, child_node_id: int) -> None:
@@ -1402,20 +1557,21 @@ class BatchedPosteriorArenaSearch:
         arena = self.arena
         if arena.node_status[int(child_node_id)] == STATUS_TERMINAL:
             return
+        if bool(arena.edge_has_post[int(edge_id)]):
+            return
         parent_node_id = int(arena.edge_parent_node[edge_id])
         parent_player = int(arena.node_current_player[parent_node_id])
         child_player = int(arena.node_current_player[child_node_id])
         value = arena.node_value_alpha[child_node_id]
         arena.edge_base_alpha[edge_id] = value[::-1] if parent_player != child_player else value
-        arena.edge_post_alpha[edge_id] = _positive(arena.edge_base_alpha[edge_id] + arena.edge_E[edge_id])
-        arena.recompute_summary(parent_node_id)
+        arena.edge_post_alpha[edge_id] = _positive(arena.edge_base_alpha[edge_id])
 
     def _update_edge_base_from_children(self, edge_ids: np.ndarray, child_node_ids: np.ndarray) -> None:
         assert self.arena is not None
         arena = self.arena
         edge_ids = np.asarray(edge_ids, dtype=np.int32)
         child_node_ids = np.asarray(child_node_ids, dtype=np.int32)
-        keep = arena.node_status[child_node_ids] != STATUS_TERMINAL
+        keep = (arena.node_status[child_node_ids] != STATUS_TERMINAL) & ~arena.edge_has_post[edge_ids]
         if not np.any(keep):
             return
         edge_ids = edge_ids[keep]
@@ -1425,24 +1581,197 @@ class BatchedPosteriorArenaSearch:
         child_players = arena.node_current_player[child_node_ids]
         value = arena.node_value_alpha[child_node_ids]
         arena.edge_base_alpha[edge_ids] = _align_rows(value, parent_players != child_players)
-        arena.edge_post_alpha[edge_ids] = _positive(arena.edge_base_alpha[edge_ids] + arena.edge_E[edge_ids])
+        arena.edge_post_alpha[edge_ids] = _positive(arena.edge_base_alpha[edge_ids])
 
-    def _refresh_edges_and_summaries(self, edge_ids: np.ndarray, parent_ids: np.ndarray) -> None:
+    def _publish_edge_posts(
+        self,
+        edge_ids: np.ndarray,
+        beta: np.ndarray,
+        eval_counts: np.ndarray,
+        *,
+        increment_eval_count: bool = False,
+    ) -> None:
         assert self.arena is not None
         arena = self.arena
-        edge_ids = np.unique(np.asarray(edge_ids, dtype=np.int32))
-        if edge_ids.size:
-            arena.edge_post_alpha[edge_ids] = _positive(arena.edge_base_alpha[edge_ids] + arena.edge_E[edge_ids])
-        parent_ids = np.unique(np.asarray(parent_ids, dtype=np.int32))
-        if parent_ids.size == 0:
+        edge_ids = np.asarray(edge_ids, dtype=np.int32).reshape((-1,))
+        beta = _positive(np.asarray(beta, dtype=np.float32).reshape((edge_ids.shape[0], arena.num_outcomes)))
+        eval_counts = np.asarray(eval_counts, dtype=np.uint32).reshape((edge_ids.shape[0],))
+        arena.edge_B[edge_ids] = beta
+        arena.edge_has_post[edge_ids] = True
+        if increment_eval_count:
+            np.add.at(arena.edge_eval_count_R, edge_ids, eval_counts)
+        else:
+            arena.edge_eval_count_R[edge_ids] = eval_counts
+        arena.edge_version[edge_ids] += np.uint32(1)
+        arena.edge_child_cache_version[edge_ids] = -1
+        arena.edge_post_alpha[edge_ids] = beta
+        arena.edge_E[edge_ids] = beta - arena.edge_base_alpha[edge_ids]
+        arena.edge_visits[edge_ids] += np.uint32(1)
+        parent_ids = np.unique(arena.edge_parent_node[edge_ids].astype(np.int32))
+        self._mark_nodes_dirty(parent_ids)
+
+    def _mark_nodes_dirty(self, node_ids: np.ndarray) -> None:
+        assert self.arena is not None
+        node_ids = np.unique(np.asarray(node_ids, dtype=np.int32))
+        node_ids = node_ids[node_ids != UNKNOWN]
+        if node_ids.size == 0:
             return
-        edge_counts = arena.node_num_edges[parent_ids].astype(np.int32)
-        if np.all(edge_counts == edge_counts[0]):
-            arena._recompute_uniform_summaries(parent_ids, int(edge_counts[0]))
-            return
-        for edge_count in np.unique(edge_counts):
-            group = parent_ids[edge_counts == edge_count]
-            arena._recompute_uniform_summaries(group, int(edge_count))
+        self.arena.node_value_cache_status[node_ids] = VALUE_CACHE_DIRTY
+        self.arena.node_edge_epoch[node_ids] += np.uint32(1)
+
+    def _refresh_edges_from_children(
+        self,
+        edge_ids: np.ndarray,
+        child_node_ids: np.ndarray,
+        config: SearchConfig,
+    ) -> np.ndarray:
+        assert self.arena is not None
+        arena = self.arena
+        edge_ids = np.asarray(edge_ids, dtype=np.int32).reshape((-1,))
+        child_node_ids = np.asarray(child_node_ids, dtype=np.int32).reshape((-1,))
+        refreshed = np.zeros((edge_ids.shape[0],), dtype=bool)
+        for ix, (edge_id, child_id) in enumerate(zip(edge_ids, child_node_ids, strict=True)):
+            refreshed[ix] = self._refresh_edge_from_child(int(edge_id), int(child_id), config)
+        return refreshed
+
+    def _refresh_edge_from_child(
+        self,
+        edge_id: int,
+        child_node_id: int,
+        config: SearchConfig,
+    ) -> bool:
+        del config
+        assert self.arena is not None
+        arena = self.arena
+        child_id = int(child_node_id)
+        edge_id = int(edge_id)
+        if child_id == UNKNOWN:
+            return True
+        child_status = arena.node_status[child_id]
+        if child_status == STATUS_TERMINAL:
+            return True
+        if child_status != STATUS_EXPANDED:
+            return True
+        first = int(arena.node_first_edge[child_id])
+        count = int(arena.node_num_edges[child_id])
+        if count <= 0 or not np.any(arena.edge_has_post[first : first + count]):
+            return True
+        parent_id = int(arena.edge_parent_node[edge_id])
+        if arena.node_value_cache_status[child_id] != VALUE_CACHE_CLEAN:
+            self._mark_nodes_dirty(np.asarray([parent_id], dtype=np.int32))
+            return False
+        if int(arena.edge_child_cache_version[edge_id]) == int(arena.node_value_cache_version[child_id]):
+            return True
+        parent_player = int(arena.node_current_player[parent_id])
+        child_player = int(arena.node_current_player[child_id])
+        beta = arena.node_value_cache_C[child_id]
+        if parent_player != child_player:
+            beta = beta[::-1]
+        self._publish_edge_posts(
+            np.asarray([edge_id], dtype=np.int32),
+            np.asarray([beta], dtype=np.float32),
+            np.asarray([1 + int(arena.node_downstream_eval_count[child_id])], dtype=np.uint32),
+        )
+        arena.edge_child_cache_version[edge_id] = np.int64(arena.node_value_cache_version[child_id])
+        return True
+
+    def _try_repair_node(
+        self,
+        node_id: int,
+        config: SearchConfig,
+        *,
+        backup_mc_samples: int | None = None,
+    ) -> bool:
+        assert self.arena is not None
+        arena = self.arena
+        node_id = int(node_id)
+        if arena.node_status[node_id] != STATUS_EXPANDED:
+            return False
+        start = int(arena.node_first_edge[node_id])
+        count = int(arena.node_num_edges[node_id])
+        if count <= 0:
+            arena.node_value_cache_C[node_id] = arena.node_value_alpha[node_id]
+            arena.node_downstream_eval_count[node_id] = np.uint32(0)
+            arena.node_value_cache_status[node_id] = VALUE_CACHE_CLEAN
+            arena.node_summary_alpha[node_id] = arena.node_value_cache_C[node_id]
+            return True
+        edge_ids = start + np.arange(count, dtype=np.int32)
+        if arena.node_value_cache_status[node_id] == VALUE_CACHE_CLEAN:
+            return True
+        if arena.node_value_cache_status[node_id] == VALUE_CACHE_UPDATING:
+            return False
+        arena.node_value_cache_status[node_id] = VALUE_CACHE_UPDATING
+        epoch = int(arena.node_edge_epoch[node_id])
+        for edge_id in edge_ids:
+            child_id = int(arena.edge_child_node[edge_id])
+            if not self._refresh_edge_from_child(int(edge_id), child_id, config):
+                arena.node_value_cache_status[node_id] = VALUE_CACHE_DIRTY
+                return False
+        if int(arena.node_edge_epoch[node_id]) != epoch:
+            arena.node_value_cache_status[node_id] = VALUE_CACHE_DIRTY
+            return False
+        if not np.any(arena.edge_has_post[edge_ids]):
+            arena.node_value_cache_C[node_id] = arena.node_value_alpha[node_id]
+            arena.node_downstream_eval_count[node_id] = np.uint32(0)
+            arena.node_value_cache_status[node_id] = VALUE_CACHE_CLEAN
+            arena.node_summary_alpha[node_id] = arena.node_value_cache_C[node_id]
+            return True
+        samples = int(config.backup_mc_samples if backup_mc_samples is None else backup_mc_samples)
+        alpha = arena.edge_post_alpha[edge_ids]
+        legal = np.ones((count,), dtype=bool)
+        pi_search = posterior_best_policy_target_np(self.rng, alpha, legal, samples)
+        e_v = np.sum(pi_search[:, None] * alpha, axis=0)
+        n_down = int(np.sum(arena.edge_eval_count_R[edge_ids], dtype=np.uint64))
+        gamma = float(n_down) / (float(config.state_posterior_kappa_n) + float(n_down))
+        cache = _positive((1.0 - gamma) * arena.node_value_alpha[node_id] + gamma * e_v)
+        if int(arena.node_edge_epoch[node_id]) != epoch:
+            arena.node_value_cache_status[node_id] = VALUE_CACHE_DIRTY
+            return False
+        arena.node_value_cache_C[node_id] = cache
+        arena.node_downstream_eval_count[node_id] = np.uint32(n_down)
+        arena.node_summary_alpha[node_id] = cache
+        arena.node_value_cache_version[node_id] += np.uint32(1)
+        arena.node_value_cache_status[node_id] = VALUE_CACHE_CLEAN
+        parent_id = int(arena.node_parent_node[node_id])
+        if parent_id != UNKNOWN:
+            self._mark_nodes_dirty(np.asarray([parent_id], dtype=np.int32))
+        return True
+
+    def _repair_path_to_root(
+        self,
+        start_node_id: int,
+        config: SearchConfig,
+        *,
+        backup_mc_samples: int | None = None,
+    ) -> None:
+        assert self.arena is not None
+        node_id = int(start_node_id)
+        seen: set[int] = set()
+        while node_id != UNKNOWN and node_id not in seen:
+            seen.add(node_id)
+            if self.arena.node_value_cache_status[node_id] != VALUE_CACHE_CLEAN:
+                if not self._try_repair_node(node_id, config, backup_mc_samples=backup_mc_samples):
+                    return
+            node_id = int(self.arena.node_parent_node[node_id])
+
+    def _repair_dirty_frontier(self, config: SearchConfig) -> None:
+        assert self.arena is not None
+        arena = self.arena
+        for _ in range(max(1, int(arena.num_nodes))):
+            node_ids = np.arange(int(arena.num_nodes), dtype=np.int32)
+            dirty = node_ids[
+                (arena.node_status[: arena.num_nodes] == STATUS_EXPANDED)
+                & (arena.node_value_cache_status[: arena.num_nodes] != VALUE_CACHE_CLEAN)
+            ]
+            if dirty.size == 0:
+                return
+            changed = False
+            for node_id in dirty[np.argsort(arena.node_depth[dirty])[::-1]]:
+                before = int(arena.node_value_cache_version[node_id])
+                self._try_repair_node(int(node_id), config)
+                changed = changed or int(arena.node_value_cache_version[node_id]) != before
+            if not changed:
+                return
 
     def _backup_path(
         self,
@@ -1452,9 +1781,8 @@ class BatchedPosteriorArenaSearch:
         *,
         leaf_node_id: int,
         leaf_value: np.ndarray,
-        leaf_weight: float,
-        c_state: float,
         backup_mc_samples: int,
+        config: SearchConfig | None = None,
     ) -> None:
         if path_nodes is None or path_edges is None or path_len <= 0:
             return
@@ -1465,32 +1793,18 @@ class BatchedPosteriorArenaSearch:
         parent_player = int(arena.node_current_player[final_parent_id])
         leaf_player = int(arena.node_current_player[leaf_node_id])
         aligned = leaf_value[::-1] if parent_player != leaf_player else leaf_value
-        arena.edge_E[final_edge_id] += np.asarray(leaf_weight, dtype=np.float32) * aligned
-        arena.edge_visits[final_edge_id] += np.uint32(1)
-        arena.edge_post_alpha[final_edge_id] = _positive(
-            arena.edge_base_alpha[final_edge_id] + arena.edge_E[final_edge_id]
+        self._publish_edge_posts(
+            np.asarray([final_edge_id], dtype=np.int32),
+            np.asarray([aligned], dtype=np.float32),
+            np.asarray([1], dtype=np.uint32),
+            increment_eval_count=True,
         )
-        arena.recompute_summary(final_parent_id)
-
-        for depth in range(path_len - 2, -1, -1):
-            edge_id = int(path_edges[depth])
-            parent_id = int(path_nodes[depth])
-            child_id = int(arena.edge_child_node[edge_id])
-            if child_id == UNKNOWN:
-                continue
-            summary = self._state_search_posterior_batch(
-                np.asarray([child_id], dtype=np.int32),
-                backup_mc_samples,
-            )[0]
-            parent_player = int(arena.node_current_player[parent_id])
-            child_player = int(arena.node_current_player[child_id])
-            aligned_summary = summary[::-1] if parent_player != child_player else summary
-            arena.edge_E[edge_id] += np.asarray(c_state, dtype=np.float32) * aligned_summary
-            arena.edge_visits[edge_id] += np.uint32(1)
-            arena.edge_post_alpha[edge_id] = _positive(
-                arena.edge_base_alpha[edge_id] + arena.edge_E[edge_id]
+        if config is not None:
+            self._repair_path_to_root(
+                final_parent_id,
+                config,
+                backup_mc_samples=backup_mc_samples,
             )
-            arena.recompute_summary(parent_id)
 
 def run_arena_posterior_tree_search(
     *,
@@ -1723,9 +2037,14 @@ def _broadcast_search_result(result: SearchResult, inverse: np.ndarray) -> Searc
         action_weights=result.action_weights[inverse_jax],
         beta_Q_target=result.beta_Q_target[inverse_jax],
         beta_V_target=result.beta_V_target[inverse_jax],
-        q_evidence_mass=result.q_evidence_mass[inverse_jax],
+        q_loss_weight=result.q_loss_weight[inverse_jax],
         alpha_root=result.alpha_root[inverse_jax],
         tree_data=result.tree_data,
+        search_loss_mask=(
+            None
+            if result.search_loss_mask is None
+            else result.search_loss_mask[inverse_jax]
+        ),
     )
 
 
@@ -1835,6 +2154,21 @@ def _align_rows(values: np.ndarray, flip_mask: np.ndarray) -> np.ndarray:
     aligned = values.copy()
     aligned[flip_mask] = aligned[flip_mask, ::-1]
     return aligned
+
+
+def _terminal_beta(outcome: int, num_outcomes: int, config: SearchConfig) -> np.ndarray:
+    beta = np.full((num_outcomes,), float(config.epsilon_terminal), dtype=np.float32)
+    beta[int(outcome)] += np.float32(config.kappa_terminal)
+    return _positive(beta)
+
+
+def _leaf_beta(alpha_v: np.ndarray, config: SearchConfig) -> np.ndarray:
+    alpha_v = _positive(alpha_v)
+    if config.leaf_value_mode == "alpha":
+        return alpha_v
+    if config.leaf_value_mode == "mean":
+        return np.asarray(config.kappa_leaf, dtype=np.float32) * outcome_mean(alpha_v)
+    raise ValueError(f"unknown leaf_value_mode: {config.leaf_value_mode!r}")
 
 
 def _commit_action(

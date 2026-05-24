@@ -35,10 +35,15 @@ class PosteriorTreeBatchOutput(NamedTuple):
     action_weights: jax.Array
     beta_Q_target: jax.Array
     beta_V_target: jax.Array
-    q_evidence_mass: jax.Array
+    q_loss_weight: jax.Array
     alpha_root: jax.Array
     trees: tuple["PosteriorTree", ...]
     tree_data: TreeTrainingData | None = None
+    search_loss_mask: jax.Array | None = None
+
+    @property
+    def q_evidence_mass(self) -> jax.Array:
+        return self.q_loss_weight
 
 
 @dataclass
@@ -55,8 +60,23 @@ class PosteriorNode:
     alpha_v: np.ndarray | None = None
     alpha_q: np.ndarray | None = None
     children: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int32))
-    evidence: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float32))
+    edge_B: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float32))
+    edge_has_post: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=bool))
+    edge_eval_count_R: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.uint32))
+    edge_version: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.uint32))
+    edge_child_cache_version: np.ndarray = field(default_factory=lambda: np.full((0,), -1, dtype=np.int64))
     visits: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int32))
+    value_cache_C: np.ndarray | None = None
+    downstream_eval_count: int = 0
+    value_cache_status: str = "clean"
+    value_cache_version: int = 0
+    edge_epoch: int = 0
+
+    @property
+    def evidence(self) -> np.ndarray:
+        if self.alpha_q is None:
+            return np.zeros_like(self.edge_B)
+        return np.where(self.edge_has_post[:, None], self.edge_B - self.alpha_q, 0.0)
 
 
 class PosteriorTree:
@@ -70,10 +90,11 @@ class PosteriorTree:
         root_alpha_q: np.ndarray,
         tree_index: int,
         rng: np.random.Generator,
-        c_leaf: float,
-        c_terminal: float,
-        c_state: float,
-        c_value_search: float,
+        leaf_value_mode: str = "alpha",
+        kappa_leaf: float = 1.0,
+        kappa_terminal: float = 8.0,
+        epsilon_terminal: float = 1e-6,
+        state_posterior_kappa_n: float = 9.0,
         policy_mc_samples: int,
         backup_mc_samples: int,
         commit: str,
@@ -81,10 +102,11 @@ class PosteriorTree:
         self.env = env
         self.tree_index = tree_index
         self.rng = rng
-        self.c_leaf = float(c_leaf)
-        self.c_terminal = float(c_terminal)
-        self.c_state = float(c_state)
-        self.c_value_search = float(c_value_search)
+        self.leaf_value_mode = leaf_value_mode
+        self.kappa_leaf = float(kappa_leaf)
+        self.kappa_terminal = float(kappa_terminal)
+        self.epsilon_terminal = float(epsilon_terminal)
+        self.state_posterior_kappa_n = float(state_posterior_kappa_n)
         self.policy_mc_samples = int(policy_mc_samples)
         self.backup_mc_samples = int(backup_mc_samples)
         self.commit = commit
@@ -129,8 +151,25 @@ class PosteriorTree:
             alpha_v=None if alpha_v is None else _positive_alpha(_as_numpy(alpha_v)),
             alpha_q=None if alpha_q is None else _positive_alpha(_as_numpy(alpha_q)),
             children=np.full((self.num_actions,), NO_CHILD, dtype=np.int32),
-            evidence=np.zeros((self.num_actions, self.num_outcomes), dtype=np.float32),
+            edge_B=(
+                np.ones((self.num_actions, self.num_outcomes), dtype=np.float32)
+                if alpha_q is None
+                else _positive_alpha(_as_numpy(alpha_q))
+            ),
+            edge_has_post=np.zeros((self.num_actions,), dtype=bool),
+            edge_eval_count_R=np.zeros((self.num_actions,), dtype=np.uint32),
+            edge_version=np.zeros((self.num_actions,), dtype=np.uint32),
+            edge_child_cache_version=np.full((self.num_actions,), -1, dtype=np.int64),
             visits=np.zeros((self.num_actions,), dtype=np.int32),
+            value_cache_C=(
+                None
+                if alpha_v is None
+                else _positive_alpha(_as_numpy(alpha_v))
+            ),
+            downstream_eval_count=0,
+            value_cache_status="clean",
+            value_cache_version=0 if alpha_v is None else 1,
+            edge_epoch=0,
         )
         self.nodes.append(node)
         return len(self.nodes) - 1
@@ -148,12 +187,22 @@ class PosteriorTree:
 
     def edge_posterior(self, node_id: int, action: int) -> np.ndarray:
         node = self.nodes[node_id]
-        return _positive_alpha(self.edge_base(node_id, action) + node.evidence[action])
+        if bool(node.edge_has_post[action]):
+            return _positive_alpha(node.edge_B[action])
+        return self.edge_base(node_id, action)
 
     def thompson_select(self, node_id: int) -> int:
         node = self.nodes[node_id]
         scores = np.full((self.num_actions,), -np.inf, dtype=np.float64)
         legal_actions = np.flatnonzero(node.legal_action_mask)
+        legal_actions = np.asarray(
+            [
+                action
+                for action in legal_actions
+                if not _child_blocks_selection(self.nodes, node, int(action))
+            ],
+            dtype=np.int32,
+        )
         if legal_actions.size == 0:
             raise ValueError("cannot select from a node with no legal actions")
         for action in legal_actions:
@@ -164,9 +213,9 @@ class PosteriorTree:
     def state_search_posterior(self, node_id: int) -> np.ndarray:
         node = self.nodes[node_id]
         if node.terminal or not node.expanded:
-            if node.alpha_v is None:
+            if node.value_cache_C is None:
                 return np.ones((self.num_outcomes,), dtype=np.float32)
-            return _positive_alpha(node.alpha_v)
+            return _positive_alpha(node.value_cache_C)
         alpha = np.stack(
             [self.edge_posterior(node_id, action) for action in range(self.num_actions)],
             axis=0,
@@ -177,7 +226,12 @@ class PosteriorTree:
             node.legal_action_mask,
             self.backup_mc_samples,
         )
-        return _positive_alpha(np.sum(policy[:, None] * alpha, axis=0))
+        e_v = np.sum(policy[:, None] * alpha, axis=0)
+        n_down = int(np.sum(node.edge_eval_count_R[node.legal_action_mask]))
+        gamma = float(n_down) / (self.state_posterior_kappa_n + float(n_down))
+        if node.alpha_v is None:
+            return _positive_alpha(e_v)
+        return _positive_alpha((1.0 - gamma) * node.alpha_v + gamma * e_v)
 
     def next_step_request(self) -> StepRequest | None:
         node_id = 0
@@ -185,14 +239,17 @@ class PosteriorTree:
         while True:
             node = self.nodes[node_id]
             if node.terminal:
-                d_leaf = self._terminal_outcome(node_id)
-                self.backup_path(tuple(path), node_id, d_leaf, self.c_terminal)
+                beta_leaf = self._terminal_beta(self._terminal_outcome(node_id))
+                self.backup_path(tuple(path), node_id, beta_leaf)
                 self.done += 1
                 return None
             if not node.expanded:
                 return None
 
-            action = self.thompson_select(node_id)
+            try:
+                action = self.thompson_select(node_id)
+            except ValueError:
+                return None
             path.append((node_id, action))
             child_id = int(node.children[action])
             if child_id != NO_CHILD:
@@ -216,8 +273,8 @@ class PosteriorTree:
         parent.children[request.action] = child_id
         child = self.nodes[child_id]
         if child.terminal:
-            d_leaf = self._terminal_outcome(child_id)
-            self.backup_path(request.path, child_id, d_leaf, self.c_terminal)
+            beta_leaf = self._terminal_beta(self._terminal_outcome(child_id))
+            self.backup_path(request.path, child_id, beta_leaf)
             self.done += 1
             return None
 
@@ -244,44 +301,140 @@ class PosteriorTree:
         node.prior_logits = _as_numpy(logits)
         node.alpha_v = _positive_alpha(_as_numpy(alpha_v))
         node.alpha_q = _positive_alpha(_as_numpy(alpha_q))
+        node.value_cache_C = node.alpha_v.copy()
+        node.downstream_eval_count = 0
+        node.value_cache_status = "clean"
+        node.value_cache_version += 1
         node.expanded = True
         if node.in_flight:
             node.in_flight = False
             self.inflight -= 1
-        d_leaf = outcome_mean_np(node.alpha_v)
-        self.backup_path(request.path, request.leaf_id, d_leaf, self.c_leaf)
+        self.backup_path(request.path, request.leaf_id, self._leaf_beta(node.alpha_v))
         self.done += 1
 
     def backup_path(
         self,
         path: tuple[tuple[int, int], ...],
         leaf_id: int,
-        d_leaf: np.ndarray,
-        leaf_weight: float,
+        beta_leaf: np.ndarray,
+        leaf_weight: float | None = None,
     ) -> None:
         if not path:
             return
+        beta_leaf = np.asarray(beta_leaf, dtype=np.float32)
+        if leaf_weight is not None:
+            beta_leaf = np.asarray(leaf_weight, dtype=np.float32) * beta_leaf
 
         final_parent, final_action = path[-1]
         final_node = self.nodes[final_parent]
-        d_parent = self._align(leaf_id, final_parent, d_leaf)
-        final_node.evidence[final_action] += np.asarray(leaf_weight, dtype=np.float32) * d_parent
+        d_parent = self._align(leaf_id, final_parent, beta_leaf)
+        final_node.edge_B[final_action] = _positive_alpha(d_parent)
+        final_node.edge_has_post[final_action] = True
+        final_node.edge_eval_count_R[final_action] += np.uint32(1)
+        final_node.edge_version[final_action] += np.uint32(1)
+        final_node.edge_child_cache_version[final_action] = -1
         final_node.visits[final_action] += 1
+        self._mark_dirty(final_parent)
+        self.repair_path_to_root(final_parent)
 
-        for parent_id, action in reversed(path[:-1]):
-            parent = self.nodes[parent_id]
-            child_id = int(parent.children[action])
-            if child_id == NO_CHILD:
-                continue
-            beta_child = self.state_search_posterior(child_id)
-            parent.evidence[action] += np.asarray(self.c_state, dtype=np.float32) * self._align(
-                child_id,
-                parent_id,
-                beta_child,
-            )
-            parent.visits[action] += 1
+    def refresh_edge_from_child(self, parent_id: int, action: int) -> bool:
+        parent = self.nodes[parent_id]
+        child_id = int(parent.children[action])
+        if child_id == NO_CHILD:
+            return True
+        child = self.nodes[child_id]
+        if child.terminal or not child.expanded:
+            return True
+        if not np.any(child.edge_has_post[child.legal_action_mask]):
+            return True
+        if child.value_cache_status != "clean" or child.value_cache_C is None:
+            self._mark_dirty(parent_id)
+            return False
+        if int(parent.edge_child_cache_version[action]) == int(child.value_cache_version):
+            return True
+        parent.edge_B[action] = self._align(child_id, parent_id, child.value_cache_C)
+        parent.edge_has_post[action] = True
+        parent.edge_eval_count_R[action] = np.uint32(1 + int(child.downstream_eval_count))
+        parent.edge_version[action] += np.uint32(1)
+        parent.edge_child_cache_version[action] = np.int64(child.value_cache_version)
+        parent.visits[action] += 1
+        self._mark_dirty(parent_id)
+        return True
+
+    def try_repair_node(self, node_id: int) -> bool:
+        node = self.nodes[node_id]
+        if node.terminal or not node.expanded:
+            return False
+        if node.alpha_v is None:
+            return False
+        if node.value_cache_status == "clean":
+            return True
+        epoch = int(node.edge_epoch)
+        for action in np.flatnonzero(node.legal_action_mask):
+            if not self.refresh_edge_from_child(node_id, int(action)):
+                node.value_cache_status = "dirty"
+                return False
+        if int(node.edge_epoch) != epoch:
+            node.value_cache_status = "dirty"
+            return False
+        if not np.any(node.edge_has_post[node.legal_action_mask]):
+            node.value_cache_C = node.alpha_v.copy()
+            node.downstream_eval_count = 0
+            node.value_cache_status = "clean"
+            return True
+        alpha = np.stack(
+            [self.edge_posterior(node_id, action) for action in range(self.num_actions)],
+            axis=0,
+        )
+        policy = posterior_best_policy_target_np(
+            self.rng,
+            alpha,
+            node.legal_action_mask,
+            self.backup_mc_samples,
+        )
+        e_v = np.sum(policy[:, None] * alpha, axis=0)
+        n_down = int(np.sum(node.edge_eval_count_R[node.legal_action_mask]))
+        gamma = float(n_down) / (self.state_posterior_kappa_n + float(n_down))
+        if int(node.edge_epoch) != epoch:
+            node.value_cache_status = "dirty"
+            return False
+        node.value_cache_C = _positive_alpha((1.0 - gamma) * node.alpha_v + gamma * e_v)
+        node.downstream_eval_count = n_down
+        node.value_cache_status = "clean"
+        node.value_cache_version += 1
+        if node.parent != NO_CHILD:
+            self._mark_dirty(node.parent)
+        return True
+
+    def repair_path_to_root(self, node_id: int) -> None:
+        seen: set[int] = set()
+        while node_id != NO_CHILD and node_id not in seen:
+            seen.add(node_id)
+            node = self.nodes[node_id]
+            if node.value_cache_status != "clean":
+                if not self.try_repair_node(node_id):
+                    return
+            node_id = node.parent
+
+    def repair_dirty_frontier(self) -> None:
+        for _ in range(max(1, len(self.nodes))):
+            dirty = [
+                node_id
+                for node_id, node in enumerate(self.nodes)
+                if node.expanded and not node.terminal and node.value_cache_status != "clean"
+            ]
+            if not dirty:
+                return
+            changed = False
+            for node_id in sorted(dirty, key=lambda ix: _depth(self.nodes, ix), reverse=True):
+                before = self.nodes[node_id].value_cache_version
+                self.try_repair_node(node_id)
+                changed = changed or self.nodes[node_id].value_cache_version != before
+            if not changed:
+                return
 
     def finish(self) -> tuple[np.ndarray, np.ndarray, int, np.ndarray, np.ndarray, np.ndarray]:
+        self.repair_dirty_frontier()
         root = self.nodes[0]
         alpha_root = np.stack(
             [self.edge_posterior(0, action) for action in range(self.num_actions)],
@@ -294,13 +447,12 @@ class PosteriorTree:
             self.policy_mc_samples,
         )
         action = self._commit_action(policy_target, alpha_root, root.legal_action_mask)
-        q_evidence_mass = np.sum(root.evidence, axis=-1)
+        q_loss_weight = policy_target
         beta_q = alpha_root
-        value_proxy = np.sum(policy_target[:, None] * alpha_root, axis=0)
-        if root.alpha_v is None:
+        if root.value_cache_C is None:
             raise ValueError("root is missing alpha_v")
-        beta_v = _positive_alpha(root.alpha_v + self.c_value_search * value_proxy)
-        return action, policy_target, beta_q, beta_v, q_evidence_mass, alpha_root
+        beta_v = _positive_alpha(root.value_cache_C)
+        return action, policy_target, beta_q, beta_v, q_loss_weight, alpha_root
 
     def _commit_action(
         self,
@@ -316,18 +468,36 @@ class PosteriorTree:
                 probs = legal_action_mask.astype(np.float64)
                 prob_sum = float(np.sum(probs))
             return int(self.rng.choice(self.num_actions, p=probs / prob_sum))
-        if mode == "scalar_q_argmax" or mode == "search_action":
+        if mode in {"scalar_q_argmax", "argmax_q_mean", "search_action"}:
             scores = outcome_utility_np(outcome_mean_np(alpha_root))
             return int(np.argmax(np.where(legal_action_mask, scores, -np.inf)))
         if mode == "posterior_argmax":
             return int(np.argmax(np.where(legal_action_mask, policy_target, -np.inf)))
         raise ValueError(f"unknown selfplay_action_source: {self.commit!r}")
 
-    def _terminal_outcome(self, node_id: int) -> np.ndarray:
+    def _terminal_outcome(self, node_id: int) -> int:
         node = self.nodes[node_id]
         rewards = _as_numpy(node.state.rewards)
         reward = float(rewards[node.current_player])
         return terminal_outcome_from_reward_np(reward, self.num_outcomes)
+
+    def _terminal_beta(self, outcome_index: int) -> np.ndarray:
+        beta = np.full((self.num_outcomes,), self.epsilon_terminal, dtype=np.float32)
+        beta[int(outcome_index)] += np.float32(self.kappa_terminal)
+        return _positive_alpha(beta)
+
+    def _leaf_beta(self, alpha_v: np.ndarray) -> np.ndarray:
+        alpha_v = _positive_alpha(alpha_v)
+        if self.leaf_value_mode == "alpha":
+            return alpha_v
+        if self.leaf_value_mode == "mean":
+            return np.asarray(self.kappa_leaf, dtype=np.float32) * outcome_mean_np(alpha_v)
+        raise ValueError(f"unknown leaf_value_mode: {self.leaf_value_mode!r}")
+
+    def _mark_dirty(self, node_id: int) -> None:
+        node = self.nodes[node_id]
+        node.edge_epoch += 1
+        node.value_cache_status = "dirty"
 
     def _align(self, source_node_id: int, target_node_id: int, value: np.ndarray) -> np.ndarray:
         source = self.nodes[source_node_id]
@@ -391,10 +561,11 @@ def run_posterior_tree_search(
             root_alpha_q=root_alpha_q[ix],
             tree_index=ix,
             rng=rng,
-            c_leaf=getattr(config, "c_leaf"),
-            c_terminal=getattr(config, "c_terminal"),
-            c_state=getattr(config, "c_state", 0.1),
-            c_value_search=getattr(config, "c_value_search", 1.0),
+            leaf_value_mode=getattr(config, "leaf_value_mode", "alpha"),
+            kappa_leaf=float(getattr(config, "kappa_leaf", 1.0)),
+            kappa_terminal=float(getattr(config, "kappa_terminal", 8.0)),
+            epsilon_terminal=float(getattr(config, "epsilon_terminal", 1e-6)),
+            state_posterior_kappa_n=float(getattr(config, "state_posterior_kappa_n", 9.0)),
             policy_mc_samples=getattr(config, "policy_mc_samples"),
             backup_mc_samples=getattr(config, "backup_mc_samples", getattr(config, "policy_mc_samples")),
             commit=getattr(config, "selfplay_action_source"),
@@ -412,16 +583,18 @@ def run_posterior_tree_search(
     )
 
     finished = [tree.finish() for tree in trees]
-    actions, policies, beta_q, beta_v, q_mass, alpha_root = zip(*finished, strict=True)
+    actions, policies, beta_q, beta_v, q_weight, alpha_root = zip(*finished, strict=True)
+    policy_array = np.stack(policies, axis=0)
     return PosteriorTreeBatchOutput(
         action=_device_put_cpu(jnp.asarray(np.asarray(actions), dtype=jnp.int32)),
-        action_weights=_device_put_cpu(jnp.asarray(np.stack(policies, axis=0))),
+        action_weights=_device_put_cpu(jnp.asarray(policy_array)),
         beta_Q_target=_device_put_cpu(jnp.asarray(np.stack(beta_q, axis=0))),
         beta_V_target=_device_put_cpu(jnp.asarray(np.stack(beta_v, axis=0))),
-        q_evidence_mass=_device_put_cpu(jnp.asarray(np.stack(q_mass, axis=0))),
+        q_loss_weight=_device_put_cpu(jnp.asarray(np.stack(q_weight, axis=0))),
         alpha_root=_device_put_cpu(jnp.asarray(np.stack(alpha_root, axis=0))),
         trees=trees,
         tree_data=None,
+        search_loss_mask=_device_put_cpu(jnp.asarray(np.sum(policy_array, axis=-1) > 0.0)),
     )
 
 
@@ -522,7 +695,7 @@ def _build_step_batch(
     requests: list[StepRequest | None] = []
     made_progress = False
     for tree in trees:
-        if tree.done >= num_simulations or tree.inflight >= inflight_limit:
+        if tree.done + tree.inflight >= num_simulations or tree.inflight >= inflight_limit:
             requests.append(None)
             continue
         before = (tree.done, tree.inflight, len(tree.nodes))
@@ -612,7 +785,7 @@ def flip_outcome_np(outcome_dist: np.ndarray) -> np.ndarray:
     return np.asarray(outcome_dist, dtype=np.float32)[..., ::-1]
 
 
-def terminal_outcome_from_reward_np(reward: float, num_outcomes: int) -> np.ndarray:
+def terminal_outcome_from_reward_np(reward: float, num_outcomes: int) -> int:
     rounded = int(np.rint(reward))
     if num_outcomes == 2:
         index = (rounded + 1) // 2
@@ -621,9 +794,25 @@ def terminal_outcome_from_reward_np(reward: float, num_outcomes: int) -> np.ndar
     else:
         raise ValueError(f"unsupported outcome count: {num_outcomes}")
     index = int(np.clip(index, 0, num_outcomes - 1))
-    outcome = np.zeros((num_outcomes,), dtype=np.float32)
-    outcome[index] = 1.0
-    return outcome
+    return index
+
+
+def _child_blocks_selection(nodes: list[PosteriorNode], node: PosteriorNode, action: int) -> bool:
+    child_id = int(node.children[action])
+    if child_id == NO_CHILD:
+        return False
+    child = nodes[child_id]
+    return bool(child.in_flight)
+
+
+def _depth(nodes: list[PosteriorNode], node_id: int) -> int:
+    depth = 0
+    seen: set[int] = set()
+    while node_id != NO_CHILD and node_id not in seen:
+        seen.add(node_id)
+        node_id = nodes[node_id].parent
+        depth += 1
+    return depth
 
 
 def _stack_states(states: list[Any]) -> Any:

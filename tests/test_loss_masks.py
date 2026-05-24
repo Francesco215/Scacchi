@@ -21,7 +21,7 @@ def _sample_posterior_fields(num_rows: int, num_actions: int = 2, num_outcomes: 
     return {
         "beta_Q_target": jnp.ones((num_rows, num_actions, num_outcomes)),
         "beta_V_target": jnp.ones((num_rows, num_outcomes)),
-        "q_evidence_mass": jnp.zeros((num_rows, num_actions)),
+        "q_loss_weight": jnp.zeros((num_rows, num_actions)),
     }
 
 
@@ -53,7 +53,7 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
         ),
         beta_Q_target=jnp.ones((3, 2, 4, 2)),
         beta_V_target=jnp.ones((3, 2, 2)),
-        q_evidence_mass=jnp.array(
+        q_loss_weight=jnp.array(
             [
                 [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 2.0, 0.0]],
                 [[0.0, 3.0, 0.0, 0.0], [4.0, 0.0, 0.0, 0.0]],
@@ -70,7 +70,7 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
     assert jnp.array_equal(sample.played_action, data.played_action)
     assert jnp.array_equal(sample.beta_Q_target, data.beta_Q_target)
     assert jnp.array_equal(sample.beta_V_target, data.beta_V_target)
-    assert jnp.array_equal(sample.q_evidence_mass, data.q_evidence_mass)
+    assert jnp.array_equal(sample.q_loss_weight, data.q_loss_weight)
     assert jnp.array_equal(
         sample.value_mask,
         jnp.array(
@@ -91,10 +91,11 @@ def test_compute_loss_input_appends_tree_rows_with_separate_loss_masks():
         legal_action_mask=jnp.array([[[True, False], [False, False]]]),
         beta_Q_target=jnp.ones((1, 2, 2, 2)),
         beta_V_target=jnp.ones((1, 2, 2)),
-        q_evidence_mass=jnp.array([[[2.0, 0.0], [0.0, 0.0]]]),
+        q_loss_weight=jnp.array([[[1.0, 0.0], [0.0, 0.0]]]),
         value_tgt=jnp.array([[0.5, 1.0]]),
         policy_loss_mask=jnp.array([[True, False]]),
         value_loss_mask=jnp.array([[True, True]]),
+        search_loss_mask=jnp.array([[True, False]]),
         outcome_mask=jnp.array([[False, True]]),
     )
     data = SelfplayOutput(
@@ -106,7 +107,7 @@ def test_compute_loss_input_appends_tree_rows_with_separate_loss_masks():
         legal_action_mask=jnp.array([[[True, True]]]),
         beta_Q_target=jnp.ones((1, 1, 2, 2)),
         beta_V_target=jnp.ones((1, 1, 2)),
-        q_evidence_mass=jnp.zeros((1, 1, 2)),
+        q_loss_weight=jnp.zeros((1, 1, 2)),
         discount=jnp.zeros((1, 1)),
         tree_data=tree_data,
     )
@@ -130,7 +131,7 @@ def test_compute_loss_input_trains_root_search_targets_before_terminal_result():
         legal_action_mask=jnp.ones((2, 3, 4), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((2, 3, 4, 3)),
         beta_V_target=jnp.ones((2, 3, 3)),
-        q_evidence_mass=jnp.ones((2, 3, 4)),
+        q_loss_weight=jnp.ones((2, 3, 4)) / 4.0,
         discount=-jnp.ones((2, 3)),
     )
     config = SimpleNamespace(max_num_steps=2, selfplay_batch_size=3)
@@ -153,7 +154,7 @@ def test_make_minibatches_replays_active_rows_and_keeps_compute_shape():
         value_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((1, 8, 2, 2)),
         beta_V_target=jnp.ones((1, 8, 2)),
-        q_evidence_mass=jnp.zeros((1, 8, 2)),
+        q_loss_weight=jnp.zeros((1, 8, 2)),
         policy_loss_mask=active_mask,
         value_loss_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
         outcome_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
@@ -305,7 +306,8 @@ def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
             ]
         ),
         beta_V_target=jnp.array([[1.0, 2.0], [1000.0, 1.0]]),
-        q_evidence_mass=jnp.array([[0.0, 100.0, 2.0], [100.0, 100.0, 100.0]]),
+        q_loss_weight=jnp.array([[0.0, 0.0, 1.0], [1.0, 1.0, 1.0]]),
+        search_loss_mask=jnp.array([True, False]),
     )
     logits = jnp.zeros((2, 3))
     alpha_v = jnp.array([[1.0, 2.0], [1.0, 1000.0]])
@@ -328,7 +330,7 @@ def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
     expected_q = _dirichlet_kl(data.beta_Q_target[0, 2], alpha_q[0, 2])
     assert jnp.allclose(metrics.value_dir_kl_loss, 0.0, atol=1e-6)
     assert jnp.allclose(metrics.q_dir_kl_loss, expected_q, atol=1e-6)
-    assert jnp.allclose(metrics.q_evidence_mass_mean, 2.0)
+    assert jnp.allclose(metrics.q_loss_weight_mean, 1.0)
 
 
 def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():
@@ -341,7 +343,7 @@ def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():
         value_mask=jnp.array([True]),
         beta_Q_target=jnp.ones((1, 2, 2)),
         beta_V_target=jnp.ones((1, 2)),
-        q_evidence_mass=jnp.zeros((1, 2)),
+        q_loss_weight=jnp.zeros((1, 2)),
     )
     logits = jnp.array([[0.0, 0.0]])
     alpha_v = jnp.ones((1, 2))

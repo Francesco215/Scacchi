@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Iterable, Protocol
 
 from .codec import decode_node, encode_node
-from .types import NodeBlob, StateKey
+from .types import EVAL_EXPANDING, EVAL_INFLIGHT, NodeBlob, StateKey
 
 
 @dataclass(slots=True)
@@ -87,7 +87,7 @@ class InMemoryNodeStore:
             if node is None:
                 self.nodes[key] = NodeBlob.inflight_node(key=key)
                 claimed.append(key)
-            elif node.status == 0:
+            elif node.status in (EVAL_INFLIGHT, EVAL_EXPANDING):
                 inflight.append(key)
             else:
                 expanded.append(key)
@@ -172,7 +172,7 @@ class RedisNodeStore:
         for key in unique:
             cached = self.cache.get(key)
             if cached is not None:
-                if cached.status == 0:
+                if cached.status in (EVAL_INFLIGHT, EVAL_EXPANDING):
                     inflight.append(key)
                 else:
                     expanded.append(key)
@@ -196,7 +196,7 @@ class RedisNodeStore:
                 existing = self.get_many(misses)
                 for key in misses:
                     node = existing[key]
-                    if node is not None and node.status == 0:
+                    if node is not None and node.status in (EVAL_INFLIGHT, EVAL_EXPANDING):
                         inflight.append(key)
                     else:
                         expanded.append(key)

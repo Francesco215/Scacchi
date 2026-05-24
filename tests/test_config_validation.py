@@ -15,11 +15,16 @@ def test_nested_hex_config_loads_into_runtime_config():
     config = Config(**normalize_config_dict(container))
 
     assert config.env_id == "hex"
-    assert config.board_size == 6
+    assert config.board_size == 3
     assert config.network == "boardlaw_dirichlet"
-    assert config.selfplay_batch_size == 2048
+    assert config.selfplay_batch_size == 8
     assert config.search_policy == "posterior_tree_wavefront"
     assert config.wavefront_num_lanes_per_root == 4
+    assert config.leaf_value_mode == "alpha"
+    assert config.kappa_leaf == 1.0
+    assert config.kappa_terminal == 8.0
+    assert config.epsilon_terminal == 1e-6
+    assert config.state_posterior_kappa_n == 9.0
     assert config.train_tree_nodes is True
     assert config.training_batch_size == 8192
     assert config.eval_batch_size == 16
@@ -39,6 +44,14 @@ def test_flat_config_keys_take_precedence_over_nested_values():
 
     assert normalized["board_size"] == 7
     assert normalized["num_channels"] == 128
+
+
+def test_deprecated_search_constants_are_rejected():
+    with pytest.raises(ValueError, match="c_leaf"):
+        normalize_config_dict({"search": {"constants": {"c_leaf": 1.0}}})
+
+    with pytest.raises(ValidationError, match="c_state"):
+        Config(network="boardlaw_dirichlet", c_state=0.1)
 
 
 def test_scalar_network_rejects_dirichlet_loss_weights():
@@ -190,7 +203,7 @@ def test_wavefront_knobs_are_validated():
             search_policy="posterior_tree_wavefront",
             wavefront_final_action_mode="argmax_q_mean",
         ).wavefront_final_action_mode
-        == "argmax_q_mean"
+        == "scalar_q_argmax"
     )
 
     with pytest.raises(ValidationError, match="wavefront_final_action_mode"):

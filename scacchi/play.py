@@ -50,9 +50,14 @@ class SelfplayOutput(NamedTuple):
     legal_action_mask: jax.Array
     beta_Q_target: jax.Array
     beta_V_target: jax.Array
-    q_evidence_mass: jax.Array
+    q_loss_weight: jax.Array
     discount: jax.Array
     tree_data: TreeTrainingData | None = None
+    search_loss_mask: jax.Array | None = None
+
+    @property
+    def q_evidence_mass(self) -> jax.Array:
+        return self.q_loss_weight
 
 
 def _cpu_device() -> jax.Device:
@@ -185,8 +190,8 @@ def make_dirichlet_recurrent_fn(env, predict_fn, config):
         )
         evidence_weight = jnp.where(
             env_state.terminated,
-            jnp.asarray(config.c_terminal, dtype=outcome_dist.dtype),
-            jnp.asarray(config.c_leaf, dtype=outcome_dist.dtype),
+            jnp.asarray(config.kappa_terminal, dtype=outcome_dist.dtype),
+            jnp.asarray(config.kappa_leaf, dtype=outcome_dist.dtype),
         )
         root_action = jnp.where(
             embedding.root_action == NO_PARENT,
@@ -232,8 +237,8 @@ def _empty_posterior_targets(
         dtype=policy_target.dtype,
     )
     beta_v = jnp.zeros((batch_size, num_outcomes), dtype=policy_target.dtype)
-    q_evidence_mass = jnp.zeros((batch_size, num_actions), dtype=policy_target.dtype)
-    return beta_q, beta_v, q_evidence_mass
+    q_loss_weight = jnp.zeros((batch_size, num_actions), dtype=policy_target.dtype)
+    return beta_q, beta_v, q_loss_weight
 
 
 def _select_posterior_tree_played_action(
@@ -287,7 +292,8 @@ def make_posterior_tree_selfplay(env, config):
         legal_action_mask_seq = []
         beta_q_seq = []
         beta_v_seq = []
-        q_evidence_mass_seq = []
+        q_loss_weight_seq = []
+        search_loss_mask_seq = []
         discount_seq = []
         tree_data_seq = []
 
@@ -344,7 +350,11 @@ def make_posterior_tree_selfplay(env, config):
             legal_action_mask_seq.append(legal_action_mask)
             beta_q_seq.append(search_output.beta_Q_target)
             beta_v_seq.append(search_output.beta_V_target)
-            q_evidence_mass_seq.append(search_output.q_evidence_mass)
+            q_loss_weight_seq.append(search_output.q_loss_weight)
+            root_search_mask = search_output.search_loss_mask
+            if root_search_mask is None:
+                root_search_mask = jnp.sum(search_output.action_weights, axis=-1) > 0
+            search_loss_mask_seq.append(root_search_mask)
             if search_output.tree_data is not None:
                 tree_data_seq.append(search_output.tree_data)
             reward_seq.append(reward)
@@ -367,9 +377,10 @@ def make_posterior_tree_selfplay(env, config):
             legal_action_mask=jnp.stack(legal_action_mask_seq, axis=0),
             beta_Q_target=jnp.stack(beta_q_seq, axis=0),
             beta_V_target=jnp.stack(beta_v_seq, axis=0),
-            q_evidence_mass=jnp.stack(q_evidence_mass_seq, axis=0),
+            q_loss_weight=jnp.stack(q_loss_weight_seq, axis=0),
             discount=jnp.stack(discount_seq, axis=0),
             tree_data=tree_data,
+            search_loss_mask=jnp.stack(search_loss_mask_seq, axis=0),
         )
 
     return selfplay
@@ -417,7 +428,7 @@ def make_selfplay(env, config):
                 num_outcomes = config.num_outcomes
                 if num_outcomes is None:
                     num_outcomes = 2 if config.env_id == "hex" else 3
-                beta_Q_target, beta_V_target, q_evidence_mass = (
+                beta_Q_target, beta_V_target, q_loss_weight = (
                     _empty_posterior_targets(policy_target, num_outcomes)
                 )
             else:
@@ -484,7 +495,7 @@ def make_selfplay(env, config):
                         policy_target,
                     )
                 )
-                q_evidence_mass = jnp.sum(q_evidence_sum, axis=-1)
+                q_loss_weight = policy_target
                 if config.selfplay_action_source in ("posterior_best", "posterior_argmax"):
                     posterior_action = posterior_best_action(
                         policy_target,
@@ -517,10 +528,11 @@ def make_selfplay(env, config):
                 legal_action_mask=legal_action_mask,
                 beta_Q_target=beta_Q_target,
                 beta_V_target=beta_V_target,
-                q_evidence_mass=q_evidence_mass,
+                q_loss_weight=q_loss_weight,
                 reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
                 terminated=env_state.terminated,
                 discount=discount,
+                search_loss_mask=jnp.sum(policy_target, axis=-1) > 0,
             )
 
         rng_key, init_key = jax.random.split(rng_key)

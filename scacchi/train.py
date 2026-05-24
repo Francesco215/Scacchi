@@ -73,10 +73,11 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("search", "inflight_limit"), "inflight_limit"),
     (("search", "monte_carlo", "policy_samples"), "policy_mc_samples"),
     (("search", "monte_carlo", "backup_samples"), "backup_mc_samples"),
-    (("search", "constants", "c_leaf"), "c_leaf"),
-    (("search", "constants", "c_terminal"), "c_terminal"),
-    (("search", "constants", "c_state"), "c_state"),
-    (("search", "constants", "c_value_search"), "c_value_search"),
+    (("search", "constants", "kappa_leaf"), "kappa_leaf"),
+    (("search", "constants", "kappa_terminal"), "kappa_terminal"),
+    (("search", "constants", "epsilon_terminal"), "epsilon_terminal"),
+    (("search", "constants", "state_posterior_kappa_n"), "state_posterior_kappa_n"),
+    (("search", "leaf_value_mode"), "leaf_value_mode"),
     (("search", "wavefront", "backend"), "wavefront_backend"),
     (("search", "wavefront", "num_lanes_per_root"), "wavefront_num_lanes_per_root"),
     (("search", "wavefront", "max_depth"), "wavefront_max_depth"),
@@ -118,6 +119,33 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 _NESTED_CONFIG_GROUPS = frozenset(path[0] for path, _ in _NESTED_CONFIG_FIELDS)
 _NESTED_CONFIG_PATHS = frozenset(path for path, _ in _NESTED_CONFIG_FIELDS)
+_DEPRECATED_CONFIG_KEYS = frozenset(
+    {
+        "c_leaf",
+        "c_terminal",
+        "c_state",
+        "c_value_search",
+    }
+)
+_DEPRECATED_NESTED_CONFIG_PATHS = frozenset(
+    ("search", "constants", key) for key in _DEPRECATED_CONFIG_KEYS
+)
+
+
+def _raise_deprecated_config(key: str) -> None:
+    replacements = {
+        "c_leaf": "kappa_leaf",
+        "c_terminal": "kappa_terminal",
+        "c_state": "state_posterior_kappa_n",
+        "c_value_search": None,
+    }
+    leaf = key.rsplit(".", 1)[-1]
+    replacement = replacements.get(leaf)
+    if replacement is None:
+        message = f"{key!r} is deprecated and no longer used by posterior-tree search."
+    else:
+        message = f"{key!r} is deprecated; use {replacement!r} instead."
+    raise ValueError(message)
 
 
 def _nested_value(
@@ -152,6 +180,8 @@ def normalize_config_dict(config: Mapping[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for key, value in config.items():
         key = str(key)
+        if key in _DEPRECATED_CONFIG_KEYS:
+            _raise_deprecated_config(key)
         if key not in _NESTED_CONFIG_GROUPS:
             normalized[key] = value
             continue
@@ -159,6 +189,8 @@ def normalize_config_dict(config: Mapping[str, Any]) -> dict[str, Any]:
             normalized[key] = value
             continue
         for path, leaf_value in _iter_nested_leaves(value, (key,)):
+            if path in _DEPRECATED_NESTED_CONFIG_PATHS:
+                _raise_deprecated_config(".".join(path))
             if path not in _NESTED_CONFIG_PATHS:
                 normalized[".".join(path)] = leaf_value
 
@@ -188,10 +220,11 @@ class Config(BaseModel):
     max_num_steps: int = 256
     policy_mc_samples: int = 32
     backup_mc_samples: int = Field(default=16, ge=1)
-    c_leaf: float = 1.0
-    c_terminal: float = 8.0
-    c_state: float = Field(default=0.1, ge=0.0)
-    c_value_search: float = Field(default=1.0, ge=0.0)
+    leaf_value_mode: str = "alpha"
+    kappa_leaf: float = Field(default=1.0, gt=0.0)
+    kappa_terminal: float = Field(default=8.0, gt=0.0)
+    epsilon_terminal: float = Field(default=1e-6, gt=0.0)
+    state_posterior_kappa_n: float = Field(default=9.0, gt=0.0)
     inflight_limit: int = Field(default=1, ge=1)
     search_eval_batch_size: int | None = Field(default=None, ge=1)
     selfplay_action_source: str = "posterior_best"
@@ -209,7 +242,7 @@ class Config(BaseModel):
     wavefront_backend: str = "arena"
     train_tree_nodes: bool = False
     train_tree_include_root: bool = False
-    train_tree_include_terminal: bool = True
+    train_tree_include_terminal: bool = False
     train_tree_min_q_evidence: float = Field(default=0.0, ge=0.0)
     train_tree_max_nodes_per_step: int | None = Field(default=None, ge=1)
     # training params
@@ -234,6 +267,19 @@ class Config(BaseModel):
     ckpt_save_interval_steps: int = 50
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_search_config(cls, values: Any):
+        if not isinstance(values, Mapping):
+            return values
+        values = dict(values)
+        for key in sorted(_DEPRECATED_CONFIG_KEYS):
+            if key in values:
+                _raise_deprecated_config(key)
+        if values.get("wavefront_final_action_mode") == "argmax_q_mean":
+            values["wavefront_final_action_mode"] = "scalar_q_argmax"
+        return values
 
     @model_validator(mode="after")
     def require_dirichlet_network_for_dirichlet_losses(self, info: ValidationInfo):
@@ -283,7 +329,6 @@ class Config(BaseModel):
             )
         valid_wavefront_action_modes = {
             "scalar_q_argmax",
-            "argmax_q_mean",
             "posterior_argmax",
             "posterior_sample",
         }
@@ -293,6 +338,8 @@ class Config(BaseModel):
                 "wavefront_final_action_mode must be one of "
                 f"{allowed}; got {self.wavefront_final_action_mode!r}."
             )
+        if self.leaf_value_mode not in {"alpha", "mean"}:
+            raise ValueError("leaf_value_mode must be 'alpha' or 'mean'.")
         if self.wavefront_backend != "arena":
             raise ValueError("wavefront_backend currently supports only 'arena'.")
         if self.train_tree_nodes and self.search_policy != "posterior_tree_wavefront":
@@ -397,7 +444,7 @@ def main(cfg: DictConfig) -> None:
                         "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
                         "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
                         "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
-                        "train/q_evidence_mass_mean": train_metrics.q_evidence_mass_mean.mean().item(),
+                        "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
                         "train/hours": hours,
                         "train/frames": frames,
                     }

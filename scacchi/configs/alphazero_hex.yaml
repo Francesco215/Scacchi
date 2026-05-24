@@ -12,8 +12,8 @@ num_simulations: 32
 max_num_steps: 32
 num_search_blocks: 5
 policy_mc_samples: 32
-c_leaf: 1.0
-c_terminal: 8.0
+kappa_leaf: 1.0
+kappa_terminal: 8.0
 selfplay_action_source: search_action
 search_policy: gumbel
 training_batch_size: 1024
