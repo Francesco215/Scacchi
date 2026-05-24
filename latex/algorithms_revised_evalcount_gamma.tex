@@ -406,20 +406,23 @@ R_{v,a}\in\mathbb{N},
 Here \(B_{v,a}\) is the latest completed backed-up Dirichlet posterior for edge
 \((v,a)\), \(m_{v,a}\) says whether such a completed posterior exists,
 \(R_{v,a}\) is the number of completed terminal or neural evaluations represented
-by that edge posterior, and \(\nu^B_{v,a}\) is incremented whenever \(B_{v,a}\) is
+by that edge snapshot, and \(\nu^B_{v,a}\) is incremented whenever \(B_{v,a}\) is
 atomically replaced. The count \(R_{v,a}\) is \emph{not} a visit-count policy
 statistic. It is only used to decide how much downstream search work a node's
 state-posterior cache should trust. If \(m_{v,a}=0\), then \(R_{v,a}=0\).
-A direct terminal or neural leaf backup sets \(R_{v,a}=1\). A refresh from an
-interior child sets \(R_{v,a}=1+N^\downarrow_u\), counting the child's own neural
-evaluation plus the completed evaluations already incorporated below that child.
+A direct terminal or neural leaf backup increments \(R_{v,a}\) by one. A refresh
+from an interior child sets \(R_{v,a}=1+N^\downarrow_u\), counting the child's own
+neural evaluation plus the completed evaluations already incorporated below that
+child.
 
 A write to \(B_{v,a}\) is a \emph{publish}: the writer constructs the complete
 three-component vector privately and then atomically swaps the edge snapshot.
 Readers never observe a half-written posterior. When a new backup reaches edge
 \((v,a)\), it overwrites \(B_{v,a}\). It does not add a delta to the previous
-value of \(B_{v,a}\). The object being stored is the current completed posterior
-for the edge, not an accumulated visit-count statistic.
+value of \(B_{v,a}\). The object stored in \(B_{v,a}\) is the current completed
+posterior snapshot for the edge, not accumulated Dirichlet mass. Repeated direct
+leaf completions increase \(R_{v,a}\), so the state-posterior cache can trust the
+same edge more without artificially sharpening that edge's WDL posterior.
 
 The posterior used for selection and targets is
 
@@ -1183,7 +1186,9 @@ B_{v_{\ell-1},a_{\ell-1}}
 \gets
 \Align_{v_{\ell-1}\leftarrow \ell}(\beta_\ell),
 \qquad
-R_{v_{\ell-1},a_{\ell-1}}\gets 1,
+R_{v_{\ell-1},a_{\ell-1}}
+\gets
+R_{v_{\ell-1},a_{\ell-1}}+1,
 \qquad
 m_{v_{\ell-1},a_{\ell-1}}
 \gets 1.
@@ -1192,8 +1197,10 @@ m_{v_{\ell-1},a_{\ell-1}}
 The edge base prior is used only as the fallback before an edge has completed
 posterior information. Once a terminal or neural leaf has been evaluated, the
 completed edge posterior is the backed-up leaf Dirichlet vector, not
-\(\EdgeBase+\beta_\ell\). Concurrent writes replace the edge snapshot; they do
-not add posterior mass twice.
+\(\EdgeBase+\beta_\ell\). Repeated leaf completions increment the edge's
+completed-evaluation count \(R\), but they do not add posterior mass to \(B\).
+Concurrent writes replace the edge posterior snapshot and atomically advance the
+edge count.
 
 After the final edge is published, node \(v_{\ell-1}\) is dirty. If two paths
 update different children of the same node, both child edges publish, both bump
@@ -1220,15 +1227,19 @@ snapshots.
 
   \item Atomically publish the final edge posterior:
   \[
-  B_{v_{\ell-1},a_{\ell-1}}\gets\tilde B,
-  \qquad
-  R_{v_{\ell-1},a_{\ell-1}}\gets 1,
-  \qquad
-  m_{v_{\ell-1},a_{\ell-1}}\gets 1,
-  \qquad
+  \begin{aligned}
+  B_{v_{\ell-1},a_{\ell-1}}&\gets\tilde B,
+  &
+  R_{v_{\ell-1},a_{\ell-1}}
+  &\gets
+  R_{v_{\ell-1},a_{\ell-1}}+1,
+  \\[2pt]
+  m_{v_{\ell-1},a_{\ell-1}}&\gets 1,
+  &
   \nu^B_{v_{\ell-1},a_{\ell-1}}
-  \gets
+  &\gets
   \nu^B_{v_{\ell-1},a_{\ell-1}}+1.
+  \end{aligned}
   \]
 
   \item Mark the final-edge parent dirty and advance its epoch:
@@ -1370,6 +1381,8 @@ cache state used by concurrent repair.
   B_{v_{\mathrm{root}},a}\gets \bot,
   \qquad
   m_{v_{\mathrm{root}},a}\gets 0,
+  \qquad
+  R_{v_{\mathrm{root}},a}\gets 0,
   \qquad
   \nu^B_{v_{\mathrm{root}},a}\gets 0,
   \qquad
@@ -2642,8 +2655,10 @@ The recommended implementation is fine-grained and non-blocking:
   two workers create the same child concurrently, exactly one child is installed
   and the loser discards its private candidate.
 
-  \item Use an edge-local lock or atomic pointer/snapshot swap for \(B_{v,a}\).
-  Edge posterior publication is a full-vector replacement.
+  \item Use an edge-local lock or atomic pointer/snapshot swap for the completed
+  edge snapshot \((B_{v,a},m_{v,a},R_{v,a},\nu^B_{v,a})\). Edge posterior
+  publication is a full-vector replacement for \(B_{v,a}\), while direct leaf
+  backups atomically increment \(R_{v,a}\) in the same edge update.
 
   \item Use a node-local repair token for \(C^V_v\). Repair is best-effort: if a
   worker cannot acquire the token, it returns immediately and some later worker
