@@ -297,8 +297,8 @@ function runSimulation(root) {
     path.push({ node, action });
 
     const { child, isNew } = getOrCreateChild(node, action);
-    if (isNew) {
-      const childResult = gameResult(child.board);
+    const childResult = gameResult(child.board);
+    if (childResult.terminal || isNew) {
       const beta = childResult.terminal
         ? terminalOutcomeAlpha(child.board, child.player)
         : child.alphaV.slice();
@@ -319,7 +319,7 @@ function backupPath(path, betaLeaf) {
   const finalEdge = finalStep.node.edge(finalStep.action);
   finalEdge.B = flipAlpha(betaLeaf);
   finalEdge.m = true;
-  finalEdge.R = 1;
+  finalEdge.R += 1;
 
   for (let i = path.length - 1; i >= 0; i -= 1) {
     repairNode(path[i].node);
