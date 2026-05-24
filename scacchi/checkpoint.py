@@ -121,7 +121,7 @@ def from_pretrained(
         rngs = nnx.Rngs(0)
     checkpoint_path = str(Path(checkpoint_path).resolve())
 
-    from .train import Config  # local import to avoid circular at module level
+    from .train import Config, normalize_config_dict  # local import avoids circular
 
     with ocp.CheckpointManager(checkpoint_path) as manager:
         step = manager.latest_step()
@@ -132,7 +132,7 @@ def from_pretrained(
             step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
         )
         config = Config.model_validate(
-            meta_restored["meta"]["config"],
+            normalize_config_dict(meta_restored["meta"]["config"]),
             extra="ignore",
             context={"model_construction_only": True},
         )

@@ -12,26 +12,33 @@
 # Usage:
 #   scripts/sweep_hex.sh                       # all board sizes 3..9
 #   scripts/sweep_hex.sh --board-sizes 3,4,5   # subset (comma- or space-sep)
-#   scripts/sweep_hex.sh -b "3 4" wandb_enabled=false   # + hydra overrides
+#   scripts/sweep_hex.sh -b "3 4" logging.wandb.enabled=false   # + hydra overrides
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Read selfplay_batch_size / max_num_steps from the hex config so the iter
+# Read selfplay.batch_size / selfplay.max_num_steps from the hex config so the iter
 # budget stays in sync with whatever the trainer actually consumes.
 CONFIG_PATH="${ROOT_DIR}/scacchi/configs/hex.yaml"
 read_yaml_int() {
-    # Strip optional `_` digit separators (e.g. 8_192 → 8192).
-    awk -v key="$1" '
-        $1 == key":" { gsub(/_/, "", $2); print $2; exit }
-    ' "$CONFIG_PATH"
+    uv run python - "$CONFIG_PATH" "$1" <<'PY'
+import sys
+
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    value = yaml.safe_load(fh)
+for part in sys.argv[2].split("."):
+    value = value[part]
+print(str(value).replace("_", ""))
+PY
 }
-SELFPLAY_BATCH_SIZE="$(read_yaml_int selfplay_batch_size)"
-MAX_NUM_STEPS="$(read_yaml_int max_num_steps)"
-: "${SELFPLAY_BATCH_SIZE:?could not read selfplay_batch_size from ${CONFIG_PATH}}"
-: "${MAX_NUM_STEPS:?could not read max_num_steps from ${CONFIG_PATH}}"
+SELFPLAY_BATCH_SIZE="$(read_yaml_int selfplay.batch_size)"
+MAX_NUM_STEPS="$(read_yaml_int selfplay.max_num_steps)"
+: "${SELFPLAY_BATCH_SIZE:?could not read selfplay.batch_size from ${CONFIG_PATH}}"
+: "${MAX_NUM_STEPS:?could not read selfplay.max_num_steps from ${CONFIG_PATH}}"
 SAMPLES_PER_ITER=$(( SELFPLAY_BATCH_SIZE * MAX_NUM_STEPS ))
 
 # Widths and depths per board size — powers of two, capped by Table II.
@@ -111,10 +118,10 @@ for bs in "${BOARD_SIZES[@]}"; do
         for nl in $depths; do
             echo "=== hex bs=${bs} width=${nc} depth=${nl} iters=${max_num_iters} (sample cap=${samples}) ==="
             uv run python -m scacchi.train \
-                board_size="${bs}" \
-                num_channels="${nc}" \
-                num_layers="${nl}" \
-                max_num_iters="${max_num_iters}" \
+                env.board_size="${bs}" \
+                model.num_channels="${nc}" \
+                model.num_layers="${nl}" \
+                run.max_num_iters="${max_num_iters}" \
                 "${HYDRA_ARGS[@]}"
         done
     done

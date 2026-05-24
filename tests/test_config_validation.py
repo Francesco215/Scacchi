@@ -1,7 +1,44 @@
+from pathlib import Path
+
 import pytest
+from omegaconf import OmegaConf
 from pydantic import ValidationError
 
-from scacchi.train import Config
+from scacchi.train import Config, normalize_config_dict
+
+
+def test_nested_hex_config_loads_into_runtime_config():
+    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex.yaml"
+    container = OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True)
+
+    assert isinstance(container, dict)
+    config = Config(**normalize_config_dict(container))
+
+    assert config.env_id == "hex"
+    assert config.board_size == 6
+    assert config.network == "boardlaw_dirichlet"
+    assert config.selfplay_batch_size == 2048
+    assert config.search_policy == "posterior_tree_wavefront"
+    assert config.wavefront_num_lanes_per_root == 4
+    assert config.train_tree_nodes is True
+    assert config.training_batch_size == 8192
+    assert config.eval_batch_size == 16
+    assert config.wandb_enabled is False
+    assert config.ckpt_max_to_keep == 0
+
+
+def test_flat_config_keys_take_precedence_over_nested_values():
+    normalized = normalize_config_dict(
+        {
+            "env": {"board_size": 6},
+            "model": {"num_channels": 64},
+            "board_size": 7,
+            "num_channels": 128,
+        }
+    )
+
+    assert normalized["board_size"] == 7
+    assert normalized["num_channels"] == 128
 
 
 def test_scalar_network_rejects_dirichlet_loss_weights():

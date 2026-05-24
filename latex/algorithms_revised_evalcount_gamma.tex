@@ -1,0 +1,2837 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, mathtools}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+% -----------------------------------------------------------------------------
+% Basic notation
+% -----------------------------------------------------------------------------
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\one}{\mathbf{1}}
+
+\newcommand{\Dir}{\operatorname{Dirichlet}}
+\newcommand{\Cat}{\operatorname{Categorical}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\mean}{\operatorname{mean}}
+\newcommand{\stopgrad}{\operatorname{stopgrad}}
+
+\newcommand{\Tree}{\mathcal{T}}
+\newcommand{\Path}{\mathcal{P}}
+\newcommand{\States}{\mathcal{S}}
+\newcommand{\Actions}{\mathcal{A}}
+\newcommand{\Legal}{\mathcal{A}_{\mathrm{legal}}}
+\newcommand{\Available}{\mathcal{A}_{\mathrm{avail}}}
+\newcommand{\Interior}{\mathcal{I}}
+\newcommand{\Z}{\mathcal{Z}}
+
+\newcommand{\Step}{\operatorname{Step}}
+\newcommand{\Eval}{\operatorname{Eval}}
+\newcommand{\Flip}{\operatorname{flip}}
+\newcommand{\Align}{\operatorname{align}}
+\newcommand{\Utility}{U}
+
+\newcommand{\ThompsonSelect}{\operatorname{ThompsonSelect}}
+\newcommand{\EdgeBase}{\operatorname{EdgeBase}}
+\newcommand{\EdgePosterior}{\operatorname{EdgePosterior}}
+\newcommand{\StateSearchPosterior}{\operatorname{StateSearchPosterior}}
+\newcommand{\BackupPath}{\operatorname{BackupPath}}
+\newcommand{\EvaluateReachedLeaf}{\operatorname{EvaluateReachedLeaf}}
+\newcommand{\NextRequest}{\operatorname{NextRequest}}
+\newcommand{\ConsumeResult}{\operatorname{ConsumeResult}}
+\newcommand{\BuildEvalBatch}{\operatorname{BuildEvalBatch}}
+\newcommand{\GpuEvaluate}{\operatorname{GpuEvaluate}}
+\newcommand{\PosteriorBestPolicyTarget}{\operatorname{PosteriorBestPolicyTarget}}
+\newcommand{\FinishSearch}{\operatorname{FinishSearch}}
+\newcommand{\MakeTargets}{\operatorname{MakeTargets}}
+\newcommand{\NoRequest}{\operatorname{NoRequest}}
+\newcommand{\ComputeStateSearchPosterior}{\operatorname{ComputeStateSearchPosterior}}
+\newcommand{\RefreshEdgeFromChild}{\operatorname{RefreshEdgeFromChild}}
+\newcommand{\TryRepairNode}{\operatorname{TryRepairNode}}
+\newcommand{\RepairPathToRoot}{\operatorname{RepairPathToRoot}}
+\newcommand{\RepairDirtyFrontier}{\operatorname{RepairDirtyFrontier}}
+\newcommand{\TryMarkInflight}{\operatorname{TryMarkInflight}}
+\newcommand{\TryGetOrCreateChild}{\operatorname{TryGetOrCreateChild}}
+\newcommand{\CAS}{\operatorname{CAS}}
+
+% -----------------------------------------------------------------------------
+% Lightweight algorithm box
+% -----------------------------------------------------------------------------
+
+\newenvironment{algorithmblock}[1]
+{
+  \par\medskip
+  \noindent\hrule\par\smallskip
+  \noindent\textbf{#1}
+  \par\smallskip
+}
+{
+  \par\smallskip\noindent\hrule\par\medskip
+}
+
+\newcommand{\Input}{\textbf{Input: }}
+\newcommand{\Output}{\textbf{Output: }}
+\newcommand{\Require}{\textbf{Require: }}
+\newcommand{\Return}{\textbf{return }}
+\newcommand{\If}{\textbf{if }}
+\newcommand{\Then}{\textbf{ then }}
+\newcommand{\Else}{\textbf{else }}
+\newcommand{\EndIf}{\textbf{end if}}
+\newcommand{\For}{\textbf{for }}
+\newcommand{\EndFor}{\textbf{end for}}
+\newcommand{\While}{\textbf{while }}
+\newcommand{\EndWhile}{\textbf{end while}}
+\newcommand{\Do}{\textbf{ do }}
+\newcommand{\Break}{\textbf{break}}
+\newcommand{\Continue}{\textbf{continue}}
+
+\title{Dirichlet-Q AlphaZero: Posterior Tree Search Algorithms}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+
+\section*{1. Purpose of this file}
+
+This document defines the search-side algorithms for Dirichlet-Q AlphaZero.
+
+The central change from standard AlphaZero-style MCTS is that the tree does not
+store scalar action values as its main memory. Instead, each completed tree edge
+stores a WDL Dirichlet posterior. Search is therefore a posterior-refinement
+process.
+
+The CPU owns a mutable posterior tree. The GPU only evaluates batches of leaf
+states. The search interface is:
+
+\[
+\NextRequest(\Tree),
+\qquad
+\ConsumeResult(\Tree,r),
+\qquad
+\FinishSearch(\Tree).
+\]
+
+The CPU repeatedly selects paths through the current posterior tree, creates
+leaf-evaluation requests, sends leaf states to the GPU in batches, and then backs
+up WDL evidence when terminal or neural leaf evaluations become available.
+
+This version deliberately does \emph{not} include temporary reservation mass or
+virtual-loss-style in-flight Dirichlet mass. In-flight leaves are tracked only
+for scheduling. They do not alter edge posteriors, policy targets, Q targets, or
+value targets.
+
+The algorithms are written so that a tree can be searched by multiple CPU
+workers without a global tree lock. Correctness comes from five rules:
+
+\begin{enumerate}[leftmargin=2em]
+  \item Node expansion uses an atomic
+  \(\texttt{unexpanded}\rightarrow\texttt{inflight}\rightarrow
+  \texttt{expanding}\rightarrow\texttt{expanded}\) state machine, so a
+  non-terminal leaf emits at most one GPU request and is not visible as expanded
+  until its network outputs are installed.
+
+  \item Edge posterior writes are atomic publishes of a full WDL vector. A
+  reader sees either the old completed posterior or the new completed posterior,
+  never a partially written vector.
+
+  \item Internal value posteriors are lazy derived caches. A node cache has a
+  dirty/clean status and a version. A dirty child is never used as backup
+  evidence by its parent.
+
+  \item When an outgoing edge changes, the owning node is marked dirty. Any CPU
+  worker may attempt to repair that node. If another write occurs during repair,
+  the repair is discarded and the node remains dirty.
+
+  \item Search selection is non-blocking. It may read the last stable completed
+  edge posterior while a repair is pending, but final export first repairs the
+  dirty frontier so training targets are produced from clean posterior caches.
+\end{enumerate}
+
+Thus two simultaneous backups may safely touch the same ancestor: both publish
+edge updates, both mark the ancestor dirty, and the next successful repair
+recomputes the ancestor posterior from the merged current children.
+
+\section*{2. Outcome space, utility, and action notation}
+
+For a two-player zero-sum game, define the WDL outcome space
+
+\[
+\Z = \{L,D,W\}.
+\]
+
+A WDL distribution is
+
+\[
+\phi = (\phi_L,\phi_D,\phi_W) \in \Delta^2.
+\]
+
+The scalar utility used everywhere is
+
+\[
+\Utility(\phi) = \phi_W - \phi_L.
+\]
+
+For a Dirichlet parameter vector
+
+\[
+\alpha = (\alpha_L,\alpha_D,\alpha_W),
+\]
+
+define its mean as
+
+\[
+\mean(\alpha)
+=
+\frac{\alpha}{\alpha_0},
+\qquad
+\alpha_0 = \sum_{z \in \{L,D,W\}} \alpha_z.
+\]
+
+For action posteriors \(\{\alpha^{\mathrm{post}}_{v,a}\}\), define the local
+posterior-best policy by
+
+\[
+\pi_{\mathrm{search}}^v(a)
+=
+\Prob
+\left(
+  a=
+  \argmax_{b\in\Legal(s_v)}
+  \Utility(\phi_{v,b})
+\right),
+\qquad
+\phi_{v,b}\sim\Dir(\alpha^{\mathrm{post}}_{v,b}).
+\]
+
+A single Thompson draw samples all \(\phi_{v,b}\) and then returns
+
+\[
+\tilde a
+=
+\argmax_{b\in\Legal(s_v)}
+\Utility(\phi_{v,b}).
+\]
+
+Thus \(\tilde a\) is a random sample from \(\pi_{\mathrm{search}}^v\). It is
+not denoted by \(a^\star\). Throughout this document, \(a^\star\) is reserved
+for the mode of the posterior-best policy:
+
+\[
+a^\star_v
+=
+\argmax_{a\in\Legal(s_v)}
+\pi_{\mathrm{search}}^v(a).
+\]
+
+When the intended action rule is greedy with respect to a posterior mean, define
+
+\[
+\bar\phi_{v,a}
+=
+\mean
+\left(
+\alpha^{\mathrm{post}}_{v,a}
+\right).
+\]
+
+Then the greedy mean action is
+
+\[
+a_{\mathrm{mean}}(v)
+=
+\argmax_{a\in\Legal(s_v)}
+\left(
+\bar\phi_{v,a,W}-\bar\phi_{v,a,L}
+\right).
+\]
+
+The opponent-perspective flip is
+
+\[
+\Flip(d_L,d_D,d_W)
+=
+(d_W,d_D,d_L).
+\]
+
+The same flip applies to Dirichlet parameters:
+
+\[
+\Flip(\alpha_L,\alpha_D,\alpha_W)
+=
+(\alpha_W,\alpha_D,\alpha_L).
+\]
+
+For zero-sum alternating-turn games,
+
+\[
+\Utility(\Flip(d)) = -\Utility(d).
+\]
+
+\section*{3. Network outputs}
+
+At state \(s\), the network predicts:
+
+\[
+\ell_\theta(s,a),
+\qquad
+\alpha_\theta^V(s),
+\qquad
+\alpha_\theta^Q(s,a).
+\]
+
+The policy head is
+
+\[
+\pi_\theta(a \mid s)
+=
+\softmax(\ell_\theta(s,\cdot))_a.
+\]
+
+The value head represents a WDL belief over the state value:
+
+\[
+\phi_s^V
+\sim
+\Dir(\alpha_\theta^V(s)).
+\]
+
+The Q head represents a WDL belief over each state-action value:
+
+\[
+\phi_{s,a}^Q
+\sim
+\Dir(\alpha_\theta^Q(s,a)).
+\]
+
+Both Dirichlet heads use the stable mean-concentration parameterization:
+
+\[
+\alpha_\theta
+=
+\alpha_{\theta,0}\bar{\phi}_\theta,
+\]
+
+where
+
+\[
+\bar{\phi}_\theta = \softmax(r_\theta),
+\qquad
+\alpha_{\theta,0} = \softplus(t_\theta)^2.
+\]
+
+
+\section*{4. Posterior tree state}
+
+A posterior tree is denoted by
+
+\[
+\Tree.
+\]
+
+Each node \(v\) stores its game state and parent pointer:
+
+\[
+s_v,
+\qquad
+\operatorname{parent}(v),
+\qquad
+\operatorname{parent\_action}(v).
+\]
+
+For neural evaluation and expansion, each non-terminal node has an evaluation
+status
+
+\[
+\sigma^{\mathrm{eval}}_v
+\in
+\{\texttt{unexpanded},\texttt{inflight},\texttt{expanding},\texttt{expanded}\}.
+\]
+
+Terminal states are detected from \(s_v\) and do not require a neural evaluation.
+A non-terminal node may move from \(\texttt{unexpanded}\) to
+\(\texttt{inflight}\) only through an atomic compare-and-swap. A GPU result may
+be consumed only if the node is still \(\texttt{inflight}\). During result
+installation, the node briefly enters \(\texttt{expanding}\); it becomes
+\(\texttt{expanded}\) only after all neural outputs and cache fields have been
+published.
+
+After expansion, node \(v\) stores the network outputs from the fixed
+self-play/search snapshot:
+
+\[
+\alpha_{\theta^-}^V(s_v),
+\qquad
+\alpha_{\theta^-}^Q(s_v,\cdot),
+\qquad
+\ell_{\theta^-}(s_v,\cdot).
+\]
+
+The superscript \(\theta^-\) emphasizes that these are data-generation priors.
+They are treated as stop-gradient values when constructing training targets.
+
+\subsection*{4.1 Completed edge posterior}
+
+Each edge \((v,a)\) stores:
+
+\[
+\texttt{child}(v,a),
+\qquad
+B_{v,a}\in\R_{>0}^{3}\cup\{\bot\},
+\qquad
+m_{v,a}\in\{0,1\},
+\qquad
+R_{v,a}\in\mathbb{N},
+\qquad
+\nu^B_{v,a}\in\mathbb{N}.
+\]
+
+Here \(B_{v,a}\) is the latest completed backed-up Dirichlet posterior for edge
+\((v,a)\), \(m_{v,a}\) says whether such a completed posterior exists,
+\(R_{v,a}\) is the number of completed terminal or neural evaluations represented
+by that edge posterior, and \(\nu^B_{v,a}\) is incremented whenever \(B_{v,a}\) is
+atomically replaced. The count \(R_{v,a}\) is \emph{not} a visit-count policy
+statistic. It is only used to decide how much downstream search work a node's
+state-posterior cache should trust. If \(m_{v,a}=0\), then \(R_{v,a}=0\).
+A direct terminal or neural leaf backup sets \(R_{v,a}=1\). A refresh from an
+interior child sets \(R_{v,a}=1+N^\downarrow_u\), counting the child's own neural
+evaluation plus the completed evaluations already incorporated below that child.
+
+A write to \(B_{v,a}\) is a \emph{publish}: the writer constructs the complete
+three-component vector privately and then atomically swaps the edge snapshot.
+Readers never observe a half-written posterior. When a new backup reaches edge
+\((v,a)\), it overwrites \(B_{v,a}\). It does not add a delta to the previous
+value of \(B_{v,a}\). The object being stored is the current completed posterior
+for the edge, not an accumulated visit-count statistic.
+
+The posterior used for selection and targets is
+
+\[
+\alpha^{\mathrm{post}}_{v,a}
+=
+\begin{cases}
+B_{v,a},
+& m_{v,a}=1,\\[3pt]
+\alpha^{\mathrm{base}}_{v,a},
+& m_{v,a}=0.
+\end{cases}
+\]
+
+In-flight descent never changes \(B_{v,a}\), \(m_{v,a}\), \(R_{v,a}\),
+\(\nu^B_{v,a}\), or any posterior.
+
+\subsection*{4.2 Lazy state-posterior cache}
+
+An expanded non-terminal node also has a cached state posterior:
+
+\[
+C^V_v\in\R_{>0}^3,
+\qquad
+N^\downarrow_v\in\mathbb{N},
+\qquad
+\sigma^V_v\in\{\texttt{clean},\texttt{dirty},\texttt{updating}\},
+\qquad
+\nu^V_v\in\mathbb{N}.
+\]
+
+The count \(N^\downarrow_v\) is the number of completed terminal or neural
+evaluations represented by the outgoing edge snapshots currently summarized by
+\(C^V_v\). It is meaningful only when \(\sigma^V_v=\texttt{clean}\).
+
+The intended meaning is
+
+\[
+C^V_v = \alpha^{V,\mathrm{post}}_v,
+\]
+
+but only when \(\sigma^V_v=\texttt{clean}\). If
+\(\sigma^V_v=\texttt{dirty}\), the cache may be stale and may not be used as
+backup evidence by the parent. If \(\sigma^V_v=\texttt{updating}\), some worker
+is currently trying to recompute it.
+
+Each node also stores an edge-change epoch
+
+\[
+e_v\in\mathbb{N}.
+\]
+
+Whenever any outgoing edge \((v,a)\) publishes a new \(B_{v,a}\), or whenever a
+child publishes a newer clean cache that makes an incoming edge stale, the
+implementation increments \(e_v\) and marks \(v\) dirty. A repair of \(v\)
+snapshots \(e_v\) before computing. If \(e_v\) changes before the repaired cache
+is published, the repair is discarded and \(v\) remains dirty. This prevents a
+lost update when two paths update the same node concurrently.
+
+Finally, each incoming edge remembers which child cache version it has absorbed:
+
+\[
+\chi_{v,a}\in\mathbb{N}\cup\{-1\}.
+\]
+
+If \(u=\texttt{child}(v,a)\) has a clean state-posterior cache and
+\(\chi_{v,a}=\nu^V_u\), then edge \((v,a)\) has already been refreshed from the
+current child posterior. If \(\chi_{v,a}<\nu^V_u\), the edge is stale with respect
+to that child. The stale edge may still be read as the last stable snapshot for
+non-blocking selection, but it is not considered current for final target export.
+
+\subsection*{4.3 Leaf, interior, dirty, and in-flight nodes}
+
+A newly expanded neural leaf has network outputs but no completed outgoing edge.
+It is not yet an interior posterior node. Define
+
+\[
+\operatorname{has\_child\_evidence}(v)
+\iff
+\exists a\in\Legal(s_v):m_{v,a}=1.
+\]
+
+Only a non-terminal expanded node with
+\(\operatorname{has\_child\_evidence}(v)\) is allowed to overwrite its incoming
+edge using \(C^V_v\). This distinction is important: the first backup into a
+newly expanded neural leaf uses the leaf Dirichlet vector returned by evaluation; it
+must not immediately be overwritten by the child's own prior-only cache.
+
+The key invariants are:
+
+\begin{enumerate}[leftmargin=2em]
+  \item A parent edge may refresh from child \(u\) only if
+  \[
+  \sigma^V_u=\texttt{clean}
+  \quad\text{and}\quad
+  \operatorname{has\_child\_evidence}(u).
+  \]
+
+  \item A dirty or updating child is never used as backup evidence by its
+  parent.
+
+  \item A clean node has incorporated every completed child edge snapshot visible
+  at its repair epoch.
+
+  \item A stale edge may be used for non-blocking selection, but final export
+  repairs dirty and stale dependencies first.
+\end{enumerate}
+
+These invariants allow multiple workers to select, request, consume, and back up
+against the same tree while preserving eventual posterior consistency.
+
+\section*{5. Edge base prior}
+
+For an edge \((v,a)\), the base Dirichlet prior depends on whether the child
+state has already been expanded.
+
+If the child is not expanded, use the Q-head prediction at the parent node:
+
+\[
+\alpha^{\mathrm{base}}_{v,a}
+=
+\alpha_{\theta^-}^Q(s_v,a).
+\]
+
+If the child \(u=\texttt{child}(v,a)\) is expanded, use the child value head,
+aligned back to the perspective of the player to move at node \(v\):
+
+\[
+\alpha^{\mathrm{base}}_{v,a}
+=
+\Align_{v \leftarrow u}
+\left(
+\alpha_{\theta^-}^V(s_u)
+\right).
+\]
+
+For ordinary alternating-turn two-player games, this is usually
+
+\[
+\alpha^{\mathrm{base}}_{v,a}
+=
+\Flip
+\left(
+\alpha_{\theta^-}^V(s_u)
+\right).
+\]
+
+The general alignment notation is used because some environments may include
+passes, chance transitions, or non-alternating turns.
+
+\begin{algorithmblock}{Algorithm 1: EdgeBase\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), expanded node \(v\), legal action \(a\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item If edge \((v,a)\) has an expanded child \(u\), set
+  \[
+  \alpha^{\mathrm{base}}_{v,a}
+  \gets
+  \Align_{v \leftarrow u}
+  \left(
+  \alpha_{\theta^-}^V(s_u)
+  \right).
+  \]
+
+  \item Otherwise set
+  \[
+  \alpha^{\mathrm{base}}_{v,a}
+  \gets
+  \alpha_{\theta^-}^Q(s_v,a).
+  \]
+
+  \item \Return \(\alpha^{\mathrm{base}}_{v,a}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 2: EdgePosterior\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), expanded node \(v\), legal action \(a\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(m_{v,a}=1\) \Then
+  \[
+  \Return B_{v,a}.
+  \]
+  \EndIf
+
+  \item Compute
+  \[
+  \alpha^{\mathrm{base}}_{v,a}
+  \gets
+  \EdgeBase(\Tree,v,a).
+  \]
+
+  \item \Return \(\alpha^{\mathrm{base}}_{v,a}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{6. Thompson action selection at a node}
+
+At an expanded node \(v\), selection samples one WDL distribution per available
+action:
+
+\[
+\phi_{v,a}
+\sim
+\Dir
+\left(
+\alpha^{\mathrm{post}}_{v,a}
+\right),
+\qquad
+ a \in \Available(v).
+\]
+
+The returned Thompson action is
+
+\[
+\tilde a
+=
+\argmax_{a \in \Available(v)}
+\Utility(\phi_{v,a})
+=
+\argmax_{a \in \Available(v)}
+\left(
+\phi_{v,a,W}-\phi_{v,a,L}
+\right).
+\]
+
+This is a sample from the posterior-best policy restricted to \(\Available(v)\).
+The argmax sits inside the sampling procedure: first sample the WDL values, then
+take the maximizing action for that sampled posterior world.
+
+\begin{algorithmblock}{Algorithm 3: ThompsonSelect\((\Tree,v,\Available(v))\)}
+
+\Input posterior tree \(\Tree\), expanded node \(v\), nonempty available action set \(\Available(v)\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each action \(a \in \Available(v)\), compute
+  \[
+  \alpha_{v,a}
+  \gets
+  \EdgePosterior(\Tree,v,a).
+  \]
+
+  \item Sample
+  \[
+  \phi_{v,a}
+  \sim
+  \Dir(\alpha_{v,a})
+  \qquad
+  \text{for each } a \in \Available(v).
+  \]
+
+  \item Compute
+  \[
+  u_a
+  \gets
+  \Utility(\phi_{v,a})
+  =
+  \phi_{v,a,W}-\phi_{v,a,L}
+  \qquad
+  \text{for each } a \in \Available(v).
+  \]
+
+  \item Select the Thompson action
+  \[
+  \tilde a
+  \gets
+  \argmax_{a \in \Available(v)} u_a.
+  \]
+
+  \item \Return \(\tilde a\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{7. Leaf evaluation}
+
+Search stops at either terminal or non-terminal leaves. A reached leaf has a
+unified interface: it either produces a positive Dirichlet vector that can be
+backed up immediately, or it produces one neural-evaluation request to be sent
+through the CPU/GPU boundary.
+
+The leaf interface is now
+
+\[
+\operatorname{LeafEval}(s_\ell)
+\Rightarrow
+\beta_\ell\in\R_{>0}^3,
+\]
+
+where \(\beta_\ell\) is interpreted directly as a WDL Dirichlet posterior for the
+leaf state. Thus backup does not split leaf information into a normalized mean
+\(d_\ell\) and a strength \(\lambda_\ell\). The concentration
+\(\beta_{\ell,0}=\sum_z\beta_{\ell,z}\) is itself the evidence/confidence carried
+by the leaf evaluation.
+
+\subsection*{7.1 Terminal leaf}
+
+If the leaf is terminal with exact outcome \(z\), return a very narrow positive
+Dirichlet distribution around the terminal value:
+
+\[
+\beta_\ell^{\mathrm{term}}(z)
+=
+\epsilon_{\mathrm{term}}\mathbf{1}
++
+\kappa_{\mathrm{term}} e_z,
+\qquad
+0<\epsilon_{\mathrm{term}}\ll \kappa_{\mathrm{term}}.
+\]
+
+For example, for a terminal win from the leaf player's perspective,
+
+\[
+\beta_\ell^{\mathrm{term}}
+=
+(\epsilon_{\mathrm{term}},
+ \epsilon_{\mathrm{term}},
+ \epsilon_{\mathrm{term}}+\kappa_{\mathrm{term}}).
+\]
+
+This keeps every Dirichlet component strictly positive while representing the
+fact that terminal outcomes are exact rather than bootstrapped estimates.
+
+\subsection*{7.2 Non-terminal neural leaf}
+
+For a non-terminal leaf, the GPU returns the value-head Dirichlet vector
+\(\alpha_{\theta^-}^V(s_\ell)\). The Bayesian default is to back up this vector
+directly:
+
+\[
+\beta_\ell
+=
+\alpha_{\theta^-}^V(s_\ell).
+\]
+
+The implementation may retain the ablation switch
+
+\[
+\texttt{leaf\_value\_mode}
+\in
+\{\texttt{alpha},\texttt{mean}\}.
+\]
+
+Use
+
+\[
+\beta_\ell
+=
+\begin{cases}
+\alpha_{\theta^-}^V(s_\ell),
+&\texttt{leaf\_value\_mode}=\texttt{alpha},\\[4pt]
+\kappa_{\mathrm{leaf}}
+\mean\!\left(\alpha_{\theta^-}^V(s_\ell)\right),
+&\texttt{leaf\_value\_mode}=\texttt{mean}.
+\end{cases}
+\]
+
+The \(\texttt{alpha}\) mode preserves the network's predicted concentration and
+is the Bayesian version. The \(\texttt{mean}\) mode deliberately discards that
+concentration and reintroduces a fixed leaf concentration
+\(\kappa_{\mathrm{leaf}}\); it is useful as an ablation, not as the preferred
+posterior semantics.
+
+\section*{8. Search-weighted state-posterior cache}
+
+A non-leaf expanded node backs up the search posterior implied by its current
+children, not an incremental delta. The value posterior of a node is a lazy
+cache derived from outgoing edge posteriors.
+
+For an expanded non-terminal node \(u\), first compute the local posterior-best
+policy from outgoing action posteriors:
+
+\[
+\hat\pi_{\mathrm{search}}^u
+=
+\PosteriorBestPolicyTarget
+\left(
+\left\{
+\alpha^{\mathrm{post}}_{u,b}
+\right\}_{b\in\Legal(s_u)},
+M_\pi,
+\Legal(s_u)
+\right).
+\]
+
+Then define the search-weighted state posterior vector
+
+\[
+E^V_u
+=
+\sum_{b\in\Legal(s_u)}
+\hat\pi_{\mathrm{search}}^u(b)
+\alpha^{\mathrm{post}}_{u,b}.
+\]
+
+This replaces the previous ``delta evidence'' formulation. Whenever \(u\) is
+repaired, \(E^V_u\) is recomputed from the current edge snapshots. It is not
+added to a previous \(E^V_u\).
+
+Unvisited legal actions are \emph{not} masked out of this mixture. If an
+unvisited action has tiny posterior-best probability, it contributes almost
+nothing. If it still has large posterior-best probability, then search has not
+ruled it out, and the state posterior should retain that uncertainty. The only
+masks used in this document are legality masks and scheduler masks that prevent
+duplicate work on in-flight children.
+
+The blend weight should grow with the amount of downstream search work, not with
+Dirichlet concentration. Let \(R_{u,b}\) be the number of completed terminal or
+neural evaluations represented by edge \((u,b)\). Define the downstream completed
+evaluation count at node \(u\) as
+
+\[
+N^\downarrow_u
+=
+\sum_{b\in\Legal(s_u)} R_{u,b}.
+\]
+
+Thus an unvisited fallback action has \(R_{u,b}=0\), but its fallback posterior
+still participates in \(E^V_u\). A completed terminal or neural leaf contributes
+one completed evaluation. A completed interior child contributes the number of
+evaluations represented by that child's clean cache.
+
+Given an evaluation-count half-trust hyperparameter \(\kappa_N>0\), set the local
+blend weight
+
+\[
+\gamma^V_u
+=
+\frac{N^\downarrow_u}{\kappa_N+N^\downarrow_u}.
+\]
+
+Here \(\kappa_N\) has the simple interpretation
+
+\[
+N^\downarrow_u=\kappa_N
+\quad\Longrightarrow\quad
+\gamma^V_u=\frac12.
+\]
+
+The Dirichlet vectors themselves still carry confidence. A terminal leaf can
+return a very narrow Dirichlet around the terminal result, and a confident neural
+leaf can return a high-concentration \(\alpha^V_{\theta^-}\). The count
+\(N^\downarrow_u\) only says how many completed evaluations have been incorporated;
+the backed-up alphas say what those evaluations believe and how concentrated
+that belief is.
+
+The cached state posterior is
+
+\[
+C^V_u
+=
+\alpha^{V,\mathrm{post}}_u
+=
+(1-\gamma^V_u)\alpha_{\theta^-}^V(s_u)
++
+\gamma^V_u E^V_u.
+\]
+
+This gives the desired behavior:
+
+\[
+\begin{array}{rcl}
+\text{little completed downstream work} &\Rightarrow&
+C^V_u \text{ stays close to } \alpha_{\theta^-}^V(s_u),\\[2pt]
+\text{many completed downstream evaluations} &\Rightarrow&
+C^V_u \text{ moves toward the search-weighted child posterior},\\[2pt]
+\text{terminal or highly confident child alpha} &\Rightarrow&
+\text{that confidence propagates through } E^V_u.
+\end{array}
+\]
+
+\begin{algorithmblock}{Algorithm 4: ComputeStateSearchPosterior\((\Tree,u,M_\pi,\kappa_N)\)}
+
+\Input posterior tree \(\Tree\), expanded non-terminal node \(u\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\)
+
+\Output derived value posterior \(\alpha^{V,\mathrm{post}}_u\) and downstream completed evaluation count \(N^\downarrow_u\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each legal action \(b\in\Legal(s_u)\), read a stable edge snapshot and compute
+  \[
+  \alpha^{\mathrm{post}}_{u,b}
+  \gets
+  \EdgePosterior(\Tree,u,b),
+  \qquad
+  R_{u,b}
+  \gets
+  \text{the completed-evaluation count stored on edge }(u,b).
+  \]
+  If \(m_{u,b}=0\), then \(\EdgePosterior\) returns the fallback/base prior and
+  \(R_{u,b}=0\).
+
+  \item Compute the local posterior-best policy over all legal actions:
+  \[
+  \hat\pi_{\mathrm{search}}^u
+  \gets
+  \PosteriorBestPolicyTarget
+  \left(
+  \left\{\alpha^{\mathrm{post}}_{u,b}\right\}_{b\in\Legal(s_u)},
+  M_\pi,
+  \Legal(s_u)
+  \right).
+  \]
+
+  \item Compute the search-weighted state posterior vector over all legal actions,
+  including unvisited fallback actions:
+  \[
+  E^V_u
+  \gets
+  \sum_{b\in\Legal(s_u)}
+  \hat\pi_{\mathrm{search}}^u(b)
+  \alpha^{\mathrm{post}}_{u,b}.
+  \]
+
+  \item Compute the downstream completed evaluation count:
+  \[
+  N^\downarrow_u
+  \gets
+  \sum_{b\in\Legal(s_u)}R_{u,b}.
+  \]
+
+  \item Compute the local blend factor:
+  \[
+  \gamma^V_u
+  \gets
+  \frac{N^\downarrow_u}{\kappa_N+N^\downarrow_u}.
+  \]
+
+  \item Compute the evaluation-count-weighted posterior:
+  \[
+  \alpha^{V,\mathrm{post}}_u
+  \gets
+  (1-\gamma^V_u)\alpha_{\theta^-}^V(s_u)
+  +
+  \gamma^V_u E^V_u.
+  \]
+
+  \item \Return \((\alpha^{V,\mathrm{post}}_u,N^\downarrow_u)\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\subsection*{8.1 Refreshing a parent edge from a clean child}
+
+The incoming edge to a child may be refreshed from the child's state-posterior
+cache only after the child has become an interior posterior node and its cache is
+clean. This is the mechanism that prevents a parent from using a child whose
+posterior has not been updated yet.
+
+If \(u=\texttt{child}(v,a)\), the refresh rule is
+
+\[
+B_{v,a}
+\gets
+\Align_{v\leftarrow u}(C^V_u),
+\qquad
+R_{v,a}\gets 1+N^\downarrow_u,
+\qquad
+m_{v,a}\gets 1,
+\qquad
+\chi_{v,a}\gets \nu^V_u,
+\]
+
+but only if
+
+\[
+\sigma^V_u=\texttt{clean}
+\quad\text{and}\quad
+\operatorname{has\_child\_evidence}(u).
+\]
+
+If the child is dirty, updating, in flight, or merely a newly expanded neural
+leaf with no completed outgoing edge, the refresh does not happen.
+
+\begin{algorithmblock}{Algorithm 5: RefreshEdgeFromChild\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), parent node \(v\), legal action \(a\)
+
+\Output \(\texttt{true}\) if the edge is current or does not require child refresh; \(\texttt{false}\) if the child is not ready
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If edge \((v,a)\) has no child \(u\) \Then \Return \(\texttt{true}\). \EndIf
+
+  \item \If \(s_u\) is terminal \Then \Return \(\texttt{true}\). \EndIf
+
+  \item \If \(\sigma^{\mathrm{eval}}_u\ne\texttt{expanded}\) \Then
+  the child has no neural outputs yet. Do not refresh from it.
+  \[
+  \Return \texttt{true}.
+  \]
+  \EndIf
+
+  \item \If \(\operatorname{has\_child\_evidence}(u)=0\) \Then
+  the child is still a neural leaf, not an interior posterior node. Keep the
+  current leaf-evidence edge posterior.
+  \[
+  \Return \texttt{true}.
+  \]
+  \EndIf
+
+  \item \If \(\sigma^V_u\ne\texttt{clean}\) \Then
+  the child posterior is not ready. Mark \(v\) dirty and stop the repair.
+  \[
+  e_v\gets e_v+1,
+  \qquad
+  \sigma^V_v\gets\texttt{dirty}.
+  \]
+  \[
+  \Return \texttt{false}.
+  \]
+  \EndIf
+
+  \item \If \(\chi_{v,a}=\nu^V_u\) \Then the edge already absorbed the latest
+  clean child cache, so \Return \(\texttt{true}\). \EndIf
+
+  \item Atomically publish the refreshed edge posterior:
+  \[
+  B_{v,a}
+  \gets
+  \Align_{v\leftarrow u}(C^V_u),
+  \qquad
+  R_{v,a}\gets 1+N^\downarrow_u,
+  \qquad
+  m_{v,a}\gets 1,
+  \qquad
+  \chi_{v,a}\gets \nu^V_u,
+  \qquad
+  \nu^B_{v,a}\gets\nu^B_{v,a}+1.
+  \]
+
+  \item Mark the parent dirty because one of its outgoing edges just changed:
+  \[
+  e_v\gets e_v+1,
+  \qquad
+  \sigma^V_v\gets\texttt{dirty}.
+  \]
+
+  \item \Return \(\texttt{true}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\subsection*{8.2 Repairing one dirty node}
+
+A dirty node is repaired by first making sure that any child-derived edge
+posterior it depends on has been refreshed from a clean child. Then the node
+recomputes its own state-posterior cache from its current outgoing edge
+posteriors.
+
+The repair is deliberately non-blocking. If the repair token is already held, or
+if a child is not clean, or if an edge changes during the repair, the function
+returns \(\texttt{false}\). Some later worker can retry.
+
+\begin{algorithmblock}{Algorithm 6: TryRepairNode\((\Tree,u,M_\pi,\kappa_N)\)}
+
+\Input posterior tree \(\Tree\), node \(u\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\)
+
+\Output \(\texttt{true}\) if \(u\)'s value-posterior cache is clean after this call; otherwise \(\texttt{false}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(s_u\) is terminal \Then \Return \(\texttt{false}\). \EndIf
+
+  \item \If \(\sigma^{\mathrm{eval}}_u\ne\texttt{expanded}\) \Then \Return \(\texttt{false}\). \EndIf
+
+  \item \If \(\operatorname{has\_child\_evidence}(u)=0\) \Then
+  there is no child evidence to summarize. Set
+  \[
+  N^\downarrow_u\gets 0,
+  \qquad
+  \sigma^V_u\gets\texttt{clean}
+  \]
+  and \Return \(\texttt{true}\). \EndIf
+
+  \item Try to acquire the repair token for node \(u\). If it is already held,
+  \Return \(\texttt{false}\).
+
+  \item Set
+  \[
+  \sigma^V_u\gets\texttt{updating}
+  \]
+  and snapshot the node epoch:
+  \[
+  e_0\gets e_u.
+  \]
+
+  \item For each legal action \(b\in\Legal(s_u)\):
+  \[
+  ok_b\gets\RefreshEdgeFromChild(\Tree,u,b).
+  \]
+  If any \(ok_b=\texttt{false}\), release the repair token, set
+  \[
+  \sigma^V_u\gets\texttt{dirty},
+  \]
+  and \Return \(\texttt{false}\).
+
+  \item Compute a candidate posterior from the current edge snapshots:
+  \[
+  (\tilde C^V_u,\tilde N^\downarrow_u)
+  \gets
+  \ComputeStateSearchPosterior(\Tree,u,M_\pi,\kappa_N).
+  \]
+
+  \item Before publishing, check whether an outgoing edge changed during the
+  repair. If
+  \[
+  e_u\ne e_0,
+  \]
+  discard \(\tilde C^V_u\), release the repair token, set
+  \[
+  \sigma^V_u\gets\texttt{dirty},
+  \]
+  and \Return \(\texttt{false}\).
+
+  \item Atomically publish the clean cache:
+  \[
+  C^V_u\gets\tilde C^V_u,
+  \qquad
+  N^\downarrow_u\gets\tilde N^\downarrow_u,
+  \qquad
+  \nu^V_u\gets\nu^V_u+1,
+  \qquad
+  \sigma^V_u\gets\texttt{clean}.
+  \]
+
+  \item Release the repair token.
+
+  \item \If \(u\) has a parent \(p\) \Then mark the parent dirty and advance its
+  epoch, because the incoming edge \((p,\operatorname{parent\_action}(u))\) may
+  now be stale:
+  \[
+  e_p\gets e_p+1,
+  \qquad
+  \sigma^V_p\gets\texttt{dirty}.
+  \]
+  \EndIf
+
+  \item \Return \(\texttt{true}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{9. Concurrency-safe backup}
+
+Given a selected path
+
+\[
+\Path=((v_0,a_0),\ldots,(v_{\ell-1},a_{\ell-1})),
+\]
+
+and a leaf Dirichlet vector \(\beta_\ell\), backup first publishes the final
+edge posterior and then attempts to repair dirty nodes from the final edge's
+parent back toward the root.
+
+The final edge receives the aligned leaf Dirichlet posterior directly:
+
+\[
+B_{v_{\ell-1},a_{\ell-1}}
+\gets
+\Align_{v_{\ell-1}\leftarrow \ell}(\beta_\ell),
+\qquad
+R_{v_{\ell-1},a_{\ell-1}}\gets 1,
+\qquad
+m_{v_{\ell-1},a_{\ell-1}}
+\gets 1.
+\]
+
+The edge base prior is used only as the fallback before an edge has completed
+posterior information. Once a terminal or neural leaf has been evaluated, the
+completed edge posterior is the backed-up leaf Dirichlet vector, not
+\(\EdgeBase+\beta_\ell\). Concurrent writes replace the edge snapshot; they do
+not add posterior mass twice.
+
+After the final edge is published, node \(v_{\ell-1}\) is dirty. If two paths
+update different children of the same node, both child edges publish, both bump
+that node's epoch, and the successful repair recomputes from both current edge
+snapshots.
+
+\begin{algorithmblock}{Algorithm 7: BackupPath\((\Tree,\Path,\beta_\ell,M_\pi,\kappa_N)\)}
+
+\Input posterior tree \(\Tree\), selected path \(\Path\), leaf Dirichlet vector \(\beta_\ell\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\)
+
+\Output \(\Tree\), possibly with some ancestors still marked dirty if repair could not complete immediately
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(\Path\) is empty, \Return \(\Tree\). \EndIf
+
+  \item Let \((v_{\ell-1},a_{\ell-1})\) be the final edge in \(\Path\).
+
+  \item Privately compute
+  \[
+  \tilde B
+  \gets
+  \Align_{v_{\ell-1}\leftarrow \ell}(\beta_\ell).
+  \]
+
+  \item Atomically publish the final edge posterior:
+  \[
+  B_{v_{\ell-1},a_{\ell-1}}\gets\tilde B,
+  \qquad
+  R_{v_{\ell-1},a_{\ell-1}}\gets 1,
+  \qquad
+  m_{v_{\ell-1},a_{\ell-1}}\gets 1,
+  \qquad
+  \nu^B_{v_{\ell-1},a_{\ell-1}}
+  \gets
+  \nu^B_{v_{\ell-1},a_{\ell-1}}+1.
+  \]
+
+  \item Mark the final-edge parent dirty and advance its epoch:
+  \[
+  e_{v_{\ell-1}}\gets e_{v_{\ell-1}}+1,
+  \qquad
+  \sigma^V_{v_{\ell-1}}\gets\texttt{dirty}.
+  \]
+
+  \item Run a non-blocking repair walk:
+  \[
+  \RepairPathToRoot(\Tree,v_{\ell-1},M_\pi,\kappa_N).
+  \]
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 8: RepairPathToRoot\((\Tree,u,M_\pi,\kappa_N)\)}
+
+\Input posterior tree \(\Tree\), starting node \(u\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\)
+
+\Output updated tree with as many ancestors repaired as are currently ready
+
+\begin{enumerate}[leftmargin=2em]
+  \item Set \(w\gets u\).
+
+  \item \While \(w\ne\bot\) \Do
+  \begin{enumerate}[leftmargin=2em]
+    \item \If \(\sigma^V_w=\texttt{clean}\) and \(w\) has a parent \Then
+    the parent edge may already be stale with respect to \(w\)'s clean cache, so
+    continue upward:
+    \[
+    w\gets\operatorname{parent}(w).
+    \]
+    \Continue.
+    \EndIf
+
+    \item Run
+    \[
+    ok\gets\TryRepairNode(\Tree,w,M_\pi,\kappa_N).
+    \]
+
+    \item \If \(ok=\texttt{false}\) \Then
+    stop the repair walk. The remaining ancestors stay dirty and can be repaired
+    by a later worker or by final export.
+    \[
+    \Return \Tree.
+    \]
+    \EndIf
+
+    \item Set
+    \[
+    w\gets\operatorname{parent}(w).
+    \]
+  \end{enumerate}
+  \item \EndWhile
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 9: RepairDirtyFrontier\((\Tree,M_\pi,\kappa_N)\)}
+
+\Input posterior tree \(\Tree\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\)
+
+\Output tree whose exportable interior nodes are clean, or a tree with remaining dirty nodes if in-flight dependencies still exist
+
+\begin{enumerate}[leftmargin=2em]
+  \item Process dirty expanded nodes from greatest depth to root depth.
+
+  \item For each dirty node \(u\), run
+  \[
+  \TryRepairNode(\Tree,u,M_\pi,\kappa_N).
+  \]
+
+  \item Repeat the depth-ordered pass until either no dirty node changes state,
+  or all exportable interior nodes are clean.
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+
+\section*{10. Initializing a posterior tree}
+
+The root node must be evaluated before search begins, because Thompson selection
+requires root priors. Initialization also creates the version counters and clean
+cache state used by concurrent repair.
+
+\begin{algorithmblock}{Algorithm 10: InitializePosteriorTree\((s,\theta^-)\)}
+
+\Input root state \(s\), data-generation network parameters \(\theta^-\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Run the network on the root state:
+  \[
+  \left(
+  \ell_{\theta^-}(s,\cdot),
+  \alpha_{\theta^-}^V(s),
+  \alpha_{\theta^-}^Q(s,\cdot)
+  \right)
+  \gets
+  f_{\theta^-}(s).
+  \]
+
+  \item Create root node \(v_{\mathrm{root}}\) with state \(s\), no parent, and
+  evaluation status
+  \[
+  \sigma^{\mathrm{eval}}_{v_{\mathrm{root}}}\gets\texttt{expanded}.
+  \]
+
+  \item Store
+  \[
+  \ell_{\theta^-}(s,\cdot),
+  \qquad
+  \alpha_{\theta^-}^V(s),
+  \qquad
+  \alpha_{\theta^-}^Q(s,\cdot)
+  \]
+  in the root node.
+
+  \item Initialize the root state-posterior cache to the network value prior:
+  \[
+  C^V_{v_{\mathrm{root}}}\gets \alpha_{\theta^-}^V(s),
+  \qquad
+  \sigma^V_{v_{\mathrm{root}}}\gets\texttt{clean},
+  \qquad
+  \nu^V_{v_{\mathrm{root}}}\gets 0,
+  \qquad
+  e_{v_{\mathrm{root}}}\gets 0.
+  \]
+
+  \item For every root edge, initialize
+  \[
+  B_{v_{\mathrm{root}},a}\gets \bot,
+  \qquad
+  m_{v_{\mathrm{root}},a}\gets 0,
+  \qquad
+  \nu^B_{v_{\mathrm{root}},a}\gets 0,
+  \qquad
+  \chi_{v_{\mathrm{root}},a}\gets -1.
+  \]
+
+  \item Initialize atomic counters:
+  \[
+  T_{\mathrm{done}}(\Tree) \gets 0,
+  \qquad
+  T_{\mathrm{inflight}}(\Tree) \gets 0.
+  \]
+
+  \item \Return posterior tree \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{11. CPU iterator: producing one leaf-evaluation request}
+
+The CPU tree exposes an iterator-like method:
+
+\[
+\NextRequest(\Tree).
+\]
+
+It walks down the current posterior tree by Thompson sampling until it reaches a
+leaf. The leaf is handled in one place by \(\EvaluateReachedLeaf\). This keeps
+terminal and neural leaves under the same conceptual rule:
+
+\[
+\text{reached leaf}
+\quad\Longrightarrow\quad
+\begin{cases}
+\text{terminal evidence, backup now},\\
+\text{neural request, atomically mark in flight and return request}.
+\end{cases}
+\]
+
+\(\NextRequest\) is explicitly non-blocking. It either emits one new GPU request,
+completes one terminal simulation, or returns \(\NoRequest\). Multiple CPU
+workers may call it concurrently on the same tree.
+
+At an expanded node, action selection is restricted to actions that are not
+blocked by an existing in-flight child:
+
+\[
+\Available(v)
+=
+\left\{
+ a\in\Legal(s_v):
+ \neg\left(
+   \exists u=\texttt{child}(v,a)
+   \text{ with }
+   \sigma^{\mathrm{eval}}_u\in\{\texttt{inflight},\texttt{expanding}\}
+ \right)
+\right\}.
+\]
+
+Dirty expanded children are \emph{not} blocked. They may still be descended into
+for further search, because selection uses outgoing edge posteriors, not the
+child's state-posterior cache. A dirty child is only blocked from being used as
+backup evidence by its parent.
+
+If \(\Available(v)=\varnothing\), the descent stops and returns \(\NoRequest\).
+The scheduler can then try another lane, another tree, or wait for GPU results.
+
+\subsection*{11.1 Atomic child creation}
+
+When a worker selects an unexpanded edge, another worker may be selecting the
+same edge at the same time. Child creation is therefore also an atomic publish.
+
+\begin{algorithmblock}{Algorithm 11: TryGetOrCreateChild\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), parent node \(v\), selected action \(a\)
+
+\Output the unique child node \(u=\texttt{child}(v,a)\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If edge \((v,a)\) already has a child \(u\), \Return \(u\). \EndIf
+
+  \item Privately compute
+  \[
+  s_u\gets\Step(s_v,a).
+  \]
+
+  \item Privately allocate a candidate child node \(u_{\mathrm{new}}\) with
+  parent \(v\), parent action \(a\), and state \(s_u\). If \(s_u\) is
+  non-terminal, initialize
+  \[
+  \sigma^{\mathrm{eval}}_{u_{\mathrm{new}}}\gets\texttt{unexpanded},
+  \qquad
+  \sigma^V_{u_{\mathrm{new}}}\gets\texttt{clean},
+  \qquad
+  \nu^V_{u_{\mathrm{new}}}\gets 0,
+  \qquad
+  e_{u_{\mathrm{new}}}\gets 0.
+  \]
+
+  \item Atomically compare-and-swap
+  \[
+  \texttt{child}(v,a):\bot\rightarrow u_{\mathrm{new}}.
+  \]
+
+  \item \If the compare-and-swap succeeds, \Return \(u_{\mathrm{new}}\). \EndIf
+
+  \item Otherwise another worker published a child first. Discard
+  \(u_{\mathrm{new}}\) and \Return the existing child \(u=\texttt{child}(v,a)\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 12: EvaluateReachedLeaf\((\Tree,u,\Path,M_\pi,\kappa_N)\)}
+
+\Input posterior tree \(\Tree\), reached leaf node \(u\), selected path \(\Path\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\)
+
+\Output either \(\NoRequest\) after terminal completion, one \(\operatorname{EvalRequest}\), or \(\NoRequest\) because another worker already owns the leaf
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(s_u\) is terminal with outcome \(z\) \Then
+  \[
+  \beta_\ell
+  \gets
+  \epsilon_{\mathrm{term}}\mathbf{1}
+  +
+  \kappa_{\mathrm{term}}e_z.
+  \]
+
+  \item[] Run
+  \[
+  \Tree
+  \gets
+  \BackupPath(\Tree,\Path,\beta_\ell,M_\pi,\kappa_N).
+  \]
+
+  \item[] Atomically increment
+  \[
+  T_{\mathrm{done}}(\Tree)
+  \gets
+  T_{\mathrm{done}}(\Tree)+1.
+  \]
+
+  \item[] \Return \(\NoRequest\). \EndIf
+
+  \item \If \(\sigma^{\mathrm{eval}}_u=\texttt{expanded}\) \Then
+  this is no longer a leaf for request purposes. Another worker expanded it
+  first, so do not create a duplicate request or backup.
+  \[
+  \Return \NoRequest.
+  \]
+  \EndIf
+
+  \item Attempt the atomic transition
+  \[
+  ok\gets
+  \CAS
+  \left(
+  \sigma^{\mathrm{eval}}_u,
+  \texttt{unexpanded},
+  \texttt{inflight}
+  \right).
+  \]
+
+  \item \If \(ok=\texttt{false}\) \Then
+  the leaf is already in flight or was expanded concurrently. Do not emit a
+  duplicate GPU request and do not add posterior mass or backup evidence.
+  \[
+  \Return \NoRequest.
+  \]
+  \EndIf
+
+  \item Atomically increment
+  \[
+  T_{\mathrm{inflight}}(\Tree)
+  \gets
+  T_{\mathrm{inflight}}(\Tree)+1.
+  \]
+
+  \item \Return
+  \[
+  \operatorname{EvalRequest}
+  \left(
+  \texttt{tree\_id},
+  u,
+  \Path,
+  s_u
+  \right).
+  \]
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 13: NextRequest\((\Tree,M_\pi,\kappa_N)\)}
+
+\Input posterior tree \(\Tree\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\)
+
+\Output either no GPU request, or one evaluation request
+
+\begin{enumerate}[leftmargin=2em]
+  \item Set
+  \[
+  v \gets v_{\mathrm{root}},
+  \qquad
+  \Path \gets ().
+  \]
+
+  \item \While true \Do
+
+  \begin{enumerate}[leftmargin=2em]
+    \item \If \(s_v\) is terminal \Then
+    \[
+    \Return
+    \EvaluateReachedLeaf(\Tree,v,\Path,M_\pi,\kappa_N).
+    \]
+    \EndIf
+
+    \item \If \(\sigma^{\mathrm{eval}}_v\ne\texttt{expanded}\) \Then
+    \[
+    \Return
+    \EvaluateReachedLeaf(\Tree,v,\Path,M_\pi,\kappa_N).
+    \]
+    \EndIf
+
+    \item Compute the non-blocked action set:
+    \[
+    \Available(v)
+    \gets
+    \{a\in\Legal(s_v):a\text{ does not lead to an in-flight or expanding child}\}.
+    \]
+
+    \item \If \(\Available(v)=\varnothing\) \Then
+    \[
+    \Return \NoRequest.
+    \]
+    \EndIf
+
+    \item Select a Thompson action only from available actions:
+    \[
+    \tilde a
+    \gets
+    \ThompsonSelect(\Tree,v,\Available(v)).
+    \]
+
+    \item Append the edge to the path:
+    \[
+    \Path
+    \gets
+    \Path \mathbin{\Vert} ((v,\tilde a)).
+    \]
+
+    \item Get the unique child for this edge:
+    \[
+    u\gets\TryGetOrCreateChild(\Tree,v,\tilde a).
+    \]
+
+    \item \If \(s_u\) is terminal \Then
+    \[
+    \Return
+    \EvaluateReachedLeaf(\Tree,u,\Path,M_\pi,\kappa_N).
+    \]
+    \EndIf
+
+    \item \If \(\sigma^{\mathrm{eval}}_u=\texttt{expanded}\) \Then
+    \[
+    v\gets u.
+    \]
+    \Continue.
+    \EndIf
+
+    \item Otherwise \(u\) is an unexpanded, in-flight, or expanding non-terminal leaf. Run
+    \[
+    \Return
+    \EvaluateReachedLeaf(\Tree,u,\Path,M_\pi,\kappa_N).
+    \]
+
+  \end{enumerate}
+
+  \item \EndWhile
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{12. Consuming a GPU result}
+
+A GPU result for leaf \(u\) contains
+
+\[
+\ell_{\theta^-}(s_u,\cdot),
+\qquad
+\alpha_{\theta^-}^V(s_u),
+\qquad
+\alpha_{\theta^-}^Q(s_u,\cdot).
+\]
+
+The CPU stores these outputs in the leaf node, atomically claims the in-flight
+result with \(\texttt{inflight}\rightarrow\texttt{expanding}\), publishes the
+network outputs, then marks the node \(\texttt{expanded}\). It decrements
+\(T_{\mathrm{inflight}}\), backs up the neural leaf Dirichlet vector, and increments
+\(T_{\mathrm{done}}\). A stale or duplicate GPU result is ignored.
+
+\begin{algorithmblock}{Algorithm 14: ConsumeResult\((\Tree,r,M_\pi,\kappa_N,\texttt{leaf\_value\_mode})\)}
+
+\Input posterior tree \(\Tree\), GPU result \(r\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), leaf evaluation mode \(\texttt{leaf\_value\_mode}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Extract from \(r\):
+  \[
+  u,
+  \qquad
+  \Path,
+  \qquad
+  \ell_{\theta^-}(s_u,\cdot),
+  \qquad
+  \alpha_{\theta^-}^V(s_u),
+  \qquad
+  \alpha_{\theta^-}^Q(s_u,\cdot).
+  \]
+
+  \item Acquire ownership of the in-flight node with an atomic transition:
+  \[
+  ok\gets
+  \CAS
+  \left(
+  \sigma^{\mathrm{eval}}_u,
+  \texttt{inflight},
+  \texttt{expanding}
+  \right).
+  \]
+
+  \item \If \(ok=\texttt{false}\) \Then
+  this result is stale, duplicated, or belongs to a node that was cancelled. Do
+  not back it up.
+  \[
+  \Return \Tree.
+  \]
+  \EndIf
+
+  \item Store the network outputs in node \(u\).
+
+  \item Initialize the node's own state-posterior cache to the value prior, but
+  do not make it eligible to overwrite the parent until it has completed child
+  evidence:
+  \[
+  C^V_u\gets\alpha_{\theta^-}^V(s_u),
+  \qquad
+  \sigma^V_u\gets\texttt{clean},
+  \qquad
+  \nu^V_u\gets\nu^V_u+1.
+  \]
+
+  \item Publish the completed expansion only after the network outputs and cache
+  fields are installed:
+  \[
+  \sigma^{\mathrm{eval}}_u\gets\texttt{expanded}.
+  \]
+
+  \item Atomically decrement the in-flight counter:
+  \[
+  T_{\mathrm{inflight}}(\Tree)
+  \gets
+  T_{\mathrm{inflight}}(\Tree)-1.
+  \]
+
+  \item Convert the value head into a positive leaf Dirichlet vector using the
+  configured switch:
+  \[
+  \beta_\ell
+  \gets
+  \begin{cases}
+  \alpha_{\theta^-}^V(s_u),
+  & \texttt{leaf\_value\_mode}=\texttt{alpha},\\[4pt]
+  \kappa_{\mathrm{leaf}}
+  \mean\left(\alpha_{\theta^-}^V(s_u)\right),
+  & \texttt{leaf\_value\_mode}=\texttt{mean}.
+  \end{cases}
+  \]
+
+
+  \item Back up the neural leaf Dirichlet vector:
+  \[
+  \Tree
+  \gets
+  \BackupPath(\Tree,\Path,\beta_\ell,M_\pi,\kappa_N).
+  \]
+
+  \item Atomically increment
+  \[
+  T_{\mathrm{done}}(\Tree)
+  \gets
+  T_{\mathrm{done}}(\Tree)+1.
+  \]
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+
+\section*{13. Batched CPU/GPU search driver}
+
+The driver maintains many active posterior trees. This gives game-parallelism.
+Each tree may also have several in-flight leaves. This gives leaf-parallelism
+without adding reservation mass to the posterior.
+
+Let
+
+\[
+\begin{aligned}
+G &= \text{number of active root trees},\\
+L &= \text{maximum in-flight leaves per tree},\\
+F &= \text{GPU inference batch size}.
+\end{aligned}
+\]
+
+and let \(T\) be the target number of simulations issued per root. To avoid
+large overshoot, a tree stops issuing new neural requests once
+
+\[
+T_{\mathrm{done}}(\Tree)+T_{\mathrm{inflight}}(\Tree)\ge T.
+\]
+
+Already issued in-flight requests are still consumed unless they are explicitly
+cancelled by the implementation. Consuming them is the simplest policy: it keeps
+posterior updates deterministic and leaves no permanently in-flight nodes in the
+exported tree.
+
+The GPU evaluator is the compilation boundary. It receives a preallocated batch
+of observations and returns a preallocated batch of network outputs. CPU workers
+may call \(\NextRequest\) in parallel while other workers consume previous GPU
+results and repair dirty nodes.
+
+\begin{algorithmblock}{Algorithm 15: BuildEvalBatch\((\{\Tree_b\}_{b=1}^{G},F,L,T,M_\pi,\kappa_N)\)}
+
+\Input active trees \(\{\Tree_b\}_{b=1}^{G}\), GPU batch size \(F\), in-flight limit \(L\), simulation budget \(T\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\)
+
+\Output evaluation request batch \(\mathcal{Q}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Initialize
+  \[
+  \mathcal{Q} \gets ().
+  \]
+
+  \item \While \(|\mathcal{Q}| < F\) and some tree can still issue work \Do
+
+  \begin{enumerate}[leftmargin=2em]
+    \item Choose an active tree \(\Tree_b\). This choice can be round-robin,
+    work-stealing, or priority-based.
+
+    \item \If
+    \[
+    T_{\mathrm{done}}(\Tree_b)+T_{\mathrm{inflight}}(\Tree_b) \ge T
+    \]
+    \Then skip this tree. \EndIf
+
+    \item \If
+    \[
+    T_{\mathrm{inflight}}(\Tree_b) \ge L
+    \]
+    \Then skip this tree. \EndIf
+
+    \item Optionally run a bounded amount of repair work:
+    \[
+    \RepairDirtyFrontier(\Tree_b,M_\pi,\kappa_N).
+    \]
+    This is opportunistic; failure to repair must not block request generation.
+
+    \item Run
+    \[
+    q
+    \gets
+    \NextRequest(\Tree_b,M_\pi,\kappa_N).
+    \]
+
+    \item \If \(q\) is a GPU evaluation request \Then append \(q\) to
+    \(\mathcal{Q}\). \EndIf
+
+    \item If all trees are either budget-limited, in-flight-limited, or blocked
+    by in-flight or expanding children, \Break.
+
+  \end{enumerate}
+
+  \item \EndWhile
+
+  \item \Return \(\mathcal{Q}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 16: RunPosteriorTreeSearch\((\{s_b\}_{b=1}^{G},\theta^-,T,F,L,M_\pi,\kappa_N,\texttt{leaf\_value\_mode})\)}
+
+\Input root states \(\{s_b\}_{b=1}^{G}\), data-generation network parameters \(\theta^-\), simulation budget \(T\), GPU batch size \(F\), in-flight limit \(L\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), leaf evaluation mode \(\texttt{leaf\_value\_mode}\)
+
+\Output completed posterior trees \(\{\Tree_b\}_{b=1}^{G}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each root state \(s_b\), initialize
+  \[
+  \Tree_b
+  \gets
+  \operatorname{InitializePosteriorTree}(s_b,\theta^-).
+  \]
+
+  \item \While some tree satisfies
+  \[
+  T_{\mathrm{done}}(\Tree_b)<T
+  \quad\text{or}\quad
+  T_{\mathrm{inflight}}(\Tree_b)>0
+  \]
+  \Do
+
+  \begin{enumerate}[leftmargin=2em]
+    \item Build a GPU evaluation batch:
+    \[
+    \mathcal{Q}
+    \gets
+    \BuildEvalBatch
+    \left(
+    \{\Tree_b\}_{b=1}^{G},
+    F,
+    L,
+    T,
+    M_\pi,
+    \kappa_N
+    \right).
+    \]
+
+    \item \If \(\mathcal{Q}\) is nonempty \Then send it to the GPU evaluator:
+    \[
+    \mathcal{R}
+    \gets
+    \GpuEvaluate(\mathcal{Q},\theta^-).
+    \]
+    \Else receive any completed outstanding GPU results. \EndIf
+
+    \item For each available result \(r\in\mathcal{R}\), send it back to its
+    owning CPU tree:
+    \[
+    \Tree_r
+    \gets
+    \ConsumeResult(\Tree_r,r,M_\pi,\kappa_N,\texttt{leaf\_value\_mode}).
+    \]
+
+    \item Opportunistically repair dirty nodes in each active tree:
+    \[
+    \RepairDirtyFrontier(\Tree_b,M_\pi,\kappa_N).
+    \]
+  \end{enumerate}
+
+  \item \EndWhile
+
+  \item For each tree, run a final repair pass before export:
+  \[
+  \Tree_b\gets\RepairDirtyFrontier(\Tree_b,M_\pi,\kappa_N).
+  \]
+
+  \item \Return \(\{\Tree_b\}_{b=1}^{G}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{14. Posterior-best policy target and NLL}
+
+After search, the root action posterior is
+
+\[
+\alpha_{\mathrm{root}}(a)
+=
+\EdgePosterior(\Tree,v_{\mathrm{root}},a).
+\]
+
+The search-improved policy target is the posterior probability that each action
+is optimal:
+
+\[
+\pi_{\mathrm{search}}(a\mid s)
+=
+\Prob
+\left(
+  a
+  =
+  \argmax_{b\in\Legal(s)}
+  \Utility(\phi_b)
+\right),
+\]
+
+where
+
+\[
+\phi_b
+\sim
+\Dir(\alpha_{\mathrm{root}}(b)).
+\]
+
+Estimate this distribution with multiple Monte Carlo Thompson samples. For
+\(m=1,\ldots,M_\pi\), sample
+
+\[
+\phi_b^{(m)}
+\sim
+\Dir(\alpha_{\mathrm{root}}(b)),
+\qquad
+b\in\Legal(s),
+\]
+
+then compute the sampled posterior-best action
+
+\[
+\tilde a^{(m)}
+=
+\argmax_{b\in\Legal(s)}
+\Utility(\phi_b^{(m)}).
+\]
+
+The estimator is
+
+\[
+\hat{\pi}_{\mathrm{search}}(a\mid s)
+=
+\frac{1}{M_\pi}
+\sum_{m=1}^{M_\pi}
+\one[\tilde a^{(m)}=a].
+\]
+
+The policy-head loss is the negative log-likelihood of this rough posterior-best
+distribution:
+
+\[
+\mathcal{L}_\pi(s)
+=
+-
+\sum_{a\in\Legal(s)}
+\stopgrad\left(\hat\pi_{\mathrm{search}}(a\mid s)\right)
+\log \pi_\theta(a\mid s).
+\]
+
+The deterministic posterior-best action is
+
+\[
+a^\star
+=
+\argmax_{a\in\Legal(s)}
+\hat\pi_{\mathrm{search}}(a\mid s).
+\]
+
+\begin{algorithmblock}{Algorithm 17: PosteriorBestPolicyTarget\((\alpha,M_\pi,\Legal(s))\)}
+
+\Input action posteriors \(\alpha(a)\), number of Monte Carlo samples \(M_\pi\), legal action set \(\Legal(s)\)
+
+\Output Monte Carlo posterior-best policy target \(\hat{\pi}_{\mathrm{search}}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Initialize counts:
+  \[
+  C(a)\gets 0
+  \qquad
+  \text{for all } a\in\Legal(s).
+  \]
+
+  \item For \(m=1,\ldots,M_\pi\):
+
+  \begin{enumerate}[leftmargin=2em]
+    \item For each legal action \(b\), sample
+    \[
+    \phi_b^{(m)}
+    \sim
+    \Dir(\alpha(b)).
+    \]
+
+    \item Compute the sampled posterior-best action
+    \[
+    \tilde a^{(m)}
+    \gets
+    \argmax_{b\in\Legal(s)}
+    \Utility(\phi_b^{(m)}).
+    \]
+
+    \item Increment
+    \[
+    C(\tilde a^{(m)})
+    \gets
+    C(\tilde a^{(m)})+1.
+    \]
+  \end{enumerate}
+
+  \item Return
+  \[
+  \hat{\pi}_{\mathrm{search}}(a\mid s)
+  =
+  \frac{C(a)}{M_\pi}.
+  \]
+\end{enumerate}
+
+\end{algorithmblock}
+
+
+\section*{15. Final action selection}
+
+Search produces a posterior-best policy target, but the committed action can be
+selected in several ways. Before final action selection, the tree runs a final
+repair pass so that the root sees the newest clean child caches that are not
+blocked by in-flight work:
+
+\[
+\Tree\gets\RepairDirtyFrontier(\Tree,M_\pi,\kappa_N).
+\]
+
+First define the posterior mean scalar Q estimate:
+
+\[
+\hat{q}_T(a)
+=
+\Utility
+\left(
+\mean
+\left(
+\alpha_{\mathrm{root}}(a)
+\right)
+\right).
+\]
+
+Equivalently,
+
+\[
+\hat{q}_T(a)
+=
+\frac{
+\alpha_{\mathrm{root},W}(a)
+-
+\alpha_{\mathrm{root},L}(a)
+}{
+\sum_z \alpha_{\mathrm{root},z}(a)
+}.
+\]
+
+The supported committed-action modes are:
+
+\[
+\texttt{posterior\_sample},
+\qquad
+\texttt{posterior\_argmax},
+\qquad
+\texttt{scalar\_q\_argmax}.
+\]
+
+Posterior sampling chooses
+
+\[
+a_{\mathrm{play}}
+\sim
+\Cat
+\left(
+\hat{\pi}_{\mathrm{search}}(\cdot\mid s)
+\right).
+\]
+
+Posterior argmax chooses
+
+\[
+a_{\mathrm{play}}
+=
+a^\star
+=
+\argmax_a
+\hat\pi_{\mathrm{search}}(a\mid s).
+\]
+
+Scalar-Q argmax chooses
+
+\[
+a_{\mathrm{play}}
+=
+\argmax_a
+\hat{q}_T(a)
+=
+\argmax_a
+\left(
+\bar\phi_{a,W}-\bar\phi_{a,L}
+\right),
+\qquad
+\bar\phi_a=\mean(\alpha_{\mathrm{root}}(a)).
+\]
+
+The posterior-best policy target is used for policy training regardless of which
+committed-action mode is used.
+
+\begin{algorithmblock}{Algorithm 18: FinishSearch\((\Tree,M_\pi,\kappa_N,\texttt{commit})\)}
+
+\Input completed posterior tree \(\Tree\), posterior-best samples \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), committed-action mode \(\texttt{commit}\)
+
+\Output root posteriors, policy target, committed action
+
+\begin{enumerate}[leftmargin=2em]
+  \item Run final dirty-cache repair:
+  \[
+  \Tree\gets\RepairDirtyFrontier(\Tree,M_\pi,\kappa_N).
+  \]
+
+  \item For each legal root action \(a\), compute
+  \[
+  \alpha_{\mathrm{root}}(a)
+  \gets
+  \EdgePosterior(\Tree,v_{\mathrm{root}},a).
+  \]
+
+  \item Compute the posterior-best policy target:
+  \[
+  \hat{\pi}_{\mathrm{search}}
+  \gets
+  \PosteriorBestPolicyTarget
+  \left(
+  \alpha_{\mathrm{root}},
+  M_\pi,
+  \Legal(s_{\mathrm{root}})
+  \right).
+  \]
+
+  \item \If
+  \[
+  \texttt{commit}=\texttt{posterior\_sample},
+  \]
+  sample
+  \[
+  a_{\mathrm{play}}
+  \sim
+  \Cat
+  \left(
+  \hat{\pi}_{\mathrm{search}}
+  \right).
+  \]
+  \EndIf
+
+  \item \If
+  \[
+  \texttt{commit}=\texttt{posterior\_argmax},
+  \]
+  choose
+  \[
+  a_{\mathrm{play}}
+  \gets
+  \argmax_a
+  \hat\pi_{\mathrm{search}}(a\mid s_{\mathrm{root}}).
+  \]
+  \EndIf
+
+  \item \If
+  \[
+  \texttt{commit}=\texttt{scalar\_q\_argmax},
+  \]
+  choose
+  \[
+  a_{\mathrm{play}}
+  \gets
+  \argmax_a
+  \Utility
+  \left(
+  \mean
+  \left(
+  \alpha_{\mathrm{root}}(a)
+  \right)
+  \right).
+  \]
+  \EndIf
+
+  \item \Return
+  \[
+  \left(
+  \alpha_{\mathrm{root}},
+  \hat{\pi}_{\mathrm{search}},
+  a_{\mathrm{play}}
+  \right).
+  \]
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{16. Estimated-Q improvement view}
+
+Let \(A_0\) be a Thompson-proposed root action from the initial posterior. This
+means \(A_0\) is sampled from the initial posterior-best policy; it is not
+\(a^\star\). Let \(C\) be a candidate set generated by Thompson search such that
+
+\[
+A_0 \in C.
+\]
+
+After search, define
+
+\[
+\hat{q}_T(a)
+=
+\Utility
+\left(
+\mean
+\left(
+\alpha_{\mathrm{root}}(a)
+\right)
+\right).
+\]
+
+If the committed action is
+
+\[
+A_+
+=
+\argmax_{a\in C}
+\hat{q}_T(a),
+\]
+
+then the estimated-Q improvement is pointwise:
+
+\[
+\hat{q}_T(A_+)
+\ge
+\hat{q}_T(A_0).
+\]
+
+Taking expectation over Thompson proposal randomness gives
+
+\[
+\E
+\left[
+\hat{q}_T(A_+)
+\right]
+\ge
+\E_{A_0}
+\left[
+\hat{q}_T(A_0)
+\right].
+\]
+
+This is an estimated-value improvement statement. It becomes a true value
+improvement only to the extent that \(\hat{q}_T\) is an accurate estimate of the
+true action value.
+
+
+\section*{17. Training targets from the whole posterior tree}
+
+Training should use the whole completed posterior tree, except leaf nodes. After
+search finishes, the implementation first drains or cancels in-flight work and
+runs final dirty-cache repair. Then all eligible nodes are flattened into
+independent rows, shuffled, and sent to the learner. The learner does not
+receive a pointer-based tree. It receives arrays of observations, legal masks,
+posterior policy targets, Dirichlet-Q targets, value-posterior targets, and loss
+masks.
+
+Before export, run
+
+\[
+\Tree\gets\RepairDirtyFrontier(\Tree,M_\pi,\kappa_N).
+\]
+
+Define the set of exported interior nodes as
+
+\[
+\Interior(\Tree)
+=
+\left\{
+ v:
+ \sigma^{\mathrm{eval}}_v=\texttt{expanded},
+ \ s_v\text{ is non-terminal},
+ \operatorname{has\_child\_evidence}(v),
+ \sigma^V_v=\texttt{clean}
+\right\}.
+\]
+
+This excludes terminal leaves, in-flight leaves, newly expanded neural leaves
+with no completed outgoing edge, dirty internal nodes whose dependencies are not
+yet ready, and padded/unused slots. The root is included exactly once if it
+satisfies the condition.
+
+For each exported node \(v\), local action posteriors are
+
+\[
+\alpha^{\mathrm{post}}_{v,a}
+=
+\EdgePosterior(\Tree,v,a),
+\qquad
+ a\in\Legal(s_v).
+\]
+
+Because \(v\) is clean at export, any edge that should have been refreshed from
+a clean interior child has already been refreshed or the node would not be
+exported.
+
+\subsection*{17.1 Policy target}
+
+The policy target for every exported node is the multi-sample posterior-best
+distribution:
+
+\[
+\hat\pi_{\mathrm{search}}^v
+=
+\PosteriorBestPolicyTarget
+\left(
+\left\{\alpha^{\mathrm{post}}_{v,a}\right\}_{a\in\Legal(s_v)},
+M_\pi,
+\Legal(s_v)
+\right).
+\]
+
+The policy loss is the NLL of that Monte Carlo distribution:
+
+\[
+\mathcal{L}_\pi(v)
+=
+-
+\sum_{a\in\Legal(s_v)}
+\stopgrad
+\left(
+\hat\pi_{\mathrm{search}}^v(a)
+\right)
+\log
+\pi_\theta(a\mid s_v).
+\]
+
+\subsection*{17.2 Q targets}
+
+For every exported node and every legal action, the Q target is the posterior
+currently used by search:
+
+\[
+\alpha^{Q,\mathrm{target}}_{v,a}
+=
+\EdgePosterior(\Tree,v,a),
+\qquad
+ a\in\Legal(s_v).
+\]
+
+Thus completed actions use their backed-up edge posterior \(B_{v,a}\), while
+unvisited actions use their fallback/base prior. Legal actions are not masked out
+merely because they were unvisited. If an unvisited action has small posterior-best
+probability, it receives little Q-loss weight; if it still has substantial
+posterior-best probability, the learner should preserve that uncertainty.
+
+Use the posterior-best policy itself as the default Q-loss weight:
+
+\[
+w_Q(v,a)=\stopgrad\left(\hat\pi_{\mathrm{search}}^v(a)\right).
+\]
+
+The Q loss is
+
+\[
+\mathcal{L}_Q(v)
+=
+\frac{
+\sum_{a\in\Legal(s_v)}
+ w_Q(v,a)
+D_{\mathrm{KL}}
+\left(
+\Dir
+\left(
+\stopgrad(\alpha^{Q,\mathrm{target}}_{v,a})
+\right)
+\,\|\,
+\Dir
+\left(
+\alpha_\theta^Q(s_v,a)
+\right)
+\right)
+}{
+\sum_{a\in\Legal(s_v)}w_Q(v,a)+\varepsilon
+}.
+\]
+
+\subsection*{17.3 Value targets}
+
+For every exported node, the value target is the node's clean state-posterior
+cache:
+
+\[
+\alpha^{V,\mathrm{target}}_v
+=
+C^V_v.
+\]
+
+Equivalently, because \(v\) is clean, this cache equals
+
+\[
+E^V_v
+=
+\sum_{a\in\Legal(s_v)}
+\hat\pi_{\mathrm{search}}^v(a)
+\alpha^{\mathrm{post}}_{v,a},
+\]
+
+\[
+N^\downarrow_v
+=
+\sum_{a\in\Legal(s_v)}R_{v,a},
+\qquad
+\gamma^V_v
+=
+\frac{N^\downarrow_v}{\kappa_N+N^\downarrow_v},
+\]
+
+and
+
+\[
+C^V_v
+=
+(1-\gamma^V_v)\alpha_{\theta^-}^V(s_v)
++
+\gamma^V_v E^V_v.
+\]
+
+The value loss is
+
+\[
+\mathcal{L}_V(v)
+=
+D_{\mathrm{KL}}
+\left(
+\Dir
+\left(
+\stopgrad(\alpha^{V,\mathrm{target}}_v)
+\right)
+\,\|\,
+\Dir
+\left(
+\alpha_\theta^V(s_v)
+\right)
+\right).
+\]
+
+\subsection*{17.4 Flattening, shuffling, and batching}
+
+A flattened training row for node \(v\in\Interior(\Tree)\) contains
+
+\[
+s_v,
+\qquad
+\Legal(s_v),
+\qquad
+\hat\pi_{\mathrm{search}}^v,
+\qquad
+\{\alpha^{Q,\mathrm{target}}_{v,a}\}_{a\in\Actions},
+\qquad
+\alpha^{V,\mathrm{target}}_v,
+\qquad
+\{w_Q(v,a)\}_{a\in\Actions}.
+\]
+
+The rows from all active trees and self-play positions are concatenated and
+shuffled before being sent to the learner. Padding rows have all loss weights and masks set
+to zero. The loss compares the current neural evaluation of each row with the
+posterior targets produced by search.
+
+\begin{algorithmblock}{Algorithm 19: MakeTargets\((\Tree,M_\pi,\kappa_N,\texttt{commit})\)}
+
+\Input completed posterior tree \(\Tree\), posterior-best samples \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), committed-action mode \(\texttt{commit}\)
+
+\Output flattened training rows and root committed action
+
+\begin{enumerate}[leftmargin=2em]
+  \item Run final dirty-cache repair:
+  \[
+  \Tree\gets\RepairDirtyFrontier(\Tree,M_\pi,\kappa_N).
+  \]
+
+  \item Run
+  \[
+  \left(
+  \alpha_{\mathrm{root}},
+  \hat{\pi}_{\mathrm{root}},
+  a_{\mathrm{play}}
+  \right)
+  \gets
+  \FinishSearch(\Tree,M_\pi,\kappa_N,\texttt{commit}).
+  \]
+
+  \item Initialize an empty row list \(\mathcal{D}\gets()\).
+
+  \item For each node \(v\in\Interior(\Tree)\):
+
+  \begin{enumerate}[leftmargin=2em]
+    \item For each legal action \(a\), compute
+    \[
+    \alpha^{\mathrm{post}}_{v,a}
+    \gets
+    \EdgePosterior(\Tree,v,a).
+    \]
+
+    \item Compute the local policy target using \(M_\pi\) Monte Carlo samples:
+    \[
+    \hat\pi_{\mathrm{search}}^v
+    \gets
+    \PosteriorBestPolicyTarget
+    \left(
+    \left\{\alpha^{\mathrm{post}}_{v,a}\right\}_{a\in\Legal(s_v)},
+    M_\pi,
+    \Legal(s_v)
+    \right).
+    \]
+
+    \item For each legal action, set
+    \[
+    \alpha^{Q,\mathrm{target}}_{v,a}
+    \gets
+    \EdgePosterior(\Tree,v,a),
+    \qquad
+    w_Q(v,a)
+    \gets
+    \hat\pi_{\mathrm{search}}^v(a).
+    \]
+
+    \item Set the value target from the clean node cache:
+    \[
+    \alpha^{V,\mathrm{target}}_v
+    \gets
+    C^V_v.
+    \]
+
+    \item Append the flattened row for \(v\) to \(\mathcal{D}\).
+  \end{enumerate}
+
+  \item Shuffle \(\mathcal{D}\) across all trees and positions before forming GPU
+  learner minibatches.
+
+  \item \Return \((\mathcal{D},a_{\mathrm{play}})\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+
+\section*{18. Practical implementation notes}
+
+\subsection*{18.1 CPU tree layout}
+
+The CPU tree should be implemented as an arena of nodes and edges. Prefer
+integer indices over pointers:
+
+\[
+\texttt{node\_id},
+\qquad
+\texttt{edge\_id},
+\qquad
+\texttt{child\_id}.
+\]
+
+For small or medium action spaces such as Hex, dense edge arrays are often
+reasonable:
+
+\[
+\texttt{nodes} \times |\Actions| \times 3.
+\]
+
+For large action spaces such as chess-style encodings, sparse edge storage may
+be required.
+
+Each node should store parent information, evaluation status, dirty status,
+version counters, and a small repair token. Each edge should store its child
+index, completed WDL posterior snapshot, completion bit, edge version, and the
+child cache version last absorbed.
+
+\subsection*{18.2 Concurrency model}
+
+The recommended implementation is fine-grained and non-blocking:
+
+\begin{enumerate}[leftmargin=2em]
+  \item Use atomic compare-and-swap for node evaluation status:
+  \[
+  \texttt{unexpanded}\rightarrow\texttt{inflight}\rightarrow\texttt{expanding}\rightarrow\texttt{expanded}.
+  \]
+  This prevents duplicate GPU requests for the same non-terminal leaf and prevents
+  selectors from seeing a node as expanded before its outputs are installed.
+
+  \item Use atomic compare-and-swap for first child publication on an edge. If
+  two workers create the same child concurrently, exactly one child is installed
+  and the loser discards its private candidate.
+
+  \item Use an edge-local lock or atomic pointer/snapshot swap for \(B_{v,a}\).
+  Edge posterior publication is a full-vector replacement.
+
+  \item Use a node-local repair token for \(C^V_v\). Repair is best-effort: if a
+  worker cannot acquire the token, it returns immediately and some later worker
+  can repair the node.
+
+  \item Use the node epoch \(e_v\) to reject stale repairs. A repair that started
+  before a concurrent edge update or child-cache version update must not publish
+  a clean cache.
+\end{enumerate}
+
+This allows high parallelism without making backups commute algebraically. Edge
+updates are small atomic publishes; state posteriors are derived caches; dirty
+flags and versions ensure eventual consistency.
+
+The intended worker behavior is:
+
+\[
+\begin{aligned}
+&\text{many selectors}
++\text{batched GPU evaluator}\\
+&\qquad
++\text{many result consumers}
++\text{opportunistic repair}.
+\end{aligned}
+\]
+
+There is no requirement for a single global tree mutex. A global per-tree mutex
+is acceptable for a first prototype, but it is not required by the algorithm.
+
+\subsection*{18.3 Queueing and tree storage}
+
+Use an in-process arena for active trees because search repeatedly reads and
+writes adjacent node and edge statistics. The inner loop should not depend on an
+external key-value store or service. Work queues, result queues, trajectory
+buffers, and checkpoints can exist around the search system, but they are not
+part of the posterior-tree mathematics and should not be touched on every edge
+selection or backup.
+
+The practical split is:
+
+\[
+\begin{aligned}
+&\text{active mutable tree in process memory},\\
+&\text{serialized training rows and checkpoints outside the search loop}.
+\end{aligned}
+\]
+
+\subsection*{18.4 GPU boundary}
+
+The GPU evaluator should be the compiled part:
+
+\[
+\GpuEvaluate(\mathcal{Q},\theta^-).
+\]
+
+It receives a preallocated batch of observations and legal masks, and returns
+preallocated arrays containing:
+
+\[
+\ell_{\theta^-}(s,\cdot),
+\qquad
+\alpha_{\theta^-}^V(s),
+\qquad
+\alpha_{\theta^-}^Q(s,\cdot).
+\]
+
+The CPU tree should not wait after every single descent. It should fill batches
+using both game-parallelism and leaf-parallelism. If every legal action in a lane
+is blocked by in-flight or expanding children, \(\NextRequest\) returns \(\NoRequest\) and the
+scheduler tries another lane or waits for GPU results.
+
+\subsection*{18.5 Dirty repair queues}
+
+A practical implementation should keep a queue or bitset of dirty nodes ordered
+approximately by depth. Exact priority is not required. The useful rule is:
+
+\[
+\text{repair deeper nodes before their parents}.
+\]
+
+A dirty node can be repaired by any worker. If repair fails because a child is
+not clean, the node remains dirty. When the child later publishes a clean cache,
+the parent will be marked dirty again and retried.
+
+At final export, call \(\RepairDirtyFrontier\) until no more nodes change. If
+in-flight work is still outstanding, either drain those GPU results first or
+exclude dirty/in-flight nodes from export.
+
+\subsection*{18.6 Flattened training batch boundary}
+
+The mutable posterior tree is a search-side data structure. It is not sent to the
+training step as a pointer-based tree. Instead, after a search finishes, the CPU
+or host-side search code materializes dense training arrays:
+
+\[
+\begin{aligned}
+&\texttt{obs},
+\quad \texttt{policy\_target},
+\quad \texttt{legal\_mask},\\
+&\texttt{alpha\_Q\_target},
+\quad \texttt{alpha\_V\_target},
+\quad \texttt{loss\_masks}.
+\end{aligned}
+\]
+
+All clean non-leaf posterior-tree rows are concatenated, shuffled, trimmed to a
+multiple of the training batch size, and reshaped into minibatches. At that
+point there is no parent/child structure left in the learner input.
+
+For a self-play batch size \(B\), game horizon \(H\), and per-root simulation
+count \(N\), the root-only data volume is
+
+\[
+B\,H.
+\]
+
+If all non-leaf tree nodes are retained, the rough upper bound is
+
+\[
+B\,H\,(N+1),
+\]
+
+because each completed simulation can add at most one new node in addition to the
+root. In practice, excluding leaf nodes, dirty nodes, and padding rows reduces
+this count.
+
+\subsection*{18.7 Tree lifetime and reuse}
+
+In the arena implementation, each posterior tree is temporary. For each self-play
+move, search builds a fresh arena from the current batch of root states, runs the
+configured number of simulations, extracts the flattened posterior rows, commits
+one action per root, and then drops the arena.
+
+Thus the active tree is not reused across self-play moves or training
+iterations. Only the neural network parameters, optimizer state, and checkpointed
+training state persist. A separate implementation may cache serialized nodes or
+root summaries, but that is a search-system optimization, not part of the basic
+training-data contract.
+
+\subsection*{18.8 Recommended initial knobs}
+
+A reasonable initial setting is
+
+\[
+L \in \{4,8\},
+\]
+
+where \(L\) is the number of in-flight leaves allowed per root tree.
+
+For the state-posterior evidence blend, choose \(\kappa_N>0\) on the scale of
+completed downstream evaluations, not on the scale of Dirichlet concentration.
+Larger \(\kappa_N\) means that more completed terminal/neural evaluations are
+needed before a node moves strongly away from its own value prior. Smaller
+\(\kappa_N\) lets completed search work dominate earlier:
+
+\[
+\gamma^V_u=\frac{N^\downarrow_u}{\kappa_N+N^\downarrow_u}.
+\]
+
+The confidence of a terminal or neural leaf remains in the returned Dirichlet
+vector \(\beta_\ell\); \(\gamma^V_u\) only measures how much downstream search work
+has been incorporated.
+
+For terminal leaves, use a narrow but strictly positive Dirichlet:
+
+\[
+\beta^{\mathrm{term}}=\epsilon_{\mathrm{term}}\mathbf{1}
++\kappa_{\mathrm{term}} e_z,
+\qquad
+0<\epsilon_{\mathrm{term}}\ll\kappa_{\mathrm{term}}.
+\]
+
+For neural leaves, the preferred setting is
+
+\[
+\texttt{leaf\_value\_mode}=\texttt{alpha},
+\]
+
+with \(\texttt{mean}\) retained only as an ablation using fixed concentration
+\(\kappa_{\mathrm{leaf}}\).
+
+\subsection*{18.9 Completed posteriors only}
+
+Only completed backed-up posteriors \(B_{v,a}\) are used as Q targets. In-flight
+scheduling state is not Bayesian evidence and is not included in
+\(\alpha^{\mathrm{post}}_{v,a}\).
+
+Dirty state-posterior caches are also not training targets. A dirty node is
+repaired before export or excluded from the flattened batch.
+
+\end{document}

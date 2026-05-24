@@ -1,55 +1,85 @@
-env_id: hex
-board_size: 6
-network: boardlaw_dirichlet
-num_outcomes: 3
-seed: 0
-max_num_iters: 300
-num_channels: 64
-num_layers: 4
-resnet_v2: true
-selfplay_batch_size: 2048
-num_simulations: 4
-max_num_steps: 8
-num_search_blocks: 8
-policy_mc_samples: 1
-backup_mc_samples: 1
-c_leaf: 1.0
-c_terminal: 8.0
-c_state: 0.1
-c_value_search: 1.0
-inflight_limit: 1
-search_eval_batch_size: 8192
-selfplay_action_source: posterior_sample
-search_policy: posterior_tree_wavefront
-wavefront_num_lanes_per_root: 4
-wavefront_max_depth: 128
-wavefront_final_action_mode: scalar_q_argmax
-wavefront_pad_eval_batches: true
-wavefront_pad_jax_select: false
-wavefront_np_select_below: 1024
-wavefront_grouped_expansion: true
-wavefront_lane_indexed_step: true
-wavefront_stable_lane_batch: true
-wavefront_pad_pending_observation_gather: true
-wavefront_backend: arena
-train_tree_nodes: true
-train_tree_include_root: true
-train_tree_include_terminal: true
-train_tree_min_q_evidence: 0.0
-train_tree_max_nodes_per_step: null
-training_batch_size: 8192
-learning_rate: 3e-3
-grad_clip_norm: 1.0
-policy_loss_weight: 1.0
-value_dir_kl_weight: 1.0
-q_dir_kl_weight: 1.0
-value_outcome_weight: 0.25
-q_outcome_weight: 0.10
-dirichlet_concentration_clip: 100.0
-log_interval: 1
-eval_interval: 1
-eval_batch_size: 16
-wandb_enabled: false
-wandb_project: scacchi-az
-ckpt_max_to_keep: 0
-ckpt_save_interval_steps: 50
+run:
+  seed: 0
+  max_num_iters: 300
+
+env:
+  id: hex
+  board_size: 6
+  num_outcomes: 3
+
+model:
+  network: boardlaw_dirichlet
+  num_channels: 64
+  num_layers: 4
+  resnet_v2: true
+
+selfplay:
+  batch_size: 2048
+  max_num_steps: 8
+  action_source: posterior_sample
+
+search:
+  policy: posterior_tree_wavefront
+  num_simulations: 4
+  num_blocks: 8
+  eval_batch_size: 8192
+  inflight_limit: 1
+
+  monte_carlo:
+    policy_samples: 1
+    backup_samples: 1
+
+  constants:
+    c_leaf: 1.0
+    c_terminal: 8.0
+    c_state: 0.1
+    c_value_search: 1.0
+
+  wavefront:
+    backend: arena
+    num_lanes_per_root: 4
+    max_depth: 128
+    final_action_mode: scalar_q_argmax
+    pad_eval_batches: true
+    pad_jax_select: false
+    np_select_below: 1024
+    grouped_expansion: true
+    lane_indexed_step: true
+    stable_lane_batch: true
+    pad_pending_observation_gather: true
+
+training:
+  batch_size: 8192
+  learning_rate: 3e-3
+  grad_clip_norm: 1.0
+
+  tree:
+    enabled: true
+    include_root: true
+    include_terminal: true
+    min_q_evidence: 0.0
+    max_nodes_per_step: null
+
+  losses:
+    policy_weight: 1.0
+    value_dir_kl_weight: 1.0
+    q_dir_kl_weight: 1.0
+    value_outcome_weight: 0.25
+    q_outcome_weight: 0.10
+
+  regularization:
+    dirichlet_concentration_clip: 100.0
+
+eval:
+  interval: 1
+  batch_size: 16
+
+logging:
+  interval: 1
+  wandb:
+    enabled: false
+    project: scacchi-az
+
+checkpointing:
+  max_to_keep: 0
+  save_interval_steps: 50

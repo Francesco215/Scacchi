@@ -14,6 +14,7 @@
 
 import os
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -50,6 +51,123 @@ def report_jax_backend() -> None:
             "JAX is not using a GPU backend. Set SCACCHI_ALLOW_CPU=1 only for "
             "intentional CPU runs."
         )
+
+
+_NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("run", "seed"), "seed"),
+    (("run", "max_num_iters"), "max_num_iters"),
+    (("env", "id"), "env_id"),
+    (("env", "board_size"), "board_size"),
+    (("env", "num_outcomes"), "num_outcomes"),
+    (("model", "network"), "network"),
+    (("model", "num_channels"), "num_channels"),
+    (("model", "num_layers"), "num_layers"),
+    (("model", "resnet_v2"), "resnet_v2"),
+    (("selfplay", "batch_size"), "selfplay_batch_size"),
+    (("selfplay", "max_num_steps"), "max_num_steps"),
+    (("selfplay", "action_source"), "selfplay_action_source"),
+    (("search", "policy"), "search_policy"),
+    (("search", "num_simulations"), "num_simulations"),
+    (("search", "num_blocks"), "num_search_blocks"),
+    (("search", "eval_batch_size"), "search_eval_batch_size"),
+    (("search", "inflight_limit"), "inflight_limit"),
+    (("search", "monte_carlo", "policy_samples"), "policy_mc_samples"),
+    (("search", "monte_carlo", "backup_samples"), "backup_mc_samples"),
+    (("search", "constants", "c_leaf"), "c_leaf"),
+    (("search", "constants", "c_terminal"), "c_terminal"),
+    (("search", "constants", "c_state"), "c_state"),
+    (("search", "constants", "c_value_search"), "c_value_search"),
+    (("search", "wavefront", "backend"), "wavefront_backend"),
+    (("search", "wavefront", "num_lanes_per_root"), "wavefront_num_lanes_per_root"),
+    (("search", "wavefront", "max_depth"), "wavefront_max_depth"),
+    (("search", "wavefront", "final_action_mode"), "wavefront_final_action_mode"),
+    (("search", "wavefront", "pad_eval_batches"), "wavefront_pad_eval_batches"),
+    (("search", "wavefront", "pad_jax_select"), "wavefront_pad_jax_select"),
+    (("search", "wavefront", "np_select_below"), "wavefront_np_select_below"),
+    (("search", "wavefront", "grouped_expansion"), "wavefront_grouped_expansion"),
+    (("search", "wavefront", "lane_indexed_step"), "wavefront_lane_indexed_step"),
+    (("search", "wavefront", "stable_lane_batch"), "wavefront_stable_lane_batch"),
+    (
+        ("search", "wavefront", "pad_pending_observation_gather"),
+        "wavefront_pad_pending_observation_gather",
+    ),
+    (("training", "batch_size"), "training_batch_size"),
+    (("training", "learning_rate"), "learning_rate"),
+    (("training", "grad_clip_norm"), "grad_clip_norm"),
+    (("training", "tree", "enabled"), "train_tree_nodes"),
+    (("training", "tree", "include_root"), "train_tree_include_root"),
+    (("training", "tree", "include_terminal"), "train_tree_include_terminal"),
+    (("training", "tree", "min_q_evidence"), "train_tree_min_q_evidence"),
+    (("training", "tree", "max_nodes_per_step"), "train_tree_max_nodes_per_step"),
+    (("training", "losses", "policy_weight"), "policy_loss_weight"),
+    (("training", "losses", "value_dir_kl_weight"), "value_dir_kl_weight"),
+    (("training", "losses", "q_dir_kl_weight"), "q_dir_kl_weight"),
+    (("training", "losses", "value_outcome_weight"), "value_outcome_weight"),
+    (("training", "losses", "q_outcome_weight"), "q_outcome_weight"),
+    (
+        ("training", "regularization", "dirichlet_concentration_clip"),
+        "dirichlet_concentration_clip",
+    ),
+    (("eval", "interval"), "eval_interval"),
+    (("eval", "batch_size"), "eval_batch_size"),
+    (("logging", "interval"), "log_interval"),
+    (("logging", "wandb", "enabled"), "wandb_enabled"),
+    (("logging", "wandb", "project"), "wandb_project"),
+    (("checkpointing", "max_to_keep"), "ckpt_max_to_keep"),
+    (("checkpointing", "save_interval_steps"), "ckpt_save_interval_steps"),
+)
+_NESTED_CONFIG_GROUPS = frozenset(path[0] for path, _ in _NESTED_CONFIG_FIELDS)
+_NESTED_CONFIG_PATHS = frozenset(path for path, _ in _NESTED_CONFIG_FIELDS)
+
+
+def _nested_value(
+    config: Mapping[str, Any],
+    path: tuple[str, ...],
+) -> tuple[bool, Any]:
+    value: Any = config
+    for part in path:
+        if not isinstance(value, Mapping) or part not in value:
+            return False, None
+        value = value[part]
+    return True, value
+
+
+def _iter_nested_leaves(
+    value: Any,
+    prefix: tuple[str, ...],
+) -> tuple[tuple[tuple[str, ...], Any], ...]:
+    if not isinstance(value, Mapping):
+        return ((prefix, value),)
+    if not value:
+        return ((prefix, value),)
+    leaves: list[tuple[tuple[str, ...], Any]] = []
+    for key, child in value.items():
+        leaves.extend(_iter_nested_leaves(child, (*prefix, str(key))))
+    return tuple(leaves)
+
+
+def normalize_config_dict(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Flatten the readable nested YAML shape into the runtime Config fields."""
+
+    normalized: dict[str, Any] = {}
+    for key, value in config.items():
+        key = str(key)
+        if key not in _NESTED_CONFIG_GROUPS:
+            normalized[key] = value
+            continue
+        if not isinstance(value, Mapping):
+            normalized[key] = value
+            continue
+        for path, leaf_value in _iter_nested_leaves(value, (key,)):
+            if path not in _NESTED_CONFIG_PATHS:
+                normalized[".".join(path)] = leaf_value
+
+    for path, target in _NESTED_CONFIG_FIELDS:
+        found, value = _nested_value(config, path)
+        if found and target not in normalized:
+            normalized[target] = value
+
+    return normalized
 
 
 class Config(BaseModel):
@@ -203,7 +321,7 @@ class Config(BaseModel):
 @hydra.main(version_base=None, config_path="configs", config_name="hex")
 def main(cfg: DictConfig) -> None:
     container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
-    config = Config(**container)
+    config = Config(**normalize_config_dict(container))
     report_jax_backend()
 
     env = make_env(config.env_id, config.board_size)
