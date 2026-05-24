@@ -44,6 +44,9 @@ class TrainMetrics(NamedTuple):
 def make_compute_loss_input(config):
     def compute_loss_input(data: SelfplayOutput) -> Sample:
         value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
+        legal_policy_mask = jnp.any(data.legal_action_mask, axis=-1)
+        policy_target_mask = jnp.sum(data.action_weights, axis=-1) > 0
+        search_value_mask = jnp.sum(data.q_evidence_mass, axis=-1) > 0
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
         def body_fn(carry: jax.Array, i: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -67,8 +70,8 @@ def make_compute_loss_input(config):
             beta_Q_target=data.beta_Q_target,
             beta_V_target=data.beta_V_target,
             q_evidence_mass=data.q_evidence_mass,
-            policy_loss_mask=value_mask,
-            value_loss_mask=value_mask,
+            policy_loss_mask=legal_policy_mask & policy_target_mask,
+            value_loss_mask=value_mask | search_value_mask,
             outcome_mask=value_mask,
         )
         if data.tree_data is None:

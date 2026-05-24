@@ -236,6 +236,22 @@ def _empty_posterior_targets(
     return beta_q, beta_v, q_evidence_mass
 
 
+def _select_posterior_tree_played_action(
+    action_source: str,
+    rng_key: jax.Array,
+    action_weights: jax.Array,
+    legal_action_mask: jax.Array,
+    search_action: jax.Array,
+) -> jax.Array:
+    if action_source in ("posterior_best", "posterior_argmax"):
+        return posterior_best_action(action_weights, legal_action_mask)
+    if action_source == "posterior_sample":
+        return posterior_sample_action(rng_key, action_weights, legal_action_mask)
+    if action_source in ("search_action", "scalar_q_argmax"):
+        return search_action
+    raise ValueError(f"unknown selfplay_action_source: {action_source!r}")
+
+
 def make_posterior_tree_selfplay(env, config):
     @nnx.jit
     def evaluate_leaves(model: nnx.Module, obs: jax.Array):
@@ -276,7 +292,7 @@ def make_posterior_tree_selfplay(env, config):
         tree_data_seq = []
 
         for _ in range(config.max_num_steps):
-            rng_key, search_key, reset_key = jax.random.split(rng_key, 3)
+            rng_key, search_key, action_key, reset_key = jax.random.split(rng_key, 4)
             observation = env_state.observation
             legal_action_mask = env_state.legal_action_mask
             actor = env_state.current_player
@@ -297,7 +313,22 @@ def make_posterior_tree_selfplay(env, config):
                     rng_key=search_key,
                     config=config,
                 )
-            played_action = search_output.action if use_wavefront_arena else _device_put_cpu(search_output.action)
+            search_action = (
+                search_output.action
+                if use_wavefront_arena
+                else _device_put_cpu(search_output.action)
+            )
+            played_action = (
+                _select_posterior_tree_played_action(
+                    config.selfplay_action_source,
+                    action_key,
+                    search_output.action_weights,
+                    legal_action_mask,
+                    search_action,
+                )
+                if use_wavefront_arena
+                else search_action
+            )
 
             reset_keys = jax.random.split(reset_key, config.selfplay_batch_size)
             if not use_wavefront_arena:

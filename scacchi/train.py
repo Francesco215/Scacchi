@@ -252,14 +252,16 @@ def main(cfg: DictConfig) -> None:
             pbar.refresh()
             for iteration in pbar:
                 dict_to_log = {}
-                if iteration == config.max_num_iters - 1 or (config.eval_interval > 0 and iteration % config.eval_interval == 0):
-                    rng_key, subkey = jax.random.split(rng_key)
-                    returns = evaluate(subkey, model)
+                rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
+                if config.eval_interval > 0 and (
+                    iteration == config.max_num_iters - 1
+                    or iteration % config.eval_interval == 0
+                ):
+                    returns = evaluate(eval_key, model)
                     dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
 
                 st = time.time()
-                rng_key, subkey = jax.random.split(rng_key)
-                train_metrics = training_iteration(model, optimizer, subkey)
+                train_metrics = training_iteration(model, optimizer, train_key)
                 frames += config.selfplay_batch_size * config.max_num_steps
 
                 et = time.time()

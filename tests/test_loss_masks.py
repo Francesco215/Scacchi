@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 import optax
 
@@ -12,6 +13,7 @@ from scacchi.loss import (
     _outcome_target,
     make_compute_loss_input,
 )
+from scacchi.pipeline import make_minibatches
 from scacchi.play import SelfplayOutput
 
 
@@ -116,6 +118,54 @@ def test_compute_loss_input_appends_tree_rows_with_separate_loss_masks():
     assert jnp.array_equal(sample.policy_loss_mask, jnp.array([[True, True, False]]))
     assert jnp.array_equal(sample.value_loss_mask, jnp.array([[True, True, True]]))
     assert jnp.array_equal(sample.outcome_mask, jnp.array([[True, False, True]]))
+
+
+def test_compute_loss_input_trains_root_search_targets_before_terminal_result():
+    data = SelfplayOutput(
+        obs=jnp.zeros((2, 3, 1)),
+        reward=jnp.zeros((2, 3)),
+        terminated=jnp.zeros((2, 3), dtype=jnp.bool_),
+        action_weights=jnp.full((2, 3, 4), 0.25),
+        played_action=jnp.zeros((2, 3), dtype=jnp.int32),
+        legal_action_mask=jnp.ones((2, 3, 4), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((2, 3, 4, 3)),
+        beta_V_target=jnp.ones((2, 3, 3)),
+        q_evidence_mass=jnp.ones((2, 3, 4)),
+        discount=-jnp.ones((2, 3)),
+    )
+    config = SimpleNamespace(max_num_steps=2, selfplay_batch_size=3)
+
+    sample = make_compute_loss_input(config)(data)
+
+    assert jnp.array_equal(sample.policy_loss_mask, jnp.ones((2, 3), dtype=jnp.bool_))
+    assert jnp.array_equal(sample.value_loss_mask, jnp.ones((2, 3), dtype=jnp.bool_))
+    assert jnp.array_equal(sample.outcome_mask, jnp.zeros((2, 3), dtype=jnp.bool_))
+
+
+def test_make_minibatches_replays_active_rows_and_keeps_compute_shape():
+    active_mask = jnp.array([[False, True, False, False, False, False, True, False]])
+    sample = Sample(
+        obs=jnp.arange(8, dtype=jnp.float32).reshape(1, 8, 1),
+        policy_tgt=jnp.ones((1, 8, 2)) / 2,
+        value_tgt=jnp.zeros((1, 8)),
+        played_action=jnp.zeros((1, 8), dtype=jnp.int32),
+        policy_mask=jnp.ones((1, 8, 2), dtype=jnp.bool_),
+        value_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((1, 8, 2, 2)),
+        beta_V_target=jnp.ones((1, 8, 2)),
+        q_evidence_mass=jnp.zeros((1, 8, 2)),
+        policy_loss_mask=active_mask,
+        value_loss_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
+        outcome_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
+    )
+
+    minibatches = make_minibatches(sample, jax.random.PRNGKey(0), 4)
+
+    assert minibatches.obs.shape == (2, 4, 1)
+    assert bool(
+        jnp.all((minibatches.obs[..., 0] == 1.0) | (minibatches.obs[..., 0] == 6.0))
+    )
+    assert bool(jnp.all(minibatches.policy_loss_mask))
 
 
 def test_policy_loss_ignores_illegal_logits():

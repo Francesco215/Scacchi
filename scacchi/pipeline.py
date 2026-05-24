@@ -16,17 +16,43 @@ def make_minibatches(
         lambda x: x.reshape((-1, *x.shape[2:])),
         samples,
     )
-    ixs = jax.random.permutation(rng_key, jnp.arange(samples.obs.shape[0]))
-    samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)
-
-    num_updates = samples.obs.shape[0] // training_batch_size
+    num_rows = samples.obs.shape[0]
+    num_updates = num_rows // training_batch_size
     num_train_samples = num_updates * training_batch_size
-    samples = jax.tree_util.tree_map(lambda x: x[:num_train_samples], samples)
+    active_mask = _active_sample_rows(samples)
+    active_indices = jnp.nonzero(active_mask, size=num_rows, fill_value=0)[0]
+    active_count = jnp.sum(active_mask.astype(jnp.int32))
+    safe_active_count = jnp.maximum(active_count, 1)
+    draw_key, fallback_key = jax.random.split(rng_key)
+    raw_draws = jax.random.randint(
+        draw_key,
+        (num_train_samples,),
+        minval=0,
+        maxval=max(num_rows, 1),
+        dtype=jnp.int32,
+    )
+    active_ixs = active_indices[raw_draws % safe_active_count]
+    fallback_ixs = jax.random.permutation(fallback_key, jnp.arange(num_rows))[
+        :num_train_samples
+    ]
+    ixs = jnp.where(active_count > 0, active_ixs, fallback_ixs)
+    samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)
     minibatches = jax.tree_util.tree_map(
         lambda x: x.reshape((num_updates, training_batch_size) + x.shape[1:]),
         samples,
     )
     return minibatches
+
+
+def _active_sample_rows(samples: Sample) -> jax.Array:
+    policy_mask = (
+        samples.value_mask if samples.policy_loss_mask is None else samples.policy_loss_mask
+    )
+    value_mask = (
+        samples.value_mask if samples.value_loss_mask is None else samples.value_loss_mask
+    )
+    outcome_mask = samples.value_mask if samples.outcome_mask is None else samples.outcome_mask
+    return policy_mask | value_mask | outcome_mask
 
 
 def train_minibatches(
