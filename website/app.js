@@ -19,6 +19,16 @@ const WIN_LINES = Object.freeze([
   [0, 4, 8],
   [2, 4, 6],
 ]);
+const SYMMETRIES = Object.freeze([
+  [0, 1, 2, 3, 4, 5, 6, 7, 8],
+  [6, 3, 0, 7, 4, 1, 8, 5, 2],
+  [8, 7, 6, 5, 4, 3, 2, 1, 0],
+  [2, 5, 8, 1, 4, 7, 0, 3, 6],
+  [2, 1, 0, 5, 4, 3, 8, 7, 6],
+  [6, 7, 8, 3, 4, 5, 0, 1, 2],
+  [0, 3, 6, 1, 4, 7, 2, 5, 8],
+  [8, 5, 2, 7, 4, 1, 6, 3, 0],
+]);
 
 const OUTCOME = Object.freeze({
   LOSS: 0,
@@ -60,6 +70,7 @@ let board = Array(9).fill(null);
 let currentPlayer = "X";
 let analysis = null;
 let rootTree = null;
+let nodeTable = new Map();
 let completedSamples = 0;
 let sampleCarry = 0;
 let samplesPerSecond = DEFAULT_SAMPLES_PER_SECOND;
@@ -77,6 +88,7 @@ const els = {
   sims: document.getElementById("sims"),
   recommended: document.getElementById("recommended"),
   alphaTotal: document.getElementById("alpha-total"),
+  nodeCount: document.getElementById("node-count"),
   alphaReadout: document.getElementById("alpha-readout"),
   lossBar: document.getElementById("loss-bar"),
   drawBar: document.getElementById("draw-bar"),
@@ -100,6 +112,33 @@ function legalActions(stateBoard) {
     }
   }
   return actions;
+}
+
+function boardKey(stateBoard) {
+  return stateBoard.map((mark) => mark ?? "-").join("");
+}
+
+function transformBoard(stateBoard, symmetry) {
+  return symmetry.map((sourceIndex) => stateBoard[sourceIndex]);
+}
+
+function canonicalState(stateBoard, player) {
+  let bestBoard = null;
+  let bestBoardKey = null;
+
+  for (const symmetry of SYMMETRIES) {
+    const transformed = transformBoard(stateBoard, symmetry);
+    const key = boardKey(transformed);
+    if (bestBoardKey === null || key < bestBoardKey) {
+      bestBoard = transformed;
+      bestBoardKey = key;
+    }
+  }
+
+  return {
+    board: bestBoard,
+    key: `${player}:${bestBoardKey}`,
+  };
 }
 
 function gameResult(stateBoard) {
@@ -208,6 +247,28 @@ function thompsonSelect(node, actions) {
   return bestAction;
 }
 
+function getOrCreateChild(node, action) {
+  const existing = node.children.get(action);
+  if (existing) {
+    return { child: existing, isNew: false };
+  }
+
+  const nextBoard = placeMove(node.board, node.player, action);
+  const nextPlayer = opponent(node.player);
+  const canonical = canonicalState(nextBoard, nextPlayer);
+  let child = nodeTable.get(canonical.key);
+  let isNew = false;
+
+  if (!child) {
+    child = new Node(canonical.board, nextPlayer);
+    nodeTable.set(canonical.key, child);
+    isNew = true;
+  }
+
+  node.children.set(action, child);
+  return { child, isNew };
+}
+
 function runSearch(root, simulationCount) {
   for (let i = 0; i < simulationCount; i += 1) {
     runSimulation(root);
@@ -235,15 +296,11 @@ function runSimulation(root) {
     const action = thompsonSelect(node, actions);
     path.push({ node, action });
 
-    let child = node.children.get(action);
-    if (!child) {
-      const nextBoard = placeMove(node.board, node.player, action);
-      child = new Node(nextBoard, opponent(node.player), node, action);
-      node.children.set(action, child);
-
-      const childResult = gameResult(nextBoard);
+    const { child, isNew } = getOrCreateChild(node, action);
+    if (isNew) {
+      const childResult = gameResult(child.board);
       const beta = childResult.terminal
-        ? terminalOutcomeAlpha(nextBoard, child.player)
+        ? terminalOutcomeAlpha(child.board, child.player)
         : child.alphaV.slice();
       backupPath(path, beta);
       return;
@@ -269,9 +326,14 @@ function backupPath(path, betaLeaf) {
   }
 }
 
-function repairSubtree(node) {
+function repairSubtree(node, seen = new Set()) {
+  if (seen.has(node)) {
+    return;
+  }
+  seen.add(node);
+
   for (const child of node.children.values()) {
-    repairSubtree(child);
+    repairSubtree(child, seen);
   }
   repairNode(node);
 }
@@ -369,6 +431,7 @@ function analyzePosition() {
       policy: new Map(),
       bestAction: null,
       simulations: completedSamples,
+      nodes: 0,
     };
   }
 
@@ -392,6 +455,7 @@ function analyzePosition() {
     policy,
     bestAction,
     simulations: completedSamples,
+    nodes: nodeTable.size + 1,
   };
 }
 
@@ -491,6 +555,7 @@ function renderPosterior() {
   els.sims.textContent = String(analysis.simulations);
   els.recommended.textContent = actionName(analysis.bestAction);
   els.alphaTotal.textContent = formatNumber(total);
+  els.nodeCount.textContent = String(analysis.nodes);
   els.alphaReadout.textContent = `L=${formatNumber(alpha[0])}  D=${formatNumber(
     alpha[1],
   )}  W=${formatNumber(alpha[2])}`;
@@ -578,6 +643,7 @@ function setComputeBudget(value) {
 }
 
 function resetAnalysisTree() {
+  nodeTable = new Map();
   rootTree = gameResult(board).terminal ? null : new Node(board, currentPlayer);
   completedSamples = 0;
   sampleCarry = 0;
