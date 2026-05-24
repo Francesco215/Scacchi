@@ -23,6 +23,16 @@ def test_dirichlet_from_logits_uses_squared_softplus_concentration():
     assert jnp.allclose(outcome_mean(alpha), jnp.array([[0.5, 0.5]]))
 
 
+def test_dirichlet_from_logits_clips_total_concentration():
+    mean_logits = jnp.array([[0.0, 0.0, 0.0]])
+    concentration_logit = jnp.array([100.0])
+
+    alpha = dirichlet_from_logits(mean_logits, concentration_logit, concentration_clip=5.0)
+
+    assert jnp.allclose(alpha.sum(axis=-1), jnp.array([5.0]))
+    assert jnp.allclose(outcome_mean(alpha), jnp.full((1, 3), 1 / 3))
+
+
 def test_boardlaw_dirichlet_net_shapes_and_positive_alphas():
     model = BoardlawDirichletNet(
         num_actions=10,

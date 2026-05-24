@@ -1,87 +1,87 @@
 run:
-  seed: 0
-  max_num_iters: 300
+  seed: 0  # Random seed for model init, self-play, and search sampling.
+  max_num_iters: 300  # Number of training iterations to run.
 
 env:
-  id: hex
-  board_size: 3
-  num_outcomes: 3
+  id: hex  # PGX environment id.
+  board_size: 4  # Hex board side length.
+  num_outcomes: 3  # WDL outcome dimension: loss/draw/win.
 
 model:
-  network: boardlaw_dirichlet
-  num_channels: 64
-  num_layers: 4
-  resnet_v2: true
+  network: boardlaw_dirichlet  # Network architecture with policy, value-Dirichlet, and Q-Dirichlet heads.
+  num_channels: 64  # Hidden channel width.
+  num_layers: 4  # Number of residual layers.
+  resnet_v2: true  # Use pre-activation ResNet blocks.
 
 selfplay:
-  batch_size: 8
-  max_num_steps: 2048
-  action_source: posterior_sample
+  batch_size: 8  # Number of games advanced in parallel.
+  max_num_steps: 16  # Maximum game length before truncating self-play.
+  action_source: posterior_sample  # How to choose the played move from the search posterior.
 
 search:
-  policy: posterior_tree_wavefront
-  num_simulations: 4
-  num_blocks: 8
-  eval_batch_size: 8192
-  inflight_limit: 1
+  policy: posterior_tree_wavefront  # Search implementation used during self-play.
+  num_simulations: 64  # Completed leaf evaluations per root.
+  num_blocks: 8  # Deprecated: Search blocks for non-wavefront Dirichlet search paths.
+  eval_batch_size: 8192  # Neural leaf-evaluation batch size.
+  inflight_limit: 1  # Maximum outstanding GPU leaf requests per root.
 
   monte_carlo:
-    policy_samples: 1
-    backup_samples: 1
+    policy_samples: 8  # Samples used to estimate posterior-best policy targets.
+    backup_samples: 1  # Samples used when repairing state-posterior caches.
 
-  leaf_value_mode: alpha
+  leaf_value_mode: alpha  # alpha backs up alpha_V directly; mean uses kappa_leaf * mean(alpha_V).
 
   constants:
-    kappa_leaf: 1.0
-    kappa_terminal: 8.0
-    epsilon_terminal: 1e-6
-    state_posterior_kappa_n: 9.0
+    kappa_leaf: 1.0  # Fixed concentration used only when leaf_value_mode is mean.
+    kappa_terminal: 10.0  # Concentration assigned to the exact terminal outcome component.
+    epsilon_terminal: 1e0  # Positive floor for non-outcome terminal Dirichlet components.
+    state_posterior_kappa_n: 1.0  # Half-trust count for gamma = N_down / (kappa_N + N_down).
 
   wavefront:
-    backend: arena
-    num_lanes_per_root: 4
-    max_depth: 128
-    final_action_mode: scalar_q_argmax
-    pad_eval_batches: true
-    pad_jax_select: false
-    np_select_below: 1024
-    grouped_expansion: true
-    lane_indexed_step: true
-    stable_lane_batch: true
-    pad_pending_observation_gather: true
+    backend: arena  # In-memory arena backend for posterior-tree search.
+    num_lanes_per_root: 4  # Parallel traversal lanes per root.
+    max_depth: 128  # Maximum tree descent depth per simulation.
+    final_action_mode: posterior_sample  # Root action rule after search completes.
+    pad_eval_batches: true  # Pad neural evaluation batches to eval_batch_size.
+    pad_jax_select: false  # Pad JAX selection batches for uniform shapes.
+    np_select_below: 1024  # Use NumPy selection below this batch-size threshold.
+    grouped_expansion: true  # Batch node expansion by shared legal-action count.
+    lane_indexed_step: true  # Step all lane slots with lane-indexed actions.
+    stable_lane_batch: true  # Keep traversal lane batch shape stable.
+    pad_pending_observation_gather: true  # Pad gathered pending observations before evaluation.
 
 training:
-  batch_size: 8192
-  learning_rate: 3e-3
-  grad_clip_norm: 1.0
+  batch_size: 8192  # Learner minibatch size.
+  learning_rate: 1e-3  # Adam learning rate.
+  grad_clip_norm: 1.0  # Global gradient clipping norm; null disables clipping.
 
   tree:
-    enabled: true
-    include_root: true
-    include_terminal: true
-    min_q_evidence: 0.0
-    max_nodes_per_step: null
+    enabled: true  # Include flattened posterior-tree rows in training.
+    include_root: true  # Export root rows when they satisfy tree-row criteria.
+    include_terminal: true  # Keep compatibility knob; terminal leaves are excluded by posterior-tree export.
+    min_q_evidence: 0.0  # Minimum downstream evaluation count required for exported tree rows.
+    max_nodes_per_step: null  # Optional cap on exported tree rows per self-play step.
 
   losses:
-    policy_weight: 1.0
-    value_dir_kl_weight: 1.0
-    q_dir_kl_weight: 1.0
-    value_outcome_weight: 0.25
-    q_outcome_weight: 0.10
+    policy_weight: 1.0  # Weight for policy target loss.
+    value_dir_kl_weight: 1.0  # Weight for value Dirichlet KL loss.
+    q_dir_kl_weight: 1.0  # Weight for action-value Dirichlet KL loss.
+    value_outcome_weight: 0.25  # Weight for eventual-outcome value-head loss.
+    q_outcome_weight: 0.10  # Weight for eventual-outcome played-action Q-head loss.
 
   regularization:
-    dirichlet_concentration_clip: 100.0
+    dirichlet_concentration_clip: 100.0  # Optional cap on predicted Dirichlet concentration.
 
 eval:
-  interval: 1
-  batch_size: 16
+  interval: 1  # Evaluate every N training iterations.
+  batch_size: 128  # Number of evaluation games run in parallel.
 
 logging:
-  interval: 1
+  interval: 1  # Log training metrics every N iterations.
   wandb:
-    enabled: false
-    project: scacchi-az
+    enabled: false  # Enable Weights & Biases logging.
+    project: scacchi-az  # Weights & Biases project name.
 
 checkpointing:
-  max_to_keep: 0
-  save_interval_steps: 50
+  max_to_keep: 0  # Number of checkpoints to retain; 0 disables retention.
+  save_interval_steps: 50  # Save checkpoint every N iterations.

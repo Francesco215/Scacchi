@@ -23,13 +23,12 @@ def dirichlet_from_logits(
     *,
     concentration_clip: float | None = None,
 ) -> jax.Array:
-    if concentration_clip is not None:
-        concentration_logit = jnp.clip(
-            concentration_logit,
-            -concentration_clip,
-            concentration_clip,
-        )
     concentration = jax.nn.softplus(concentration_logit)**2
+    if concentration_clip is not None:
+        concentration = jnp.minimum(
+            concentration,
+            jnp.asarray(concentration_clip, dtype=concentration.dtype),
+        )
     return concentration[..., None] * jax.nn.softmax(mean_logits, axis=-1)
 
 
