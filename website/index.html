@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tic-Tac-Toe Dirichlet-Q Demo</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="play-area" aria-labelledby="app-title">
+        <header class="topbar">
+          <div>
+            <h1 id="app-title">Tic-Tac-Toe Dirichlet-Q</h1>
+            <p id="status" class="status" aria-live="polite"></p>
+          </div>
+          <div class="actions">
+            <button id="play-best" type="button">Play optimal move</button>
+            <button id="reset" type="button" class="secondary">Reset</button>
+          </div>
+        </header>
+
+        <div class="compute-control">
+          <label for="compute-slider">Sample rate</label>
+          <input
+            id="compute-slider"
+            type="range"
+            min="0"
+            max="2000"
+            step="25"
+            value="300"
+          />
+          <output id="compute-value" for="compute-slider">300/s</output>
+        </div>
+
+        <div id="board" class="board" aria-label="Tic-Tac-Toe board"></div>
+      </section>
+
+      <aside class="posterior" aria-labelledby="posterior-title">
+        <h2 id="posterior-title">Current value Dirichlet</h2>
+        <div class="meta-grid">
+          <div>
+            <span class="label">Player</span>
+            <strong id="perspective"></strong>
+          </div>
+          <div>
+            <span class="label">Samples</span>
+            <strong id="sims"></strong>
+          </div>
+          <div>
+            <span class="label">Move</span>
+            <strong id="recommended"></strong>
+          </div>
+          <div>
+            <span class="label">Alpha0</span>
+            <strong id="alpha-total"></strong>
+          </div>
+        </div>
+
+        <div class="alpha-readout" id="alpha-readout"></div>
+
+        <div class="bars" aria-label="Dirichlet mean">
+          <div class="bar-row">
+            <span>Loss</span>
+            <div class="bar-track"><div id="loss-bar" class="bar loss"></div></div>
+            <strong id="loss-pct"></strong>
+          </div>
+          <div class="bar-row">
+            <span>Draw</span>
+            <div class="bar-track"><div id="draw-bar" class="bar draw"></div></div>
+            <strong id="draw-pct"></strong>
+          </div>
+          <div class="bar-row">
+            <span>Win</span>
+            <div class="bar-track"><div id="win-bar" class="bar win"></div></div>
+            <strong id="win-pct"></strong>
+          </div>
+        </div>
+
+        <canvas id="simplex" width="520" height="420" aria-label="Dirichlet samples simplex"></canvas>
+
+        <h3>Root actions</h3>
+        <div id="action-list" class="action-list"></div>
+      </aside>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
