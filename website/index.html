@@ -65,7 +65,7 @@
 
         <div class="bars" aria-label="Dirichlet mean">
           <div class="bar-row">
-            <span>Loss</span>
+            <span id="loss-label">Loss</span>
             <div class="bar-track"><div id="loss-bar" class="bar loss"></div></div>
             <strong id="loss-pct"></strong>
           </div>
@@ -75,16 +75,13 @@
             <strong id="draw-pct"></strong>
           </div>
           <div class="bar-row">
-            <span>Win</span>
+            <span id="win-label">Win</span>
             <div class="bar-track"><div id="win-bar" class="bar win"></div></div>
             <strong id="win-pct"></strong>
           </div>
         </div>
 
         <canvas id="simplex" width="520" height="420" aria-label="Dirichlet samples simplex"></canvas>
-
-        <h3>Root actions</h3>
-        <div id="action-list" class="action-list"></div>
       </aside>
     </main>
 

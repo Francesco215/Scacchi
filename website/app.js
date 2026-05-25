@@ -4,6 +4,8 @@ const DEFAULT_SAMPLES_PER_SECOND = 300;
 const MAX_FRAME_SAMPLES = 80;
 const RENDER_INTERVAL_MS = 140;
 const POLICY_SAMPLES = 128;
+const POLICY_EMA_WINDOW = 20;
+const POLICY_EMA_ALPHA = 1 / POLICY_EMA_WINDOW;
 const PLOT_SAMPLES = 180;
 const KAPPA_N = 4;
 const EPSILON_TERM = 0.01;
@@ -71,6 +73,7 @@ let currentPlayer = "X";
 let analysis = null;
 let rootTree = null;
 let nodeTable = new Map();
+let policyEma = null;
 let completedSamples = 0;
 let sampleCarry = 0;
 let samplesPerSecond = DEFAULT_SAMPLES_PER_SECOND;
@@ -93,11 +96,12 @@ const els = {
   lossBar: document.getElementById("loss-bar"),
   drawBar: document.getElementById("draw-bar"),
   winBar: document.getElementById("win-bar"),
+  lossLabel: document.getElementById("loss-label"),
+  winLabel: document.getElementById("win-label"),
   lossPct: document.getElementById("loss-pct"),
   drawPct: document.getElementById("draw-pct"),
   winPct: document.getElementById("win-pct"),
   simplex: document.getElementById("simplex"),
-  actionList: document.getElementById("action-list"),
 };
 
 function opponent(player) {
@@ -201,11 +205,6 @@ function flipAlpha(alpha) {
 function alphaMean(alpha) {
   const total = alpha.reduce((sum, value) => sum + value, 0);
   return alpha.map((value) => value / total);
-}
-
-function utilityFromAlpha(alpha) {
-  const mean = alphaMean(alpha);
-  return mean[OUTCOME.WIN] - mean[OUTCOME.LOSS];
 }
 
 function edgePosterior(node, action) {
@@ -421,6 +420,37 @@ function posteriorBestPolicy(alphaByAction, actions, sampleCount) {
   return policy;
 }
 
+function updatePolicyEma(policy, actions) {
+  if (actions.length === 0) {
+    policyEma = null;
+    return new Map();
+  }
+
+  if (!policyEma) {
+    policyEma = new Map(actions.map((action) => [action, policy.get(action) ?? 0]));
+    return policyEma;
+  }
+
+  const nextPolicy = new Map();
+  let total = 0;
+  for (const action of actions) {
+    const previous = policyEma.get(action) ?? 0;
+    const current = policy.get(action) ?? 0;
+    const smoothed = previous + POLICY_EMA_ALPHA * (current - previous);
+    nextPolicy.set(action, smoothed);
+    total += smoothed;
+  }
+
+  if (total > 0) {
+    for (const action of actions) {
+      nextPolicy.set(action, nextPolicy.get(action) / total);
+    }
+  }
+
+  policyEma = nextPolicy;
+  return policyEma;
+}
+
 function analyzePosition() {
   const result = gameResult(board);
   if (result.terminal) {
@@ -445,7 +475,8 @@ function analyzePosition() {
     rootPosteriors.set(action, edgePosterior(rootTree, action));
   }
 
-  const policy = posteriorBestPolicy(rootPosteriors, actions, POLICY_SAMPLES);
+  const rawPolicy = posteriorBestPolicy(rootPosteriors, actions, POLICY_SAMPLES);
+  const policy = updatePolicyEma(rawPolicy, actions);
   const bestAction = bestPolicyAction(policy, actions);
 
   return {
@@ -497,7 +528,14 @@ function render() {
   renderBoard();
   renderStatus();
   renderPosterior();
-  renderActions();
+}
+
+function renderSearchUpdate() {
+  analysis = analyzePosition();
+  renderComputeControl();
+  renderBoardHighlights();
+  renderStatus();
+  renderPosterior();
 }
 
 function renderComputeControl() {
@@ -515,15 +553,25 @@ function renderBoard() {
     const mark = board[action];
     cell.type = "button";
     cell.className = "cell";
-    cell.textContent = mark ?? "";
     cell.disabled = result.terminal || mark !== null;
-    cell.setAttribute("aria-label", `Square ${actionName(action)}`);
-
     if (mark) {
+      cell.textContent = mark;
+      cell.setAttribute("aria-label", `Square ${actionName(action)}, ${mark}`);
       cell.classList.add(mark === "X" ? "mark-x" : "mark-o");
-    }
-    if (analysis.bestAction === action && !result.terminal && mark === null) {
-      cell.classList.add("recommended");
+    } else {
+      const probability = analysis.policy.get(action) ?? 0;
+      cell.setAttribute(
+        "aria-label",
+        `Square ${actionName(action)}, policy ${formatPct(probability)}`,
+      );
+      const policyFill = document.createElement("span");
+      policyFill.className = "cell-fill";
+      const policyLabel = document.createElement("span");
+      policyLabel.className = "cell-policy";
+      policyLabel.textContent = result.terminal ? "" : formatPct(probability);
+      cell.appendChild(policyFill);
+      cell.appendChild(policyLabel);
+      setCellPolicyFill(cell, probability, result.terminal);
     }
     if (result.line.includes(action)) {
       cell.classList.add("win-line");
@@ -532,6 +580,43 @@ function renderBoard() {
     cell.addEventListener("click", () => playMove(action));
     els.board.appendChild(cell);
   }
+}
+
+function renderBoardHighlights() {
+  const result = gameResult(board);
+
+  for (let action = 0; action < 9; action += 1) {
+    const cell = els.board.children[action];
+    if (!cell) {
+      continue;
+    }
+
+    const mark = board[action];
+    cell.disabled = result.terminal || mark !== null;
+    cell.classList.toggle("win-line", result.line.includes(action));
+    if (mark === null) {
+      const probability = analysis.policy.get(action) ?? 0;
+      cell.setAttribute(
+        "aria-label",
+        `Square ${actionName(action)}, policy ${formatPct(probability)}`,
+      );
+      const label = cell.querySelector(".cell-policy");
+      if (label) {
+        label.textContent = result.terminal ? "" : formatPct(probability);
+      }
+      setCellPolicyFill(cell, probability, result.terminal);
+    }
+  }
+}
+
+function setCellPolicyFill(cell, probability, isTerminal) {
+  if (isTerminal) {
+    cell.style.setProperty("--policy-fill", "0%");
+    return;
+  }
+
+  const fill = Math.max(0, Math.min(100, probability * 100));
+  cell.style.setProperty("--policy-fill", `${fill.toFixed(1)}%`);
 }
 
 function renderStatus() {
@@ -556,6 +641,8 @@ function renderPosterior() {
   els.recommended.textContent = actionName(analysis.bestAction);
   els.alphaTotal.textContent = formatNumber(total);
   els.nodeCount.textContent = String(analysis.nodes);
+  els.lossLabel.textContent = `${opponent(currentPlayer)} wins`;
+  els.winLabel.textContent = `${currentPlayer} wins`;
   els.alphaReadout.textContent = `L=${formatNumber(alpha[0])}  D=${formatNumber(
     alpha[1],
   )}  W=${formatNumber(alpha[2])}`;
@@ -569,41 +656,6 @@ function renderPosterior() {
 function setBar(bar, label, value) {
   bar.style.width = `${Math.max(0, Math.min(100, value * 100))}%`;
   label.textContent = formatPct(value);
-}
-
-function renderActions() {
-  els.actionList.innerHTML = "";
-  const result = gameResult(board);
-  const actions = legalActions(board);
-
-  if (result.terminal || actions.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "action-row";
-    empty.textContent = "No legal actions";
-    els.actionList.appendChild(empty);
-    return;
-  }
-
-  for (const action of actions) {
-    const row = document.createElement("div");
-    const probability = analysis.policy.get(action) ?? 0;
-    const alpha = analysis.rootPosteriors.get(action) ?? DUMB_ALPHA;
-    const q = utilityFromAlpha(alpha);
-
-    row.className = "action-row";
-    if (action === analysis.bestAction) {
-      row.classList.add("best");
-    }
-
-    row.innerHTML = `
-      <strong>${actionName(action)}</strong>
-      <div class="policy-track" aria-label="Posterior-best probability">
-        <div class="policy-fill" style="width: ${Math.round(probability * 100)}%"></div>
-      </div>
-      <span>${formatPct(probability)} / q ${q.toFixed(2)}</span>
-    `;
-    els.actionList.appendChild(row);
-  }
 }
 
 function playMove(action) {
@@ -626,7 +678,6 @@ function resetGame() {
 }
 
 function playBestMove() {
-  analysis = analyzePosition();
   if (analysis.bestAction !== null) {
     playMove(analysis.bestAction);
   }
@@ -645,6 +696,7 @@ function setComputeBudget(value) {
 function resetAnalysisTree() {
   nodeTable = new Map();
   rootTree = gameResult(board).terminal ? null : new Node(board, currentPlayer);
+  policyEma = null;
   completedSamples = 0;
   sampleCarry = 0;
 }
@@ -667,7 +719,7 @@ function searchTick(timestamp) {
       sampleCarry -= samplesToRun;
 
       if (timestamp - lastRenderTime >= RENDER_INTERVAL_MS) {
-        render();
+        renderSearchUpdate();
         lastRenderTime = timestamp;
       }
     }
@@ -749,46 +801,45 @@ function drawSimplex(alpha) {
   context.setTransform(ratio, 0, 0, ratio, 0, 0);
   context.clearRect(0, 0, rect.width, rect.height);
 
-  const margin = 34;
+  const margin = 30;
   const vertices = {
     L: { x: margin, y: rect.height - margin },
     D: { x: rect.width / 2, y: margin },
     W: { x: rect.width - margin, y: rect.height - margin },
   };
 
-  context.lineWidth = 1.4;
-  context.strokeStyle = "#252a32";
-  context.fillStyle = "#fbfbfc";
+  context.lineWidth = 1;
+  context.strokeStyle = "#8f8f88";
   context.beginPath();
   context.moveTo(vertices.L.x, vertices.L.y);
   context.lineTo(vertices.D.x, vertices.D.y);
   context.lineTo(vertices.W.x, vertices.W.y);
   context.closePath();
-  context.fill();
   context.stroke();
 
   context.font = "12px ui-sans-serif, system-ui, sans-serif";
-  context.fillStyle = "#4b5563";
+  context.fillStyle = "#666666";
   context.textAlign = "center";
   context.fillText("D", vertices.D.x, vertices.D.y - 10);
   context.fillText("L", vertices.L.x - 14, vertices.L.y + 4);
   context.fillText("W", vertices.W.x + 14, vertices.W.y + 4);
 
-  context.fillStyle = "rgba(31, 122, 140, 0.24)";
+  context.fillStyle = "rgba(29, 111, 130, 0.18)";
   for (let i = 0; i < PLOT_SAMPLES; i += 1) {
     const point = simplexPoint(sampleDirichlet(alpha), vertices);
     context.beginPath();
-    context.arc(point.x, point.y, 2.2, 0, Math.PI * 2);
+    context.arc(point.x, point.y, 1.7, 0, Math.PI * 2);
     context.fill();
   }
 
   const meanPoint = simplexPoint(alphaMean(alpha), vertices);
-  context.fillStyle = "#c2413d";
-  context.strokeStyle = "#ffffff";
-  context.lineWidth = 2;
+  context.strokeStyle = "#161616";
+  context.lineWidth = 1.4;
   context.beginPath();
-  context.arc(meanPoint.x, meanPoint.y, 6, 0, Math.PI * 2);
-  context.fill();
+  context.moveTo(meanPoint.x - 6, meanPoint.y);
+  context.lineTo(meanPoint.x + 6, meanPoint.y);
+  context.moveTo(meanPoint.x, meanPoint.y - 6);
+  context.lineTo(meanPoint.x, meanPoint.y + 6);
   context.stroke();
 }
 
