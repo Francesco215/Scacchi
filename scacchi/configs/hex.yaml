@@ -79,13 +79,13 @@ training:
     dirichlet_concentration_clip: 8.0  # Bound Dirichlet confidence during fine tuning.
 
 eval:
-  interval: 5  # Evaluate often enough to monitor convergence without dominating runtime.
+  interval: 1  # Evaluate often enough to monitor convergence without dominating runtime.
   batch_size: 512  # Number of evaluation games run in parallel.
 
 logging:
   interval: 1  # Log training metrics every N iterations.
   wandb:
-    enabled: false  # Keep local verification runs self-contained.
+    enabled: true  # Keep local verification runs self-contained.
     project: scacchi-az  # Weights & Biases project name.
 
 checkpointing:

@@ -1,0 +1,4033 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, mathtools}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+% -----------------------------------------------------------------------------
+% Basic notation
+% -----------------------------------------------------------------------------
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\one}{\mathbf{1}}
+
+\newcommand{\Dir}{\operatorname{Dirichlet}}
+\newcommand{\Cat}{\operatorname{Categorical}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\mean}{\operatorname{mean}}
+\newcommand{\stopgrad}{\operatorname{stopgrad}}
+
+\newcommand{\Tree}{\mathcal{T}}
+\newcommand{\Path}{\mathcal{P}}
+\newcommand{\States}{\mathcal{S}}
+\newcommand{\Actions}{\mathcal{A}}
+\newcommand{\Legal}{\mathcal{A}_{\mathrm{legal}}}
+\newcommand{\Available}{\mathcal{A}_{\mathrm{avail}}}
+\newcommand{\Interior}{\mathcal{I}}
+\newcommand{\Z}{\mathcal{Z}}
+
+\newcommand{\Step}{\operatorname{Step}}
+\newcommand{\Eval}{\operatorname{Eval}}
+\newcommand{\Flip}{\operatorname{flip}}
+\newcommand{\Align}{\operatorname{align}}
+\newcommand{\Utility}{U}
+
+\newcommand{\ThompsonSelect}{\operatorname{ThompsonSelect}}
+\newcommand{\EdgeBase}{\operatorname{EdgeBase}}
+\newcommand{\EdgePosterior}{\operatorname{EdgePosterior}}
+\newcommand{\StateSearchPosterior}{\operatorname{StateSearchPosterior}}
+\newcommand{\BackupPath}{\operatorname{BackupPath}}
+\newcommand{\EvaluateReachedLeaf}{\operatorname{EvaluateReachedLeaf}}
+\newcommand{\NextRequest}{\operatorname{NextRequest}}
+\newcommand{\ConsumeResult}{\operatorname{ConsumeResult}}
+\newcommand{\BuildEvalBatch}{\operatorname{BuildEvalBatch}}
+\newcommand{\GpuEvaluate}{\operatorname{GpuEvaluate}}
+\newcommand{\PosteriorBestPolicyTarget}{\operatorname{PosteriorBestPolicyTarget}}
+\newcommand{\FinishSearch}{\operatorname{FinishSearch}}
+\newcommand{\MakeTargets}{\operatorname{MakeTargets}}
+\newcommand{\NoRequest}{\operatorname{NoRequest}}
+\newcommand{\ComputeStateSearchPosterior}{\operatorname{ComputeStateSearchPosterior}}
+\newcommand{\RefreshEdgeFromChild}{\operatorname{RefreshEdgeFromChild}}
+\newcommand{\TryRepairNode}{\operatorname{TryRepairNode}}
+\newcommand{\RepairPathToRoot}{\operatorname{RepairPathToRoot}}
+\newcommand{\RepairDirtyFrontier}{\operatorname{RepairDirtyFrontier}}
+\newcommand{\TryMarkInflight}{\operatorname{TryMarkInflight}}
+\newcommand{\TryGetOrCreateChild}{\operatorname{TryGetOrCreateChild}}
+\newcommand{\CAS}{\operatorname{CAS}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\KL}{D_{\mathrm{KL}}}
+\newcommand{\OutcomeUtility}{u_{\mathrm{cat}}}
+\newcommand{\epscat}{\epsilon_{\mathrm{cat}}}
+\newcommand{\CatPoint}{\varphi_{\epsilon_{\mathrm{cat}}}}
+\newcommand{\DirNLL}{\operatorname{DirNLL}}
+\newcommand{\Unresolved}{\mathcal{U}}
+\newcommand{\Native}{\mathfrak{Y}}
+\newcommand{\DirObj}{\mathsf{Dir}}
+\newcommand{\CatObj}{\mathsf{Cat}}
+\newcommand{\MixObj}{\mathsf{Mix}}
+\newcommand{\SampleUtility}{\operatorname{SampleUtility}}
+\newcommand{\NativeEdgePosterior}{\operatorname{NativeEdgePosterior}}
+\newcommand{\NativeStatePosterior}{\operatorname{NativeStatePosterior}}
+\newcommand{\RefreshCategoricalEdge}{\operatorname{RefreshCategoricalEdge}}
+\newcommand{\TryCategorizeNode}{\operatorname{TryCategorizeNode}}
+\newcommand{\PropagateCategorical}{\operatorname{PropagateCategorical}}
+
+
+% -----------------------------------------------------------------------------
+% Lightweight algorithm box
+% -----------------------------------------------------------------------------
+
+\newenvironment{algorithmblock}[1]
+{
+  \par\medskip
+  \noindent\hrule\par\smallskip
+  \noindent\textbf{#1}
+  \par\smallskip
+}
+{
+  \par\smallskip\noindent\hrule\par\medskip
+}
+
+\newcommand{\Input}{\textbf{Input: }}
+\newcommand{\Output}{\textbf{Output: }}
+\newcommand{\Require}{\textbf{Require: }}
+\newcommand{\Return}{\textbf{return }}
+\newcommand{\If}{\textbf{if }}
+\newcommand{\Then}{\textbf{ then }}
+\newcommand{\Else}{\textbf{else }}
+\newcommand{\EndIf}{\textbf{end if}}
+\newcommand{\For}{\textbf{for }}
+\newcommand{\EndFor}{\textbf{end for}}
+\newcommand{\While}{\textbf{while }}
+\newcommand{\EndWhile}{\textbf{end while}}
+\newcommand{\Do}{\textbf{ do }}
+\newcommand{\Break}{\textbf{break}}
+\newcommand{\Continue}{\textbf{continue}}
+
+\title{Dirichlet-Q AlphaZero: Posterior Tree Search with Native Categorical Leaves}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+
+\section*{1. Purpose of this file}
+
+This document defines the search-side algorithms for Dirichlet-Q AlphaZero with
+native categorical leaves and categorical node propagation.
+
+The central change from standard AlphaZero-style MCTS is that the tree does not
+store scalar action values as its main memory. Instead, each non-categorical
+completed tree edge stores a WDL Dirichlet posterior or a native posterior target
+object derived from a clean child. Search is therefore a posterior-refinement
+process.
+
+This version adds an exact categorical layer. A categorical leaf is a successor
+that has an exact WDL outcome: win, draw, or loss. A categorical node is a node
+whose value has been certified by the local categorical rules in this document.
+Once a node becomes categorical, no further tree search is performed below that
+node. Categorical status is represented natively in the CPU posterior tree by an
+outcome and a certified distance, not by a Dirichlet proxy.
+
+The intended categorical behavior is:
+
+\begin{enumerate}[leftmargin=2em]
+  \item If any legal action has a categorical winning successor, the node becomes
+  a categorical win. The categorical action is the winning action with the
+  shortest certified distance to terminal outcome.
+
+  \item If every legal action has a categorical losing successor, the node
+  becomes a categorical loss. The categorical action is the losing action with
+  the longest certified distance to terminal outcome.
+
+  \item If every legal action has a categorical draw or loss successor, and at
+  least one legal action is a draw, the node becomes a categorical draw. The
+  categorical action is selected by an externally supplied draw-action rule.
+
+  \item If none of these rules applies, the node remains posterior-valued and
+  ordinary posterior tree search continues through unresolved actions.
+\end{enumerate}
+
+The CPU owns a mutable posterior tree. The GPU only evaluates batches of
+non-terminal leaf states. The search interface is:
+
+\[
+\NextRequest(\Tree),
+\qquad
+\ConsumeResult(\Tree,r),
+\qquad
+\FinishSearch(\Tree).
+\]
+
+The CPU repeatedly selects paths through the current posterior tree, creates
+leaf-evaluation requests, sends leaf states to the GPU in batches, and then backs
+up WDL information when terminal, categorical, or neural leaf information becomes
+available.
+
+A categorical datapoint is never converted into a Dirichlet distribution. In the
+CPU posterior tree it is stored natively as
+\((z,\tau)\), where \(z\in\{L,D,W\}\) and \(\tau\) is a certified distance. When
+the tree is flattened for JAX training, the row stores categorical masks and
+categorical outcomes. The JAX loss then evaluates the predicted Dirichlet density
+at the smoothed categorical WDL point \(\CatPoint(z)\). This point is a
+categorical WDL sample moved into the interior of the simplex for numerical
+stability; it is not a target Dirichlet and not a synthetic posterior.
+
+This version deliberately does \emph{not} include temporary reservation mass or
+virtual-loss-style in-flight Dirichlet mass. In-flight leaves are tracked only
+for scheduling. They do not alter edge posteriors, policy targets, Q targets, or
+value targets.
+
+The algorithms are written so that a tree can be searched by multiple CPU
+workers without a global tree lock. Correctness comes from six rules:
+
+\begin{enumerate}[leftmargin=2em]
+  \item Node expansion uses an atomic
+  \(\texttt{unexpanded}\rightarrow\texttt{inflight}\rightarrow
+  \texttt{expanding}\rightarrow\texttt{expanded}\) state machine, so a
+  non-terminal leaf emits at most one GPU request and is not visible as expanded
+  until its network outputs are installed.
+
+  \item Categorical node and edge publication is an atomic full-snapshot write.
+  A reader sees either the previous non-categorical state or the completed
+  categorical state, never a partial categorical certificate.
+
+  \item Non-categorical edge posterior writes are atomic publishes of a full
+  native edge object. A reader sees either the old completed object or the new
+  completed object, never a partially written object.
+
+  \item Internal value posteriors are lazy derived caches. A node cache has a
+  dirty/clean status and a version. A dirty child is never used as backup
+  evidence by its parent.
+
+  \item When an outgoing edge changes, the owning node is marked dirty. Any CPU
+  worker may attempt to repair that node. If another write occurs during repair,
+  the repair is discarded and the node remains dirty.
+
+  \item Search selection is non-blocking. It may read the last stable completed
+  edge object while a repair is pending, but final export first repairs the dirty
+  frontier so training targets are produced from clean posterior caches or exact
+  categorical certificates.
+\end{enumerate}
+
+Thus two simultaneous backups may safely touch the same ancestor: both publish
+edge updates, both mark the ancestor dirty, and the next successful repair
+recomputes the ancestor posterior from the merged current children. If an
+ancestor becomes categorical, that categorical status absorbs later uncertain
+posterior updates below it.
+
+\section*{2. Outcome space, utility, and action notation}
+
+For a two-player zero-sum game, define the WDL outcome space
+
+\[
+\Z = \{L,D,W\}.
+\]
+
+A WDL distribution is
+
+\[
+\phi = (\phi_L,\phi_D,\phi_W) \in \Delta^2.
+\]
+
+The scalar utility used everywhere for WDL distributions is
+
+\[
+\Utility(\phi) = \phi_W - \phi_L.
+\]
+
+For a categorical outcome, use the matching scalar utility
+
+\[
+\OutcomeUtility(W)=+1,
+\qquad
+\OutcomeUtility(D)=0,
+\qquad
+\OutcomeUtility(L)=-1.
+\]
+
+For a Dirichlet parameter vector
+
+\[
+\alpha = (\alpha_L,\alpha_D,\alpha_W),
+\]
+
+define its mean as
+
+\[
+\mean(\alpha)
+=
+\frac{\alpha}{\alpha_0},
+\qquad
+\alpha_0 = \sum_{z \in \{L,D,W\}} \alpha_z.
+\]
+
+The opponent-perspective flip for categorical outcomes is
+
+\[
+\Flip(L)=W,
+\qquad
+\Flip(D)=D,
+\qquad
+\Flip(W)=L.
+\]
+
+The same flip applies to WDL distributions and Dirichlet parameters:
+
+\[
+\Flip(d_L,d_D,d_W)
+=
+(d_W,d_D,d_L),
+\]
+
+\[
+\Flip(\alpha_L,\alpha_D,\alpha_W)
+=
+(\alpha_W,\alpha_D,\alpha_L).
+\]
+
+For zero-sum alternating-turn games,
+
+\[
+\Utility(\Flip(d)) = -\Utility(d).
+\]
+
+The generic alignment notation
+
+\[
+\Align_{v\leftarrow u}(\cdot)
+\]
+
+means: represent the object from the perspective of the player to move at node
+\(v\), rather than the perspective of the player to move at node \(u\). For
+ordinary alternating two-player zero-sum games this is usually \(\Flip\). For
+passes, chance transitions, repeated turns, or non-alternating environments,
+\(\Align\) is the environment-specific perspective map.
+
+For action posteriors or native action objects, define the local posterior-best
+policy by
+
+\[
+\pi_{\mathrm{search}}^v(a)
+=
+\Prob
+\left(
+  a=
+  \argmax_{b\in\Legal(s_v)}
+  X_{v,b}
+\right),
+\]
+
+where \(X_{v,b}\) is the sampled utility of edge \((v,b)\). For a categorical
+edge \(X_{v,b}=\OutcomeUtility(\zeta_{v,b})\). For a Dirichlet-valued edge,
+\(X_{v,b}=\Utility(\phi_{v,b})\) with
+\(\phi_{v,b}\sim\Dir(\alpha^{\mathrm{post}}_{v,b})\). For native mixtures,
+\(X_{v,b}\) is sampled recursively as specified below.
+
+A single Thompson draw samples one utility per available action and then returns
+
+\[
+\tilde a
+=
+\argmax_{b\in\Available(v)} X_{v,b}.
+\]
+
+Thus \(\tilde a\) is a random sample from the posterior-best policy restricted
+to \(\Available(v)\). It is not denoted by \(a^\star\). Throughout this document,
+\(a^\star\) is reserved for the mode of the posterior-best policy:
+
+\[
+a^\star_v
+=
+\argmax_{a\in\Legal(s_v)}
+\pi_{\mathrm{search}}^v(a).
+\]
+
+When the intended action rule is greedy with respect to a posterior mean, define
+for a Dirichlet edge
+
+\[
+\bar\phi_{v,a}
+=
+\mean
+\left(
+\alpha^{\mathrm{post}}_{v,a}
+\right).
+\]
+
+Then the greedy mean action in a purely Dirichlet node is
+
+\[
+a_{\mathrm{mean}}(v)
+=
+\argmax_{a\in\Legal(s_v)}
+\left(
+\bar\phi_{v,a,W}-\bar\phi_{v,a,L}
+\right).
+\]
+
+\subsection*{2.1 Smoothed categorical WDL sample for neural loss}
+
+For a categorical WDL outcome \(z\in\Z\), define the smoothed categorical point
+
+\[
+\CatPoint(z)_i=
+\begin{cases}
+1-2\epscat, & i=z,\\
+\epscat, & i\ne z,
+\end{cases}
+\qquad
+0<\epscat<\frac12.
+\]
+
+Thus
+
+\[
+\CatPoint(z)\in\operatorname{int}(\Delta^2),
+\qquad
+\sum_{i\in\Z}\CatPoint(z)_i=1.
+\]
+
+For example,
+
+\[
+\CatPoint(W)=(\epscat,\epscat,1-2\epscat).
+\]
+
+The point \(\CatPoint(z)\) is used only after a native categorical CPU-side
+target has been flattened into a JAX training row. It is still a categorical WDL
+datapoint: the probability vector of an \(\epscat\)-smoothed categorical sample
+over \(\{L,D,W\}\). The smoothing only moves the categorical sample away from
+the boundary of the simplex for numerical stability. It is not a Dirichlet
+distribution, it is not a Dirichlet posterior, and it is not inserted into the
+CPU posterior tree as a Dirichlet-valued object.
+\section*{3. Network outputs}
+
+At state \(s\), the network predicts:
+
+\[
+\ell_\theta(s,a),
+\qquad
+\alpha_\theta^V(s),
+\qquad
+\alpha_\theta^Q(s,a).
+\]
+
+The policy head is
+
+\[
+\pi_\theta(a \mid s)
+=
+\softmax(\ell_\theta(s,\cdot))_a.
+\]
+
+The value head represents a WDL belief over the state value:
+
+\[
+\phi_s^V
+\sim
+\Dir(\alpha_\theta^V(s)).
+\]
+
+The Q head represents a WDL belief over each state-action value:
+
+\[
+\phi_{s,a}^Q
+\sim
+\Dir(\alpha_\theta^Q(s,a)).
+\]
+
+Both Dirichlet heads use the stable mean-concentration parameterization:
+
+\[
+\alpha_\theta
+=
+\alpha_{\theta,0}\bar{\phi}_\theta,
+\]
+
+where
+
+\[
+\bar{\phi}_\theta = \softmax(r_\theta),
+\qquad
+\alpha_{\theta,0} = \softplus(t_\theta)^2.
+\]
+
+
+
+\section*{3.1 Native posterior target objects}
+
+The original non-categorical algorithm can represent every search value as a
+Dirichlet parameter vector. With categorical leaves, the CPU posterior tree needs
+a richer native object type. Define the native WDL target-object space
+
+\[
+\Native
+=
+\left\{
+\DirObj(\alpha),\ \CatObj(z,\tau),\ \MixObj\left(\{(\omega_i,Y_i)\}_{i=1}^m\right)
+\right\}.
+\]
+
+The cases are:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \(\DirObj(\alpha)\) is an uncertain Dirichlet WDL posterior with
+  \(\alpha\in\R_{>0}^3\).
+
+  \item \(\CatObj(z,\tau)\) is an exact categorical WDL certificate with
+  \(z\in\{L,D,W\}\) and certified distance \(\tau\in\N\cup\{\infty\}\). This is
+  the native representation of terminal leaves and solved nodes/edges.
+
+  \item \(\MixObj(\{(\omega_i,Y_i)\})\) is a native mixture over target objects,
+  with \(\omega_i\ge 0\), \(\sum_i\omega_i=1\), and \(Y_i\in\Native\). It is
+  used only when a non-categorical state cache must summarize outgoing action
+  objects of mixed type. A categorical component inside a mixture remains a
+  categorical component. It is never converted into a Dirichlet distribution.
+\end{enumerate}
+
+The utility-sampling operation is recursive:
+
+\[
+\SampleUtility(\DirObj(\alpha)):
+\quad
+\phi\sim\Dir(\alpha),
+\quad
+X=\Utility(\phi),
+\]
+
+\[
+\SampleUtility(\CatObj(z,\tau)):
+\quad
+X=\OutcomeUtility(z),
+\]
+
+\[
+\SampleUtility\left(\MixObj(\{(\omega_i,Y_i)\}_{i=1}^m)\right):
+\quad
+I\sim\Cat(\omega_1,\ldots,\omega_m),
+\quad
+X=\SampleUtility(Y_I).
+\]
+
+Alignment acts recursively:
+
+\[
+\Align_{v\leftarrow u}(\DirObj(\alpha))
+=
+\DirObj(\Align_{v\leftarrow u}(\alpha)),
+\]
+
+\[
+\Align_{v\leftarrow u}(\CatObj(z,\tau))
+=
+\CatObj(\Align_{v\leftarrow u}(z),\tau),
+\]
+
+and
+
+\[
+\Align_{v\leftarrow u}\left(\MixObj(\{(\omega_i,Y_i)\})\right)
+=
+\MixObj(\{(\omega_i,\Align_{v\leftarrow u}(Y_i))\}).
+\]
+
+If every component of a native mixture is Dirichlet-valued, the implementation
+may collapse the mixture to the original Dirichlet vector whenever this is the
+chosen approximation:
+
+\[
+\MixObj\left(\{(\omega_i,\DirObj(\alpha_i))\}_{i=1}^m\right)
+\leadsto
+\DirObj\left(\sum_{i=1}^m \omega_i\alpha_i\right).
+\]
+
+This collapse is the old all-Dirichlet behavior. It is not allowed when any
+component is categorical, because that would convert a categorical datapoint into
+Dirichlet parameters.
+
+The learner-side loss for a native object is also recursive. A Dirichlet object
+uses the original KL loss. A categorical object uses Dirichlet density NLL at the
+smoothed categorical point. A mixture uses the weighted sum of the component
+losses. This keeps the CPU representation and the JAX loss contract aligned.
+
+\section*{4. Posterior tree state}
+
+A posterior tree is denoted by
+
+\[
+\Tree.
+\]
+
+Each node \(v\) stores its game state and parent pointer:
+
+\[
+s_v,
+\qquad
+\operatorname{parent}(v),
+\qquad
+\operatorname{parent\_action}(v).
+\]
+
+For neural evaluation and expansion, each non-terminal node has an evaluation
+status
+
+\[
+\sigma^{\mathrm{eval}}_v
+\in
+\{\texttt{unexpanded},\texttt{inflight},\texttt{expanding},\texttt{expanded}\}.
+\]
+
+Terminal states are detected from \(s_v\) and do not require a neural evaluation.
+A non-terminal node may move from \(\texttt{unexpanded}\) to
+\(\texttt{inflight}\) only through an atomic compare-and-swap. A GPU result may
+be consumed only if the node is still \(\texttt{inflight}\). During result
+installation, the node briefly enters \(\texttt{expanding}\); it becomes
+\(\texttt{expanded}\) only after all neural outputs and cache fields have been
+published.
+
+After expansion, node \(v\) stores the network outputs from the fixed
+self-play/search snapshot:
+
+\[
+\alpha_{\theta^-}^V(s_v),
+\qquad
+\alpha_{\theta^-}^Q(s_v,\cdot),
+\qquad
+\ell_{\theta^-}(s_v,\cdot).
+\]
+
+The superscript \(\theta^-\) emphasizes that these are data-generation priors.
+They are treated as stop-gradient values when constructing training targets.
+
+\subsection*{4.1 Native categorical node and edge fields}
+
+In addition to the original posterior fields, every node stores a categorical
+status
+
+\[
+\zeta_v\in\{\bot,L,D,W\},
+\]
+
+a certified distance
+
+\[
+\tau_v\in\N\cup\{\infty\},
+\]
+
+and a categorical committed action
+
+\[
+a_v^{\mathrm{cat}}\in\Legal(s_v)\cup\{\bot\}.
+\]
+
+The value \(\zeta_v=\bot\) means that the node is not categorical. If
+\(\zeta_v\ne\bot\), then \(v\) is categorical and search must not descend
+through \(v\). Terminal states may be represented as categorical nodes with
+
+\[
+\zeta_v=z_{\mathrm{terminal}}(s_v),
+\qquad
+\tau_v=0,
+\qquad
+a_v^{\mathrm{cat}}=\bot.
+\]
+
+Each edge \((v,a)\) stores a categorical edge status
+
+\[
+\zeta_{v,a}\in\{\bot,L,D,W\},
+\qquad
+\tau_{v,a}\in\N\cup\{\infty\}.
+\]
+
+The edge status is always from the perspective of the player to move at \(v\).
+If \(\zeta_{v,a}\ne\bot\), then edge \((v,a)\) is exact and should not be
+selected for further tree search. For a parent edge leading directly to a
+terminal state, the edge distance is one:
+
+\[
+\tau_{v,a}=1.
+\]
+
+Categorical status is absorbing. Once a node or edge has been published as
+categorical, posterior search below it cannot change the categorical value,
+training target, or committed action. In a concurrent implementation,
+categorical publication should be an atomic full snapshot write.
+
+\subsection*{4.2 Completed edge posterior}
+
+Each edge \((v,a)\) stores:
+
+\[
+\texttt{child}(v,a),
+\qquad
+Y^B_{v,a}\in\Native\cup\{\bot\},
+\qquad
+m_{v,a}\in\{0,1\},
+\qquad
+R_{v,a}\in\mathbb{N},
+\qquad
+\nu^B_{v,a}\in\mathbb{N}.
+\]
+
+Here \(Y^B_{v,a}\) is the latest completed backed-up native edge object for edge
+\((v,a)\). In the all-Dirichlet case it is simply
+\(Y^B_{v,a}=\DirObj(B_{v,a})\) with \(B_{v,a}\in\R_{>0}^3\). In a categorical
+case it is \(Y^B_{v,a}=\CatObj(\zeta_{v,a},\tau_{v,a})\). In a mixed child-cache
+case it can be a native mixture. The bit \(m_{v,a}\) says whether such a
+completed object exists, \(R_{v,a}\) is the number of completed terminal or
+neural evaluations represented by that edge snapshot, and \(\nu^B_{v,a}\) is
+incremented whenever \(Y^B_{v,a}\) is atomically replaced.
+
+The count \(R_{v,a}\) is \emph{not} a visit-count policy statistic. It is only
+used to decide how much downstream search work a node's state-posterior cache
+should trust. If \(m_{v,a}=0\), then \(R_{v,a}=0\). A direct terminal categorical
+leaf or direct neural leaf backup increments \(R_{v,a}\) by one. A refresh from
+an interior child sets \(R_{v,a}=1+N^\downarrow_u\), counting the child's own
+neural evaluation plus the completed evaluations already incorporated below that
+child.
+
+A write to \(Y^B_{v,a}\) is a \emph{publish}: the writer constructs the complete
+native object privately and then atomically swaps the edge snapshot. Readers
+never observe a half-written posterior or half-written categorical certificate.
+When a new backup reaches edge \((v,a)\), it overwrites \(Y^B_{v,a}\). It does
+not add a delta to the previous value of \(Y^B_{v,a}\). The object stored in
+\(Y^B_{v,a}\) is the current completed posterior snapshot for the edge, not
+accumulated Dirichlet mass. Repeated direct leaf completions increase
+\(R_{v,a}\), so the state-posterior cache can trust the same edge more without
+artificially sharpening that edge's WDL posterior.
+
+The native object used for selection and targets is
+
+\[
+Y^{\mathrm{post}}_{v,a}
+=
+\begin{cases}
+\CatObj(\zeta_{v,a},\tau_{v,a}),
+& \zeta_{v,a}\ne\bot,\\[3pt]
+Y^B_{v,a},
+& \zeta_{v,a}=\bot\text{ and }m_{v,a}=1,\\[3pt]
+\DirObj(\alpha^{\mathrm{base}}_{v,a}),
+& \zeta_{v,a}=\bot\text{ and }m_{v,a}=0.
+\end{cases}
+\]
+
+The Dirichlet parameter notation
+\(\alpha^{\mathrm{post}}_{v,a}\) is used only for the third branch or for a
+completed branch known to be \(\DirObj(\alpha)\). A categorical edge has no
+\(\alpha^{\mathrm{post}}_{v,a}\), because it is not Dirichlet-valued.
+
+In-flight descent never changes \(Y^B_{v,a}\), \(m_{v,a}\), \(R_{v,a}\),
+\(\nu^B_{v,a}\), \(\zeta_{v,a}\), \(\tau_{v,a}\), or any posterior.
+
+\subsection*{4.3 Lazy state-posterior cache}
+
+An expanded non-terminal non-categorical node also has a cached state target
+object:
+
+\[
+C^V_v\in\Native,
+\qquad
+N^\downarrow_v\in\mathbb{N},
+\qquad
+\sigma^V_v\in\{\texttt{clean},\texttt{dirty},\texttt{updating}\},
+\qquad
+\nu^V_v\in\mathbb{N}.
+\]
+
+In the original all-Dirichlet special case, \(C^V_v=\DirObj(\alpha^{V,
+\mathrm{post}}_v)\) and the stored numeric payload is a single vector in
+\(\R_{>0}^3\). With categorical edges, \(C^V_v\) may instead be a native mixture.
+A categorical component inside \(C^V_v\) remains categorical. It is not converted
+into Dirichlet parameters.
+
+The count \(N^\downarrow_v\) is the number of completed terminal or neural
+evaluations represented by the outgoing edge snapshots currently summarized by
+\(C^V_v\). It is meaningful only when \(\sigma^V_v=\texttt{clean}\).
+
+The intended meaning is
+
+\[
+C^V_v = \text{native value target object for state }s_v,
+\]
+
+but only when \(\sigma^V_v=\texttt{clean}\). If
+\(\sigma^V_v=\texttt{dirty}\), the cache may be stale and may not be used as
+backup evidence by the parent. If \(\sigma^V_v=\texttt{updating}\), some worker
+is currently trying to recompute it.
+
+Each node also stores an edge-change epoch
+
+\[
+e_v\in\mathbb{N}.
+\]
+
+Whenever any outgoing edge \((v,a)\) publishes a new \(Y^B_{v,a}\), whenever a
+categorical edge is published, or whenever a child publishes a newer clean cache
+that makes an incoming edge stale, the implementation increments \(e_v\) and
+marks \(v\) dirty. A repair of \(v\) snapshots \(e_v\) before computing. If
+\(e_v\) changes before the repaired cache is published, the repair is discarded
+and \(v\) remains dirty. This prevents a lost update when two paths update the
+same node concurrently.
+
+Finally, each incoming edge remembers which child cache version it has absorbed:
+
+\[
+\chi_{v,a}\in\mathbb{N}\cup\{-1\}.
+\]
+
+If \(u=\texttt{child}(v,a)\) has a clean state-posterior cache and
+\(\chi_{v,a}=\nu^V_u\), then edge \((v,a)\) has already been refreshed from the
+current child posterior. If \(\chi_{v,a}<\nu^V_u\), the edge is stale with
+respect to that child. The stale edge may still be read as the last stable
+snapshot for non-blocking selection, but it is not considered current for final
+target export.
+
+\subsection*{4.4 Leaf, interior, dirty, categorical, and in-flight nodes}
+
+A newly expanded neural leaf has network outputs but no completed outgoing edge.
+It is not yet an interior posterior node. Define
+
+\[
+\operatorname{has\_child\_evidence}(v)
+\iff
+\exists a\in\Legal(s_v):m_{v,a}=1\text{ or }\zeta_{v,a}\ne\bot.
+\]
+
+Only a non-terminal expanded node with
+\(\operatorname{has\_child\_evidence}(v)\) is allowed to overwrite its incoming
+edge using \(C^V_v\). This distinction is important: the first backup into a
+newly expanded neural leaf uses the leaf Dirichlet vector returned by
+evaluation; it must not immediately be overwritten by the child's own prior-only
+cache.
+
+The key invariants are:
+
+\begin{enumerate}[leftmargin=2em]
+  \item A categorical node is absorbing and has priority over dirty-cache repair.
+  Once \(\zeta_v\ne\bot\), no more search is issued below \(v\).
+
+  \item A parent edge may refresh from child \(u\) only if either \(u\) is
+  categorical, or
+  \[
+  \sigma^V_u=\texttt{clean}
+  \quad\text{and}\quad
+  \operatorname{has\_child\_evidence}(u).
+  \]
+
+  \item A dirty or updating child is never used as backup evidence by its
+  parent.
+
+  \item A clean node has incorporated every completed child edge snapshot and
+  categorical child snapshot visible at its repair epoch.
+
+  \item A stale edge may be used for non-blocking selection, but final export
+  repairs dirty and stale dependencies first.
+\end{enumerate}
+
+These invariants allow multiple workers to select, request, consume, and back up
+against the same tree while preserving eventual posterior consistency and native
+categorical correctness.
+
+\section*{5. Edge base prior}
+
+For an unresolved non-categorical edge \((v,a)\), the base Dirichlet prior
+depends on whether the child state has already been expanded.
+
+If \(\zeta_{v,a}\ne\bot\), the edge is categorical and \(\EdgeBase\) is not
+called. Its native search object is \(\CatObj(\zeta_{v,a},\tau_{v,a})\).
+
+If the child is not expanded and the edge is not categorical, use the Q-head
+prediction at the parent node:
+
+\[
+\alpha^{\mathrm{base}}_{v,a}
+=
+\alpha_{\theta^-}^Q(s_v,a).
+\]
+
+If the child \(u=\texttt{child}(v,a)\) is expanded and non-categorical, use the
+child value head as the fallback base, aligned back to the perspective of the
+player to move at node \(v\):
+
+\[
+\alpha^{\mathrm{base}}_{v,a}
+=
+\Align_{v \leftarrow u}
+\left(
+\alpha_{\theta^-}^V(s_u)
+\right).
+\]
+
+For ordinary alternating-turn two-player games, this is usually
+
+\[
+\alpha^{\mathrm{base}}_{v,a}
+=
+\Flip
+\left(
+\alpha_{\theta^-}^V(s_u)
+\right).
+\]
+
+The general alignment notation is used because some environments may include
+passes, chance transitions, or non-alternating turns.
+
+\begin{algorithmblock}{Algorithm 1: EdgeBase\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), expanded node \(v\), legal action \(a\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(\zeta_{v,a}\ne\bot\) \Then the edge is categorical and has no
+  Dirichlet base prior. \Return \(\bot\). \EndIf
+
+  \item If edge \((v,a)\) has an expanded non-categorical child \(u\), set
+  \[
+  \alpha^{\mathrm{base}}_{v,a}
+  \gets
+  \Align_{v \leftarrow u}
+  \left(
+  \alpha_{\theta^-}^V(s_u)
+  \right).
+  \]
+
+  \item Otherwise set
+  \[
+  \alpha^{\mathrm{base}}_{v,a}
+  \gets
+  \alpha_{\theta^-}^Q(s_v,a).
+  \]
+
+  \item \Return \(\alpha^{\mathrm{base}}_{v,a}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 2: NativeEdgePosterior\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), expanded node \(v\), legal action \(a\)
+
+\Output native edge object \(Y^{\mathrm{post}}_{v,a}\in\Native\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(\zeta_{v,a}\ne\bot\) \Then
+  \[
+  \Return \CatObj(\zeta_{v,a},\tau_{v,a}).
+  \]
+  \EndIf
+
+  \item \If \(m_{v,a}=1\) \Then
+  \[
+  \Return Y^B_{v,a}.
+  \]
+  \EndIf
+
+  \item Compute
+  \[
+  \alpha^{\mathrm{base}}_{v,a}
+  \gets
+  \EdgeBase(\Tree,v,a).
+  \]
+
+  \item \Return \(\DirObj(\alpha^{\mathrm{base}}_{v,a})\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+For compatibility with the original notation, define
+\(\EdgePosterior(\Tree,v,a)\) as the Dirichlet parameter vector carried by
+\(\NativeEdgePosterior(\Tree,v,a)\) only when that native object is known to be
+\(\DirObj(\alpha)\). Calling \(\EdgePosterior\) on a categorical edge is an error;
+the categorical edge must be handled by its native branch.
+
+\section*{6. Thompson action selection at a node}
+
+At a non-categorical expanded node \(v\), selection samples one utility per
+searchable action. Categorical edges are not searchable: their exact value is
+used in policy targets and node categorization, but no further tree search is
+performed through them.
+
+The searchable action set is
+
+\[
+\Available(v)
+=
+\left\{
+ a\in\Legal(s_v):
+ \zeta_{v,a}=\bot
+ \text{ and edge }(v,a)\text{ is not blocked by in-flight expansion}
+\right\}.
+\]
+
+For \(a\in\Available(v)\), compute
+
+\[
+Y^{\mathrm{post}}_{v,a}
+=
+\NativeEdgePosterior(\Tree,v,a).
+\]
+
+The returned Thompson action is
+
+\[
+\tilde a
+=
+\argmax_{a \in \Available(v)}
+\SampleUtility(Y^{\mathrm{post}}_{v,a}).
+\]
+
+In the common all-Dirichlet branch this reduces to the original rule:
+
+\[
+\phi_{v,a}
+\sim
+\Dir
+\left(
+\alpha^{\mathrm{post}}_{v,a}
+\right),
+\qquad
+\tilde a
+=
+\argmax_{a \in \Available(v)}
+\Utility(\phi_{v,a}).
+\]
+
+This is a sample from the posterior-best policy restricted to unresolved
+available actions. The argmax sits inside the sampling procedure: first sample
+the WDL values or native utility values, then take the maximizing unresolved
+action for that sampled posterior world.
+
+\begin{algorithmblock}{Algorithm 3: ThompsonSelect\((\Tree,v,\Available(v))\)}
+
+\Input posterior tree \(\Tree\), non-categorical expanded node \(v\), nonempty searchable action set \(\Available(v)\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each action \(a \in \Available(v)\), compute
+  \[
+  Y_{v,a}
+  \gets
+  \NativeEdgePosterior(\Tree,v,a).
+  \]
+
+  \item For each \(a\in\Available(v)\), sample a utility
+  \[
+  X_{v,a}
+  \gets
+  \SampleUtility(Y_{v,a}).
+  \]
+
+  \item Select the Thompson action
+  \[
+  \tilde a
+  \gets
+  \argmax_{a \in \Available(v)} X_{v,a}.
+  \]
+
+  \item \Return \(\tilde a\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{7. Leaf evaluation and native categorical propagation}
+
+Search stops at terminal leaves, categorical nodes, or non-terminal neural
+leaves. A terminal leaf is not backed up as a narrow Dirichlet. It is published
+as a native categorical certificate. A non-terminal neural leaf is backed up as a
+Dirichlet object returned by the value head.
+
+The leaf interface is therefore native:
+
+\[
+\operatorname{LeafEval}(s_\ell)
+\Rightarrow
+Y_\ell\in\Native,
+\]
+
+where terminal leaves return \(\CatObj(z,0)\) at the leaf node and neural leaves
+return \(\DirObj(\alpha_{\theta^-}^V(s_\ell))\) or an ablation version.
+
+\subsection*{7.1 Terminal leaf}
+
+If the reached leaf is terminal with exact outcome \(z\), publish a categorical
+leaf:
+
+\[
+\zeta_\ell\gets z,
+\qquad
+\tau_\ell\gets 0,
+\qquad
+a_\ell^{\mathrm{cat}}\gets\bot.
+\]
+
+For the incoming parent edge \((v,a)\), the edge becomes categorical from the
+parent perspective:
+
+\[
+\zeta_{v,a}\gets\Align_{v\leftarrow \ell}(z),
+\qquad
+\tau_{v,a}\gets 1.
+\]
+
+This is the CPU-side representation of a categorical leaf. No Dirichlet vector
+\(\epsilon_{\mathrm{term}}\mathbf{1}+\kappa_{\mathrm{term}}e_z\) is created, and
+no terminal Dirichlet proxy is inserted into the posterior tree.
+
+\subsection*{7.2 Non-terminal neural leaf}
+
+For a non-terminal leaf, the GPU returns the value-head Dirichlet vector
+\(\alpha_{\theta^-}^V(s_\ell)\). The Bayesian default is to back up this vector
+directly as a Dirichlet native object:
+
+\[
+Y_\ell
+=
+\DirObj(\alpha_{\theta^-}^V(s_\ell)).
+\]
+
+The implementation may retain the ablation switch
+
+\[
+\texttt{leaf\_value\_mode}
+\in
+\{\texttt{alpha},\texttt{mean}\}.
+\]
+
+Use
+
+\[
+Y_\ell
+=
+\begin{cases}
+\DirObj(\alpha_{\theta^-}^V(s_\ell)),
+&\texttt{leaf\_value\_mode}=\texttt{alpha},\\[4pt]
+\DirObj\left(\kappa_{\mathrm{leaf}}
+\mean\!\left(\alpha_{\theta^-}^V(s_\ell)\right)\right),
+&\texttt{leaf\_value\_mode}=\texttt{mean}.
+\end{cases}
+\]
+
+The \(\texttt{alpha}\) mode preserves the network's predicted concentration and
+is the Bayesian version. The \(\texttt{mean}\) mode deliberately discards that
+concentration and reintroduces a fixed leaf concentration
+\(\kappa_{\mathrm{leaf}}\); it is useful as an ablation, not as the preferred
+posterior semantics.
+
+\subsection*{7.3 Constructing categorical edges}
+
+An edge \((v,a)\) becomes categorical in two cases.
+
+\paragraph{Direct terminal successor.}
+Let \(s_u=\Step(s_v,a)\). If \(s_u\) is terminal with outcome \(z\) from the
+perspective of node \(v\), then
+
+\[
+\zeta_{v,a}\gets z,
+\qquad
+\tau_{v,a}\gets 1.
+\]
+
+\paragraph{Categorical child successor.}
+If edge \((v,a)\) has a child \(u\) and \(u\) is already categorical, then the
+edge is categorical from the parent perspective:
+
+\[
+\zeta_{v,a}\gets \Align_{v\leftarrow u}(\zeta_u),
+\qquad
+\tau_{v,a}\gets 1+\tau_u.
+\]
+
+For an alternating zero-sum game, a child categorical loss for the opponent is a
+parent categorical win.
+
+\begin{algorithmblock}{Algorithm 4: RefreshCategoricalEdge\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), node \(v\), legal action \(a\)
+
+\Output whether edge \((v,a)\) is categorical after the refresh
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(\zeta_{v,a}\ne\bot\) \Then \Return \(\texttt{true}\). \EndIf
+
+  \item If edge \((v,a)\) has a child \(u\) and \(\zeta_u\ne\bot\), atomically
+  publish
+  \[
+  \zeta_{v,a}\gets\Align_{v\leftarrow u}(\zeta_u),
+  \qquad
+  \tau_{v,a}\gets 1+\tau_u,
+  \]
+  set \(Y^B_{v,a}\gets\CatObj(\zeta_{v,a},\tau_{v,a})\), set \(m_{v,a}\gets1\),
+  increment \(\nu^B_{v,a}\), mark \(v\) dirty, and \Return \(\texttt{true}\).
+
+  \item Otherwise compute or read the one-step successor
+  \[
+  s_u\gets\Step(s_v,a).
+  \]
+  If \(s_u\) is terminal with parent-perspective outcome \(z\), atomically
+  publish
+  \[
+  \zeta_{v,a}\gets z,
+  \qquad
+  \tau_{v,a}\gets 1,
+  \]
+  set \(Y^B_{v,a}\gets\CatObj(z,1)\), set \(m_{v,a}\gets1\), increment
+  \(R_{v,a}\) and \(\nu^B_{v,a}\), mark \(v\) dirty, and \Return
+  \(\texttt{true}\).
+
+  \item \Return \(\texttt{false}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+The one-step terminal scan may be performed eagerly when a node is expanded or
+lazily when an action is considered. To certify a node as a categorical loss or
+categorical draw, however, all legal actions must have known categorical edge
+statuses.
+
+\subsection*{7.4 Categorical node rules}
+
+For node \(v\), define the categorical edge sets
+
+\[
+\mathcal{W}_v=\{a\in\Legal(s_v):\zeta_{v,a}=W\},
+\]
+
+\[
+\mathcal{D}_v=\{a\in\Legal(s_v):\zeta_{v,a}=D\},
+\]
+
+\[
+\mathcal{L}_v=\{a\in\Legal(s_v):\zeta_{v,a}=L\},
+\]
+
+and the unresolved action set
+
+\[
+\Unresolved(v)=\{a\in\Legal(s_v):\zeta_{v,a}=\bot\}.
+\]
+
+The categorical value of a non-terminal node is determined in priority order.
+
+\paragraph{Categorical win.}
+If there is at least one categorical winning edge,
+
+\[
+\mathcal{W}_v\ne\varnothing,
+\]
+
+then \(v\) becomes a categorical win:
+
+\[
+\zeta_v\gets W.
+\]
+
+The chosen action is the certified quickest win:
+
+\[
+a_v^{\mathrm{cat}}
+\gets
+\argmin_{a\in\mathcal{W}_v}\tau_{v,a},
+\qquad
+\tau_v\gets\tau_{v,a_v^{\mathrm{cat}}}.
+\]
+
+\paragraph{Categorical loss.}
+If every legal action is a categorical loss,
+
+\[
+\Unresolved(v)=\varnothing,
+\qquad
+\mathcal{L}_v=\Legal(s_v),
+\]
+
+then \(v\) becomes a categorical loss:
+
+\[
+\zeta_v\gets L.
+\]
+
+The chosen action delays defeat as long as possible:
+
+\[
+a_v^{\mathrm{cat}}
+\gets
+\argmax_{a\in\mathcal{L}_v}\tau_{v,a},
+\qquad
+\tau_v\gets\tau_{v,a_v^{\mathrm{cat}}}.
+\]
+
+\paragraph{Categorical draw.}
+If every legal action is a categorical draw or loss, and at least one legal
+action is a draw,
+
+\[
+\Unresolved(v)=\varnothing,
+\qquad
+\mathcal{W}_v=\varnothing,
+\qquad
+\mathcal{D}_v\ne\varnothing,
+\]
+
+then \(v\) becomes a categorical draw:
+
+\[
+\zeta_v\gets D.
+\]
+
+The chosen draw action is determined by an external rule
+
+\[
+\rho_D:
+(v,\mathcal{D}_v,\{\tau_{v,a}\}_{a\in\mathcal{D}_v})
+\mapsto a\in\mathcal{D}_v.
+\]
+
+Thus
+
+\[
+a_v^{\mathrm{cat}}\gets\rho_D(v,\mathcal{D}_v,\{\tau_{v,a}\}),
+\qquad
+\tau_v\gets\tau_{v,a_v^{\mathrm{cat}}}.
+\]
+
+Useful choices include
+
+\[
+\rho_D=\texttt{fastest\_draw},
+\qquad
+\rho_D=\texttt{slowest\_draw},
+\qquad
+\rho_D=\texttt{policy\_prior},
+\qquad
+\rho_D=\texttt{fixed\_order}.
+\]
+
+The draw rule should only select from \(\mathcal{D}_v\). Losses are considered
+only if no draw exists, which is exactly the categorical-loss case above.
+
+\paragraph{Non-categorical node.}
+If none of the three rules applies, then \(\zeta_v=\bot\) and the node remains
+posterior-valued.
+
+\paragraph{Distance convention.}
+The distance \(\tau\) is measured in environment steps, or plies, from the node
+at which the decision is made. The win rule chooses the shortest certified
+winning successor. If an implementation requires a globally shortest forced win
+among all legal actions, it must continue the categorical proof search until all
+potentially shorter winning certificates have either been discovered or ruled
+out. The shortcut specified here freezes a node as soon as the categorical rules
+above certify its outcome; after that point, no further posterior tree search is
+performed below the node.
+
+\begin{algorithmblock}{Algorithm 5: TryCategorizeNode\((\Tree,v,\rho_D)\)}
+
+\Input posterior tree \(\Tree\), node \(v\), draw-action rule \(\rho_D\)
+
+\Output whether \(v\) is categorical after this call
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(\zeta_v\ne\bot\) \Then \Return \(\texttt{true}\). \EndIf
+
+  \item \If \(s_v\) is terminal with outcome \(z\) from \(v\)'s perspective
+  \Then publish
+  \[
+  \zeta_v\gets z,
+  \qquad
+  \tau_v\gets 0,
+  \qquad
+  a_v^{\mathrm{cat}}\gets\bot,
+  \]
+  and \Return \(\texttt{true}\). \EndIf
+
+  \item For every legal action \(a\in\Legal(s_v)\), run
+  \[
+  \RefreshCategoricalEdge(\Tree,v,a).
+  \]
+
+  \item Construct \(\mathcal{W}_v\), \(\mathcal{D}_v\), \(\mathcal{L}_v\), and
+  \(\Unresolved(v)\).
+
+  \item \If \(\mathcal{W}_v\ne\varnothing\) \Then publish
+  \[
+  \zeta_v\gets W,
+  \qquad
+  a_v^{\mathrm{cat}}\gets\argmin_{a\in\mathcal{W}_v}\tau_{v,a},
+  \qquad
+  \tau_v\gets\tau_{v,a_v^{\mathrm{cat}}},
+  \]
+  and \Return \(\texttt{true}\). \EndIf
+
+  \item \If \(\Unresolved(v)=\varnothing\) and \(\mathcal{L}_v=\Legal(s_v)\)
+  \Then publish
+  \[
+  \zeta_v\gets L,
+  \qquad
+  a_v^{\mathrm{cat}}\gets\argmax_{a\in\mathcal{L}_v}\tau_{v,a},
+  \qquad
+  \tau_v\gets\tau_{v,a_v^{\mathrm{cat}}},
+  \]
+  and \Return \(\texttt{true}\). \EndIf
+
+  \item \If \(\Unresolved(v)=\varnothing\), \(\mathcal{W}_v=\varnothing\), and
+  \(\mathcal{D}_v\ne\varnothing\) \Then publish
+  \[
+  \zeta_v\gets D,
+  \qquad
+  a_v^{\mathrm{cat}}\gets\rho_D(v,\mathcal{D}_v,\{\tau_{v,a}\}),
+  \qquad
+  \tau_v\gets\tau_{v,a_v^{\mathrm{cat}}},
+  \]
+  and \Return \(\texttt{true}\). \EndIf
+
+  \item \Return \(\texttt{false}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 6: PropagateCategorical\((\Tree,v,\rho_D)\)}
+
+\Input posterior tree \(\Tree\), starting node \(v\), draw-action rule \(\rho_D\)
+
+\Output tree with all newly certified ancestors updated
+
+\begin{enumerate}[leftmargin=2em]
+  \item Set \(u\gets v\).
+
+  \item \While \(u\ne\bot\) \Do
+  \begin{enumerate}[leftmargin=2em]
+    \item Run
+    \[
+    changed\gets\TryCategorizeNode(\Tree,u,\rho_D).
+    \]
+
+    \item \If \(changed=\texttt{false}\) \Then \Return \(\Tree\). \EndIf
+
+    \item \If \(u\) has no parent \Then \Return \(\Tree\). \EndIf
+
+    \item Let \(p=\operatorname{parent}(u)\) and
+    \(a=\operatorname{parent\_action}(u)\). Publish the parent edge as
+    categorical:
+    \[
+    \zeta_{p,a}\gets\Align_{p\leftarrow u}(\zeta_u),
+    \qquad
+    \tau_{p,a}\gets 1+\tau_u,
+    \]
+    \[
+    Y^B_{p,a}\gets\CatObj(\zeta_{p,a},\tau_{p,a}),
+    \qquad
+    m_{p,a}\gets1,
+    \qquad
+    \nu^B_{p,a}\gets\nu^B_{p,a}+1.
+    \]
+    Mark \(p\) dirty and increment \(e_p\).
+
+    \item Set \(u\gets p\).
+  \end{enumerate}
+  \item \EndWhile
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+If an edge only becomes a categorical draw or categorical loss, the parent may
+remain non-categorical because unresolved actions could still become wins or
+draws. In that case posterior search continues through unresolved actions. If
+the parent becomes categorical, all search below the parent stops.
+
+\section*{8. Search-weighted state-posterior cache}
+
+A non-leaf expanded non-categorical node backs up the search posterior implied
+by its current children, not an incremental delta. The value posterior of a node
+is a lazy cache derived from outgoing edge objects.
+
+For an expanded non-terminal non-categorical node \(u\), first compute the local
+posterior-best policy from outgoing native action objects:
+
+\[
+\hat\pi_{\mathrm{search}}^u
+=
+\PosteriorBestPolicyTarget
+\left(
+\Tree,u,M_\pi
+\right).
+\]
+
+For each legal action \(b\), define the native edge object
+
+\[
+Y_{u,b}^{\mathrm{post}}
+=
+\NativeEdgePosterior(\Tree,u,b).
+\]
+
+Then define the search-weighted child target object
+
+\[
+E^V_u
+=
+\MixObj
+\left(
+\left\{
+\left(
+\hat\pi_{\mathrm{search}}^u(b),
+Y_{u,b}^{\mathrm{post}}
+\right)
+\right\}_{b\in\Legal(s_u)}
+\right).
+\]
+
+If every \(Y_{u,b}^{\mathrm{post}}\) is Dirichlet-valued, the implementation may
+collapse this native mixture to the original all-Dirichlet vector
+
+\[
+E^V_u
+=
+\DirObj\left(
+\sum_{b\in\Legal(s_u)}
+\hat\pi_{\mathrm{search}}^u(b)
+\alpha^{\mathrm{post}}_{u,b}
+\right).
+\]
+
+This collapse is exactly the previous search-weighted state-posterior cache. If
+any \(Y_{u,b}^{\mathrm{post}}\) is categorical, the mixture stays native and no
+categorical component is converted into Dirichlet parameters.
+
+Unvisited legal actions are \emph{not} masked out of this mixture. If an
+unvisited action has tiny posterior-best probability, it contributes almost
+nothing. If it still has large posterior-best probability, then search has not
+ruled it out, and the state posterior should retain that uncertainty. The only
+masks used in this document are legality masks and scheduler masks that prevent
+duplicate work on in-flight children.
+
+The blend weight should grow with the amount of downstream search work, not with
+Dirichlet concentration. Let \(R_{u,b}\) be the number of completed terminal or
+neural evaluations represented by edge \((u,b)\). Define the downstream completed
+evaluation count at node \(u\) as
+
+\[
+N^\downarrow_u
+=
+\sum_{b\in\Legal(s_u)} R_{u,b}.
+\]
+
+Thus an unvisited fallback action has \(R_{u,b}=0\), but its fallback posterior
+or fallback native object still participates in \(E^V_u\). A completed terminal
+categorical leaf contributes one completed evaluation. A completed neural leaf
+contributes one completed evaluation. A completed interior child contributes the
+number of evaluations represented by that child's clean cache.
+
+Given an evaluation-count half-trust hyperparameter \(\kappa_N>0\), set the
+local blend weight
+
+\[
+\gamma^V_u
+=
+\frac{N^\downarrow_u}{\kappa_N+N^\downarrow_u}.
+\]
+
+Here \(\kappa_N\) has the simple interpretation
+
+\[
+N^\downarrow_u=\kappa_N
+\quad\Longrightarrow\quad
+\gamma^V_u=\frac12.
+\]
+
+The Dirichlet objects themselves still carry confidence. A confident neural leaf
+can return a high-concentration \(\alpha^V_{\theta^-}\). A categorical leaf
+carries exact categorical status instead of Dirichlet concentration. The count
+\(N^\downarrow_u\) only says how many completed evaluations have been
+incorporated.
+
+The cached state target object is
+
+\[
+C^V_u
+=
+\MixObj
+\left(
+\left\{
+(1-\gamma^V_u,\DirObj(\alpha_{\theta^-}^V(s_u))),
+(\gamma^V_u,E^V_u)
+\right\}
+\right).
+\]
+
+If both components are Dirichlet-valued, this native object may be collapsed to
+the original Dirichlet vector
+
+\[
+C^V_u
+=
+\DirObj\left(
+(1-\gamma^V_u)\alpha_{\theta^-}^V(s_u)
++
+\gamma^V_u
+\sum_{b\in\Legal(s_u)}
+\hat\pi_{\mathrm{search}}^u(b)
+\alpha^{\mathrm{post}}_{u,b}
+\right).
+\]
+
+In the pure Dirichlet case this gives the desired behavior:
+
+\[
+\begin{array}{rcl}
+\text{little completed downstream work} &\Rightarrow&
+C^V_u \text{ stays close to } \alpha_{\theta^-}^V(s_u),\\[2pt]
+\text{many completed downstream evaluations} &\Rightarrow&
+C^V_u \text{ moves toward the search-weighted child posterior},\\[2pt]
+\text{highly confident child alpha} &\Rightarrow&
+\text{that confidence propagates through } E^V_u.
+\end{array}
+\]
+
+With categorical components, the same structural behavior holds, but the cache
+is a native mixture and the categorical components remain categorical.
+
+\begin{algorithmblock}{Algorithm 7: ComputeStateSearchPosterior\((\Tree,u,M_\pi,\kappa_N)\)}
+
+\Input posterior tree \(\Tree\), expanded non-terminal non-categorical node \(u\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\)
+
+\Output derived value target object \(C^V_u\) and downstream completed evaluation count \(N^\downarrow_u\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each legal action \(b\in\Legal(s_u)\), read a stable edge snapshot and compute
+  \[
+  Y^{\mathrm{post}}_{u,b}
+  \gets
+  \NativeEdgePosterior(\Tree,u,b),
+  \qquad
+  R_{u,b}
+  \gets
+  \text{the completed-evaluation count stored on edge }(u,b).
+  \]
+  If \(m_{u,b}=0\) and \(\zeta_{u,b}=\bot\), then
+  \(\NativeEdgePosterior\) returns the fallback/base prior as a Dirichlet object
+  and \(R_{u,b}=0\).
+
+  \item Compute the local posterior-best policy over all legal actions:
+  \[
+  \hat\pi_{\mathrm{search}}^u
+  \gets
+  \PosteriorBestPolicyTarget(\Tree,u,M_\pi).
+  \]
+
+  \item Compute the native search-weighted child target object:
+  \[
+  E^V_u
+  \gets
+  \MixObj
+  \left(
+  \left\{
+  (\hat\pi_{\mathrm{search}}^u(b),Y^{\mathrm{post}}_{u,b})
+  \right\}_{b\in\Legal(s_u)}
+  \right).
+  \]
+  If all components are Dirichlet-valued, optionally collapse this to the
+  original Dirichlet vector.
+
+  \item Compute the downstream completed evaluation count:
+  \[
+  N^\downarrow_u
+  \gets
+  \sum_{b\in\Legal(s_u)}R_{u,b}.
+  \]
+
+  \item Compute the local blend factor:
+  \[
+  \gamma^V_u
+  \gets
+  \frac{N^\downarrow_u}{\kappa_N+N^\downarrow_u}.
+  \]
+
+  \item Compute the native value target object:
+  \[
+  C^V_u
+  \gets
+  \MixObj
+  \left(
+  \left\{
+  (1-\gamma^V_u,\DirObj(\alpha_{\theta^-}^V(s_u))),
+  (\gamma^V_u,E^V_u)
+  \right\}
+  \right).
+  \]
+  If all components are Dirichlet-valued, optionally collapse to the original
+  single Dirichlet vector.
+
+  \item \Return \((C^V_u,N^\downarrow_u)\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\subsection*{8.1 Refreshing a parent edge from a clean child}
+
+The incoming edge to a child may be refreshed from the child's categorical
+status or state-posterior cache only after the child information is current.
+
+If \(u=\texttt{child}(v,a)\) and \(u\) is categorical, the refresh rule is
+
+\[
+Y^B_{v,a}
+\gets
+\CatObj(\Align_{v\leftarrow u}(\zeta_u),1+\tau_u),
+\]
+
+\[
+\zeta_{v,a}
+\gets
+\Align_{v\leftarrow u}(\zeta_u),
+\qquad
+\tau_{v,a}\gets 1+\tau_u,
+\qquad
+m_{v,a}\gets1.
+\]
+
+If \(u\) is non-categorical with a clean cache, the refresh rule is
+
+\[
+Y^B_{v,a}
+\gets
+\Align_{v\leftarrow u}(C^V_u),
+\qquad
+R_{v,a}\gets 1+N^\downarrow_u,
+\qquad
+m_{v,a}\gets 1,
+\qquad
+\chi_{v,a}\gets \nu^V_u,
+\]
+
+but only if
+
+\[
+\sigma^V_u=\texttt{clean}
+\quad\text{and}\quad
+\operatorname{has\_child\_evidence}(u).
+\]
+
+If the child is dirty, updating, in flight, or merely a newly expanded neural
+leaf with no completed outgoing edge, the refresh does not happen.
+
+\begin{algorithmblock}{Algorithm 8: RefreshEdgeFromChild\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), parent node \(v\), legal action \(a\)
+
+\Output \(\texttt{true}\) if the edge is current or does not require child refresh; \(\texttt{false}\) if the child is not ready
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If edge \((v,a)\) has no child \(u\) \Then \Return \(\texttt{true}\). \EndIf
+
+  \item \If \(\zeta_u\ne\bot\) \Then publish the categorical parent edge:
+  \[
+  \zeta_{v,a}\gets\Align_{v\leftarrow u}(\zeta_u),
+  \qquad
+  \tau_{v,a}\gets1+\tau_u,
+  \qquad
+  Y^B_{v,a}\gets\CatObj(\zeta_{v,a},\tau_{v,a}),
+  \]
+  set \(m_{v,a}\gets1\), increment \(\nu^B_{v,a}\), mark \(v\) dirty, and
+  \Return \(\texttt{true}\). \EndIf
+
+  \item \If \(s_u\) is terminal \Then run
+  \[
+  \TryCategorizeNode(\Tree,u,\rho_D)
+  \]
+  in implementations that pass \(\rho_D\) here, then repeat the categorical
+  branch. If no categorical publication happens, \Return \(\texttt{true}\).
+  \EndIf
+
+  \item \If \(\sigma^{\mathrm{eval}}_u\ne\texttt{expanded}\) \Then
+  the child has no neural outputs yet. Do not refresh from it.
+  \[
+  \Return \texttt{true}.
+  \]
+  \EndIf
+
+  \item \If \(\operatorname{has\_child\_evidence}(u)=0\) \Then
+  the child is still a neural leaf, not an interior posterior node. Keep the
+  current leaf-evidence edge posterior.
+  \[
+  \Return \texttt{true}.
+  \]
+  \EndIf
+
+  \item \If \(\sigma^V_u\ne\texttt{clean}\) \Then
+  the child posterior is not ready. Mark \(v\) dirty and stop the repair.
+  \[
+  e_v\gets e_v+1,
+  \qquad
+  \sigma^V_v\gets\texttt{dirty}.
+  \]
+  \[
+  \Return \texttt{false}.
+  \]
+  \EndIf
+
+  \item \If \(\chi_{v,a}=\nu^V_u\) \Then the edge already absorbed the latest
+  clean child cache, so \Return \(\texttt{true}\). \EndIf
+
+  \item Atomically publish the refreshed edge object:
+  \[
+  Y^B_{v,a}
+  \gets
+  \Align_{v\leftarrow u}(C^V_u),
+  \qquad
+  R_{v,a}\gets 1+N^\downarrow_u,
+  \qquad
+  m_{v,a}\gets 1,
+  \]
+  \[
+  \chi_{v,a}\gets \nu^V_u,
+  \qquad
+  \nu^B_{v,a}\gets\nu^B_{v,a}+1.
+  \]
+
+  \item Mark the parent dirty because one of its outgoing edges just changed:
+  \[
+  e_v\gets e_v+1,
+  \qquad
+  \sigma^V_v\gets\texttt{dirty}.
+  \]
+
+  \item \Return \(\texttt{true}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\subsection*{8.2 Repairing one dirty node}
+
+A dirty node is repaired by first making sure that any child-derived edge object
+it depends on has been refreshed from a categorical child or a clean child
+cache. Then the node recomputes its own state-posterior cache from its current
+outgoing edge objects.
+
+The repair is deliberately non-blocking. If the repair token is already held, or
+if a child is not clean, or if an edge changes during the repair, the function
+returns \(\texttt{false}\). Some later worker can retry.
+
+\begin{algorithmblock}{Algorithm 9: TryRepairNode\((\Tree,u,M_\pi,\kappa_N,\rho_D)\)}
+
+\Input posterior tree \(\Tree\), node \(u\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\)
+
+\Output \(\texttt{true}\) if \(u\)'s value-posterior cache or categorical status is clean after this call; otherwise \(\texttt{false}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Run
+  \[
+  \TryCategorizeNode(\Tree,u,\rho_D).
+  \]
+  If \(\zeta_u\ne\bot\), \Return \(\texttt{true}\).
+
+  \item \If \(s_u\) is terminal \Then \Return \(\texttt{false}\). \EndIf
+
+  \item \If \(\sigma^{\mathrm{eval}}_u\ne\texttt{expanded}\) \Then \Return \(\texttt{false}\). \EndIf
+
+  \item \If \(\operatorname{has\_child\_evidence}(u)=0\) \Then
+  there is no child evidence to summarize. Set
+  \[
+  N^\downarrow_u\gets 0,
+  \qquad
+  C^V_u\gets\DirObj(\alpha_{\theta^-}^V(s_u)),
+  \qquad
+  \sigma^V_u\gets\texttt{clean}
+  \]
+  and \Return \(\texttt{true}\). \EndIf
+
+  \item Try to acquire the repair token for node \(u\). If it is already held,
+  \Return \(\texttt{false}\).
+
+  \item Set
+  \[
+  \sigma^V_u\gets\texttt{updating}
+  \]
+  and snapshot the node epoch:
+  \[
+  e_0\gets e_u.
+  \]
+
+  \item For each legal action \(b\in\Legal(s_u)\):
+  \[
+  ok_b\gets\RefreshEdgeFromChild(\Tree,u,b).
+  \]
+  If any \(ok_b=\texttt{false}\), release the repair token, set
+  \[
+  \sigma^V_u\gets\texttt{dirty},
+  \]
+  and \Return \(\texttt{false}\).
+
+  \item Run
+  \[
+  \TryCategorizeNode(\Tree,u,\rho_D).
+  \]
+  If \(\zeta_u\ne\bot\), release the repair token, set
+  \(\sigma^V_u\gets\texttt{clean}\), and \Return \(\texttt{true}\).
+
+  \item Compute a candidate native state posterior from the current edge snapshots:
+  \[
+  (\tilde C^V_u,\tilde N^\downarrow_u)
+  \gets
+  \ComputeStateSearchPosterior(\Tree,u,M_\pi,\kappa_N).
+  \]
+
+  \item Before publishing, check whether an outgoing edge changed during the
+  repair. If
+  \[
+  e_u\ne e_0,
+  \]
+  discard \(\tilde C^V_u\), release the repair token, set
+  \[
+  \sigma^V_u\gets\texttt{dirty},
+  \]
+  and \Return \(\texttt{false}\).
+
+  \item Atomically publish the clean cache:
+  \[
+  C^V_u\gets\tilde C^V_u,
+  \qquad
+  N^\downarrow_u\gets\tilde N^\downarrow_u,
+  \qquad
+  \nu^V_u\gets\nu^V_u+1,
+  \qquad
+  \sigma^V_u\gets\texttt{clean}.
+  \]
+
+  \item Release the repair token.
+
+  \item \If \(u\) has a parent \(p\) \Then mark the parent dirty and advance its
+  epoch, because the incoming edge \((p,\operatorname{parent\_action}(u))\) may
+  now be stale:
+  \[
+  e_p\gets e_p+1,
+  \qquad
+  \sigma^V_p\gets\texttt{dirty}.
+  \]
+  \EndIf
+
+  \item \Return \(\texttt{true}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 10: RepairDirtyFrontier\((\Tree,M_\pi,\kappa_N,\rho_D)\)}
+
+\Input posterior tree \(\Tree\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\)
+
+\Output tree whose exportable interior nodes are clean or categorical, or a tree with remaining dirty nodes if in-flight dependencies still exist
+
+\begin{enumerate}[leftmargin=2em]
+  \item Process dirty expanded nodes from greatest depth to root depth.
+
+  \item For each dirty node \(u\), run
+  \[
+  \TryRepairNode(\Tree,u,M_\pi,\kappa_N,\rho_D).
+  \]
+
+  \item Repeat the depth-ordered pass until either no dirty node changes state,
+  or all exportable interior nodes are clean or categorical.
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{9. Concurrency-safe backup}
+
+Given a selected path
+
+\[
+\Path=((v_0,a_0),\ldots,(v_{\ell-1},a_{\ell-1})),
+\]
+
+and a leaf native object \(Y_\ell\), backup first publishes the final edge object
+and then attempts to repair dirty nodes from the final edge's parent back toward
+the root. For terminal leaves, \(Y_\ell\) is categorical and publication triggers
+categorical propagation. For neural leaves, \(Y_\ell\) is Dirichlet-valued.
+
+The final edge receives the aligned leaf object directly:
+
+\[
+Y^B_{v_{\ell-1},a_{\ell-1}}
+\gets
+\Align_{v_{\ell-1}\leftarrow \ell}(Y_\ell),
+\]
+
+unless \(Y_\ell\) is categorical, in which case the edge's categorical fields are
+also published:
+
+\[
+\zeta_{v_{\ell-1},a_{\ell-1}}
+\gets
+\Align_{v_{\ell-1}\leftarrow \ell}(z_\ell),
+\qquad
+\tau_{v_{\ell-1},a_{\ell-1}}
+\gets
+1+\tau_\ell.
+\]
+
+The edge base prior is used only as the fallback before an edge has completed
+posterior information. Once a terminal categorical leaf or neural leaf has been
+evaluated, the completed edge object is the backed-up native object, not
+\(\EdgeBase+Y_\ell\). Repeated leaf completions increment the edge's
+completed-evaluation count \(R\), but they do not add posterior mass to the
+completed object. Concurrent writes replace the edge snapshot and atomically
+advance the edge count.
+
+After the final edge is published, node \(v_{\ell-1}\) is dirty. If two paths
+update different children of the same node, both child edges publish, both bump
+that node's epoch, and the successful repair recomputes from both current edge
+snapshots.
+
+\begin{algorithmblock}{Algorithm 11: BackupPath\((\Tree,\Path,Y_\ell,M_\pi,\kappa_N,\rho_D)\)}
+
+\Input posterior tree \(\Tree\), selected path \(\Path\), leaf native object \(Y_\ell\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\)
+
+\Output \(\Tree\), possibly with some ancestors still marked dirty if repair could not complete immediately
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(\Path\) is empty, \Return \(\Tree\). \EndIf
+
+  \item Let \((v_{\ell-1},a_{\ell-1})\) be the final edge in \(\Path\).
+
+  \item Privately compute
+  \[
+  \tilde Y
+  \gets
+  \Align_{v_{\ell-1}\leftarrow \ell}(Y_\ell).
+  \]
+
+  \item \If \(\tilde Y=\CatObj(z,\tau)\) \Then atomically publish the categorical
+  edge snapshot:
+  \[
+  \zeta_{v_{\ell-1},a_{\ell-1}}\gets z,
+  \qquad
+  \tau_{v_{\ell-1},a_{\ell-1}}\gets \tau+1,
+  \qquad
+  Y^B_{v_{\ell-1},a_{\ell-1}}\gets\CatObj(z,\tau+1).
+  \]
+  \Else publish
+  \[
+  Y^B_{v_{\ell-1},a_{\ell-1}}\gets\tilde Y.
+  \]
+  \EndIf
+
+  \item Atomically update the edge metadata:
+  \[
+  R_{v_{\ell-1},a_{\ell-1}}
+  \gets
+  R_{v_{\ell-1},a_{\ell-1}}+1,
+  \qquad
+  m_{v_{\ell-1},a_{\ell-1}}\gets1,
+  \qquad
+  \nu^B_{v_{\ell-1},a_{\ell-1}}
+  \gets
+  \nu^B_{v_{\ell-1},a_{\ell-1}}+1.
+  \]
+
+  \item Mark the final-edge parent dirty and advance its epoch:
+  \[
+  e_{v_{\ell-1}}\gets e_{v_{\ell-1}}+1,
+  \qquad
+  \sigma^V_{v_{\ell-1}}\gets\texttt{dirty}.
+  \]
+
+  \item Run categorical propagation from the final-edge parent:
+  \[
+  \Tree\gets\PropagateCategorical(\Tree,v_{\ell-1},\rho_D).
+  \]
+
+  \item Run a non-blocking repair walk:
+  \[
+  \RepairPathToRoot(\Tree,v_{\ell-1},M_\pi,\kappa_N,\rho_D).
+  \]
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 12: RepairPathToRoot\((\Tree,u,M_\pi,\kappa_N,\rho_D)\)}
+
+\Input posterior tree \(\Tree\), starting node \(u\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\)
+
+\Output updated tree with as many ancestors repaired or categorized as are currently ready
+
+\begin{enumerate}[leftmargin=2em]
+  \item Set \(w\gets u\).
+
+  \item \While \(w\ne\bot\) \Do
+  \begin{enumerate}[leftmargin=2em]
+    \item Run
+    \[
+    \TryCategorizeNode(\Tree,w,\rho_D).
+    \]
+
+    \item \If \(\zeta_w\ne\bot\) and \(w\) has a parent \Then
+    publish the categorical parent edge through \(\PropagateCategorical\), set
+    \(w\gets\operatorname{parent}(w)\), and \Continue.
+    \EndIf
+
+    \item \If \(\sigma^V_w=\texttt{clean}\) and \(w\) has a parent \Then
+    the parent edge may already be stale with respect to \(w\)'s clean cache, so
+    continue upward:
+    \[
+    w\gets\operatorname{parent}(w).
+    \]
+    \Continue.
+    \EndIf
+
+    \item Run
+    \[
+    ok\gets\TryRepairNode(\Tree,w,M_\pi,\kappa_N,\rho_D).
+    \]
+
+    \item \If \(ok=\texttt{false}\) \Then
+    stop the repair walk. The remaining ancestors stay dirty and can be repaired
+    by a later worker or by final export.
+    \[
+    \Return \Tree.
+    \]
+    \EndIf
+
+    \item Set
+    \[
+    w\gets\operatorname{parent}(w).
+    \]
+  \end{enumerate}
+  \item \EndWhile
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{10. Initializing a posterior tree}
+
+The root node must be evaluated before posterior search begins, because
+Thompson selection requires root priors. Initialization also creates the version
+counters, categorical fields, and clean cache state used by concurrent repair.
+
+\begin{algorithmblock}{Algorithm 13: InitializePosteriorTree\((s,\theta^-,\rho_D)\)}
+
+\Input root state \(s\), data-generation network parameters \(\theta^-\), draw-action rule \(\rho_D\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Create root node \(v_{\mathrm{root}}\) with state \(s\), no parent, and
+  categorical fields initialized as
+  \[
+  \zeta_{v_{\mathrm{root}}}\gets\bot,
+  \qquad
+  \tau_{v_{\mathrm{root}}}\gets\infty,
+  \qquad
+  a_{v_{\mathrm{root}}}^{\mathrm{cat}}\gets\bot.
+  \]
+
+  \item \If \(s\) is terminal with outcome \(z\) \Then set
+  \[
+  \zeta_{v_{\mathrm{root}}}\gets z,
+  \qquad
+  \tau_{v_{\mathrm{root}}}\gets0,
+  \qquad
+  \sigma^{\mathrm{eval}}_{v_{\mathrm{root}}}\gets\texttt{expanded},
+  \]
+  initialize counters to zero, and \Return \(\Tree\). \EndIf
+
+  \item Run the network on the root state:
+  \[
+  \left(
+  \ell_{\theta^-}(s,\cdot),
+  \alpha_{\theta^-}^V(s),
+  \alpha_{\theta^-}^Q(s,\cdot)
+  \right)
+  \gets
+  f_{\theta^-}(s).
+  \]
+
+  \item Set the root evaluation status
+  \[
+  \sigma^{\mathrm{eval}}_{v_{\mathrm{root}}}\gets\texttt{expanded}.
+  \]
+
+  \item Store
+  \[
+  \ell_{\theta^-}(s,\cdot),
+  \qquad
+  \alpha_{\theta^-}^V(s),
+  \qquad
+  \alpha_{\theta^-}^Q(s,\cdot)
+  \]
+  in the root node.
+
+  \item Initialize the root state-posterior cache to the network value prior:
+  \[
+  C^V_{v_{\mathrm{root}}}\gets \DirObj(\alpha_{\theta^-}^V(s)),
+  \qquad
+  \sigma^V_{v_{\mathrm{root}}}\gets\texttt{clean},
+  \qquad
+  \nu^V_{v_{\mathrm{root}}}\gets 0,
+  \qquad
+  e_{v_{\mathrm{root}}}\gets 0.
+  \]
+
+  \item For every root edge, initialize
+  \[
+  Y^B_{v_{\mathrm{root}},a}\gets \bot,
+  \qquad
+  m_{v_{\mathrm{root}},a}\gets 0,
+  \qquad
+  R_{v_{\mathrm{root}},a}\gets 0,
+  \qquad
+  \nu^B_{v_{\mathrm{root}},a}\gets 0,
+  \qquad
+  \chi_{v_{\mathrm{root}},a}\gets -1,
+  \]
+  and
+  \[
+  \zeta_{v_{\mathrm{root}},a}\gets\bot,
+  \qquad
+  \tau_{v_{\mathrm{root}},a}\gets\infty.
+  \]
+
+  \item Initialize atomic counters:
+  \[
+  T_{\mathrm{done}}(\Tree) \gets 0,
+  \qquad
+  T_{\mathrm{inflight}}(\Tree) \gets 0.
+  \]
+
+  \item Run an initial categorical scan:
+  \[
+  \TryCategorizeNode(\Tree,v_{\mathrm{root}},\rho_D).
+  \]
+
+  \item \Return posterior tree \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{11. CPU iterator: producing one leaf-evaluation request}
+
+The CPU tree exposes an iterator-like method:
+
+\[
+\NextRequest(\Tree).
+\]
+
+It walks down the current posterior tree by Thompson sampling until it reaches a
+leaf. The leaf is handled in one place by \(\EvaluateReachedLeaf\). This keeps
+terminal categorical leaves and neural leaves under one conceptual rule:
+
+\[
+\text{reached leaf}
+\quad\Longrightarrow\quad
+\begin{cases}
+\text{terminal categorical certificate, publish and propagate now},\\
+\text{already categorical node, stop},\\
+\text{neural request, atomically mark in flight and return request}.
+\end{cases}
+\]
+
+\(\NextRequest\) is explicitly non-blocking. It either emits one new GPU
+request, completes one terminal categorical simulation, propagates an existing
+categorical certificate, or returns \(\NoRequest\). Multiple CPU workers may call
+it concurrently on the same tree.
+
+At an expanded non-categorical node, action selection is restricted to actions
+that are unresolved and not blocked by an existing in-flight child:
+
+\[
+\Available(v)
+=
+\left\{
+ a\in\Legal(s_v):
+ \zeta_{v,a}=\bot
+ \text{ and }
+ \neg\left(
+   \exists u=\texttt{child}(v,a)
+   \text{ with }
+   \sigma^{\mathrm{eval}}_u\in\{\texttt{inflight},\texttt{expanding}\}
+ \right)
+\right\}.
+\]
+
+Dirty expanded children are \emph{not} blocked. They may still be descended into
+for further search, because selection uses outgoing edge objects, not the
+child's state-posterior cache. A dirty child is only blocked from being used as
+backup evidence by its parent.
+
+If \(\Available(v)=\varnothing\), the descent stops and returns \(\NoRequest\).
+The scheduler can then try another lane, another tree, or wait for GPU results.
+
+\subsection*{11.1 Atomic child creation}
+
+When a worker selects an unexpanded edge, another worker may be selecting the
+same edge at the same time. Child creation is therefore also an atomic publish.
+
+\begin{algorithmblock}{Algorithm 14: TryGetOrCreateChild\((\Tree,v,a)\)}
+
+\Input posterior tree \(\Tree\), parent node \(v\), selected action \(a\)
+
+\Output the unique child node \(u=\texttt{child}(v,a)\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If edge \((v,a)\) already has a child \(u\), \Return \(u\). \EndIf
+
+  \item Privately compute
+  \[
+  s_u\gets\Step(s_v,a).
+  \]
+
+  \item Privately allocate a candidate child node \(u_{\mathrm{new}}\) with
+  parent \(v\), parent action \(a\), and state \(s_u\). Initialize
+  \[
+  \zeta_{u_{\mathrm{new}}}\gets\bot,
+  \qquad
+  \tau_{u_{\mathrm{new}}}\gets\infty,
+  \qquad
+  a_{u_{\mathrm{new}}}^{\mathrm{cat}}\gets\bot.
+  \]
+  If \(s_u\) is non-terminal, initialize
+  \[
+  \sigma^{\mathrm{eval}}_{u_{\mathrm{new}}}\gets\texttt{unexpanded},
+  \qquad
+  \sigma^V_{u_{\mathrm{new}}}\gets\texttt{clean},
+  \qquad
+  C^V_{u_{\mathrm{new}}}\gets\bot,
+  \qquad
+  \nu^V_{u_{\mathrm{new}}}\gets 0,
+  \qquad
+  e_{u_{\mathrm{new}}}\gets 0.
+  \]
+  If \(s_u\) is terminal, it may instead be initialized as a categorical node
+  with \(\tau=0\).
+
+  \item Atomically compare-and-swap
+  \[
+  \texttt{child}(v,a):\bot\rightarrow u_{\mathrm{new}}.
+  \]
+
+  \item \If the compare-and-swap succeeds, \Return \(u_{\mathrm{new}}\). \EndIf
+
+  \item Otherwise another worker published a child first. Discard
+  \(u_{\mathrm{new}}\) and \Return the existing child \(u=\texttt{child}(v,a)\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 15: EvaluateReachedLeaf\((\Tree,u,\Path,M_\pi,\kappa_N,\rho_D)\)}
+
+\Input posterior tree \(\Tree\), reached node \(u\), selected path \(\Path\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\)
+
+\Output either \(\NoRequest\) after terminal/categorical completion, one \(\operatorname{EvalRequest}\), or \(\NoRequest\) because another worker already owns the leaf
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(s_u\) is terminal with outcome \(z\) \Then publish \(u\) as a
+  categorical node:
+  \[
+  \zeta_u\gets z,
+  \qquad
+  \tau_u\gets 0,
+  \qquad
+  a_u^{\mathrm{cat}}\gets\bot.
+  \]
+  Run
+  \[
+  \Tree\gets\PropagateCategorical(\Tree,u,\rho_D).
+  \]
+  Atomically increment
+  \[
+  T_{\mathrm{done}}(\Tree)
+  \gets
+  T_{\mathrm{done}}(\Tree)+1.
+  \]
+  \Return \(\NoRequest\). \EndIf
+
+  \item \If \(\zeta_u\ne\bot\) \Then
+  the node is already categorical, so no request is needed. Run
+  \[
+  \Tree\gets\PropagateCategorical(\Tree,u,\rho_D),
+  \]
+  and \Return \(\NoRequest\). \EndIf
+
+  \item \If \(\sigma^{\mathrm{eval}}_u=\texttt{expanded}\) \Then
+  this is no longer a leaf for request purposes. Another worker expanded it
+  first, so do not create a duplicate request or backup.
+  \[
+  \Return \NoRequest.
+  \]
+  \EndIf
+
+  \item Attempt the atomic transition
+  \[
+  ok\gets
+  \CAS
+  \left(
+  \sigma^{\mathrm{eval}}_u,
+  \texttt{unexpanded},
+  \texttt{inflight}
+  \right).
+  \]
+
+  \item \If \(ok=\texttt{false}\) \Then
+  the leaf is already in flight or was expanded concurrently. Do not emit a
+  duplicate GPU request and do not add posterior mass or backup evidence.
+  \[
+  \Return \NoRequest.
+  \]
+  \EndIf
+
+  \item Atomically increment
+  \[
+  T_{\mathrm{inflight}}(\Tree)
+  \gets
+  T_{\mathrm{inflight}}(\Tree)+1.
+  \]
+
+  \item \Return
+  \[
+  \operatorname{EvalRequest}
+  \left(
+  \texttt{tree\_id},
+  u,
+  \Path,
+  s_u
+  \right).
+  \]
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 16: NextRequest\((\Tree,M_\pi,\kappa_N,\rho_D)\)}
+
+\Input posterior tree \(\Tree\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\)
+
+\Output either no GPU request, or one evaluation request
+
+\begin{enumerate}[leftmargin=2em]
+  \item Set
+  \[
+  v \gets v_{\mathrm{root}},
+  \qquad
+  \Path \gets ().
+  \]
+
+  \item \While true \Do
+
+  \begin{enumerate}[leftmargin=2em]
+    \item Run
+    \[
+    \TryCategorizeNode(\Tree,v,\rho_D).
+    \]
+
+    \item \If \(\zeta_v\ne\bot\) \Then
+    no tree search is needed from this node onward. Run
+    \[
+    \Tree\gets\PropagateCategorical(\Tree,v,\rho_D),
+    \]
+    and \Return \(\NoRequest\). \EndIf
+
+    \item \If \(s_v\) is terminal \Then
+    \[
+    \Return
+    \EvaluateReachedLeaf(\Tree,v,\Path,M_\pi,\kappa_N,\rho_D).
+    \]
+    \EndIf
+
+    \item \If \(\sigma^{\mathrm{eval}}_v\ne\texttt{expanded}\) \Then
+    \[
+    \Return
+    \EvaluateReachedLeaf(\Tree,v,\Path,M_\pi,\kappa_N,\rho_D).
+    \]
+    \EndIf
+
+    \item For each legal action, refresh one-step categorical information as
+    needed:
+    \[
+    \RefreshCategoricalEdge(\Tree,v,a),
+    \qquad a\in\Legal(s_v).
+    \]
+
+    \item Run
+    \[
+    \TryCategorizeNode(\Tree,v,\rho_D).
+    \]
+    If \(\zeta_v\ne\bot\), \Return \(\NoRequest\).
+
+    \item Compute the non-blocked unresolved action set:
+    \[
+    \Available(v)
+    \gets
+    \{a\in\Legal(s_v):\zeta_{v,a}=\bot
+    \text{ and }a\text{ does not lead to an in-flight or expanding child}\}.
+    \]
+
+    \item \If \(\Available(v)=\varnothing\) \Then
+    \[
+    \Return \NoRequest.
+    \]
+    \EndIf
+
+    \item Select a Thompson action only from unresolved available actions:
+    \[
+    \tilde a
+    \gets
+    \ThompsonSelect(\Tree,v,\Available(v)).
+    \]
+
+    \item Append the edge to the path:
+    \[
+    \Path
+    \gets
+    \Path \mathbin{\Vert} ((v,\tilde a)).
+    \]
+
+    \item Get the unique child for this edge:
+    \[
+    u\gets\TryGetOrCreateChild(\Tree,v,\tilde a).
+    \]
+
+    \item \If \(s_u\) is terminal \Then
+    \[
+    \Return
+    \EvaluateReachedLeaf(\Tree,u,\Path,M_\pi,\kappa_N,\rho_D).
+    \]
+    \EndIf
+
+    \item \If \(\zeta_u\ne\bot\) \Then
+    run
+    \[
+    \Tree\gets\PropagateCategorical(\Tree,u,\rho_D),
+    \]
+    and \Return \(\NoRequest\). \EndIf
+
+    \item \If \(\sigma^{\mathrm{eval}}_u=\texttt{expanded}\) \Then
+    \[
+    v\gets u.
+    \]
+    \Continue.
+    \EndIf
+
+    \item Otherwise \(u\) is an unexpanded, in-flight, or expanding non-terminal
+    leaf. Run
+    \[
+    \Return
+    \EvaluateReachedLeaf(\Tree,u,\Path,M_\pi,\kappa_N,\rho_D).
+    \]
+
+  \end{enumerate}
+
+  \item \EndWhile
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{12. Consuming a GPU result}
+
+A GPU result for non-terminal leaf \(u\) contains
+
+\[
+\ell_{\theta^-}(s_u,\cdot),
+\qquad
+\alpha_{\theta^-}^V(s_u),
+\qquad
+\alpha_{\theta^-}^Q(s_u,\cdot).
+\]
+
+The CPU stores these outputs in the leaf node, atomically claims the in-flight
+result with \(\texttt{inflight}\rightarrow\texttt{expanding}\), publishes the
+network outputs, then marks the node \(\texttt{expanded}\). It decrements
+\(T_{\mathrm{inflight}}\), backs up the neural leaf Dirichlet object, and
+increments \(T_{\mathrm{done}}\). A stale or duplicate GPU result is ignored.
+
+If an ancestor on the stored path has already become categorical, the result is
+stale for target construction below that ancestor. The implementation should
+cancel or ignore that result after decrementing the in-flight counter. It must
+not alter the categorical ancestor's target or committed action.
+
+\begin{algorithmblock}{Algorithm 17: ConsumeResult\((\Tree,r,M_\pi,\kappa_N,\rho_D,\texttt{leaf\_value\_mode})\)}
+
+\Input posterior tree \(\Tree\), GPU result \(r\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\), leaf evaluation mode \(\texttt{leaf\_value\_mode}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Extract from \(r\):
+  \[
+  u,
+  \qquad
+  \Path,
+  \qquad
+  \ell_{\theta^-}(s_u,\cdot),
+  \qquad
+  \alpha_{\theta^-}^V(s_u),
+  \qquad
+  \alpha_{\theta^-}^Q(s_u,\cdot).
+  \]
+
+  \item \If any node on \(\Path\), or \(u\) itself, already has
+  \(\zeta\ne\bot\) \Then this result is below a categorical certificate. Claim
+  or cancel the in-flight record, decrement \(T_{\mathrm{inflight}}(\Tree)\) if
+  needed, and \Return \(\Tree\) without backing up. \EndIf
+
+  \item Acquire ownership of the in-flight node with an atomic transition:
+  \[
+  ok\gets
+  \CAS
+  \left(
+  \sigma^{\mathrm{eval}}_u,
+  \texttt{inflight},
+  \texttt{expanding}
+  \right).
+  \]
+
+  \item \If \(ok=\texttt{false}\) \Then
+  this result is stale, duplicated, or belongs to a node that was cancelled. Do
+  not back it up.
+  \[
+  \Return \Tree.
+  \]
+  \EndIf
+
+  \item Store the network outputs in node \(u\).
+
+  \item Initialize the node's own state-posterior cache to the value prior, but
+  do not make it eligible to overwrite the parent until it has completed child
+  evidence:
+  \[
+  C^V_u\gets\DirObj(\alpha_{\theta^-}^V(s_u)),
+  \qquad
+  \sigma^V_u\gets\texttt{clean},
+  \qquad
+  \nu^V_u\gets\nu^V_u+1.
+  \]
+
+  \item Initialize categorical node and edge fields if they were not already
+  initialized:
+  \[
+  \zeta_u\gets\bot,
+  \qquad
+  \tau_u\gets\infty,
+  \qquad
+  a_u^{\mathrm{cat}}\gets\bot.
+  \]
+
+  \item Publish the completed expansion only after the network outputs and cache
+  fields are installed:
+  \[
+  \sigma^{\mathrm{eval}}_u\gets\texttt{expanded}.
+  \]
+
+  \item Atomically decrement the in-flight counter:
+  \[
+  T_{\mathrm{inflight}}(\Tree)
+  \gets
+  T_{\mathrm{inflight}}(\Tree)-1.
+  \]
+
+  \item Convert the value head into a positive native leaf object using the
+  configured switch:
+  \[
+  Y_\ell
+  \gets
+  \begin{cases}
+  \DirObj(\alpha_{\theta^-}^V(s_u)),
+  & \texttt{leaf\_value\_mode}=\texttt{alpha},\\[4pt]
+  \DirObj\left(\kappa_{\mathrm{leaf}}
+  \mean\left(\alpha_{\theta^-}^V(s_u)\right)\right),
+  & \texttt{leaf\_value\_mode}=\texttt{mean}.
+  \end{cases}
+  \]
+
+  \item Back up the neural leaf native object:
+  \[
+  \Tree
+  \gets
+  \BackupPath(\Tree,\Path,Y_\ell,M_\pi,\kappa_N,\rho_D).
+  \]
+
+  \item Atomically increment
+  \[
+  T_{\mathrm{done}}(\Tree)
+  \gets
+  T_{\mathrm{done}}(\Tree)+1.
+  \]
+
+  \item \Return \(\Tree\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{13. Batched CPU/GPU search driver}
+
+The driver maintains many active posterior trees. This gives game-parallelism.
+Each tree may also have several in-flight leaves. This gives leaf-parallelism
+without adding reservation mass to the posterior.
+
+Let
+
+\[
+\begin{aligned}
+G &= \text{number of active root trees},\\
+L &= \text{maximum in-flight leaves per tree},\\
+F &= \text{GPU inference batch size}.
+\end{aligned}
+\]
+
+and let \(T\) be the target number of simulations issued per root. A tree stops
+issuing new neural requests once either its root becomes categorical or
+
+\[
+T_{\mathrm{done}}(\Tree)+T_{\mathrm{inflight}}(\Tree)\ge T.
+\]
+
+Already issued in-flight requests may be consumed or cancelled. The simplest
+consistent policy is to consume outstanding results while the root remains
+non-categorical, and to ignore/cancel results below a newly categorical root.
+Those stale results must not alter the root's categorical target or action.
+
+The GPU evaluator is the compilation boundary. It receives a preallocated batch
+of observations and returns a preallocated batch of network outputs. CPU workers
+may call \(\NextRequest\) in parallel while other workers consume previous GPU
+results and repair dirty nodes.
+
+\begin{algorithmblock}{Algorithm 18: BuildEvalBatch\((\{\Tree_b\}_{b=1}^{G},F,L,T,M_\pi,\kappa_N,\rho_D)\)}
+
+\Input active trees \(\{\Tree_b\}_{b=1}^{G}\), GPU batch size \(F\), in-flight limit \(L\), simulation budget \(T\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\)
+
+\Output evaluation request batch \(\mathcal{Q}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item Initialize
+  \[
+  \mathcal{Q} \gets ().
+  \]
+
+  \item \While \(|\mathcal{Q}| < F\) and some tree can still issue work \Do
+
+  \begin{enumerate}[leftmargin=2em]
+    \item Choose an active tree \(\Tree_b\). This choice can be round-robin,
+    work-stealing, or priority-based.
+
+    \item Run
+    \[
+    \TryCategorizeNode(\Tree_b,v_{\mathrm{root}},\rho_D).
+    \]
+    \If \(\zeta_{v_{\mathrm{root}}}\ne\bot\) \Then skip this tree. \EndIf
+
+    \item \If
+    \[
+    T_{\mathrm{done}}(\Tree_b)+T_{\mathrm{inflight}}(\Tree_b) \ge T
+    \]
+    \Then skip this tree. \EndIf
+
+    \item \If
+    \[
+    T_{\mathrm{inflight}}(\Tree_b) \ge L
+    \]
+    \Then skip this tree. \EndIf
+
+    \item Optionally run a bounded amount of repair work:
+    \[
+    \RepairDirtyFrontier(\Tree_b,M_\pi,\kappa_N,\rho_D).
+    \]
+    This is opportunistic; failure to repair must not block request generation.
+
+    \item Run
+    \[
+    q
+    \gets
+    \NextRequest(\Tree_b,M_\pi,\kappa_N,\rho_D).
+    \]
+
+    \item \If \(q\) is a GPU evaluation request \Then append \(q\) to
+    \(\mathcal{Q}\). \EndIf
+
+    \item If all trees are either categorical, budget-limited, in-flight-limited,
+    or blocked by in-flight or expanding children, \Break.
+
+  \end{enumerate}
+
+  \item \EndWhile
+
+  \item \Return \(\mathcal{Q}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\begin{algorithmblock}{Algorithm 19: RunPosteriorTreeSearch\((\{s_b\}_{b=1}^{G},\theta^-,T,F,L,M_\pi,\kappa_N,\rho_D,\texttt{leaf\_value\_mode})\)}
+
+\Input root states \(\{s_b\}_{b=1}^{G}\), data-generation network parameters \(\theta^-\), simulation budget \(T\), GPU batch size \(F\), in-flight limit \(L\), posterior-best sample count \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\), leaf evaluation mode \(\texttt{leaf\_value\_mode}\)
+
+\Output completed posterior trees \(\{\Tree_b\}_{b=1}^{G}\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item For each root state \(s_b\), initialize
+  \[
+  \Tree_b
+  \gets
+  \operatorname{InitializePosteriorTree}(s_b,\theta^-,\rho_D).
+  \]
+
+  \item \While some tree satisfies
+  \[
+  \zeta_{v_{\mathrm{root}}}=\bot
+  \quad\text{and}\quad
+  \left(
+  T_{\mathrm{done}}(\Tree_b)<T
+  \quad\text{or}\quad
+  T_{\mathrm{inflight}}(\Tree_b)>0
+  \right)
+  \]
+  \Do
+
+  \begin{enumerate}[leftmargin=2em]
+    \item Build a GPU evaluation batch:
+    \[
+    \mathcal{Q}
+    \gets
+    \BuildEvalBatch
+    \left(
+    \{\Tree_b\}_{b=1}^{G},
+    F,
+    L,
+    T,
+    M_\pi,
+    \kappa_N,
+    \rho_D
+    \right).
+    \]
+
+    \item \If \(\mathcal{Q}\) is nonempty \Then send it to the GPU evaluator:
+    \[
+    \mathcal{R}
+    \gets
+    \GpuEvaluate(\mathcal{Q},\theta^-).
+    \]
+    \Else receive any completed outstanding GPU results. \EndIf
+
+    \item For each available result \(r\in\mathcal{R}\), send it back to its
+    owning CPU tree:
+    \[
+    \Tree_r
+    \gets
+    \ConsumeResult(\Tree_r,r,M_\pi,\kappa_N,\rho_D,\texttt{leaf\_value\_mode}).
+    \]
+
+    \item Opportunistically repair dirty nodes in each active non-categorical
+    tree:
+    \[
+    \RepairDirtyFrontier(\Tree_b,M_\pi,\kappa_N,\rho_D).
+    \]
+  \end{enumerate}
+
+  \item \EndWhile
+
+  \item For each tree, run categorical propagation and a final repair pass before
+  export:
+  \[
+  \Tree_b\gets\PropagateCategorical(\Tree_b,v_{\mathrm{root}},\rho_D),
+  \qquad
+  \Tree_b\gets\RepairDirtyFrontier(\Tree_b,M_\pi,\kappa_N,\rho_D).
+  \]
+
+  \item \Return \(\{\Tree_b\}_{b=1}^{G}\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{14. Posterior-best policy target and categorical NLL}
+
+After search, each legal action at a non-categorical node has a native edge
+object
+
+\[
+Y^{\mathrm{post}}_{v,a}
+=
+\NativeEdgePosterior(\Tree,v,a).
+\]
+
+The search-improved policy target is the posterior probability that each action
+is optimal under utility:
+
+\[
+\pi_{\mathrm{search}}(a\mid s_v)
+=
+\Prob
+\left(
+  a
+  =
+  \argmax_{b\in\Legal(s_v)}
+  X_{v,b}
+\right),
+\]
+
+where
+
+\[
+X_{v,b}=\SampleUtility(Y^{\mathrm{post}}_{v,b}).
+\]
+
+Estimate this distribution with multiple Monte Carlo native Thompson samples.
+For \(m=1,\ldots,M_\pi\), sample
+
+\[
+X_{v,b}^{(m)}
+\gets
+\SampleUtility(Y^{\mathrm{post}}_{v,b}),
+\qquad
+b\in\Legal(s_v),
+\]
+
+then compute the sampled posterior-best action
+
+\[
+\tilde a^{(m)}
+=
+\argmax_{b\in\Legal(s_v)}X_{v,b}^{(m)}.
+\]
+
+The estimator is
+
+\[
+\hat{\pi}_{\mathrm{search}}(a\mid s_v)
+=
+\frac{1}{M_\pi}
+\sum_{m=1}^{M_\pi}
+\one[\tilde a^{(m)}=a].
+\]
+
+If \(v\) itself is categorical, do not use this Monte Carlo target. The policy
+target is deterministic:
+
+\[
+\pi_{\mathrm{cat}}^v(a)=\one[a=a_v^{\mathrm{cat}}].
+\]
+
+The policy-head loss is the negative log-likelihood of the selected target:
+
+\[
+\mathcal{L}_\pi(v)
+=
+-
+\sum_{a\in\Legal(s_v)}
+\stopgrad(\pi_{\mathrm{target}}^v(a))
+\log \pi_\theta(a\mid s_v),
+\]
+
+where \(\pi_{\mathrm{target}}^v=\pi_{\mathrm{cat}}^v\) for categorical nodes and
+\(\pi_{\mathrm{target}}^v=\hat\pi_{\mathrm{search}}^v\) otherwise.
+
+The deterministic posterior-best action for a non-categorical node is
+
+\[
+a^\star
+=
+\argmax_{a\in\Legal(s_v)}
+\hat\pi_{\mathrm{search}}(a\mid s_v).
+\]
+
+\begin{algorithmblock}{Algorithm 20: PosteriorBestPolicyTarget\((\Tree,v,M_\pi)\)}
+
+\Input posterior tree \(\Tree\), node \(v\), number of Monte Carlo samples \(M_\pi\)
+
+\Output policy target \(\pi_{\mathrm{target}}^v\)
+
+\begin{enumerate}[leftmargin=2em]
+  \item \If \(\zeta_v\ne\bot\) \Then \Return
+  \[
+  \pi_{\mathrm{target}}^v(a)=\one[a=a_v^{\mathrm{cat}}].
+  \]
+  \EndIf
+
+  \item Initialize counts:
+  \[
+  C(a)\gets 0
+  \qquad
+  \text{for all } a\in\Legal(s_v).
+  \]
+
+  \item For each legal action \(b\), compute
+  \[
+  Y_b\gets\NativeEdgePosterior(\Tree,v,b).
+  \]
+
+  \item For \(m=1,\ldots,M_\pi\):
+
+  \begin{enumerate}[leftmargin=2em]
+    \item For each legal action \(b\), sample
+    \[
+    X_b^{(m)}\gets\SampleUtility(Y_b).
+    \]
+
+    \item Compute the sampled posterior-best action
+    \[
+    \tilde a^{(m)}
+    \gets
+    \argmax_{b\in\Legal(s_v)}X_b^{(m)}.
+    \]
+
+    \item Increment
+    \[
+    C(\tilde a^{(m)})
+    \gets
+    C(\tilde a^{(m)})+1.
+    \]
+  \end{enumerate}
+
+  \item Return
+  \[
+  \hat{\pi}_{\mathrm{search}}(a\mid s_v)
+  =
+  \frac{C(a)}{M_\pi}.
+  \]
+\end{enumerate}
+
+\end{algorithmblock}
+
+\subsection*{14.1 Dirichlet negative log-likelihood for categorical neural targets}
+
+Let \(\alpha_\theta\) be the current prediction of either the value Dirichlet
+head or the action Dirichlet-Q head. For a categorical WDL target \(z\in\Z\),
+define
+
+\[
+\DirNLL(\alpha_\theta,z;\epscat)
+=
+-\log p_{\Dir(\alpha_\theta)}(\CatPoint(z)).
+\]
+
+Expanding the Dirichlet density gives
+
+\[
+\DirNLL(\alpha_\theta,z;\epscat)
+=
+-\log\Gamma(\alpha_{\theta,0})
++
+\sum_{i\in\Z}\log\Gamma(\alpha_{\theta,i})
+-
+\sum_{i\in\Z}(\alpha_{\theta,i}-1)\log \CatPoint(z)_i,
+\]
+
+where
+
+\[
+\alpha_{\theta,0}=\sum_{i\in\Z}\alpha_{\theta,i}.
+\]
+
+The target point \(\CatPoint(z)\) is fixed and treated as a stop-gradient value.
+The hyperparameter \(\epscat\) replaces an exact one-hot point by a nearby
+interior point of the simplex, avoiding \(\log 0\) and undefined boundary-density
+behavior.
+
+For non-categorical Dirichlet targets, keep the original KL loss:
+
+\[
+\KL
+\left(
+\Dir(\stopgrad(\beta))
+\,\|\,
+\Dir(\alpha_\theta)
+\right).
+\]
+
+Thus the rule is
+
+\[
+\boxed{
+\text{categorical WDL target }z
+\Rightarrow
+\DirNLL(\alpha_\theta,z;\epscat)
+}
+\]
+
+and
+
+\[
+\boxed{
+\text{posterior Dirichlet target }\beta
+\Rightarrow
+\KL(\Dir(\stopgrad(\beta))\|\Dir(\alpha_\theta)).
+}
+\]
+
+There is no target Dirichlet \(\beta\), no posterior Dirichlet, and no Dirichlet
+proxy for a categorical datapoint.
+
+\section*{15. Final action selection}
+
+Search produces a posterior-best policy target or a deterministic categorical
+policy target. Before final action selection, the tree runs categorical
+propagation and final dirty-cache repair so that the root sees the newest clean
+child caches and categorical certificates that are not blocked by in-flight work:
+
+\[
+\Tree\gets\PropagateCategorical(\Tree,v_{\mathrm{root}},\rho_D),
+\qquad
+\Tree\gets\RepairDirtyFrontier(\Tree,M_\pi,\kappa_N,\rho_D).
+\]
+
+If the root is categorical, the committed action is deterministic:
+
+\[
+a_{\mathrm{play}}
+=
+a_{v_{\mathrm{root}}}^{\mathrm{cat}}.
+\]
+
+The root policy target is also deterministic:
+
+\[
+\pi_{\mathrm{target}}(a\mid s_{\mathrm{root}})
+=
+\one[a=a_{v_{\mathrm{root}}}^{\mathrm{cat}}].
+\]
+
+If the root is not categorical, compute the posterior-best policy target over
+native action objects and use one of the supported non-categorical committed
+action modes:
+
+\[
+\texttt{posterior\_sample},
+\qquad
+\texttt{posterior\_argmax}.
+\]
+
+Posterior sampling chooses
+
+\[
+a_{\mathrm{play}}
+\sim
+\Cat
+\left(
+\hat{\pi}_{\mathrm{search}}(\cdot\mid s_{\mathrm{root}})
+\right).
+\]
+
+Posterior argmax chooses
+
+\[
+a_{\mathrm{play}}
+=
+a^\star
+=
+\argmax_a
+\hat\pi_{\mathrm{search}}(a\mid s_{\mathrm{root}}).
+\]
+
+The posterior-best policy target is used for policy training regardless of which
+non-categorical committed-action mode is used.
+
+\begin{algorithmblock}{Algorithm 21: FinishSearch\((\Tree,M_\pi,\kappa_N,\rho_D,\texttt{commit})\)}
+
+\Input completed posterior tree \(\Tree\), posterior-best samples \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\), non-categorical committed-action mode \(\texttt{commit}\)
+
+\Output root native objects, policy target, committed action
+
+\begin{enumerate}[leftmargin=2em]
+  \item Run categorical propagation and final dirty-cache repair:
+  \[
+  \Tree\gets\PropagateCategorical(\Tree,v_{\mathrm{root}},\rho_D),
+  \qquad
+  \Tree\gets\RepairDirtyFrontier(\Tree,M_\pi,\kappa_N,\rho_D).
+  \]
+
+  \item \If \(\zeta_{v_{\mathrm{root}}}\ne\bot\) \Then
+  \[
+  a_{\mathrm{play}}
+  \gets
+  a_{v_{\mathrm{root}}}^{\mathrm{cat}},
+  \qquad
+  \pi_{\mathrm{target}}(a)
+  \gets
+  \one[a=a_{\mathrm{play}}].
+  \]
+  \Return \((\pi_{\mathrm{target}},a_{\mathrm{play}})\). \EndIf
+
+  \item For each legal root action \(a\), compute
+  \[
+  Y_{\mathrm{root}}(a)
+  \gets
+  \NativeEdgePosterior(\Tree,v_{\mathrm{root}},a).
+  \]
+
+  \item Compute the posterior-best policy target:
+  \[
+  \hat{\pi}_{\mathrm{search}}
+  \gets
+  \PosteriorBestPolicyTarget
+  \left(
+  \Tree,
+  v_{\mathrm{root}},
+  M_\pi
+  \right).
+  \]
+
+  \item \If
+  \[
+  \texttt{commit}=\texttt{posterior\_sample},
+  \]
+  sample
+  \[
+  a_{\mathrm{play}}
+  \sim
+  \Cat
+  \left(
+  \hat{\pi}_{\mathrm{search}}
+  \right).
+  \]
+  \EndIf
+
+  \item \If
+  \[
+  \texttt{commit}=\texttt{posterior\_argmax},
+  \]
+  choose
+  \[
+  a_{\mathrm{play}}
+  \gets
+  \argmax_a
+  \hat\pi_{\mathrm{search}}(a\mid s_{\mathrm{root}}).
+  \]
+  \EndIf
+
+  \item \Return
+  \[
+  \left(
+  Y_{\mathrm{root}},
+  \hat{\pi}_{\mathrm{search}},
+  a_{\mathrm{play}}
+  \right).
+  \]
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{16. Estimated-Q improvement view}
+
+The original estimated-Q improvement view applies directly to non-categorical
+root decisions whose candidate actions are evaluated by native posterior
+objects. Let \(A_0\) be a Thompson-proposed unresolved root action from the
+initial native posterior. This means \(A_0\) is sampled from the initial
+posterior-best policy; it is not \(a^\star\). Let \(C\) be a candidate set
+generated by Thompson search such that
+
+\[
+A_0 \in C.
+\]
+
+For a Dirichlet edge, define the posterior mean scalar Q estimate as before:
+
+\[
+\hat{q}_T(a)
+=
+\Utility
+\left(
+\mean
+\left(
+\alpha_{\mathrm{root}}(a)
+\right)
+\right).
+\]
+
+For a categorical edge, define the exact scalar estimate
+
+\[
+\hat q_T(a)=\OutcomeUtility(\zeta_{\mathrm{root},a}).
+\]
+
+For a native mixture, define \(\hat q_T(a)\) as the mixture mean of component
+utilities, recursively. If the committed non-categorical action is
+
+\[
+A_+
+=
+\argmax_{a\in C}
+\hat{q}_T(a),
+\]
+
+then the estimated-Q improvement is pointwise:
+
+\[
+\hat{q}_T(A_+)
+\ge
+\hat{q}_T(A_0).
+\]
+
+Taking expectation over Thompson proposal randomness gives
+
+\[
+\E
+\left[
+\hat{q}_T(A_+)
+\right]
+\ge
+\E_{A_0}
+\left[
+\hat{q}_T(A_0)
+\right].
+\]
+
+This is an estimated-value improvement statement. It becomes a true value
+improvement only to the extent that \(\hat{q}_T\) is an accurate estimate of the
+true action value. If the root is categorical, no estimated-Q improvement claim
+is needed: the committed categorical action follows the exact win/loss/draw rule.
+
+\section*{17. Training targets from the whole posterior tree}
+
+Training should use the whole completed posterior tree, except unusable leaf
+nodes. After search finishes, the implementation first drains or cancels
+in-flight work that can still affect non-categorical roots, runs categorical
+propagation, and runs final dirty-cache repair. Then all eligible nodes are
+flattened into independent rows, shuffled, and sent to the learner. The learner
+does not receive a pointer-based tree. It receives arrays of observations, legal
+masks, posterior or categorical policy targets, native Q targets, native value
+targets, and loss masks.
+
+Before export, run
+
+\[
+\Tree\gets\PropagateCategorical(\Tree,v_{\mathrm{root}},\rho_D),
+\qquad
+\Tree\gets\RepairDirtyFrontier(\Tree,M_\pi,\kappa_N,\rho_D).
+\]
+
+Define the set of exported nodes as
+
+\[
+\Interior(\Tree)
+=
+\left\{
+ v:
+ \sigma^{\mathrm{eval}}_v=\texttt{expanded},
+ \ s_v\text{ is non-terminal},
+ \left(
+ \zeta_v\ne\bot
+ \ \text{or}\
+ \left[\operatorname{has\_child\_evidence}(v)
+ \text{ and }\sigma^V_v=\texttt{clean}\right]
+ \right)
+\right\}.
+\]
+
+This excludes terminal leaves, in-flight leaves, newly expanded neural leaves
+with no completed outgoing edge, dirty internal nodes whose dependencies are not
+yet ready, and padded/unused slots. Categorical non-terminal nodes are included
+because they carry exact value and policy targets. The root is included exactly
+once if it satisfies the condition.
+
+For each exported node \(v\), local action objects are
+
+\[
+Y^{\mathrm{post}}_{v,a}
+=
+\NativeEdgePosterior(\Tree,v,a),
+\qquad
+ a\in\Legal(s_v).
+\]
+
+Because non-categorical exported nodes are clean at export, any edge that should
+have been refreshed from a categorical child or a clean interior child has
+already been refreshed, or the node would not be exported.
+
+\subsection*{17.1 Policy target}
+
+For every exported node, the policy target is
+
+\[
+\pi_{\mathrm{target}}^v
+=
+\begin{cases}
+\pi_{\mathrm{cat}}^v,
+& \zeta_v\ne\bot,\\[3pt]
+\hat\pi_{\mathrm{search}}^v,
+& \zeta_v=\bot,
+\end{cases}
+\]
+
+where
+
+\[
+\pi_{\mathrm{cat}}^v(a)=\one[a=a_v^{\mathrm{cat}}]
+\]
+
+and
+
+\[
+\hat\pi_{\mathrm{search}}^v
+=
+\PosteriorBestPolicyTarget(\Tree,v,M_\pi).
+\]
+
+The policy loss is the NLL of that target distribution:
+
+\[
+\mathcal{L}_\pi(v)
+=
+-
+\sum_{a\in\Legal(s_v)}
+\stopgrad
+\left(
+\pi_{\mathrm{target}}^v(a)
+\right)
+\log
+\pi_\theta(a\mid s_v).
+\]
+
+\subsection*{17.2 Native Q targets}
+
+For every exported node and every legal action, the Q target is the native edge
+object currently used by search:
+
+\[
+Y^{Q,\mathrm{target}}_{v,a}
+=
+\NativeEdgePosterior(\Tree,v,a),
+\qquad
+ a\in\Legal(s_v).
+\]
+
+Thus categorical actions use native categorical targets
+\(\CatObj(\zeta_{v,a},\tau_{v,a})\), completed non-categorical actions use their
+backed-up edge object \(Y^B_{v,a}\), and unvisited unresolved actions use their
+fallback/base prior as a Dirichlet object. Legal actions are not masked out
+merely because they were unvisited. If an unvisited action has small
+posterior-best probability, it receives little Q-loss weight; if it still has
+substantial posterior-best probability, the learner should preserve that
+uncertainty.
+
+Define the loss for a native Q target object recursively. For a categorical
+object,
+
+\[
+\mathcal{L}_Q(v,a;\CatObj(z,\tau))
+=
+\DirNLL(\alpha_\theta^Q(s_v,a),z;\epscat).
+\]
+
+For a Dirichlet object,
+
+\[
+\mathcal{L}_Q(v,a;\DirObj(\beta))
+=
+\KL
+\left(
+\Dir
+\left(
+\stopgrad(\beta)
+\right)
+\,\|\,
+\Dir
+\left(
+\alpha_\theta^Q(s_v,a)
+\right)
+\right).
+\]
+
+For a mixture object,
+
+\[
+\mathcal{L}_Q\left(v,a;\MixObj(\{(\omega_i,Y_i)\})\right)
+=
+\sum_i\omega_i\mathcal{L}_Q(v,a;Y_i).
+\]
+
+Use the policy target itself as the default non-categorical Q-loss weight:
+
+\[
+w_Q(v,a)=\stopgrad\left(\pi_{\mathrm{target}}^v(a)\right).
+\]
+
+For categorical nodes, the implementation may override this with a positive
+categorical-edge weight \(\omega_{\mathrm{cat}}\) for every known categorical
+legal edge if it wants to train all exact edge labels. The default conservative
+choice is to weight Q by \(\pi_{\mathrm{target}}^v\), which trains at least the
+selected categorical action.
+
+The Q loss is
+
+\[
+\mathcal{L}_Q(v)
+=
+\frac{
+\sum_{a\in\Legal(s_v)}
+ w_Q(v,a)
+\mathcal{L}_Q(v,a;Y^{Q,\mathrm{target}}_{v,a})
+}{
+\sum_{a\in\Legal(s_v)}w_Q(v,a)+\varepsilon
+}.
+\]
+
+\subsection*{17.3 Native value targets}
+
+For every exported node, the value target is native:
+
+\[
+Y^{V,\mathrm{target}}_v
+=
+\begin{cases}
+\CatObj(\zeta_v,\tau_v),
+& \zeta_v\ne\bot,\\[3pt]
+C^V_v,
+& \zeta_v=\bot.
+\end{cases}
+\]
+
+If \(Y^{V,\mathrm{target}}_v=\CatObj(z,\tau)\), the value loss is
+
+\[
+\mathcal{L}_V(v)
+=
+\DirNLL(\alpha_\theta^V(s_v),z;\epscat).
+\]
+
+If \(Y^{V,\mathrm{target}}_v=\DirObj(\beta)\), the value loss is the original KL:
+
+\[
+\mathcal{L}_V(v)
+=
+\KL
+\left(
+\Dir
+\left(
+\stopgrad(\beta)
+\right)
+\,\|\,
+\Dir
+\left(
+\alpha_\theta^V(s_v)
+\right)
+\right).
+\]
+
+If the value target is a mixture,
+
+\[
+Y^{V,\mathrm{target}}_v
+=
+\MixObj(\{(\omega_i,Y_i)\}_{i=1}^m),
+\]
+
+then
+
+\[
+\mathcal{L}_V(v)
+=
+\sum_{i=1}^m\omega_i\mathcal{L}_V(v;Y_i),
+\]
+
+with the categorical branch using \(\DirNLL\) and the Dirichlet branch using KL.
+A categorical mixture component is not converted into a Dirichlet distribution.
+
+In the all-Dirichlet case, because \(v\) is clean, the cache equals the old
+search-weighted Dirichlet target
+
+\[
+E^V_v
+=
+\sum_{a\in\Legal(s_v)}
+\hat\pi_{\mathrm{search}}^v(a)
+\alpha^{\mathrm{post}}_{v,a},
+\]
+
+\[
+N^\downarrow_v
+=
+\sum_{a\in\Legal(s_v)}R_{v,a},
+\qquad
+\gamma^V_v
+=
+\frac{N^\downarrow_v}{\kappa_N+N^\downarrow_v},
+\]
+
+and
+
+\[
+C^V_v
+=
+\DirObj\left(
+(1-\gamma^V_v)\alpha_{\theta^-}^V(s_v)
++
+\gamma^V_v E^V_v
+\right).
+\]
+
+\subsection*{17.4 Flattening, shuffling, and batching}
+
+A flattened training row for node \(v\in\Interior(\Tree)\) contains
+
+\[
+\begin{aligned}
+&s_v,
+\qquad
+\Legal(s_v),
+\qquad
+\texttt{is\_categorical}_v,
+\qquad
+\zeta_v,
+\qquad
+ a_v^{\mathrm{cat}},\\
+&\pi_{\mathrm{target}}^v,
+\qquad
+\{\zeta_{v,a}\}_{a\in\Actions},
+\qquad
+\{Y^{Q,\mathrm{target}}_{v,a}\}_{a\in\Actions},\\
+&Y^{V,\mathrm{target}}_v,
+\qquad
+\{w_Q(v,a)\}_{a\in\Actions},
+\qquad
+\texttt{loss\_masks}.
+\end{aligned}
+\]
+
+For JAX, native objects are flattened into tagged arrays:
+
+\begin{enumerate}[leftmargin=2em]
+  \item A categorical target stores a categorical mask and outcome index
+  \(z\). The JAX loss constructs \(\CatPoint(z)\) and evaluates
+  \(\DirNLL\). It does not construct a Dirichlet target.
+
+  \item A Dirichlet target stores positive Dirichlet parameters \(\beta\) and
+  uses KL toward \(\Dir(\beta)\).
+
+  \item A mixture target stores component tags, component weights, categorical
+  outcomes for categorical components, and Dirichlet parameters only for
+  genuinely Dirichlet components.
+\end{enumerate}
+
+The rows from all active trees and self-play positions are concatenated and
+shuffled before being sent to the learner. Padding rows have all loss weights
+and masks set to zero. The loss compares the current neural evaluation of each
+row with the posterior or categorical targets produced by search.
+
+\begin{algorithmblock}{Algorithm 22: MakeTargets\((\Tree,M_\pi,\kappa_N,\rho_D,\texttt{commit})\)}
+
+\Input completed posterior tree \(\Tree\), posterior-best samples \(M_\pi\), state-posterior evaluation-count half-trust \(\kappa_N\), draw-action rule \(\rho_D\), committed-action mode \(\texttt{commit}\)
+
+\Output flattened training rows and root committed action
+
+\begin{enumerate}[leftmargin=2em]
+  \item Run categorical propagation and final dirty-cache repair:
+  \[
+  \Tree\gets\PropagateCategorical(\Tree,v_{\mathrm{root}},\rho_D),
+  \qquad
+  \Tree\gets\RepairDirtyFrontier(\Tree,M_\pi,\kappa_N,\rho_D).
+  \]
+
+  \item Run
+  \[
+  \left(
+  Y_{\mathrm{root}},
+  \pi_{\mathrm{root}},
+  a_{\mathrm{play}}
+  \right)
+  \gets
+  \FinishSearch(\Tree,M_\pi,\kappa_N,\rho_D,\texttt{commit}).
+  \]
+
+  \item Initialize an empty row list \(\mathcal{D}\gets()\).
+
+  \item For each node \(v\in\Interior(\Tree)\):
+
+  \begin{enumerate}[leftmargin=2em]
+    \item Compute the local policy target:
+    \[
+    \pi_{\mathrm{target}}^v
+    \gets
+    \PosteriorBestPolicyTarget(\Tree,v,M_\pi).
+    \]
+
+    \item For each legal action, set
+    \[
+    Y^{Q,\mathrm{target}}_{v,a}
+    \gets
+    \NativeEdgePosterior(\Tree,v,a),
+    \qquad
+    w_Q(v,a)
+    \gets
+    \pi_{\mathrm{target}}^v(a).
+    \]
+
+    \item Set the value target:
+    \[
+    Y^{V,\mathrm{target}}_v
+    \gets
+    \begin{cases}
+    \CatObj(\zeta_v,\tau_v), & \zeta_v\ne\bot,\\
+    C^V_v, & \zeta_v=\bot.
+    \end{cases}
+    \]
+
+    \item Append the flattened native row for \(v\) to \(\mathcal{D}\).
+  \end{enumerate}
+
+  \item Shuffle \(\mathcal{D}\) across all trees and positions before forming GPU
+  learner minibatches.
+
+  \item \Return \((\mathcal{D},a_{\mathrm{play}})\).
+\end{enumerate}
+
+\end{algorithmblock}
+
+\section*{18. Practical implementation notes}
+
+\subsection*{18.1 CPU tree layout}
+
+The CPU tree should be implemented as an arena of nodes and edges. Prefer
+integer indices over pointers:
+
+\[
+\texttt{node\_id},
+\qquad
+\texttt{edge\_id},
+\qquad
+\texttt{child\_id}.
+\]
+
+For small or medium action spaces such as Hex, dense edge arrays are often
+reasonable:
+
+\[
+\texttt{nodes} \times |\Actions| \times 3.
+\]
+
+For large action spaces such as chess-style encodings, sparse edge storage may
+be required.
+
+Each node should store parent information, evaluation status, dirty status,
+version counters, a small repair token, categorical node fields
+\((\zeta_v,\tau_v,a_v^{\mathrm{cat}})\), and a native state-cache tag. Each edge
+should store its child index, native completed edge object, completion bit,
+completed-evaluation count, edge version, categorical edge fields
+\((\zeta_{v,a},\tau_{v,a})\), and the child cache version last absorbed.
+
+In code, a native object can be represented by a compact tag:
+
+\[
+\texttt{DIRICHLET},
+\qquad
+\texttt{CATEGORICAL},
+\qquad
+\texttt{MIXTURE}.
+\]
+
+A Dirichlet payload stores three positive floats. A categorical payload stores
+an outcome index and distance. A mixture payload stores component tags, component
+weights, and component payloads or indices into a small per-node component
+arena. A categorical payload is never stored as Dirichlet parameters.
+
+\subsection*{18.2 Concurrency model}
+
+The recommended implementation is fine-grained and non-blocking:
+
+\begin{enumerate}[leftmargin=2em]
+  \item Use atomic compare-and-swap for node evaluation status:
+  \[
+  \texttt{unexpanded}\rightarrow\texttt{inflight}\rightarrow\texttt{expanding}\rightarrow\texttt{expanded}.
+  \]
+  This prevents duplicate GPU requests for the same non-terminal leaf and prevents
+  selectors from seeing a node as expanded before its outputs are installed.
+
+  \item Use atomic compare-and-swap for first child publication on an edge. If
+  two workers create the same child concurrently, exactly one child is installed
+  and the loser discards its private candidate.
+
+  \item Use an edge-local lock or atomic pointer/snapshot swap for the completed
+  edge snapshot \((Y^B_{v,a},m_{v,a},R_{v,a},\nu^B_{v,a},\zeta_{v,a},\tau_{v,a})\).
+  Edge posterior publication is a full-object replacement, while direct leaf
+  backups atomically increment \(R_{v,a}\) in the same edge update.
+
+  \item Use a node-local repair token for \(C^V_v\). Repair is best-effort: if a
+  worker cannot acquire the token, it returns immediately and some later worker
+  can repair the node.
+
+  \item Use the node epoch \(e_v\) to reject stale repairs. A repair that started
+  before a concurrent edge update, categorical publication, or child-cache
+  version update must not publish a clean cache.
+
+  \item Treat categorical publication as absorbing. Once a node or edge is
+  categorical, later stale GPU results or stale repair attempts below that
+  categorical certificate cannot alter the categorical target.
+\end{enumerate}
+
+This allows high parallelism without making backups commute algebraically. Edge
+updates are small atomic publishes; state posteriors are derived caches;
+categorical certificates are exact absorbing objects; dirty flags and versions
+ensure eventual consistency.
+
+The intended worker behavior is:
+
+\[
+\begin{aligned}
+&\text{many selectors}
++\text{batched GPU evaluator}\\
+&\qquad
++\text{many result consumers}
++\text{opportunistic repair}
++\text{categorical propagation}.
+\end{aligned}
+\]
+
+There is no requirement for a single global tree mutex. A global per-tree mutex
+is acceptable for a first prototype, but it is not required by the algorithm.
+
+\subsection*{18.3 Queueing and tree storage}
+
+Use an in-process arena for active trees because search repeatedly reads and
+writes adjacent node and edge statistics. The inner loop should not depend on an
+external key-value store or service. Work queues, result queues, trajectory
+buffers, and checkpoints can exist around the search system, but they are not
+part of the posterior-tree mathematics and should not be touched on every edge
+selection or backup.
+
+The practical split is:
+
+\[
+\begin{aligned}
+&\text{active mutable tree in process memory},\\
+&\text{serialized training rows and checkpoints outside the search loop}.
+\end{aligned}
+\]
+
+\subsection*{18.4 GPU boundary}
+
+The GPU evaluator should be the compiled part:
+
+\[
+\GpuEvaluate(\mathcal{Q},\theta^-).
+\]
+
+It receives a preallocated batch of observations and legal masks, and returns
+preallocated arrays containing:
+
+\[
+\ell_{\theta^-}(s,\cdot),
+\qquad
+\alpha_{\theta^-}^V(s),
+\qquad
+\alpha_{\theta^-}^Q(s,\cdot).
+\]
+
+The CPU tree should not wait after every single descent. It should fill batches
+using both game-parallelism and leaf-parallelism. If every legal unresolved
+action in a lane is blocked by in-flight or expanding children,
+\(\NextRequest\) returns \(\NoRequest\) and the scheduler tries another lane or
+waits for GPU results. If the root becomes categorical, the scheduler stops
+issuing new requests for that root.
+
+\subsection*{18.5 Dirty repair queues}
+
+A practical implementation should keep a queue or bitset of dirty nodes ordered
+approximately by depth. Exact priority is not required. The useful rule is:
+
+\[
+\text{repair deeper nodes before their parents}.
+\]
+
+A dirty node can be repaired by any worker. If repair fails because a child is
+not clean, the node remains dirty. When the child later publishes a clean cache
+or categorical certificate, the parent will be marked dirty again and retried.
+
+At final export, call \(\RepairDirtyFrontier\) until no more nodes change. If
+in-flight work is still outstanding, either drain those GPU results first or
+exclude dirty/in-flight nodes from export. If a root becomes categorical, stale
+in-flight work below it should be ignored or cancelled and should not alter the
+categorical target.
+
+\subsection*{18.6 Flattened training batch boundary}
+
+The mutable posterior tree is a search-side data structure. It is not sent to the
+training step as a pointer-based tree. Instead, after a search finishes, the CPU
+or host-side search code materializes dense training arrays:
+
+\[
+\begin{aligned}
+&\texttt{obs},
+\quad \texttt{policy\_target},
+\quad \texttt{legal\_mask},\\
+&\texttt{target\_type\_tags},
+\quad \texttt{alpha\_Q\_target},
+\quad \texttt{categorical\_Q\_target},\\
+&\texttt{alpha\_V\_target},
+\quad \texttt{categorical\_V\_target},
+\quad \texttt{component\_weights},
+\quad \texttt{loss\_masks}.
+\end{aligned}
+\]
+
+All clean non-leaf posterior-tree rows and categorical non-terminal rows are
+concatenated, shuffled, trimmed to a multiple of the training batch size, and
+reshaped into minibatches. At that point there is no parent/child structure left
+in the learner input.
+
+For a self-play batch size \(B\), game horizon \(H\), and per-root simulation
+count \(N\), the root-only data volume is
+
+\[
+B\,H.
+\]
+
+If all non-leaf tree nodes are retained, the rough upper bound is
+
+\[
+B\,H\,(N+1),
+\]
+
+because each completed simulation can add at most one new node in addition to
+the root. In practice, excluding leaf nodes, dirty nodes, categorical subtrees
+that stop early, and padding rows reduces this count.
+
+\subsection*{18.7 Tree lifetime and reuse}
+
+In the arena implementation, each posterior tree is temporary. For each
+self-play move, search builds a fresh arena from the current batch of root
+states, runs until the configured simulation budget or a categorical root is
+reached, extracts the flattened posterior rows, commits one action per root, and
+then drops the arena.
+
+Thus the active tree is not reused across self-play moves or training
+iterations. Only the neural network parameters, optimizer state, and checkpointed
+training state persist. A separate implementation may cache serialized nodes or
+root summaries, but that is a search-system optimization, not part of the basic
+training-data contract.
+
+\subsection*{18.8 Recommended initial knobs}
+
+A reasonable initial setting is
+
+\[
+L \in \{4,8\},
+\]
+
+where \(L\) is the number of in-flight leaves allowed per root tree.
+
+For the state-posterior evidence blend, choose \(\kappa_N>0\) on the scale of
+completed downstream evaluations, not on the scale of Dirichlet concentration.
+Larger \(\kappa_N\) means that more completed terminal/neural evaluations are
+needed before a node moves strongly away from its own value prior. Smaller
+\(\kappa_N\) lets completed search work dominate earlier:
+
+\[
+\gamma^V_u=\frac{N^\downarrow_u}{\kappa_N+N^\downarrow_u}.
+\]
+
+For neural leaves, the preferred setting is
+
+\[
+\texttt{leaf\_value\_mode}=\texttt{alpha},
+\]
+
+with \(\texttt{mean}\) retained only as an ablation using fixed concentration
+\(\kappa_{\mathrm{leaf}}\).
+
+For categorical targets, choose
+
+\[
+0<\epscat<\frac12,
+\]
+
+usually small enough that \(\CatPoint(z)\) remains close to one-hot, but not so
+small that \(\log\CatPoint(z)_i\) causes unstable gradients or numerical issues.
+The parameter \(\epscat\) is a loss-side smoothing hyperparameter only. It does
+not appear in the CPU posterior tree.
+
+The draw action rule \(\rho_D\) should be fixed by configuration. Useful initial
+choices are \(\texttt{fastest\_draw}\), \(\texttt{slowest\_draw}\),
+\(\texttt{policy\_prior}\), or \(\texttt{fixed\_order}\). The rule should select
+only from categorical draw actions.
+
+\subsection*{18.9 Completed posteriors only}
+
+Only completed backed-up native edge objects \(Y^B_{v,a}\) and categorical edge
+certificates are used as Q targets. In-flight scheduling state is not Bayesian
+evidence and is not included in \(Y^{\mathrm{post}}_{v,a}\).
+
+Dirty state-posterior caches are also not training targets. A dirty node is
+repaired before export or excluded from the flattened batch. A categorical node
+is not dirty for value-target purposes: it exports its native categorical target
+\((\zeta_v,\tau_v)\).
+
+\subsection*{18.10 No categorical-to-Dirichlet conversion}
+
+The following are disallowed:
+
+\[
+\CatObj(z,\tau)\mapsto \DirObj(\beta_z),
+\qquad
+\CatPoint(z)\mapsto \beta_z,
+\qquad
+\beta_z=\kappa\CatPoint(z).
+\]
+
+A categorical datapoint is native on the CPU and remains categorical at the
+flattened JAX loss boundary. The only operation performed in JAX is evaluating
+the predicted Dirichlet density at the smoothed categorical sample
+\(\CatPoint(z)\):
+
+\[
+\DirNLL(\alpha_\theta,z;\epscat)
+=
+-\log p_{\Dir(\alpha_\theta)}(\CatPoint(z)).
+\]
+
+This is a likelihood of a categorical sample under the predicted Dirichlet
+belief. It is not a KL to a target Dirichlet and not a conversion of the
+categorical sample into Dirichlet parameters.
+
+\subsection*{18.11 Consistency summary}
+
+The full algorithm has the following invariants:
+
+\begin{enumerate}[leftmargin=2em]
+  \item Categorical status is exact, absorbing, and has priority over posterior
+  uncertainty.
+
+  \item A categorical edge is never selected for more tree search. A
+  categorical node emits no GPU requests and no search descends below it.
+
+  \item A node becomes a categorical win as soon as a winning categorical
+  successor is certified. It becomes a categorical loss or draw only when every
+  legal action is categorical and the loss/draw conditions are satisfied.
+
+  \item The action for a categorical win minimizes certified distance to win;
+  the action for a categorical loss maximizes certified distance to loss; the
+  action for a categorical draw is determined by the external rule \(\rho_D\).
+
+  \item Non-categorical nodes may still contain categorical edges. These edges
+  are included in policy targets through exact categorical utilities and in
+  neural losses through native categorical NLL components. They are not searched
+  further.
+
+  \item The lazy posterior cache, dirty/clean/updating status, version counters,
+  child-cache absorbed version, concurrency-safe backup, and final repair before
+  export remain central. Categorical propagation is added to this machinery; it
+  does not replace it.
+
+  \item Non-categorical Dirichlet value and Q targets keep using KL toward
+  posterior Dirichlet targets.
+
+  \item Categorical value and Q targets use the negative log-likelihood of the
+  predicted Dirichlet density at \(\CatPoint(z)\), where \(\epscat\) is a
+  smoothing hyperparameter.
+
+  \item Flattened learner rows use tags and masks to select categorical NLL,
+  Dirichlet KL, or weighted native-mixture losses. No categorical component is
+  represented as a Dirichlet distribution.
+\end{enumerate}
+\end{document}
