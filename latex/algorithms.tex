@@ -2123,9 +2123,7 @@ The supported committed-action modes are:
 \[
 \texttt{posterior\_sample},
 \qquad
-\texttt{posterior\_argmax},
-\qquad
-\texttt{scalar\_q\_argmax}.
+\texttt{posterior\_argmax}.
 \]
 
 Posterior sampling chooses
@@ -2148,22 +2146,6 @@ a^\star
 =
 \argmax_a
 \hat\pi_{\mathrm{search}}(a\mid s).
-\]
-
-Scalar-Q argmax chooses
-
-\[
-a_{\mathrm{play}}
-=
-\argmax_a
-\hat{q}_T(a)
-=
-\argmax_a
-\left(
-\bar\phi_{a,W}-\bar\phi_{a,L}
-\right),
-\qquad
-\bar\phi_a=\mean(\alpha_{\mathrm{root}}(a)).
 \]
 
 The posterior-best policy target is used for policy training regardless of which
@@ -2225,25 +2207,6 @@ committed-action mode is used.
   \gets
   \argmax_a
   \hat\pi_{\mathrm{search}}(a\mid s_{\mathrm{root}}).
-  \]
-  \EndIf
-
-  \item \If
-  \[
-  \texttt{commit}=\texttt{scalar\_q\_argmax},
-  \]
-  choose
-  \[
-  a_{\mathrm{play}}
-  \gets
-  \argmax_a
-  \Utility
-  \left(
-  \mean
-  \left(
-  \alpha_{\mathrm{root}}(a)
-  \right)
-  \right).
   \]
   \EndIf
 
