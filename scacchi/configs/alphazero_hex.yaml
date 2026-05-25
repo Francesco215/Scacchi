@@ -22,8 +22,6 @@ grad_clip_norm: 1.0
 policy_loss_weight: 1.0
 value_dir_kl_weight: 0.0
 q_dir_kl_weight: 0.0
-value_outcome_weight: 0.0
-q_outcome_weight: 0.0
 dirichlet_concentration_clip: 100.0
 log_interval: 1
 eval_interval: 1

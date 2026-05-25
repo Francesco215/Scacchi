@@ -1,6 +1,5 @@
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
-import chex
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -14,13 +13,12 @@ from .dirichlet_tree.native import (
     dirichlet_nll_at_categorical,
     native_fields_from_beta,
 )
-from .network import outcome_mean
 from .play import SelfplayOutput
 
 
 class Sample(NamedTuple):
     obs: jax.Array
-    policy_tgt: chex.Array
+    policy_tgt: jax.Array
     value_tgt: jax.Array
     played_action: jax.Array
     policy_mask: jax.Array
@@ -46,6 +44,17 @@ class Sample(NamedTuple):
         return self.q_loss_weight
 
 
+class _NativeTargetFields(NamedTuple):
+    q_target_kind: jax.Array
+    q_target_weight: jax.Array
+    q_target_outcome: jax.Array
+    q_target_distance: jax.Array
+    v_target_kind: jax.Array
+    v_target_weight: jax.Array
+    v_target_outcome: jax.Array
+    v_target_distance: jax.Array
+
+
 class TrainMetrics(NamedTuple):
     policy_loss: jax.Array
     value_loss: jax.Array
@@ -54,8 +63,6 @@ class TrainMetrics(NamedTuple):
     policy_target_entropy: jax.Array
     value_dir_kl_loss: jax.Array
     q_dir_kl_loss: jax.Array
-    value_outcome_loss: jax.Array
-    q_outcome_loss: jax.Array
     alpha_V_concentration: jax.Array
     alpha_Q_concentration: jax.Array
     q_loss_weight_mean: jax.Array
@@ -97,7 +104,7 @@ def make_compute_loss_input(config):
             jnp.arange(config.max_num_steps),
         )
         value_tgt = value_tgt[::-1, :]
-        policy_tgt = data.action_weights
+        policy_tgt = jnp.asarray(data.action_weights)
         policy_loss_mask = legal_policy_mask & search_loss_mask
         if getattr(config, "policy_target_mode", "search") == "winner_action":
             policy_tgt = jax.nn.one_hot(
@@ -130,7 +137,8 @@ def make_compute_loss_input(config):
             v_target_outcome=data.v_target_outcome,
             v_target_distance=data.v_target_distance,
         )
-        sample = _with_native_defaults(sample)
+        native_fields = _native_target_fields(sample)
+        sample = _with_native_defaults(sample, native_fields)
         if data.tree_data is None:
             return sample
 
@@ -159,41 +167,41 @@ def make_compute_loss_input(config):
         root_q_weight = flatten_root(sample.q_loss_weight)
         tree_q_weight = flatten_root(tree.q_loss_weight)
         tree_q_defaults = _tree_native_defaults(tree.beta_Q_target, tree.beta_V_target)
-        root_q_kind = flatten_root(sample.q_target_kind)
+        root_q_kind = flatten_root(native_fields.q_target_kind)
         tree_q_kind = flatten_root(_tree_field_or_default(tree, tree_q_defaults, "q_target_kind"))
-        root_q_target_weight = flatten_root(sample.q_target_weight)
+        root_q_target_weight = flatten_root(native_fields.q_target_weight)
         tree_q_target_weight = flatten_root(
             _tree_field_or_default(tree, tree_q_defaults, "q_target_weight")
         )
-        root_q_outcome = flatten_root(sample.q_target_outcome)
+        root_q_outcome = flatten_root(native_fields.q_target_outcome)
         tree_q_outcome = flatten_root(
             _tree_field_or_default(tree, tree_q_defaults, "q_target_outcome")
         )
-        root_q_distance = flatten_root(sample.q_target_distance)
+        root_q_distance = flatten_root(native_fields.q_target_distance)
         tree_q_distance = flatten_root(
             _tree_field_or_default(tree, tree_q_defaults, "q_target_distance")
         )
-        root_v_kind = flatten_root(sample.v_target_kind)
+        root_v_kind = flatten_root(native_fields.v_target_kind)
         tree_v_kind = flatten_root(_tree_field_or_default(tree, tree_q_defaults, "v_target_kind"))
-        root_v_target_weight = flatten_root(sample.v_target_weight)
+        root_v_target_weight = flatten_root(native_fields.v_target_weight)
         tree_v_target_weight = flatten_root(
             _tree_field_or_default(tree, tree_q_defaults, "v_target_weight")
         )
-        root_v_outcome = flatten_root(sample.v_target_outcome)
+        root_v_outcome = flatten_root(native_fields.v_target_outcome)
         tree_v_outcome = flatten_root(
             _tree_field_or_default(tree, tree_q_defaults, "v_target_outcome")
         )
-        root_v_distance = flatten_root(sample.v_target_distance)
+        root_v_distance = flatten_root(native_fields.v_target_distance)
         tree_v_distance = flatten_root(
             _tree_field_or_default(tree, tree_q_defaults, "v_target_distance")
         )
-        root_policy_loss_mask = flatten_root(sample.policy_loss_mask)
+        root_policy_loss_mask = flatten_root(policy_loss_mask)
         tree_policy_loss_mask = flatten_root(tree.policy_loss_mask)
-        root_value_loss_mask = flatten_root(sample.value_loss_mask)
+        root_value_loss_mask = flatten_root(search_loss_mask)
         tree_value_loss_mask = flatten_root(tree.value_loss_mask)
-        root_search_loss_mask = flatten_root(sample.search_loss_mask)
+        root_search_loss_mask = flatten_root(search_loss_mask)
         tree_search_loss_mask = flatten_root(tree.search_loss_mask)
-        root_outcome_mask = flatten_root(sample.outcome_mask)
+        root_outcome_mask = flatten_root(value_mask)
         tree_outcome_mask = flatten_root(tree.outcome_mask)
 
         return Sample(
@@ -250,9 +258,9 @@ def _mask_or(mask: jax.Array | None, fallback: jax.Array) -> jax.Array:
     return fallback if mask is None else mask
 
 
-def _with_native_defaults(sample: Sample) -> Sample:
+def _native_target_fields(sample: Sample) -> _NativeTargetFields:
     defaults = native_fields_from_beta(sample.beta_Q_target, sample.beta_V_target)
-    return sample._replace(
+    return _NativeTargetFields(
         q_target_kind=(
             defaults["q_target_kind"] if sample.q_target_kind is None else sample.q_target_kind
         ),
@@ -292,6 +300,24 @@ def _with_native_defaults(sample: Sample) -> Sample:
     )
 
 
+def _with_native_defaults(
+    sample: Sample,
+    native_fields: _NativeTargetFields | None = None,
+) -> Sample:
+    if native_fields is None:
+        native_fields = _native_target_fields(sample)
+    return sample._replace(
+        q_target_kind=native_fields.q_target_kind,
+        q_target_weight=native_fields.q_target_weight,
+        q_target_outcome=native_fields.q_target_outcome,
+        q_target_distance=native_fields.q_target_distance,
+        v_target_kind=native_fields.v_target_kind,
+        v_target_weight=native_fields.v_target_weight,
+        v_target_outcome=native_fields.v_target_outcome,
+        v_target_distance=native_fields.v_target_distance,
+    )
+
+
 def _tree_native_defaults(beta_q: jax.Array, beta_v: jax.Array) -> dict[str, jax.Array]:
     return native_fields_from_beta(beta_q, beta_v)
 
@@ -309,22 +335,6 @@ def _compute_losses(logits: jax.Array, value: jax.Array, data: Sample) -> tuple[
     value_loss = optax.l2_loss(value, data.value_tgt)
     value_loss = _masked_mean(value_loss, value_loss_mask)
     return policy_loss, value_loss
-
-
-def _outcome_target(value_tgt: jax.Array, num_outcomes: int) -> jax.Array:
-    rounded = jnp.round(value_tgt).astype(jnp.int32)
-    if num_outcomes == 2:
-        outcome_idx = (rounded + 1) // 2
-    elif num_outcomes == 3:
-        outcome_idx = rounded + 1
-    else:
-        raise ValueError(f"unsupported outcome count: {num_outcomes}")
-    return jax.nn.one_hot(outcome_idx, num_outcomes)
-
-
-def _categorical_ce_from_probs(probs: jax.Array, target: jax.Array) -> jax.Array:
-    log_probs = jnp.log(jnp.clip(probs, jnp.finfo(probs.dtype).tiny, 1.0))
-    return -jnp.sum(target * log_probs, axis=-1)
 
 
 def _categorical_entropy_from_probs(probs: jax.Array, mask: jax.Array) -> jax.Array:
@@ -376,14 +386,6 @@ def _native_dirichlet_loss(
     return target_weight * loss
 
 
-def _gather_played_action(alpha_q: jax.Array, played_action: jax.Array) -> jax.Array:
-    gather_ix = jnp.broadcast_to(
-        played_action[..., None, None],
-        (*played_action.shape, 1, alpha_q.shape[-1]),
-    )
-    return jnp.take_along_axis(alpha_q, gather_ix, axis=-2).squeeze(axis=-2)
-
-
 def _compute_dirichlet_losses(
     logits: jax.Array,
     alpha_v: jax.Array,
@@ -391,11 +393,11 @@ def _compute_dirichlet_losses(
     data: Sample,
     config,
 ) -> tuple[jax.Array, TrainMetrics]:
-    data = _with_native_defaults(data)
+    native_fields = _native_target_fields(data)
+    data = _with_native_defaults(data, native_fields)
     policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
     value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
     search_loss_mask = _mask_or(data.search_loss_mask, policy_loss_mask)
-    outcome_mask = _mask_or(data.outcome_mask, data.value_mask)
     policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt, where=data.policy_mask)
     policy_loss = _masked_mean(policy_loss, policy_loss_mask)
     policy_target_entropy = _categorical_entropy_from_probs(data.policy_tgt, data.policy_mask)
@@ -406,9 +408,9 @@ def _compute_dirichlet_losses(
     value_dir_kl = _native_dirichlet_loss(
         data.beta_V_target,
         alpha_v,
-        data.v_target_kind,
-        data.v_target_outcome,
-        data.v_target_weight,
+        native_fields.v_target_kind,
+        native_fields.v_target_outcome,
+        native_fields.v_target_weight,
         categorical_epsilon,
     )
     value_dir_kl_loss = _masked_mean(value_dir_kl, value_loss_mask)
@@ -416,9 +418,9 @@ def _compute_dirichlet_losses(
     q_dir_kl = _native_dirichlet_loss(
         data.beta_Q_target,
         alpha_q,
-        data.q_target_kind,
-        data.q_target_outcome,
-        data.q_target_weight,
+        native_fields.q_target_kind,
+        native_fields.q_target_outcome,
+        native_fields.q_target_weight,
         categorical_epsilon,
     )
     q_weights = jnp.where(
@@ -428,14 +430,6 @@ def _compute_dirichlet_losses(
     )
     q_eps = jnp.asarray(jnp.finfo(q_dir_kl.dtype).eps, dtype=q_dir_kl.dtype)
     q_dir_kl_loss = jnp.sum(q_weights * q_dir_kl) / jnp.maximum(jnp.sum(q_weights), q_eps)
-
-    outcome_tgt = _outcome_target(data.value_tgt, alpha_v.shape[-1])
-    value_outcome_loss = _categorical_ce_from_probs(outcome_mean(alpha_v), outcome_tgt)
-    value_outcome_loss = _masked_mean(value_outcome_loss, outcome_mask)
-
-    played_alpha_q = _gather_played_action(alpha_q, data.played_action)
-    q_outcome_loss = _categorical_ce_from_probs(outcome_mean(played_alpha_q), outcome_tgt)
-    q_outcome_loss = _masked_mean(q_outcome_loss, outcome_mask)
 
     alpha_v_concentration = _masked_mean(jnp.sum(alpha_v, axis=-1), value_loss_mask)
     alpha_q_concentration = _masked_mean(
@@ -448,8 +442,6 @@ def _compute_dirichlet_losses(
         config.policy_loss_weight * policy_loss
         + config.value_dir_kl_weight * value_dir_kl_loss
         + config.q_dir_kl_weight * q_dir_kl_loss
-        + config.value_outcome_weight * value_outcome_loss
-        + config.q_outcome_weight * q_outcome_loss
     )
     metrics = TrainMetrics(
         policy_loss=policy_loss,
@@ -459,8 +451,6 @@ def _compute_dirichlet_losses(
         policy_target_entropy=policy_target_entropy,
         value_dir_kl_loss=value_dir_kl_loss,
         q_dir_kl_loss=q_dir_kl_loss,
-        value_outcome_loss=value_outcome_loss,
-        q_outcome_loss=q_outcome_loss,
         alpha_V_concentration=alpha_v_concentration,
         alpha_Q_concentration=alpha_q_concentration,
         q_loss_weight_mean=q_loss_weight_mean,
@@ -478,8 +468,8 @@ def _compute_dirichlet_losses(
     return total_loss, metrics
 
 
-def train(model: nnx.Module, optimizer: nnx.Optimizer, data: Sample, config):
-    def loss_fn(model: nnx.Module):
+def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
+    def loss_fn(model: Any):
         output = model(data.obs, train=True)
         if len(output) == 2:
             logits, value = output
@@ -492,8 +482,6 @@ def train(model: nnx.Module, optimizer: nnx.Optimizer, data: Sample, config):
                 policy_target_entropy=jnp.zeros_like(policy_loss),
                 value_dir_kl_loss=jnp.zeros_like(value_loss),
                 q_dir_kl_loss=jnp.zeros_like(value_loss),
-                value_outcome_loss=jnp.zeros_like(value_loss),
-                q_outcome_loss=jnp.zeros_like(value_loss),
                 alpha_V_concentration=jnp.zeros_like(value_loss),
                 alpha_Q_concentration=jnp.zeros_like(value_loss),
                 q_loss_weight_mean=jnp.zeros_like(value_loss),

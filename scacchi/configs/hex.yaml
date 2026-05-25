@@ -71,8 +71,6 @@ training:
     policy_weight: 0.05  # Keep noisy early policy targets auxiliary during bootstrap.
     value_dir_kl_weight: 5.0  # Keep the WDL state posterior as a primary signal.
     q_dir_kl_weight: 5.0  # Keep action-Q posteriors as a primary signal.
-    value_outcome_weight: 25.0  # Strongly anchor value WDL means to realized outcomes.
-    q_outcome_weight: 10.0  # Strongly anchor played-action Q WDL means to realized outcomes.
     policy_target_mode: search  # Use the search-improved policy target.
 
   regularization:
@@ -85,7 +83,7 @@ eval:
 logging:
   interval: 1  # Log training metrics every N iterations.
   wandb:
-    enabled: false  # Keep local verification runs self-contained.
+    enabled: true  # Keep local verification runs self-contained.
     project: scacchi-az  # Weights & Biases project name.
 
 checkpointing:

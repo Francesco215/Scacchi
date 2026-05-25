@@ -110,8 +110,6 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("training", "losses", "policy_weight"), "policy_loss_weight"),
     (("training", "losses", "value_dir_kl_weight"), "value_dir_kl_weight"),
     (("training", "losses", "q_dir_kl_weight"), "q_dir_kl_weight"),
-    (("training", "losses", "value_outcome_weight"), "value_outcome_weight"),
-    (("training", "losses", "q_outcome_weight"), "q_outcome_weight"),
     (("training", "losses", "policy_target_mode"), "policy_target_mode"),
     (
         ("training", "regularization", "dirichlet_concentration_clip"),
@@ -265,8 +263,6 @@ class Config(BaseModel):
     policy_loss_weight: float = 1.0
     value_dir_kl_weight: float = 1.0
     q_dir_kl_weight: float = 1.0
-    value_outcome_weight: float = 0.0
-    q_outcome_weight: float = 0.0
     policy_target_mode: str = "search"
     dirichlet_concentration_clip: float | None = 8.0
     log_interval: int = 1
@@ -300,8 +296,6 @@ class Config(BaseModel):
         dirichlet_loss_weights = (
             "value_dir_kl_weight",
             "q_dir_kl_weight",
-            "value_outcome_weight",
-            "q_outcome_weight",
         )
         active_weights = [
             f"{name}={getattr(self, name)}"
@@ -490,8 +484,6 @@ def main(cfg: DictConfig) -> None:
                         "train/policy_target_entropy": train_metrics.policy_target_entropy.mean().item(),
                         "train/value_dir_kl_loss": train_metrics.value_dir_kl_loss.mean().item(),
                         "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
-                        "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
-                        "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
                         "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
                         "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
                         "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),

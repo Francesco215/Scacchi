@@ -53,8 +53,7 @@ def _active_sample_rows(samples: Sample) -> jax.Array:
     value_mask = (
         samples.value_mask if samples.value_loss_mask is None else samples.value_loss_mask
     )
-    outcome_mask = samples.value_mask if samples.outcome_mask is None else samples.outcome_mask
-    return policy_mask | value_mask | outcome_mask
+    return policy_mask | value_mask
 
 
 def _concat_selfplay_outputs(outputs: list[SelfplayOutput]) -> SelfplayOutput:

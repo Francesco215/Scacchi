@@ -26,16 +26,12 @@ baseline, not a source of train parameters or policy distillation.
   - `policy_weight=0.1`
   - `value_dir_kl_weight=1.0`
   - `q_dir_kl_weight=1.0`
-  - `value_outcome_weight=5.0`
-  - `q_outcome_weight=2.0`
   - 512-game evals: step 10 `-0.92578125`, step 30 `-0.84375`, step 40
     `-0.82421875`.
-- Updated config after reviewing the loss ratios:
+- Updated config after removing realized-outcome auxiliary losses:
   - `policy_weight=0.05`
   - `value_dir_kl_weight=5.0`
   - `q_dir_kl_weight=5.0`
-  - `value_outcome_weight=25.0`
-  - `q_outcome_weight=10.0`
 - Increasing `policy_weight` to `0.1` regressed, so the policy target remains
   auxiliary.
 - The strongest current direction was increasing the fresh self-play batch and

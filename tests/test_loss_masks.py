@@ -11,7 +11,6 @@ from scacchi.loss import (
     _compute_dirichlet_losses,
     _compute_losses,
     _dirichlet_kl,
-    _outcome_target,
     make_compute_loss_input,
 )
 from scacchi.pipeline import _fixed_replay_window, make_minibatches
@@ -247,48 +246,6 @@ def test_value_mask_excludes_policy_and_value_losses_from_average():
     assert jnp.allclose(value_loss, 0.0)
 
 
-def test_dirichlet_outcome_losses_use_played_action():
-    data = Sample(
-        obs=jnp.zeros((1, 1)),
-        policy_tgt=jnp.array([[1.0, 0.0]]),
-        value_tgt=jnp.array([1.0]),
-        played_action=jnp.array([1]),
-        policy_mask=jnp.array([[True, True]]),
-        value_mask=jnp.array([True]),
-        **_sample_posterior_fields(1),
-    )
-    logits = jnp.array([[0.0, 0.0]])
-    alpha_v = jnp.array([[1.0, 3.0]])
-    alpha_q = jnp.array([[[100.0, 1.0], [1.0, 4.0]]])
-    config = SimpleNamespace(
-        policy_loss_weight=1.0,
-        value_dir_kl_weight=0.0,
-        q_dir_kl_weight=0.0,
-        value_outcome_weight=1.0,
-        q_outcome_weight=0.25,
-    )
-
-    _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
-
-    assert jnp.allclose(metrics.value_outcome_loss, -jnp.log(0.75))
-    assert jnp.allclose(metrics.q_outcome_loss, -jnp.log(0.8))
-
-
-def test_wdl3_outcome_target_maps_loss_draw_win_to_three_slots():
-    target = _outcome_target(jnp.array([-1.0, 0.0, 1.0]), 3)
-
-    assert jnp.array_equal(
-        target,
-        jnp.array(
-            [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ]
-        ),
-    )
-
-
 def test_dirichlet_kl_is_zero_for_identical_parameters_and_positive_otherwise():
     beta = jnp.array([[2.0, 3.0]])
 
@@ -339,8 +296,6 @@ def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
         policy_loss_weight=0.0,
         value_dir_kl_weight=1.0,
         q_dir_kl_weight=1.0,
-        value_outcome_weight=0.0,
-        q_outcome_weight=0.0,
     )
 
     _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
@@ -370,8 +325,6 @@ def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():
         policy_loss_weight=1.0,
         value_dir_kl_weight=0.0,
         q_dir_kl_weight=0.0,
-        value_outcome_weight=0.0,
-        q_outcome_weight=0.0,
     )
 
     _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
@@ -411,8 +364,6 @@ def test_native_categorical_targets_use_dirichlet_density_nll():
         policy_loss_weight=0.0,
         value_dir_kl_weight=1.0,
         q_dir_kl_weight=1.0,
-        value_outcome_weight=0.0,
-        q_outcome_weight=0.0,
         categorical_epsilon=1e-4,
     )
 

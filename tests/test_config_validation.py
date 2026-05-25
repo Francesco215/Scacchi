@@ -44,13 +44,11 @@ def test_nested_hex_config_loads_into_runtime_config():
     assert config.policy_loss_weight == 0.05
     assert config.value_dir_kl_weight == 5.0
     assert config.q_dir_kl_weight == 5.0
-    assert config.value_outcome_weight == 25.0
-    assert config.q_outcome_weight == 10.0
     assert config.policy_target_mode == "search"
     assert config.dirichlet_concentration_clip == 8.0
-    assert config.eval_interval == 5
+    assert config.eval_interval == 1
     assert config.eval_batch_size == 512
-    assert config.wandb_enabled is False
+    assert config.wandb_enabled is True
     assert config.ckpt_max_to_keep == 0
 
 
@@ -82,8 +80,6 @@ def test_scalar_network_rejects_dirichlet_loss_weights():
             network="boardlaw",
             value_dir_kl_weight=1.0,
             q_dir_kl_weight=0.0,
-            value_outcome_weight=0.0,
-            q_outcome_weight=0.0,
         )
 
 
@@ -92,8 +88,6 @@ def test_scalar_network_allows_zero_dirichlet_loss_weights():
         network="boardlaw",
         value_dir_kl_weight=0.0,
         q_dir_kl_weight=0.0,
-        value_outcome_weight=0.0,
-        q_outcome_weight=0.0,
     )
 
     assert config.network == "boardlaw"
@@ -166,8 +160,6 @@ def test_posterior_tree_search_requires_dirichlet_network_and_wdl3():
             search_policy="posterior_tree",
             value_dir_kl_weight=0.0,
             q_dir_kl_weight=0.0,
-            value_outcome_weight=0.0,
-            q_outcome_weight=0.0,
         )
     with pytest.raises(ValidationError, match="WDL3"):
         Config(
