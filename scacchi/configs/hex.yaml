@@ -85,7 +85,7 @@ eval:
 logging:
   interval: 1  # Log training metrics every N iterations.
   wandb:
-    enabled: true  # Keep local verification runs self-contained.
+    enabled: false  # Keep local verification runs self-contained.
     project: scacchi-az  # Weights & Biases project name.
 
 checkpointing:
