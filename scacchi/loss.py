@@ -82,10 +82,19 @@ def make_compute_loss_input(config):
             jnp.arange(config.max_num_steps),
         )
         value_tgt = value_tgt[::-1, :]
+        policy_tgt = data.action_weights
+        policy_loss_mask = legal_policy_mask & search_loss_mask
+        if getattr(config, "policy_target_mode", "search") == "winner_action":
+            policy_tgt = jax.nn.one_hot(
+                data.played_action,
+                data.action_weights.shape[-1],
+                dtype=data.action_weights.dtype,
+            )
+            policy_loss_mask = legal_policy_mask & value_mask & (value_tgt > 0)
 
         sample = Sample(
             obs=data.obs,
-            policy_tgt=data.action_weights,
+            policy_tgt=policy_tgt,
             value_tgt=value_tgt,
             played_action=data.played_action,
             policy_mask=data.legal_action_mask,
@@ -93,7 +102,7 @@ def make_compute_loss_input(config):
             beta_Q_target=data.beta_Q_target,
             beta_V_target=data.beta_V_target,
             q_loss_weight=data.q_loss_weight,
-            policy_loss_mask=legal_policy_mask & search_loss_mask,
+            policy_loss_mask=policy_loss_mask,
             value_loss_mask=search_loss_mask,
             search_loss_mask=search_loss_mask,
             outcome_mask=value_mask,

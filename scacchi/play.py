@@ -493,31 +493,35 @@ def make_selfplay(env, config):
                         action_value_prior,
                     )
                     action_alpha_post = action_value_target_prior + q_evidence_sum
-                policy_target = posterior_best_policy_target(
+                posterior_policy_target = posterior_best_policy_target(
                     posterior_key,
                     action_alpha_post,
                     legal_action_mask,
                     config.policy_mc_samples,
                 )
+                if config.search_policy == "gumbel":
+                    policy_target = policy_output.action_weights
+                else:
+                    policy_target = posterior_policy_target
                 beta_Q_target, beta_V_target = (
                     posterior_targets(
                         alpha_v,
                         action_value_target_prior,
                         q_evidence_sum,
-                        policy_target,
+                        posterior_policy_target,
                     )
                 )
-                q_loss_weight = policy_target
+                q_loss_weight = posterior_policy_target
                 if config.selfplay_action_source in ("posterior_best", "posterior_argmax"):
                     posterior_action = posterior_best_action(
-                        policy_target,
+                        posterior_policy_target,
                         legal_action_mask,
                     )
                     played_action = posterior_action
                 elif config.selfplay_action_source == "posterior_sample":
                     posterior_action = posterior_sample_action(
                         action_key,
-                        policy_target,
+                        posterior_policy_target,
                         legal_action_mask,
                     )
                     played_action = posterior_action

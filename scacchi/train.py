@@ -34,7 +34,7 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 from tqdm import tqdm
 
-from .checkpoint import build_checkpoint_manager, maybe_save, restore, from_pretrained
+from .checkpoint import build_checkpoint_manager, from_pretrained, maybe_save, restore
 from .envs import make_env
 from .evaluations import make_mcts_evaluate
 from .logger import build_logger, returns_metrics
@@ -112,6 +112,7 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("training", "losses", "q_dir_kl_weight"), "q_dir_kl_weight"),
     (("training", "losses", "value_outcome_weight"), "value_outcome_weight"),
     (("training", "losses", "q_outcome_weight"), "q_outcome_weight"),
+    (("training", "losses", "policy_target_mode"), "policy_target_mode"),
     (
         ("training", "regularization", "dirichlet_concentration_clip"),
         "dirichlet_concentration_clip",
@@ -264,6 +265,7 @@ class Config(BaseModel):
     q_dir_kl_weight: float = 1.0
     value_outcome_weight: float = 0.0
     q_outcome_weight: float = 0.0
+    policy_target_mode: str = "search"
     dirichlet_concentration_clip: float | None = 8.0
     log_interval: int = 1
     # eval params
@@ -346,6 +348,8 @@ class Config(BaseModel):
             )
         if self.leaf_value_mode not in {"alpha", "mean"}:
             raise ValueError("leaf_value_mode must be 'alpha' or 'mean'.")
+        if self.policy_target_mode not in {"search", "winner_action"}:
+            raise ValueError("policy_target_mode must be 'search' or 'winner_action'.")
         if self.wavefront_backend != "arena":
             raise ValueError("wavefront_backend currently supports only 'arena'.")
         if self.train_tree_nodes and self.search_policy != "posterior_tree_wavefront":
@@ -388,7 +392,7 @@ def main(cfg: DictConfig) -> None:
     env = make_env(config.env_id, config.board_size)
     checkpoint_path = f"checkpoints/{config.board_size}_solved"
     baseline_model = from_pretrained(checkpoint_path, env, rngs=nnx.Rngs(0))
-    
+
     model = build_model(
         config,
         num_actions=env.num_actions,

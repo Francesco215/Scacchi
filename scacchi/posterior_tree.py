@@ -12,7 +12,7 @@ from .dirichlet_tree.types import TreeTrainingData
 
 
 NO_CHILD = -1
-POSTERIOR_TREE_POLICIES = {"posterior_tree", "posterior_tree_wavefront", "dirichlet_thompson"}
+POSTERIOR_TREE_POLICIES = {"posterior_tree", "posterior_tree_wavefront"}
 
 
 class EvalRequest(NamedTuple):

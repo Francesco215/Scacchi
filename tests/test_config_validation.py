@@ -4,6 +4,7 @@ import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
 
+from scacchi.posterior_tree import is_posterior_tree_policy
 from scacchi.train import Config, normalize_config_dict
 
 
@@ -15,13 +16,15 @@ def test_nested_hex_config_loads_into_runtime_config():
     config = Config(**normalize_config_dict(container))
 
     assert config.env_id == "hex"
-    assert config.board_size == 4
+    assert config.board_size == 5
     assert config.network == "boardlaw_dirichlet"
-    assert config.max_num_iters == 30
-    assert config.num_channels == 64
-    assert config.selfplay_batch_size == 32
-    assert config.search_policy == "posterior_tree_wavefront"
-    assert config.num_simulations == 1
+    assert config.max_num_iters == 80
+    assert config.num_channels == 512
+    assert config.selfplay_batch_size == 4096
+    assert config.max_num_steps == 25
+    assert config.selfplay_action_source == "posterior_argmax"
+    assert config.search_policy == "gumbel"
+    assert config.num_simulations == 32
     assert config.search_eval_batch_size == 1024
     assert config.wavefront_num_lanes_per_root == 1
     assert config.wavefront_final_action_mode == "posterior_sample"
@@ -32,12 +35,21 @@ def test_nested_hex_config_loads_into_runtime_config():
     assert config.state_posterior_kappa_n == 16.0
     assert config.train_tree_nodes is False
     assert config.train_tree_include_root is False
-    assert config.exact_hex_solver_enabled is True
-    assert config.exact_hex_solver_extra_batch_size == 128
-    assert config.training_batch_size == 256
-    assert config.replay_buffer_size == 4
-    assert config.eval_interval == 1
-    assert config.eval_batch_size == 128
+    assert config.exact_hex_solver_enabled is False
+    assert config.exact_hex_solver_extra_batch_size == 0
+    assert config.training_batch_size == 1024
+    assert config.replay_buffer_size == 1
+    assert config.learning_rate == 1e-3
+    assert config.grad_clip_norm == 1.0
+    assert config.policy_loss_weight == 0.05
+    assert config.value_dir_kl_weight == 5.0
+    assert config.q_dir_kl_weight == 5.0
+    assert config.value_outcome_weight == 25.0
+    assert config.q_outcome_weight == 10.0
+    assert config.policy_target_mode == "search"
+    assert config.dirichlet_concentration_clip == 8.0
+    assert config.eval_interval == 5
+    assert config.eval_batch_size == 512
     assert config.wandb_enabled is False
     assert config.ckpt_max_to_keep == 0
 
@@ -134,6 +146,17 @@ def test_selfplay_action_source_must_be_known():
 def test_search_policy_must_be_known():
     with pytest.raises(ValidationError, match="search_policy"):
         Config(network="boardlaw_dirichlet", search_policy="unknown")
+
+
+def test_dirichlet_thompson_uses_jitted_dirichlet_q_path():
+    assert not is_posterior_tree_policy("dirichlet_thompson")
+    assert is_posterior_tree_policy("posterior_tree")
+    assert is_posterior_tree_policy("posterior_tree_wavefront")
+
+
+def test_policy_target_mode_must_be_known():
+    with pytest.raises(ValidationError, match="policy_target_mode"):
+        Config(network="boardlaw_dirichlet", policy_target_mode="unknown")
 
 
 def test_posterior_tree_search_requires_dirichlet_network_and_wdl3():
