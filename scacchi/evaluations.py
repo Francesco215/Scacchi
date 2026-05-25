@@ -16,6 +16,7 @@ from .dirichlet_q_search import (
     posterior_best_action,
     posterior_best_policy_target,
 )
+from .exact_hex import exact_hex_actions
 from .network import policy_value_from_output
 from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
 from .posterior_tree import (
@@ -135,6 +136,13 @@ def make_mcts_evaluate(env, config, baseline_model):
             ).action
 
         def model_actions(model: nnx.Module, rng_key: jax.Array, env_state):
+            if getattr(search_config, "exact_hex_solver_enabled", False):
+                return exact_hex_actions(
+                    env_state.observation,
+                    env_state.legal_action_mask,
+                    search_config,
+                    rng_key,
+                )
             sample_output = evaluate_leaves(
                 model,
                 env_state.observation[:1],

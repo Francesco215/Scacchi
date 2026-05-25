@@ -84,7 +84,7 @@ def _config(**overrides):
         kappa_terminal=8.0,
         state_posterior_kappa_n=1.0,
         policy_mc_samples=8,
-        wavefront_final_action_mode="argmax_q_mean",
+        wavefront_final_action_mode="posterior_argmax",
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -117,6 +117,35 @@ def test_wavefront_steps_multiple_roots_in_one_batched_call_and_finishes_targets
     assert np.allclose(np.asarray(output.action_weights.sum(axis=-1)), 1.0)
     assert np.allclose(np.asarray(output.action_weights[:, 1]), 0.0)
     assert np.allclose(np.asarray(output.q_loss_weight.sum(axis=-1)), 1.0)
+
+
+def test_wavefront_search_result_includes_stability_diagnostics():
+    env = CountingToyEnv()
+
+    def leaf_evaluator(obs):
+        batch = obs.shape[0]
+        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
+        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
+        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
+        return logits, alpha_v, alpha_q
+
+    output = run_wavefront_posterior_tree_search_state_batch(
+        env=env,
+        root_state_batch=_stack_states([_state(0.0), _state(10.0)]),
+        leaf_evaluator=leaf_evaluator,
+        rng_key=jax.random.PRNGKey(13),
+        config=_config(num_simulations=2, wavefront_pad_eval_batches=False),
+    )
+
+    diagnostics = output.diagnostics
+    assert diagnostics is not None
+    assert diagnostics.path_depth_mean.shape == (2,)
+    assert np.all(np.asarray(diagnostics.path_depth_mean) >= 1.0)
+    assert np.all(np.asarray(diagnostics.path_depth_max) >= 1.0)
+    assert np.all(np.asarray(diagnostics.expanded_nodes) >= 1.0)
+    assert np.all(np.asarray(diagnostics.root_downstream_eval_count) >= 1.0)
+    assert np.all(np.asarray(diagnostics.root_gamma) > 0.0)
+    assert np.all(np.asarray(diagnostics.root_policy_entropy) >= 0.0)
 
 
 def test_wavefront_terminal_lanes_skip_leaf_evaluator_after_root_eval():

@@ -27,6 +27,7 @@ from flax import nnx
 import hydra
 from hydra.utils import get_original_cwd
 import jax
+import numpy as np
 import optax
 import pgx
 from omegaconf import DictConfig, OmegaConf
@@ -101,6 +102,11 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("training", "tree", "include_terminal"), "train_tree_include_terminal"),
     (("training", "tree", "min_q_evidence"), "train_tree_min_q_evidence"),
     (("training", "tree", "max_nodes_per_step"), "train_tree_max_nodes_per_step"),
+    (("training", "exact_hex_solver", "enabled"), "exact_hex_solver_enabled"),
+    (
+        ("training", "exact_hex_solver", "extra_batch_size"),
+        "exact_hex_solver_extra_batch_size",
+    ),
     (("training", "losses", "policy_weight"), "policy_loss_weight"),
     (("training", "losses", "value_dir_kl_weight"), "value_dir_kl_weight"),
     (("training", "losses", "q_dir_kl_weight"), "q_dir_kl_weight"),
@@ -232,7 +238,7 @@ class Config(BaseModel):
     search_policy: str = "gumbel"
     wavefront_num_lanes_per_root: int = Field(default=1, ge=1)
     wavefront_max_depth: int = Field(default=128, ge=1)
-    wavefront_final_action_mode: str = "scalar_q_argmax"
+    wavefront_final_action_mode: str = "posterior_argmax"
     wavefront_pad_eval_batches: bool = True
     wavefront_pad_jax_select: bool = False
     wavefront_np_select_below: int = Field(default=1024, ge=0)
@@ -246,6 +252,8 @@ class Config(BaseModel):
     train_tree_include_terminal: bool = False
     train_tree_min_q_evidence: float = Field(default=0.0, ge=0.0)
     train_tree_max_nodes_per_step: int | None = Field(default=None, ge=1)
+    exact_hex_solver_enabled: bool = False
+    exact_hex_solver_extra_batch_size: int = Field(default=0, ge=0)
     # training params
     training_batch_size: int = 4096
     replay_buffer_size: int = Field(default=1, ge=1)
@@ -279,8 +287,6 @@ class Config(BaseModel):
         for key in sorted(_DEPRECATED_CONFIG_KEYS):
             if key in values:
                 _raise_deprecated_config(key)
-        if values.get("wavefront_final_action_mode") == "argmax_q_mean":
-            values["wavefront_final_action_mode"] = "scalar_q_argmax"
         return values
 
     @model_validator(mode="after")
@@ -310,7 +316,6 @@ class Config(BaseModel):
             "posterior_argmax",
             "posterior_sample",
             "search_action",
-            "scalar_q_argmax",
         }
         if self.selfplay_action_source not in valid_action_sources:
             allowed = ", ".join(sorted(valid_action_sources))
@@ -330,7 +335,6 @@ class Config(BaseModel):
                 f"search_policy must be one of {allowed}; got {self.search_policy!r}."
             )
         valid_wavefront_action_modes = {
-            "scalar_q_argmax",
             "posterior_argmax",
             "posterior_sample",
         }
@@ -349,6 +353,14 @@ class Config(BaseModel):
                 "train_tree_nodes currently supports only "
                 "search_policy='posterior_tree_wavefront'."
             )
+        if self.exact_hex_solver_enabled:
+            if self.env_id != "hex" or self.board_size is None or self.board_size > 4:
+                raise ValueError(
+                    "exact_hex_solver_enabled requires env_id='hex' and "
+                    "board_size <= 4."
+                )
+            if self.num_outcomes not in (None, 3):
+                raise ValueError("exact_hex_solver_enabled requires WDL3 targets.")
         if self.search_policy in {
             "dirichlet_thompson",
             "posterior_tree",
@@ -403,6 +415,8 @@ def main(cfg: DictConfig) -> None:
 
     rng_key = jax.random.PRNGKey(config.seed)
     with build_logger(config) as logger:
+        eval_avg_return_history: list[float] = []
+        previous_eval_avg_return: float | None = None
         board_size = "none" if config.board_size is None else str(config.board_size)
         ckpt_dir = (
             Path(get_original_cwd())
@@ -426,6 +440,24 @@ def main(cfg: DictConfig) -> None:
                 ):
                     returns = evaluate(eval_key, model)
                     dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
+                    eval_avg_return = float(jax.device_get(returns.mean()))
+                    eval_avg_return_history.append(eval_avg_return)
+                    eval_window = eval_avg_return_history[-10:]
+                    eval_mean_10 = float(np.mean(eval_window))
+                    eval_std_10 = float(np.std(eval_window))
+                    eval_delta = (
+                        0.0
+                        if previous_eval_avg_return is None
+                        else abs(eval_avg_return - previous_eval_avg_return)
+                    )
+                    previous_eval_avg_return = eval_avg_return
+                    dict_to_log.update(
+                        {
+                            "eval/vs_baseline/avg_R_rolling_mean_10": eval_mean_10,
+                            "eval/vs_baseline/avg_R_rolling_std_10": eval_std_10,
+                            "eval/vs_baseline/avg_R_step_delta_abs": eval_delta,
+                        }
+                    )
 
                 st = time.time()
                 train_metrics = training_iteration(model, optimizer, train_key)
@@ -447,6 +479,16 @@ def main(cfg: DictConfig) -> None:
                         "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
                         "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
                         "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
+                        "search/path_depth_mean": train_metrics.search_path_depth_mean.mean().item(),
+                        "search/path_depth_p50": train_metrics.search_path_depth_p50.mean().item(),
+                        "search/path_depth_p90": train_metrics.search_path_depth_p90.mean().item(),
+                        "search/path_depth_max": train_metrics.search_path_depth_max.mean().item(),
+                        "search/expanded_nodes": train_metrics.search_expanded_nodes.mean().item(),
+                        "search/terminal_fraction": train_metrics.search_terminal_fraction.mean().item(),
+                        "search/root_policy_entropy": train_metrics.search_root_policy_entropy.mean().item(),
+                        "search/root_gamma": train_metrics.search_root_gamma.mean().item(),
+                        "search/root_downstream_eval_count": train_metrics.search_root_downstream_eval_count.mean().item(),
+                        "search/root_q_concentration": train_metrics.search_root_q_concentration.mean().item(),
                         "train/hours": hours,
                         "train/frames": frames,
                     }

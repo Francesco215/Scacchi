@@ -24,7 +24,7 @@ from .dirichlet_q_search import (
     root_action_value_priors_from_tree,
     terminal_outcome_from_reward,
 )
-from .dirichlet_tree.types import TreeTrainingData
+from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
 from .network import policy_value_from_output
 from .posterior_tree import (
     is_posterior_tree_policy,
@@ -54,6 +54,7 @@ class SelfplayOutput(NamedTuple):
     discount: jax.Array
     tree_data: TreeTrainingData | None = None
     search_loss_mask: jax.Array | None = None
+    search_diagnostics: SearchDiagnostics | None = None
 
     @property
     def q_evidence_mass(self) -> jax.Array:
@@ -252,7 +253,7 @@ def _select_posterior_tree_played_action(
         return posterior_best_action(action_weights, legal_action_mask)
     if action_source == "posterior_sample":
         return posterior_sample_action(rng_key, action_weights, legal_action_mask)
-    if action_source in ("search_action", "scalar_q_argmax"):
+    if action_source == "search_action":
         return search_action
     raise ValueError(f"unknown selfplay_action_source: {action_source!r}")
 
@@ -296,6 +297,7 @@ def make_posterior_tree_selfplay(env, config):
         search_loss_mask_seq = []
         discount_seq = []
         tree_data_seq = []
+        search_diagnostics_seq = []
 
         for _ in range(config.max_num_steps):
             rng_key, search_key, action_key, reset_key = jax.random.split(rng_key, 4)
@@ -357,6 +359,9 @@ def make_posterior_tree_selfplay(env, config):
             search_loss_mask_seq.append(root_search_mask)
             if search_output.tree_data is not None:
                 tree_data_seq.append(search_output.tree_data)
+            diagnostics = getattr(search_output, "diagnostics", None)
+            if diagnostics is not None:
+                search_diagnostics_seq.append(diagnostics)
             reward_seq.append(reward)
             terminated_seq.append(env_state.terminated)
             discount_seq.append(discount)
@@ -366,6 +371,12 @@ def make_posterior_tree_selfplay(env, config):
             tree_data = jax.tree_util.tree_map(
                 lambda *xs: jnp.stack(xs, axis=0),
                 *tree_data_seq,
+            )
+        search_diagnostics = None
+        if search_diagnostics_seq:
+            search_diagnostics = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs, axis=0),
+                *search_diagnostics_seq,
             )
 
         return SelfplayOutput(
@@ -381,6 +392,7 @@ def make_posterior_tree_selfplay(env, config):
             discount=jnp.stack(discount_seq, axis=0),
             tree_data=tree_data,
             search_loss_mask=jnp.stack(search_loss_mask_seq, axis=0),
+            search_diagnostics=search_diagnostics,
         )
 
     return selfplay

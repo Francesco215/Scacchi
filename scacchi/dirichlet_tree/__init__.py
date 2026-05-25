@@ -6,7 +6,7 @@ from .search import (
     run_wavefront_posterior_tree_search_state_batch,
 )
 from .store import InMemoryNodeStore, RedisNodeStore
-from .types import NodeBlob, SearchConfig, SearchResult, StateKey
+from .types import NodeBlob, SearchConfig, SearchDiagnostics, SearchResult, StateKey
 
 __all__ = [
     "BatchedPosteriorSearch",
@@ -16,6 +16,7 @@ __all__ = [
     "PosteriorArena",
     "RedisNodeStore",
     "SearchConfig",
+    "SearchDiagnostics",
     "SearchResult",
     "StateKey",
     "decode_node",

@@ -460,7 +460,11 @@ class PosteriorTree:
         alpha_root: np.ndarray,
         legal_action_mask: np.ndarray,
     ) -> int:
-        mode = "posterior_argmax" if self.commit == "posterior_best" else self.commit
+        mode = (
+            "posterior_argmax"
+            if self.commit in {"posterior_best", "search_action"}
+            else self.commit
+        )
         if mode == "posterior_sample":
             probs = np.where(legal_action_mask, policy_target, 0.0)
             prob_sum = float(np.sum(probs))
@@ -468,9 +472,6 @@ class PosteriorTree:
                 probs = legal_action_mask.astype(np.float64)
                 prob_sum = float(np.sum(probs))
             return int(self.rng.choice(self.num_actions, p=probs / prob_sum))
-        if mode in {"scalar_q_argmax", "argmax_q_mean", "search_action"}:
-            scores = outcome_utility_np(outcome_mean_np(alpha_root))
-            return int(np.argmax(np.where(legal_action_mask, scores, -np.inf)))
         if mode == "posterior_argmax":
             return int(np.argmax(np.where(legal_action_mask, policy_target, -np.inf)))
         raise ValueError(f"unknown selfplay_action_source: {self.commit!r}")

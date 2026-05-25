@@ -13,7 +13,7 @@ from scacchi.loss import (
     _outcome_target,
     make_compute_loss_input,
 )
-from scacchi.pipeline import make_minibatches
+from scacchi.pipeline import _fixed_replay_window, make_minibatches
 from scacchi.play import SelfplayOutput
 
 
@@ -167,6 +167,23 @@ def test_make_minibatches_replays_active_rows_and_keeps_compute_shape():
         jnp.all((minibatches.obs[..., 0] == 1.0) | (minibatches.obs[..., 0] == 6.0))
     )
     assert bool(jnp.all(minibatches.policy_loss_mask))
+
+
+def test_fixed_replay_window_pads_early_batches_to_stable_shape():
+    first = object()
+    second = object()
+    third = object()
+    fourth = object()
+    fifth = object()
+
+    assert _fixed_replay_window([first], 4) == [first, first, first, first]
+    assert _fixed_replay_window([first, second], 4) == [first, first, first, second]
+    assert _fixed_replay_window([first, second, third, fourth, fifth], 4) == [
+        second,
+        third,
+        fourth,
+        fifth,
+    ]
 
 
 def test_policy_loss_ignores_illegal_logits():

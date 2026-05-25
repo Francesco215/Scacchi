@@ -22,8 +22,6 @@ VALUE_CACHE_CLEAN = 1
 VALUE_CACHE_UPDATING = 2
 
 FinalActionMode = Literal[
-    "scalar_q_argmax",
-    "argmax_q_mean",
     "posterior_argmax",
     "posterior_sample",
 ]
@@ -360,7 +358,7 @@ class SearchConfig:
     backup_mc_samples: int = 16
     tau_internal: float = 1.0
     duplicate_leaf_mode: DuplicateLeafMode = "recycle_lane"
-    final_action_mode: FinalActionMode = "scalar_q_argmax"
+    final_action_mode: FinalActionMode = "posterior_argmax"
     pad_eval_batches: bool = True
     pad_jax_select: bool = False
     np_select_below: int = 1024
@@ -409,6 +407,19 @@ class TreeTrainingData(NamedTuple):
         return self.q_loss_weight
 
 
+class SearchDiagnostics(NamedTuple):
+    path_depth_mean: jax.Array
+    path_depth_p50: jax.Array
+    path_depth_p90: jax.Array
+    path_depth_max: jax.Array
+    expanded_nodes: jax.Array
+    terminal_fraction: jax.Array
+    root_policy_entropy: jax.Array
+    root_gamma: jax.Array
+    root_downstream_eval_count: jax.Array
+    root_q_concentration: jax.Array
+
+
 class SearchResult(NamedTuple):
     action: jax.Array
     action_weights: jax.Array
@@ -418,6 +429,7 @@ class SearchResult(NamedTuple):
     alpha_root: jax.Array
     tree_data: TreeTrainingData | None = None
     search_loss_mask: jax.Array | None = None
+    diagnostics: SearchDiagnostics | None = None
 
     @property
     def q_evidence_mass(self) -> jax.Array:

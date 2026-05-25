@@ -289,12 +289,12 @@ def test_terminal_leaf_is_backed_up_without_calling_leaf_evaluator():
     assert tree.nodes[0].visits[0] == 1
 
 
-def test_finish_search_returns_theory_targets_and_scalar_q_action():
+def test_finish_search_returns_theory_targets_and_posterior_argmax_action():
     tree = _tree(
         root_state=_state(player=0, legal=(True, True)),
         root_alpha_v=np.array([1.0, 1.0, 1.0], dtype=np.float32),
         root_alpha_q=np.array([[2.0, 2.0, 1.0], [1.0, 2.0, 2.0]], dtype=np.float32),
-        commit="scalar_q_argmax",
+        commit="posterior_argmax",
     )
     tree.nodes[0].edge_B[0] = np.array([2.0, 2.0, 3.0], dtype=np.float32)
     tree.nodes[0].edge_B[1] = np.array([1.0, 3.0, 2.0], dtype=np.float32)
@@ -305,7 +305,7 @@ def test_finish_search_returns_theory_targets_and_scalar_q_action():
     action, policy, beta_q, beta_v, q_weight, alpha_root = tree.finish()
 
     expected_alpha = np.array([[2.0, 2.0, 3.0], [1.0, 3.0, 2.0]], dtype=np.float32)
-    assert action == int(np.argmax(outcome_utility_np(outcome_mean_np(expected_alpha))))
+    assert action == int(np.argmax(policy))
     assert np.allclose(alpha_root, expected_alpha)
     assert np.allclose(beta_q, expected_alpha)
     assert np.allclose(beta_v, tree.nodes[0].value_cache_C)

@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from .selection import (
-    greedy_q_action,
     posterior_best_policy_target_np,
     thompson_select_jax,
     thompson_select_np,
@@ -20,6 +19,7 @@ from .state_hash import canonical_state_key
 from .types import (
     LeafEvaluator,
     SearchConfig,
+    SearchDiagnostics,
     SearchResult,
     TreeTrainingData,
     outcome_mean,
@@ -575,6 +575,8 @@ class BatchedPosteriorArenaSearch:
         self.root_node_ids: np.ndarray | None = None
         self.root_keys: np.ndarray | None = None
         self.tree_sample_capacity: int | None = None
+        self._completed_path_depths: np.ndarray | None = None
+        self._completed_path_counts: np.ndarray | None = None
         self.timing_enabled = False
         self.timing_sync = False
         self.timing = {bucket: 0.0 for bucket in TIMING_BUCKETS}
@@ -598,6 +600,17 @@ class BatchedPosteriorArenaSearch:
     def _block_if_timing(self, value: Any) -> None:
         if self.timing_enabled and self.timing_sync:
             _block_until_ready(value)
+
+    def _record_completed_path_depth(self, root_id: int, depth: int) -> None:
+        if self._completed_path_depths is None or self._completed_path_counts is None:
+            return
+        root_ix = int(root_id)
+        if root_ix < 0 or root_ix >= self._completed_path_counts.shape[0]:
+            return
+        write_ix = int(self._completed_path_counts[root_ix])
+        if write_ix < self._completed_path_depths.shape[1]:
+            self._completed_path_depths[root_ix, write_ix] = np.int16(max(0, int(depth)))
+        self._completed_path_counts[root_ix] += 1
 
     def search_batch(
         self,
@@ -650,6 +663,12 @@ class BatchedPosteriorArenaSearch:
         num_roots = int(root_logits.shape[0])
         num_actions = int(root_logits.shape[-1])
         num_outcomes = int(root_value_alpha.shape[-1])
+        self._completed_path_depths = np.full(
+            (num_roots, max(1, int(config.num_simulations))),
+            -1,
+            dtype=np.int16,
+        )
+        self._completed_path_counts = np.zeros((num_roots,), dtype=np.int32)
         with self._timed("device_get"):
             root_players, root_legal, root_term, root_rewards = jax.device_get(
                 (
@@ -779,6 +798,7 @@ class BatchedPosteriorArenaSearch:
                 q_loss_weight=jnp.asarray(q_weight, dtype=jnp.float32),
                 alpha_root=jnp.asarray(alpha_root, dtype=jnp.float32),
                 search_loss_mask=jnp.asarray(np.sum(policies, axis=-1) > 0.0),
+                diagnostics=self._build_search_diagnostics(config, policies, alpha_root),
             )
             result = self._attach_tree_data(result, config)
             self._block_if_timing(result)
@@ -836,7 +856,79 @@ class BatchedPosteriorArenaSearch:
             q_loss_weight=jnp.asarray(q_weight, dtype=jnp.float32),
             alpha_root=jnp.asarray(alpha_root, dtype=jnp.float32),
             search_loss_mask=jnp.asarray(np.sum(policies, axis=-1) > 0.0),
+            diagnostics=self._build_search_diagnostics(config, policies, alpha_root),
         )
+
+    def _build_search_diagnostics(
+        self,
+        config: SearchConfig,
+        policies: np.ndarray,
+        alpha_root: np.ndarray,
+    ) -> SearchDiagnostics:
+        if self.arena is None or self.root_node_ids is None:
+            raise ValueError("search has not been initialized")
+        arena = self.arena
+        root_ids = self.root_node_ids.astype(np.int32)
+        depth_mean, depth_p50, depth_p90, depth_max = self._completed_path_depth_stats(
+            root_ids.shape[0]
+        )
+        expanded_nodes, terminal_fraction = _arena_root_descendant_stats(arena, root_ids)
+        n_down = np.zeros((root_ids.shape[0],), dtype=np.float32)
+        root_q_concentration = np.zeros((root_ids.shape[0],), dtype=np.float32)
+        for ix, node_id in enumerate(root_ids):
+            start = int(arena.node_first_edge[node_id])
+            count = int(arena.node_num_edges[node_id])
+            if count <= 0:
+                continue
+            edge_ids = np.arange(start, start + count, dtype=np.int32)
+            n_down[ix] = float(np.sum(arena.edge_eval_count_R[edge_ids], dtype=np.uint64))
+            legal_alpha = alpha_root[ix, arena.edge_action[edge_ids].astype(np.int32)]
+            root_q_concentration[ix] = float(np.mean(np.sum(legal_alpha, axis=-1)))
+        gamma = n_down / (float(config.state_posterior_kappa_n) + n_down)
+        policy = np.asarray(policies, dtype=np.float32)
+        entropy = -np.sum(
+            np.where(policy > 0.0, policy * np.log(np.maximum(policy, 1e-12)), 0.0),
+            axis=-1,
+        ).astype(np.float32)
+        return SearchDiagnostics(
+            path_depth_mean=jnp.asarray(depth_mean, dtype=jnp.float32),
+            path_depth_p50=jnp.asarray(depth_p50, dtype=jnp.float32),
+            path_depth_p90=jnp.asarray(depth_p90, dtype=jnp.float32),
+            path_depth_max=jnp.asarray(depth_max, dtype=jnp.float32),
+            expanded_nodes=jnp.asarray(expanded_nodes, dtype=jnp.float32),
+            terminal_fraction=jnp.asarray(terminal_fraction, dtype=jnp.float32),
+            root_policy_entropy=jnp.asarray(entropy, dtype=jnp.float32),
+            root_gamma=jnp.asarray(gamma, dtype=jnp.float32),
+            root_downstream_eval_count=jnp.asarray(n_down, dtype=jnp.float32),
+            root_q_concentration=jnp.asarray(root_q_concentration, dtype=jnp.float32),
+        )
+
+    def _completed_path_depth_stats(
+        self,
+        num_roots: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        mean = np.zeros((num_roots,), dtype=np.float32)
+        p50 = np.zeros((num_roots,), dtype=np.float32)
+        p90 = np.zeros((num_roots,), dtype=np.float32)
+        max_depth = np.zeros((num_roots,), dtype=np.float32)
+        if self._completed_path_depths is None or self._completed_path_counts is None:
+            return mean, p50, p90, max_depth
+        for ix in range(num_roots):
+            count = min(
+                int(self._completed_path_counts[ix]),
+                int(self._completed_path_depths.shape[1]),
+            )
+            if count <= 0:
+                continue
+            values = self._completed_path_depths[ix, :count].astype(np.float32)
+            values = values[values >= 0]
+            if values.size == 0:
+                continue
+            mean[ix] = float(np.mean(values))
+            p50[ix] = float(np.percentile(values, 50))
+            p90[ix] = float(np.percentile(values, 90))
+            max_depth[ix] = float(np.max(values))
+        return mean, p50, p90, max_depth
 
     def _build_tree_training_data(self, config: SearchConfig) -> TreeTrainingData:
         if self.arena is None or self.root_node_ids is None:
@@ -1035,6 +1127,7 @@ class BatchedPosteriorArenaSearch:
                             backup_mc_samples=config.backup_mc_samples,
                             config=config,
                         )
+                    self._record_completed_path_depth(int(lane_root_ids[row]), int(path_len[row]))
                     done[lane_root_ids[row]] += 1
 
             selectable_mask = (status == STATUS_EXPANDED) & (arena.node_num_edges[node_ids] > 0)
@@ -1272,6 +1365,7 @@ class BatchedPosteriorArenaSearch:
                         backup_mc_samples=config.backup_mc_samples,
                         config=config,
                     )
+                    self._record_completed_path_depth(int(lane_root_ids[row]), int(path_len[row]))
                     done[lane_root_ids[row]] += 1
 
             if missing_rows:
@@ -1504,6 +1598,8 @@ class BatchedPosteriorArenaSearch:
             np.ones((final_edges.shape[0],), dtype=np.uint32),
             increment_eval_count=True,
         )
+        for root_id, depth in zip(active_root_ids, active_path_len, strict=True):
+            self._record_completed_path_depth(int(root_id), int(depth))
         np.add.at(done, active_root_ids, 1)
         for parent_id in np.unique(final_parents):
             self._repair_path_to_root(
@@ -2045,7 +2141,56 @@ def _broadcast_search_result(result: SearchResult, inverse: np.ndarray) -> Searc
             if result.search_loss_mask is None
             else result.search_loss_mask[inverse_jax]
         ),
+        diagnostics=(
+            None
+            if result.diagnostics is None
+            else jax.tree_util.tree_map(lambda x: x[inverse_jax], result.diagnostics)
+        ),
     )
+
+
+def _arena_root_descendant_stats(
+    arena: PosteriorArena,
+    root_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    root_ids = np.asarray(root_ids, dtype=np.int32)
+    num_roots = int(root_ids.shape[0])
+    expanded = np.zeros((num_roots,), dtype=np.float32)
+    terminal = np.zeros((num_roots,), dtype=np.float32)
+    total = np.zeros((num_roots,), dtype=np.float32)
+    if num_roots == 0 or int(arena.num_nodes) == 0:
+        return expanded, terminal
+
+    owner = np.full((int(arena.num_nodes),), UNKNOWN, dtype=np.int32)
+    for root_pos, node_id in enumerate(root_ids):
+        if 0 <= int(node_id) < owner.shape[0]:
+            owner[int(node_id)] = np.int32(root_pos)
+
+    for node_id in range(int(arena.num_nodes)):
+        if owner[node_id] != UNKNOWN:
+            continue
+        chain: list[int] = []
+        current = node_id
+        while current != UNKNOWN and owner[current] == UNKNOWN:
+            chain.append(current)
+            current = int(arena.node_parent_node[current])
+        root_pos = UNKNOWN if current == UNKNOWN else int(owner[current])
+        for chained_node in chain:
+            owner[chained_node] = np.int32(root_pos)
+
+    for node_id in range(int(arena.num_nodes)):
+        root_pos = int(owner[node_id])
+        if root_pos == UNKNOWN:
+            continue
+        total[root_pos] += 1.0
+        status = arena.node_status[node_id]
+        if status == STATUS_EXPANDED:
+            expanded[root_pos] += 1.0
+        elif status == STATUS_TERMINAL:
+            terminal[root_pos] += 1.0
+
+    terminal_fraction = terminal / np.maximum(total, 1.0)
+    return expanded, terminal_fraction.astype(np.float32)
 
 
 def _selected_positions(actions_padded: np.ndarray, actions: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -2189,8 +2334,6 @@ def _commit_action(
         return int(rng.choice(alpha.shape[0], p=probs / total))
     if config.final_action_mode == "posterior_argmax":
         return int(np.argmax(np.where(legal, policy, -np.inf)))
-    if config.final_action_mode in {"scalar_q_argmax", "argmax_q_mean"}:
-        return greedy_q_action(alpha, legal)
     raise ValueError(f"unknown final_action_mode: {config.final_action_mode!r}")
 
 
@@ -2208,9 +2351,6 @@ def _commit_actions_batch(
         return actions
     if config.final_action_mode == "posterior_argmax":
         return np.argmax(np.where(legal, policies, -np.inf), axis=-1).astype(np.int32)
-    if config.final_action_mode in {"scalar_q_argmax", "argmax_q_mean"}:
-        scores = outcome_mean(alpha)[..., -1] - outcome_mean(alpha)[..., 0]
-        return np.argmax(np.where(legal, scores, -np.inf), axis=-1).astype(np.int32)
     raise ValueError(f"unknown final_action_mode: {config.final_action_mode!r}")
 
 

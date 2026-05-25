@@ -44,6 +44,16 @@ class TrainMetrics(NamedTuple):
     alpha_V_concentration: jax.Array
     alpha_Q_concentration: jax.Array
     q_loss_weight_mean: jax.Array
+    search_path_depth_mean: jax.Array
+    search_path_depth_p50: jax.Array
+    search_path_depth_p90: jax.Array
+    search_path_depth_max: jax.Array
+    search_expanded_nodes: jax.Array
+    search_terminal_fraction: jax.Array
+    search_root_policy_entropy: jax.Array
+    search_root_gamma: jax.Array
+    search_root_downstream_eval_count: jax.Array
+    search_root_q_concentration: jax.Array
 
     @property
     def q_evidence_mass_mean(self) -> jax.Array:
@@ -281,6 +291,16 @@ def _compute_dirichlet_losses(
         alpha_V_concentration=alpha_v_concentration,
         alpha_Q_concentration=alpha_q_concentration,
         q_loss_weight_mean=q_loss_weight_mean,
+        search_path_depth_mean=jnp.zeros_like(policy_loss),
+        search_path_depth_p50=jnp.zeros_like(policy_loss),
+        search_path_depth_p90=jnp.zeros_like(policy_loss),
+        search_path_depth_max=jnp.zeros_like(policy_loss),
+        search_expanded_nodes=jnp.zeros_like(policy_loss),
+        search_terminal_fraction=jnp.zeros_like(policy_loss),
+        search_root_policy_entropy=jnp.zeros_like(policy_loss),
+        search_root_gamma=jnp.zeros_like(policy_loss),
+        search_root_downstream_eval_count=jnp.zeros_like(policy_loss),
+        search_root_q_concentration=jnp.zeros_like(policy_loss),
     )
     return total_loss, metrics
 
@@ -304,6 +324,16 @@ def train(model: nnx.Module, optimizer: nnx.Optimizer, data: Sample, config):
                 alpha_V_concentration=jnp.zeros_like(value_loss),
                 alpha_Q_concentration=jnp.zeros_like(value_loss),
                 q_loss_weight_mean=jnp.zeros_like(value_loss),
+                search_path_depth_mean=jnp.zeros_like(value_loss),
+                search_path_depth_p50=jnp.zeros_like(value_loss),
+                search_path_depth_p90=jnp.zeros_like(value_loss),
+                search_path_depth_max=jnp.zeros_like(value_loss),
+                search_expanded_nodes=jnp.zeros_like(value_loss),
+                search_terminal_fraction=jnp.zeros_like(value_loss),
+                search_root_policy_entropy=jnp.zeros_like(value_loss),
+                search_root_gamma=jnp.zeros_like(value_loss),
+                search_root_downstream_eval_count=jnp.zeros_like(value_loss),
+                search_root_q_concentration=jnp.zeros_like(value_loss),
             )
             return policy_loss + value_loss, metrics
 

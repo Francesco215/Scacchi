@@ -2,6 +2,7 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 
+from .exact_hex import relabel_selfplay_with_exact_hex
 from .loss import Sample, TrainMetrics, make_compute_loss_input, train
 from .play import make_selfplay
 from .play import SelfplayOutput
@@ -76,6 +77,13 @@ def _concat_selfplay_outputs(outputs: list[SelfplayOutput]) -> SelfplayOutput:
             *(output.search_loss_mask for output in outputs),
         )
 
+    search_diagnostics = None
+    if outputs[0].search_diagnostics is not None:
+        search_diagnostics = jax.tree_util.tree_map(
+            concat_batch,
+            *(output.search_diagnostics for output in outputs),
+        )
+
     return SelfplayOutput(
         obs=concat_batch(*(output.obs for output in outputs)),
         reward=concat_batch(*(output.reward for output in outputs)),
@@ -89,6 +97,52 @@ def _concat_selfplay_outputs(outputs: list[SelfplayOutput]) -> SelfplayOutput:
         discount=concat_batch(*(output.discount for output in outputs)),
         tree_data=tree_data,
         search_loss_mask=search_loss_mask,
+        search_diagnostics=search_diagnostics,
+    )
+
+
+def _fixed_replay_window(
+    outputs: list[SelfplayOutput],
+    replay_buffer_size: int,
+) -> list[SelfplayOutput]:
+    if not outputs:
+        raise ValueError("replay buffer is empty")
+    if replay_buffer_size <= 1:
+        return [outputs[-1]]
+    window = outputs[-replay_buffer_size:]
+    if len(window) == replay_buffer_size:
+        return window
+    return [window[0]] * (replay_buffer_size - len(window)) + window
+
+
+def _mean_or_zero(value: jax.Array | None, dtype) -> jax.Array:
+    if value is None:
+        return jnp.asarray(0.0, dtype=dtype)
+    return jnp.asarray(jnp.mean(value), dtype=dtype)
+
+
+def _with_search_diagnostics(
+    metrics: TrainMetrics,
+    data: SelfplayOutput,
+) -> TrainMetrics:
+    diagnostics = data.search_diagnostics
+    if diagnostics is None:
+        return metrics
+    dtype = metrics.policy_loss.dtype
+    return metrics._replace(
+        search_path_depth_mean=_mean_or_zero(diagnostics.path_depth_mean, dtype),
+        search_path_depth_p50=_mean_or_zero(diagnostics.path_depth_p50, dtype),
+        search_path_depth_p90=_mean_or_zero(diagnostics.path_depth_p90, dtype),
+        search_path_depth_max=_mean_or_zero(diagnostics.path_depth_max, dtype),
+        search_expanded_nodes=_mean_or_zero(diagnostics.expanded_nodes, dtype),
+        search_terminal_fraction=_mean_or_zero(diagnostics.terminal_fraction, dtype),
+        search_root_policy_entropy=_mean_or_zero(diagnostics.root_policy_entropy, dtype),
+        search_root_gamma=_mean_or_zero(diagnostics.root_gamma, dtype),
+        search_root_downstream_eval_count=_mean_or_zero(
+            diagnostics.root_downstream_eval_count,
+            dtype,
+        ),
+        search_root_q_concentration=_mean_or_zero(diagnostics.root_q_concentration, dtype),
     )
 
 
@@ -132,12 +186,17 @@ def make_training_iteration(env, config):
             optimizer: nnx.Optimizer,
             rng_key: jax.Array,
         ) -> TrainMetrics:
-            selfplay_key, perm_key = jax.random.split(rng_key)
+            selfplay_key, perm_key, exact_key = jax.random.split(rng_key, 3)
             data = selfplay(model, selfplay_key)
+            if getattr(config, "exact_hex_solver_enabled", False):
+                data = relabel_selfplay_with_exact_hex(data, config, exact_key)
             replay_buffer.append(data)
             del replay_buffer[:-replay_buffer_size]
-            replay_data = _concat_selfplay_outputs(replay_buffer)
-            return train_from_selfplay_data(model, optimizer, replay_data, perm_key)
+            replay_data = _concat_selfplay_outputs(
+                _fixed_replay_window(replay_buffer, replay_buffer_size)
+            )
+            metrics = train_from_selfplay_data(model, optimizer, replay_data, perm_key)
+            return _with_search_diagnostics(metrics, data)
 
         return training_iteration
 

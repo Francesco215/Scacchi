@@ -16,7 +16,7 @@ from .backup import (
     update_parent_child_edge,
 )
 from .pack import pack_nodes_for_selection
-from .selection import greedy_q_action, posterior_best_policy_target_np, thompson_select_jax
+from .selection import posterior_best_policy_target_np, thompson_select_jax
 from .state_hash import canonical_state_key, state_keys_to_host
 from .store import InMemoryNodeStore, NodeStore
 from .types import (
@@ -26,6 +26,7 @@ from .types import (
     NodeBlob,
     PathStep,
     SearchConfig,
+    SearchDiagnostics,
     SearchResult,
     StateKey,
     TreeTrainingData,
@@ -44,6 +45,7 @@ class WavefrontPosteriorTreeBatchOutput(NamedTuple):
     trees: tuple[Any, ...]
     tree_data: TreeTrainingData | None = None
     search_loss_mask: jax.Array | None = None
+    diagnostics: SearchDiagnostics | None = None
 
     @property
     def q_evidence_mass(self) -> jax.Array:
@@ -170,10 +172,12 @@ class BatchedPosteriorSearch:
         beta_v = []
         q_weight = []
         alpha_roots = []
+        root_nodes = []
         for root_key in root_keys:
             root = self.store.get_many([root_key])[root_key]
             if root is None:
                 raise KeyError(f"missing root node {root_key.redis_hex}")
+            root_nodes.append(root)
             alpha_dense = np.zeros((self.num_actions, self.num_outcomes), dtype=np.float32)
             legal = np.zeros((self.num_actions,), dtype=bool)
             for ix, action in enumerate(root.legal_actions):
@@ -193,15 +197,18 @@ class BatchedPosteriorSearch:
             q_weight.append(policy)
             alpha_roots.append(alpha_dense)
         self.store.flush_dirty()
-        search_loss_mask = np.sum(np.stack(policies, axis=0), axis=-1) > 0.0
+        policy_array = np.stack(policies, axis=0)
+        alpha_array = np.stack(alpha_roots, axis=0)
+        search_loss_mask = np.sum(policy_array, axis=-1) > 0.0
         return SearchResult(
             action=jnp.asarray(actions, dtype=jnp.int32),
-            action_weights=jnp.asarray(np.stack(policies, axis=0), dtype=jnp.float32),
+            action_weights=jnp.asarray(policy_array, dtype=jnp.float32),
             beta_Q_target=jnp.asarray(np.stack(beta_q, axis=0), dtype=jnp.float32),
             beta_V_target=jnp.asarray(np.stack(beta_v, axis=0), dtype=jnp.float32),
             q_loss_weight=jnp.asarray(np.stack(q_weight, axis=0), dtype=jnp.float32),
-            alpha_root=jnp.asarray(np.stack(alpha_roots, axis=0), dtype=jnp.float32),
+            alpha_root=jnp.asarray(alpha_array, dtype=jnp.float32),
             search_loss_mask=jnp.asarray(search_loss_mask),
+            diagnostics=_store_search_diagnostics(root_nodes, policy_array, alpha_array, config),
         )
 
     def _run_wavefront(
@@ -463,6 +470,7 @@ def run_wavefront_posterior_tree_search(
             trees=(),
             tree_data=result.tree_data,
             search_loss_mask=result.search_loss_mask,
+            diagnostics=result.diagnostics,
         )
 
     search_config = search_config_from_any(config, num_roots=len(root_states))
@@ -478,6 +486,7 @@ def run_wavefront_posterior_tree_search(
         trees=(),
         tree_data=result.tree_data,
         search_loss_mask=result.search_loss_mask,
+        diagnostics=result.diagnostics,
     )
 
 
@@ -513,6 +522,7 @@ def run_wavefront_posterior_tree_search_state_batch(
             trees=(),
             tree_data=result.tree_data,
             search_loss_mask=result.search_loss_mask,
+            diagnostics=result.diagnostics,
         )
 
     return run_wavefront_posterior_tree_search(
@@ -529,9 +539,7 @@ def search_config_from_any(config: Any, *, num_roots: int = 1) -> SearchConfig:
     eval_batch_size = getattr(config, "search_eval_batch_size", None)
     if eval_batch_size is None:
         eval_batch_size = max(1, int(num_roots))
-    final_action_mode = getattr(config, "wavefront_final_action_mode", "scalar_q_argmax")
-    if final_action_mode == "argmax_q_mean":
-        final_action_mode = "scalar_q_argmax"
+    final_action_mode = getattr(config, "wavefront_final_action_mode", "posterior_argmax")
     return SearchConfig(
         num_simulations=int(getattr(config, "num_simulations")),
         max_depth=int(getattr(config, "wavefront_max_depth", getattr(config, "max_depth", 128))),
@@ -581,9 +589,55 @@ def _commit_action(
         return int(rng.choice(alpha.shape[0], p=probs / total))
     if config.final_action_mode == "posterior_argmax":
         return int(np.argmax(np.where(legal, policy, -np.inf)))
-    if config.final_action_mode in {"scalar_q_argmax", "argmax_q_mean"}:
-        return greedy_q_action(alpha, legal)
     raise ValueError(f"unknown final_action_mode: {config.final_action_mode!r}")
+
+
+def _store_search_diagnostics(
+    roots: list[NodeBlob],
+    policies: np.ndarray,
+    alpha_root: np.ndarray,
+    config: SearchConfig,
+) -> SearchDiagnostics:
+    num_roots = len(roots)
+    n_down = np.asarray(
+        [
+            float(np.sum(root.edge_eval_count_R, dtype=np.uint64))
+            for root in roots
+        ],
+        dtype=np.float32,
+    )
+    expanded_nodes = np.asarray(
+        [
+            float(np.sum(np.asarray(root.edge_has_post, dtype=bool)))
+            for root in roots
+        ],
+        dtype=np.float32,
+    )
+    gamma = n_down / (float(config.state_posterior_kappa_n) + n_down)
+    policy = np.asarray(policies, dtype=np.float32)
+    entropy = -np.sum(
+        np.where(policy > 0.0, policy * np.log(np.maximum(policy, 1e-12)), 0.0),
+        axis=-1,
+    ).astype(np.float32)
+    concentration = np.zeros((num_roots,), dtype=np.float32)
+    for ix, root in enumerate(roots):
+        if root.legal_actions.shape[0] == 0:
+            continue
+        legal_alpha = alpha_root[ix, root.legal_actions.astype(np.int32)]
+        concentration[ix] = float(np.mean(np.sum(legal_alpha, axis=-1)))
+    zeros = np.zeros((num_roots,), dtype=np.float32)
+    return SearchDiagnostics(
+        path_depth_mean=jnp.asarray(zeros),
+        path_depth_p50=jnp.asarray(zeros),
+        path_depth_p90=jnp.asarray(zeros),
+        path_depth_max=jnp.asarray(zeros),
+        expanded_nodes=jnp.asarray(expanded_nodes),
+        terminal_fraction=jnp.asarray(zeros),
+        root_policy_entropy=jnp.asarray(entropy),
+        root_gamma=jnp.asarray(gamma, dtype=jnp.float32),
+        root_downstream_eval_count=jnp.asarray(n_down, dtype=jnp.float32),
+        root_q_concentration=jnp.asarray(concentration, dtype=jnp.float32),
+    )
 
 
 def _batched_step(env: Any):
