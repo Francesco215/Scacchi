@@ -68,7 +68,7 @@ def make_compute_loss_input(config):
             return value, value
 
         _, value_tgt = body_fn(
-            jnp.zeros(config.selfplay_batch_size, dtype=data.reward.dtype),
+            jnp.zeros(data.reward.shape[1], dtype=data.reward.dtype),
             jnp.arange(config.max_num_steps),
         )
         value_tgt = value_tgt[::-1, :]

@@ -93,6 +93,7 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
         "wavefront_pad_pending_observation_gather",
     ),
     (("training", "batch_size"), "training_batch_size"),
+    (("training", "replay_buffer_size"), "replay_buffer_size"),
     (("training", "learning_rate"), "learning_rate"),
     (("training", "grad_clip_norm"), "grad_clip_norm"),
     (("training", "tree", "enabled"), "train_tree_nodes"),
@@ -247,6 +248,7 @@ class Config(BaseModel):
     train_tree_max_nodes_per_step: int | None = Field(default=None, ge=1)
     # training params
     training_batch_size: int = 4096
+    replay_buffer_size: int = Field(default=1, ge=1)
     learning_rate: float = 0.001
     grad_clip_norm: float | None = Field(default=None, gt=0)
     policy_loss_weight: float = 1.0

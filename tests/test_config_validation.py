@@ -15,19 +15,24 @@ def test_nested_hex_config_loads_into_runtime_config():
     config = Config(**normalize_config_dict(container))
 
     assert config.env_id == "hex"
-    assert config.board_size == 3
+    assert config.board_size == 4
     assert config.network == "boardlaw_dirichlet"
-    assert config.selfplay_batch_size == 8
+    assert config.selfplay_batch_size == 64
     assert config.search_policy == "posterior_tree_wavefront"
-    assert config.wavefront_num_lanes_per_root == 4
+    assert config.num_simulations == 16
+    assert config.search_eval_batch_size == 1024
+    assert config.wavefront_num_lanes_per_root == 16
     assert config.leaf_value_mode == "alpha"
     assert config.kappa_leaf == 1.0
     assert config.kappa_terminal == 8.0
-    assert config.epsilon_terminal == 1e-6
+    assert config.epsilon_terminal == 5e-2
     assert config.state_posterior_kappa_n == 9.0
     assert config.train_tree_nodes is True
-    assert config.training_batch_size == 8192
-    assert config.eval_batch_size == 16
+    assert config.train_tree_include_root is False
+    assert config.training_batch_size == 1024
+    assert config.replay_buffer_size == 4
+    assert config.eval_interval == 20
+    assert config.eval_batch_size == 128
     assert config.wandb_enabled is False
     assert config.ckpt_max_to_keep == 0
 
