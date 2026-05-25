@@ -25,6 +25,7 @@ from .dirichlet_q_search import (
     terminal_outcome_from_reward,
 )
 from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
+from .dirichlet_tree.native import native_fields_from_beta
 from .network import policy_value_from_output
 from .posterior_tree import (
     is_posterior_tree_policy,
@@ -55,6 +56,14 @@ class SelfplayOutput(NamedTuple):
     tree_data: TreeTrainingData | None = None
     search_loss_mask: jax.Array | None = None
     search_diagnostics: SearchDiagnostics | None = None
+    q_target_kind: jax.Array | None = None
+    q_target_weight: jax.Array | None = None
+    q_target_outcome: jax.Array | None = None
+    q_target_distance: jax.Array | None = None
+    v_target_kind: jax.Array | None = None
+    v_target_weight: jax.Array | None = None
+    v_target_outcome: jax.Array | None = None
+    v_target_distance: jax.Array | None = None
 
     @property
     def q_evidence_mass(self) -> jax.Array:
@@ -294,6 +303,14 @@ def make_posterior_tree_selfplay(env, config):
         beta_q_seq = []
         beta_v_seq = []
         q_loss_weight_seq = []
+        q_target_kind_seq = []
+        q_target_weight_seq = []
+        q_target_outcome_seq = []
+        q_target_distance_seq = []
+        v_target_kind_seq = []
+        v_target_weight_seq = []
+        v_target_outcome_seq = []
+        v_target_distance_seq = []
         search_loss_mask_seq = []
         discount_seq = []
         tree_data_seq = []
@@ -353,6 +370,50 @@ def make_posterior_tree_selfplay(env, config):
             beta_q_seq.append(search_output.beta_Q_target)
             beta_v_seq.append(search_output.beta_V_target)
             q_loss_weight_seq.append(search_output.q_loss_weight)
+            native_defaults = native_fields_from_beta(
+                search_output.beta_Q_target,
+                search_output.beta_V_target,
+            )
+            q_target_kind_seq.append(
+                search_output.q_target_kind
+                if search_output.q_target_kind is not None
+                else native_defaults["q_target_kind"]
+            )
+            q_target_weight_seq.append(
+                search_output.q_target_weight
+                if search_output.q_target_weight is not None
+                else native_defaults["q_target_weight"]
+            )
+            q_target_outcome_seq.append(
+                search_output.q_target_outcome
+                if search_output.q_target_outcome is not None
+                else native_defaults["q_target_outcome"]
+            )
+            q_target_distance_seq.append(
+                search_output.q_target_distance
+                if search_output.q_target_distance is not None
+                else native_defaults["q_target_distance"]
+            )
+            v_target_kind_seq.append(
+                search_output.v_target_kind
+                if search_output.v_target_kind is not None
+                else native_defaults["v_target_kind"]
+            )
+            v_target_weight_seq.append(
+                search_output.v_target_weight
+                if search_output.v_target_weight is not None
+                else native_defaults["v_target_weight"]
+            )
+            v_target_outcome_seq.append(
+                search_output.v_target_outcome
+                if search_output.v_target_outcome is not None
+                else native_defaults["v_target_outcome"]
+            )
+            v_target_distance_seq.append(
+                search_output.v_target_distance
+                if search_output.v_target_distance is not None
+                else native_defaults["v_target_distance"]
+            )
             root_search_mask = search_output.search_loss_mask
             if root_search_mask is None:
                 root_search_mask = jnp.sum(search_output.action_weights, axis=-1) > 0
@@ -393,6 +454,14 @@ def make_posterior_tree_selfplay(env, config):
             tree_data=tree_data,
             search_loss_mask=jnp.stack(search_loss_mask_seq, axis=0),
             search_diagnostics=search_diagnostics,
+            q_target_kind=jnp.stack(q_target_kind_seq, axis=0),
+            q_target_weight=jnp.stack(q_target_weight_seq, axis=0),
+            q_target_outcome=jnp.stack(q_target_outcome_seq, axis=0),
+            q_target_distance=jnp.stack(q_target_distance_seq, axis=0),
+            v_target_kind=jnp.stack(v_target_kind_seq, axis=0),
+            v_target_weight=jnp.stack(v_target_weight_seq, axis=0),
+            v_target_outcome=jnp.stack(v_target_outcome_seq, axis=0),
+            v_target_distance=jnp.stack(v_target_distance_seq, axis=0),
         )
 
     return selfplay

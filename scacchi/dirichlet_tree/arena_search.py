@@ -10,8 +10,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .native import (
+    NO_DISTANCE,
+    NO_OUTCOME,
+    TARGET_CATEGORICAL,
+    TARGET_DIRICHLET,
+    categorical_proxy_np,
+    native_policy_target_np,
+)
 from .selection import (
-    posterior_best_policy_target_np,
     thompson_select_jax,
     thompson_select_np,
 )
@@ -120,6 +127,9 @@ class PosteriorArena:
         self.node_value_cache_version = np.zeros((self.max_nodes,), dtype=np.uint32)
         self.node_edge_epoch = np.zeros((self.max_nodes,), dtype=np.uint32)
         self.node_terminal_outcome = np.full((self.max_nodes,), -1, dtype=np.int8)
+        self.node_cat_outcome = np.full((self.max_nodes,), int(NO_OUTCOME), dtype=np.int8)
+        self.node_cat_distance = np.full((self.max_nodes,), int(NO_DISTANCE), dtype=np.int32)
+        self.node_cat_action = np.full((self.max_nodes,), UNKNOWN, dtype=np.int32)
         self.node_observation = None
         if observation_shape is not None:
             dtype = np.dtype(np.float32 if observation_dtype is None else observation_dtype)
@@ -142,6 +152,8 @@ class PosteriorArena:
         self.edge_post_alpha = np.ones((self.max_edges, self.num_outcomes), dtype=np.float32)
         self.edge_logit = np.zeros((self.max_edges,), dtype=np.float32)
         self.edge_visits = np.zeros((self.max_edges,), dtype=np.uint32)
+        self.edge_cat_outcome = np.full((self.max_edges,), int(NO_OUTCOME), dtype=np.int8)
+        self.edge_cat_distance = np.full((self.max_edges,), int(NO_DISTANCE), dtype=np.int32)
 
         self.key_to_node: dict[bytes, int] = {}
         self._key_index_complete = True
@@ -190,6 +202,9 @@ class PosteriorArena:
         self.node_value_cache_version[node_id] += np.uint32(1)
         self.node_edge_epoch[node_id] = np.uint32(0)
         self.node_terminal_outcome[node_id] = np.int8(-1)
+        self.node_cat_outcome[node_id] = np.int8(NO_OUTCOME)
+        self.node_cat_distance[node_id] = np.int32(NO_DISTANCE)
+        self.node_cat_action[node_id] = np.int32(UNKNOWN)
         self._set_node_observation(node_id, observation)
 
         end_edge = first_edge + edge_count
@@ -208,6 +223,8 @@ class PosteriorArena:
         self.edge_post_alpha[first_edge:end_edge] = sparse_q
         self.edge_logit[first_edge:end_edge] = np.asarray(policy_logits, dtype=np.float32)[legal_actions]
         self.edge_visits[first_edge:end_edge] = 0
+        self.edge_cat_outcome[first_edge:end_edge] = np.int8(NO_OUTCOME)
+        self.edge_cat_distance[first_edge:end_edge] = np.int32(NO_DISTANCE)
         self.num_edges = end_edge
         self.node_summary_alpha[node_id] = self.node_value_cache_C[node_id]
         self.node_status[node_id] = STATUS_EXPANDED
@@ -357,6 +374,9 @@ class PosteriorArena:
         self.node_value_cache_version[node_ids] += np.uint32(1)
         self.node_edge_epoch[node_ids] = np.uint32(0)
         self.node_terminal_outcome[node_ids] = np.int8(-1)
+        self.node_cat_outcome[node_ids] = np.int8(NO_OUTCOME)
+        self.node_cat_distance[node_ids] = np.int32(NO_DISTANCE)
+        self.node_cat_action[node_ids] = np.int32(UNKNOWN)
         self._set_node_observations(node_ids, observations)
         if self._key_index_complete and count < 4096:
             self.key_to_node.update((keys[ix].tobytes(), int(node_ids[ix])) for ix in range(count))
@@ -396,6 +416,8 @@ class PosteriorArena:
         )
         self.edge_logit[edge_start:edge_end] = sparse_logits.reshape((edge_count,))
         self.edge_visits[edge_start:edge_end] = 0
+        self.edge_cat_outcome[edge_start:edge_end] = np.int8(NO_OUTCOME)
+        self.edge_cat_distance[edge_start:edge_end] = np.int32(NO_DISTANCE)
         self.num_edges = edge_end
         self.node_summary_alpha[node_ids] = self.node_value_cache_C[node_ids]
         self.node_status[node_ids] = STATUS_EXPANDED
@@ -437,6 +459,9 @@ class PosteriorArena:
         self.node_edge_epoch[node_id] = np.uint32(0)
         self.node_summary_alpha[node_id] = self.node_value_cache_C[node_id]
         self.node_terminal_outcome[node_id] = np.int8(terminal_outcome)
+        self.node_cat_outcome[node_id] = np.int8(terminal_outcome)
+        self.node_cat_distance[node_id] = np.int32(0)
+        self.node_cat_action[node_id] = np.int32(UNKNOWN)
         self._set_node_observation(node_id, observation)
         return node_id
 
@@ -474,6 +499,9 @@ class PosteriorArena:
         self.node_edge_epoch[node_id] = np.uint32(0)
         self.node_summary_alpha[node_id] = self.node_value_cache_C[node_id]
         self.node_terminal_outcome[node_id] = np.int8(-1)
+        self.node_cat_outcome[node_id] = np.int8(NO_OUTCOME)
+        self.node_cat_distance[node_id] = np.int32(NO_DISTANCE)
+        self.node_cat_action[node_id] = np.int32(UNKNOWN)
         self._set_node_observation(node_id, observation)
         return node_id
 
@@ -771,6 +799,14 @@ class BatchedPosteriorArenaSearch:
             beta_v = np.zeros((self.root_node_ids.shape[0], arena.num_outcomes), dtype=np.float32)
             q_weight = np.zeros((self.root_node_ids.shape[0], arena.num_actions), dtype=np.float32)
             alpha_root = np.zeros_like(beta_q)
+            q_kind = np.zeros((self.root_node_ids.shape[0], arena.num_actions), dtype=np.int8)
+            q_target_weight = np.zeros((self.root_node_ids.shape[0], arena.num_actions), dtype=np.float32)
+            q_outcome = np.full((self.root_node_ids.shape[0], arena.num_actions), int(NO_OUTCOME), dtype=np.int8)
+            q_distance = np.full((self.root_node_ids.shape[0], arena.num_actions), int(NO_DISTANCE), dtype=np.int32)
+            v_kind = np.full((self.root_node_ids.shape[0],), int(TARGET_DIRICHLET), dtype=np.int8)
+            v_target_weight = np.ones((self.root_node_ids.shape[0],), dtype=np.float32)
+            v_outcome = np.full((self.root_node_ids.shape[0],), int(NO_OUTCOME), dtype=np.int8)
+            v_distance = np.full((self.root_node_ids.shape[0],), int(NO_DISTANCE), dtype=np.int32)
             for out_ix, node_id in enumerate(self.root_node_ids):
                 start = int(arena.node_first_edge[node_id])
                 count = int(arena.node_num_edges[node_id])
@@ -780,10 +816,37 @@ class BatchedPosteriorArenaSearch:
                     legal[action] = True
                     alpha_root[out_ix, action] = arena.edge_post_alpha[edge_id]
                     beta_q[out_ix, action] = arena.edge_post_alpha[edge_id]
-                policies[out_ix] = posterior_best_policy_target_np(
+                    q_kind[out_ix, action] = (
+                        int(TARGET_CATEGORICAL)
+                        if int(arena.edge_cat_outcome[edge_id]) != int(NO_OUTCOME)
+                        else int(TARGET_DIRICHLET)
+                    )
+                    q_target_weight[out_ix, action] = 1.0
+                    q_outcome[out_ix, action] = arena.edge_cat_outcome[edge_id]
+                    q_distance[out_ix, action] = arena.edge_cat_distance[edge_id]
+                if int(arena.node_cat_outcome[node_id]) != int(NO_OUTCOME):
+                    action = int(arena.node_cat_action[node_id])
+                    if action < 0 or action >= arena.num_actions:
+                        action = _first_legal_action(legal)
+                    if 0 <= action < arena.num_actions and bool(legal[action]):
+                        policies[out_ix, action] = 1.0
+                    beta_v[out_ix] = categorical_proxy_np(
+                        int(arena.node_cat_outcome[node_id]),
+                        arena.num_outcomes,
+                        epsilon=1e-6,
+                    )
+                    v_kind[out_ix] = int(TARGET_CATEGORICAL)
+                    v_outcome[out_ix] = arena.node_cat_outcome[node_id]
+                    v_distance[out_ix] = arena.node_cat_distance[node_id]
+                    actions[out_ix] = action
+                    q_weight[out_ix] = policies[out_ix]
+                    continue
+                policies[out_ix] = native_policy_target_np(
                     self.rng,
                     alpha_root[out_ix],
                     legal,
+                    q_kind[out_ix],
+                    q_outcome[out_ix],
                     config.policy_mc_samples,
                 )
                 q_weight[out_ix] = policies[out_ix]
@@ -799,6 +862,14 @@ class BatchedPosteriorArenaSearch:
                 alpha_root=jnp.asarray(alpha_root, dtype=jnp.float32),
                 search_loss_mask=jnp.asarray(np.sum(policies, axis=-1) > 0.0),
                 diagnostics=self._build_search_diagnostics(config, policies, alpha_root),
+                q_target_kind=jnp.asarray(q_kind, dtype=jnp.int8),
+                q_target_weight=jnp.asarray(q_target_weight, dtype=jnp.float32),
+                q_target_outcome=jnp.asarray(q_outcome, dtype=jnp.int8),
+                q_target_distance=jnp.asarray(q_distance, dtype=jnp.int32),
+                v_target_kind=jnp.asarray(v_kind, dtype=jnp.int8),
+                v_target_weight=jnp.asarray(v_target_weight, dtype=jnp.float32),
+                v_target_outcome=jnp.asarray(v_outcome, dtype=jnp.int8),
+                v_target_distance=jnp.asarray(v_distance, dtype=jnp.int32),
             )
             result = self._attach_tree_data(result, config)
             self._block_if_timing(result)
@@ -815,6 +886,8 @@ class BatchedPosteriorArenaSearch:
         arena = self.arena
         root_ids = self.root_node_ids.astype(np.int32)
         if root_ids.size == 0:
+            return None
+        if np.any(arena.node_cat_outcome[root_ids] != int(NO_OUTCOME)):
             return None
         edge_counts = arena.node_num_edges[root_ids].astype(np.int32)
         if not np.all(edge_counts == edge_counts[0]):
@@ -838,16 +911,49 @@ class BatchedPosteriorArenaSearch:
 
         legal = np.zeros((root_ids.shape[0], arena.num_actions), dtype=bool)
         legal[row_ids, action_ids] = True
+        q_kind = np.zeros((root_ids.shape[0], arena.num_actions), dtype=np.int8)
+        q_target_weight = np.zeros((root_ids.shape[0], arena.num_actions), dtype=np.float32)
+        q_outcome = np.full((root_ids.shape[0], arena.num_actions), int(NO_OUTCOME), dtype=np.int8)
+        q_distance = np.full((root_ids.shape[0], arena.num_actions), int(NO_DISTANCE), dtype=np.int32)
+        sparse_cat_outcome = arena.edge_cat_outcome[edge_ids]
+        q_kind[row_ids, action_ids] = np.where(
+            sparse_cat_outcome != int(NO_OUTCOME),
+            int(TARGET_CATEGORICAL),
+            int(TARGET_DIRICHLET),
+        ).astype(np.int8)
+        q_target_weight[row_ids, action_ids] = 1.0
+        q_outcome[row_ids, action_ids] = sparse_cat_outcome
+        q_distance[row_ids, action_ids] = arena.edge_cat_distance[edge_ids]
 
-        policies = _posterior_best_policy_target_batch_np(
-            self.rng,
-            alpha_root,
-            legal,
-            config.policy_mc_samples,
-        )
+        if np.any(sparse_cat_outcome != int(NO_OUTCOME)):
+            policies = np.stack(
+                [
+                    native_policy_target_np(
+                        self.rng,
+                        alpha_root[ix],
+                        legal[ix],
+                        q_kind[ix],
+                        q_outcome[ix],
+                        config.policy_mc_samples,
+                    )
+                    for ix in range(root_ids.shape[0])
+                ],
+                axis=0,
+            )
+        else:
+            policies = _posterior_best_policy_target_batch_np(
+                self.rng,
+                alpha_root,
+                legal,
+                config.policy_mc_samples,
+            )
         q_weight = policies.copy()
         beta_v = arena.node_value_cache_C[root_ids]
         actions = _commit_actions_batch(self.rng, config, policies, alpha_root, legal)
+        v_kind = np.full((root_ids.shape[0],), int(TARGET_DIRICHLET), dtype=np.int8)
+        v_target_weight = np.ones((root_ids.shape[0],), dtype=np.float32)
+        v_outcome = np.full((root_ids.shape[0],), int(NO_OUTCOME), dtype=np.int8)
+        v_distance = np.full((root_ids.shape[0],), int(NO_DISTANCE), dtype=np.int32)
         return SearchResult(
             action=jnp.asarray(actions, dtype=jnp.int32),
             action_weights=jnp.asarray(policies, dtype=jnp.float32),
@@ -857,6 +963,14 @@ class BatchedPosteriorArenaSearch:
             alpha_root=jnp.asarray(alpha_root, dtype=jnp.float32),
             search_loss_mask=jnp.asarray(np.sum(policies, axis=-1) > 0.0),
             diagnostics=self._build_search_diagnostics(config, policies, alpha_root),
+            q_target_kind=jnp.asarray(q_kind, dtype=jnp.int8),
+            q_target_weight=jnp.asarray(q_target_weight, dtype=jnp.float32),
+            q_target_outcome=jnp.asarray(q_outcome, dtype=jnp.int8),
+            q_target_distance=jnp.asarray(q_distance, dtype=jnp.int32),
+            v_target_kind=jnp.asarray(v_kind, dtype=jnp.int8),
+            v_target_weight=jnp.asarray(v_target_weight, dtype=jnp.float32),
+            v_target_outcome=jnp.asarray(v_outcome, dtype=jnp.int8),
+            v_target_distance=jnp.asarray(v_distance, dtype=jnp.int32),
         )
 
     def _build_search_diagnostics(
@@ -947,6 +1061,14 @@ class BatchedPosteriorArenaSearch:
         beta_q = np.zeros((capacity, arena.num_actions, arena.num_outcomes), dtype=np.float32)
         beta_v = np.ones((capacity, arena.num_outcomes), dtype=np.float32)
         q_weight = np.zeros((capacity, arena.num_actions), dtype=np.float32)
+        q_kind = np.zeros((capacity, arena.num_actions), dtype=np.int8)
+        q_target_weight = np.zeros((capacity, arena.num_actions), dtype=np.float32)
+        q_outcome = np.full((capacity, arena.num_actions), int(NO_OUTCOME), dtype=np.int8)
+        q_distance = np.full((capacity, arena.num_actions), int(NO_DISTANCE), dtype=np.int32)
+        v_kind = np.full((capacity,), int(TARGET_DIRICHLET), dtype=np.int8)
+        v_target_weight = np.ones((capacity,), dtype=np.float32)
+        v_outcome = np.full((capacity,), int(NO_OUTCOME), dtype=np.int8)
+        v_distance = np.full((capacity,), int(NO_DISTANCE), dtype=np.int32)
         value_tgt = np.zeros((capacity,), dtype=np.float32)
         policy_loss_mask = np.zeros((capacity,), dtype=bool)
         value_loss_mask = np.zeros((capacity,), dtype=bool)
@@ -983,6 +1105,18 @@ class BatchedPosteriorArenaSearch:
                 legal_mask[row, actions] = True
                 beta_q[row, actions] = arena.edge_post_alpha[edge_ids]
                 beta_v[row] = arena.node_value_cache_C[node_id]
+                q_kind[row, actions] = np.where(
+                    arena.edge_cat_outcome[edge_ids] != int(NO_OUTCOME),
+                    int(TARGET_CATEGORICAL),
+                    int(TARGET_DIRICHLET),
+                ).astype(np.int8)
+                q_target_weight[row, actions] = 1.0
+                q_outcome[row, actions] = arena.edge_cat_outcome[edge_ids]
+                q_distance[row, actions] = arena.edge_cat_distance[edge_ids]
+                if int(arena.node_cat_outcome[node_id]) != int(NO_OUTCOME):
+                    v_kind[row] = int(TARGET_CATEGORICAL)
+                    v_outcome[row] = arena.node_cat_outcome[node_id]
+                    v_distance[row] = arena.node_cat_distance[node_id]
                 policy_loss_mask[row] = True
                 value_loss_mask[row] = True
                 search_loss_mask[row] = True
@@ -994,12 +1128,39 @@ class BatchedPosteriorArenaSearch:
         if expanded_rows:
             row_ix = np.asarray(expanded_rows, dtype=np.int32)
             node_ix = np.asarray(expanded_node_ids, dtype=np.int32)
-            policies = _posterior_best_policy_target_batch_np(
-                self.rng,
-                beta_q[row_ix],
-                legal_mask[row_ix],
-                config.policy_mc_samples,
-            )
+            if np.any(q_kind[row_ix] == int(TARGET_CATEGORICAL)):
+                policies = np.stack(
+                    [
+                        native_policy_target_np(
+                            self.rng,
+                            beta_q[row],
+                            legal_mask[row],
+                            q_kind[row],
+                            q_outcome[row],
+                            config.policy_mc_samples,
+                        )
+                        for row in row_ix
+                    ],
+                    axis=0,
+                )
+            else:
+                policies = _posterior_best_policy_target_batch_np(
+                    self.rng,
+                    beta_q[row_ix],
+                    legal_mask[row_ix],
+                    config.policy_mc_samples,
+                )
+            categorical_nodes = arena.node_cat_outcome[node_ix] != int(NO_OUTCOME)
+            for local_ix, is_categorical in enumerate(categorical_nodes):
+                if not bool(is_categorical):
+                    continue
+                row = int(row_ix[local_ix])
+                action = int(arena.node_cat_action[int(node_ix[local_ix])])
+                if action < 0 or action >= arena.num_actions:
+                    action = _first_legal_action(legal_mask[row])
+                policies[local_ix] = 0.0
+                if 0 <= action < arena.num_actions and bool(legal_mask[row, action]):
+                    policies[local_ix, action] = 1.0
             action_weights[row_ix] = policies
             q_weight[row_ix] = policies
             beta_v[row_ix] = arena.node_value_cache_C[node_ix]
@@ -1025,6 +1186,14 @@ class BatchedPosteriorArenaSearch:
             value_loss_mask=jnp.asarray(value_loss_mask),
             search_loss_mask=jnp.asarray(search_loss_mask),
             outcome_mask=jnp.asarray(outcome_mask),
+            q_target_kind=jnp.asarray(q_kind, dtype=jnp.int8),
+            q_target_weight=jnp.asarray(q_target_weight, dtype=jnp.float32),
+            q_target_outcome=jnp.asarray(q_outcome, dtype=jnp.int8),
+            q_target_distance=jnp.asarray(q_distance, dtype=jnp.int32),
+            v_target_kind=jnp.asarray(v_kind, dtype=jnp.int8),
+            v_target_weight=jnp.asarray(v_target_weight, dtype=jnp.float32),
+            v_target_outcome=jnp.asarray(v_outcome, dtype=jnp.int8),
+            v_target_distance=jnp.asarray(v_distance, dtype=jnp.int32),
         )
 
     def _run_wavefront(
@@ -1116,21 +1285,34 @@ class BatchedPosteriorArenaSearch:
                         continue
                     node_id = int(current_node_ids[row])
                     if path_len[row] > 0:
-                        outcome = int(arena.node_terminal_outcome[node_id])
-                        value = _terminal_beta(outcome, arena.num_outcomes, config)
-                        self._backup_path(
-                            path_nodes[row],
-                            path_edges[row],
-                            int(path_len[row]),
-                            leaf_node_id=node_id,
-                            leaf_value=value,
-                            backup_mc_samples=config.backup_mc_samples,
-                            config=config,
+                        final_edge = int(path_edges[row, int(path_len[row]) - 1])
+                        self._publish_categorical_edge_from_child(
+                            final_edge,
+                            node_id,
+                            config,
+                            increment_eval_count=True,
                         )
+                        final_parent = int(path_nodes[row, int(path_len[row]) - 1])
+                        self._propagate_categorical(final_parent, config)
                     self._record_completed_path_depth(int(lane_root_ids[row]), int(path_len[row]))
                     done[lane_root_ids[row]] += 1
 
-            selectable_mask = (status == STATUS_EXPANDED) & (arena.node_num_edges[node_ids] > 0)
+                categorical_rows = active_rows[
+                    (status == STATUS_EXPANDED)
+                    & (arena.node_cat_outcome[node_ids] != int(NO_OUTCOME))
+                ]
+                for row in categorical_rows:
+                    if done[lane_root_ids[row]] >= config.num_simulations:
+                        continue
+                    self._propagate_categorical(int(current_node_ids[row]), config)
+                    self._record_completed_path_depth(int(lane_root_ids[row]), int(path_len[row]))
+                    done[lane_root_ids[row]] += 1
+
+            selectable_mask = (
+                (status == STATUS_EXPANDED)
+                & (arena.node_num_edges[node_ids] > 0)
+                & (arena.node_cat_outcome[node_ids] == int(NO_OUTCOME))
+            )
             selectable_rows = active_rows[selectable_mask]
             selectable_state_pos = active_state_pos[selectable_mask]
             if selectable_rows.size == 0:
@@ -1138,6 +1320,15 @@ class BatchedPosteriorArenaSearch:
 
             with self._timed("node_packing"):
                 select_nodes = current_node_ids[selectable_rows]
+                for node_id in np.unique(select_nodes):
+                    self._try_categorize_node(int(node_id), config)
+                selectable_now = arena.node_cat_outcome[select_nodes] == int(NO_OUTCOME)
+                if not np.any(selectable_now):
+                    continue
+                if not np.all(selectable_now):
+                    selectable_rows = selectable_rows[selectable_now]
+                    selectable_state_pos = selectable_state_pos[selectable_now]
+                    select_nodes = select_nodes[selectable_now]
                 first_edges = arena.node_first_edge[select_nodes].astype(np.int32)
                 edge_counts = arena.node_num_edges[select_nodes].astype(np.int32)
                 max_edges = int(np.max(edge_counts))
@@ -1152,6 +1343,7 @@ class BatchedPosteriorArenaSearch:
                     (child_status == STATUS_INFLIGHT) | (child_status == STATUS_EXPANDING)
                 )
                 mask = mask & ~blocked
+                mask = mask & (arena.edge_cat_outcome[safe_edge_ids] == int(NO_OUTCOME))
                 has_available = np.any(mask, axis=1)
                 if not np.any(has_available):
                     break
@@ -1336,6 +1528,9 @@ class BatchedPosteriorArenaSearch:
                     if child_status == STATUS_TERMINAL:
                         terminal_backup_rows.append(int(row))
                         terminal_backup_children.append(child_node_id)
+                    elif int(arena.node_cat_outcome[child_node_id]) != int(NO_OUTCOME):
+                        terminal_backup_rows.append(int(row))
+                        terminal_backup_children.append(child_node_id)
                     else:
                         base_update_edges.append(edge_id)
                         base_update_children.append(child_node_id)
@@ -1354,17 +1549,15 @@ class BatchedPosteriorArenaSearch:
                 for row, child_node_id in zip(terminal_backup_rows, terminal_backup_children, strict=True):
                     if done[lane_root_ids[row]] >= config.num_simulations:
                         continue
-                    outcome = int(arena.node_terminal_outcome[child_node_id])
-                    value = _terminal_beta(outcome, arena.num_outcomes, config)
-                    self._backup_path(
-                        path_nodes[row],
-                        path_edges[row],
-                        int(path_len[row]),
-                        leaf_node_id=child_node_id,
-                        leaf_value=value,
-                        backup_mc_samples=config.backup_mc_samples,
-                        config=config,
+                    final_edge = int(path_edges[row, int(path_len[row]) - 1])
+                    self._publish_categorical_edge_from_child(
+                        final_edge,
+                        int(child_node_id),
+                        config,
+                        increment_eval_count=True,
                     )
+                    final_parent = int(path_nodes[row, int(path_len[row]) - 1])
+                    self._propagate_categorical(final_parent, config)
                     self._record_completed_path_depth(int(lane_root_ids[row]), int(path_len[row]))
                     done[lane_root_ids[row]] += 1
 
@@ -1586,6 +1779,51 @@ class BatchedPosteriorArenaSearch:
         active_path_len = path_len[active_ix].astype(np.int32)
         final_edges = path_edges[active_ix, active_path_len - 1].astype(np.int32)
         final_parents = path_nodes[active_ix, active_path_len - 1].astype(np.int32)
+        fresh = arena.edge_cat_outcome[final_edges] == int(NO_OUTCOME)
+        if not np.any(fresh):
+            np.add.at(done, active_root_ids, 1)
+            return
+        if not np.all(fresh):
+            stale_root_ids = active_root_ids[~fresh]
+            np.add.at(done, stale_root_ids, 1)
+            active_child_ids = active_child_ids[fresh]
+            active_root_ids = active_root_ids[fresh]
+            active_path_len = active_path_len[fresh]
+            final_edges = final_edges[fresh]
+            final_parents = final_parents[fresh]
+
+        categorical_children = arena.node_cat_outcome[active_child_ids] != int(NO_OUTCOME)
+        if np.any(categorical_children):
+            cat_edges = final_edges[categorical_children]
+            cat_children = active_child_ids[categorical_children]
+            for edge_id, child_id, parent_id in zip(
+                cat_edges,
+                cat_children,
+                final_parents[categorical_children],
+                strict=True,
+            ):
+                self._publish_categorical_edge_from_child(
+                    int(edge_id),
+                    int(child_id),
+                    config,
+                    increment_eval_count=True,
+                )
+                self._propagate_categorical(int(parent_id), config)
+            for root_id, depth in zip(
+                active_root_ids[categorical_children],
+                active_path_len[categorical_children],
+                strict=True,
+            ):
+                self._record_completed_path_depth(int(root_id), int(depth))
+            np.add.at(done, active_root_ids[categorical_children], 1)
+            keep = ~categorical_children
+            if not np.any(keep):
+                return
+            active_child_ids = active_child_ids[keep]
+            active_root_ids = active_root_ids[keep]
+            active_path_len = active_path_len[keep]
+            final_edges = final_edges[keep]
+            final_parents = final_parents[keep]
 
         arena.edge_child_node[final_edges] = active_child_ids
         leaf_value = _leaf_beta(arena.node_value_alpha[active_child_ids], config)
@@ -1633,11 +1871,19 @@ class BatchedPosteriorArenaSearch:
             edge_ids = first_edges[:, None] + np.arange(int(edge_count), dtype=np.int32)[None, :]
             alpha = arena.edge_post_alpha[edge_ids]
             legal = np.ones((group_ids.shape[0], int(edge_count)), dtype=bool)
-            pi_search = _posterior_best_policy_target_batch_np(
-                self.rng,
-                alpha,
-                legal,
-                int(backup_mc_samples),
+            pi_search = np.stack(
+                [
+                    native_policy_target_np(
+                        self.rng,
+                        alpha[ix],
+                        legal[ix],
+                        _edge_target_kind_np(arena.edge_cat_outcome[edge_ids[ix]]),
+                        arena.edge_cat_outcome[edge_ids[ix]],
+                        int(backup_mc_samples),
+                    )
+                    for ix in range(group_ids.shape[0])
+                ],
+                axis=0,
             )
             e_v = np.sum(pi_search[..., None] * alpha, axis=1)
             n_down = np.sum(arena.edge_eval_count_R[edge_ids], axis=1).astype(np.float32)
@@ -1651,7 +1897,10 @@ class BatchedPosteriorArenaSearch:
     def _update_edge_base_from_child(self, edge_id: int, child_node_id: int) -> None:
         assert self.arena is not None
         arena = self.arena
-        if arena.node_status[int(child_node_id)] == STATUS_TERMINAL:
+        if (
+            arena.node_status[int(child_node_id)] == STATUS_TERMINAL
+            or int(arena.node_cat_outcome[int(child_node_id)]) != int(NO_OUTCOME)
+        ):
             return
         if bool(arena.edge_has_post[int(edge_id)]):
             return
@@ -1667,7 +1916,11 @@ class BatchedPosteriorArenaSearch:
         arena = self.arena
         edge_ids = np.asarray(edge_ids, dtype=np.int32)
         child_node_ids = np.asarray(child_node_ids, dtype=np.int32)
-        keep = (arena.node_status[child_node_ids] != STATUS_TERMINAL) & ~arena.edge_has_post[edge_ids]
+        keep = (
+            (arena.node_status[child_node_ids] != STATUS_TERMINAL)
+            & (arena.node_cat_outcome[child_node_ids] == int(NO_OUTCOME))
+            & ~arena.edge_has_post[edge_ids]
+        )
         if not np.any(keep):
             return
         edge_ids = edge_ids[keep]
@@ -1706,6 +1959,266 @@ class BatchedPosteriorArenaSearch:
         parent_ids = np.unique(arena.edge_parent_node[edge_ids].astype(np.int32))
         self._mark_nodes_dirty(parent_ids)
 
+    def _publish_categorical_edges(
+        self,
+        edge_ids: np.ndarray,
+        outcomes: np.ndarray,
+        distances: np.ndarray,
+        *,
+        increment_eval_count: bool = False,
+    ) -> np.ndarray:
+        assert self.arena is not None
+        arena = self.arena
+        edge_ids = np.asarray(edge_ids, dtype=np.int32).reshape((-1,))
+        outcomes = np.asarray(outcomes, dtype=np.int8).reshape((edge_ids.shape[0],))
+        distances = np.asarray(distances, dtype=np.int32).reshape((edge_ids.shape[0],))
+        if edge_ids.size == 0:
+            return np.zeros((0,), dtype=bool)
+
+        previous_outcome = arena.edge_cat_outcome[edge_ids].copy()
+        previous_distance = arena.edge_cat_distance[edge_ids].copy()
+        changed = (previous_outcome != outcomes) | (previous_distance != distances)
+        if not np.any(changed):
+            return changed
+
+        changed_edges = edge_ids[changed]
+        changed_outcomes = outcomes[changed]
+        changed_distances = distances[changed]
+        arena.edge_cat_outcome[changed_edges] = changed_outcomes
+        arena.edge_cat_distance[changed_edges] = changed_distances
+        proxies = np.stack(
+            [
+                categorical_proxy_np(
+                    int(outcome),
+                    arena.num_outcomes,
+                    epsilon=1e-6,
+                )
+                for outcome in changed_outcomes
+            ],
+            axis=0,
+        )
+        arena.edge_B[changed_edges] = proxies
+        arena.edge_post_alpha[changed_edges] = proxies
+        arena.edge_E[changed_edges] = proxies - arena.edge_base_alpha[changed_edges]
+        arena.edge_has_post[changed_edges] = True
+        first_publish = previous_outcome[changed] == int(NO_OUTCOME)
+        if increment_eval_count:
+            np.add.at(arena.edge_eval_count_R, changed_edges, np.ones_like(changed_edges, dtype=np.uint32))
+        else:
+            np.add.at(
+                arena.edge_eval_count_R,
+                changed_edges[first_publish],
+                np.ones((int(np.sum(first_publish)),), dtype=np.uint32),
+            )
+        np.add.at(arena.edge_visits, changed_edges, np.ones_like(changed_edges, dtype=np.uint32))
+        arena.edge_version[changed_edges] += np.uint32(1)
+        arena.edge_child_cache_version[changed_edges] = -1
+        parent_ids = np.unique(arena.edge_parent_node[changed_edges].astype(np.int32))
+        self._mark_nodes_dirty(parent_ids)
+        return changed
+
+    def _publish_categorical_edge_from_child(
+        self,
+        edge_id: int,
+        child_node_id: int,
+        config: SearchConfig | None,
+        *,
+        increment_eval_count: bool = False,
+    ) -> bool:
+        assert self.arena is not None
+        arena = self.arena
+        edge_id = int(edge_id)
+        child_id = int(child_node_id)
+        if child_id == UNKNOWN:
+            return False
+        if int(arena.node_cat_outcome[child_id]) == int(NO_OUTCOME):
+            if config is None:
+                return False
+            self._try_categorize_node(child_id, config)
+        if int(arena.node_cat_outcome[child_id]) == int(NO_OUTCOME):
+            return False
+        parent_id = int(arena.edge_parent_node[edge_id])
+        outcome = _align_outcome_index(
+            int(arena.node_cat_outcome[child_id]),
+            int(arena.node_current_player[child_id]),
+            int(arena.node_current_player[parent_id]),
+            arena.num_outcomes,
+        )
+        distance = int(arena.node_cat_distance[child_id]) + 1
+        self._publish_categorical_edges(
+            np.asarray([edge_id], dtype=np.int32),
+            np.asarray([outcome], dtype=np.int8),
+            np.asarray([distance], dtype=np.int32),
+            increment_eval_count=increment_eval_count,
+        )
+        return True
+
+    def _publish_categorical_node(
+        self,
+        node_id: int,
+        outcome: int,
+        distance: int,
+        action: int,
+    ) -> bool:
+        assert self.arena is not None
+        arena = self.arena
+        node_id = int(node_id)
+        changed = (
+            int(arena.node_cat_outcome[node_id]) != int(outcome)
+            or int(arena.node_cat_distance[node_id]) != int(distance)
+            or int(arena.node_cat_action[node_id]) != int(action)
+        )
+        arena.node_cat_outcome[node_id] = np.int8(outcome)
+        arena.node_cat_distance[node_id] = np.int32(distance)
+        arena.node_cat_action[node_id] = np.int32(action)
+        arena.node_value_cache_C[node_id] = categorical_proxy_np(
+            int(outcome),
+            arena.num_outcomes,
+            epsilon=1e-6,
+        )
+        start = int(arena.node_first_edge[node_id])
+        count = int(arena.node_num_edges[node_id])
+        if count > 0:
+            edge_ids = start + np.arange(count, dtype=np.int32)
+            arena.node_downstream_eval_count[node_id] = np.uint32(
+                np.sum(arena.edge_eval_count_R[edge_ids], dtype=np.uint64)
+            )
+        else:
+            arena.node_downstream_eval_count[node_id] = np.uint32(0)
+        arena.node_value_cache_status[node_id] = VALUE_CACHE_CLEAN
+        arena.node_summary_alpha[node_id] = arena.node_value_cache_C[node_id]
+        if changed:
+            arena.node_value_cache_version[node_id] += np.uint32(1)
+            parent_id = int(arena.node_parent_node[node_id])
+            if parent_id != UNKNOWN:
+                self._mark_nodes_dirty(np.asarray([parent_id], dtype=np.int32))
+        return True
+
+    def _try_categorize_node(self, node_id: int, config: SearchConfig) -> bool:
+        assert self.arena is not None
+        arena = self.arena
+        node_id = int(node_id)
+        if int(arena.node_cat_outcome[node_id]) != int(NO_OUTCOME):
+            return True
+        status = arena.node_status[node_id]
+        if status == STATUS_TERMINAL:
+            outcome = int(arena.node_terminal_outcome[node_id])
+            if outcome == int(NO_OUTCOME):
+                return False
+            return self._publish_categorical_node(node_id, outcome, 0, UNKNOWN)
+        if status != STATUS_EXPANDED:
+            return False
+        start = int(arena.node_first_edge[node_id])
+        count = int(arena.node_num_edges[node_id])
+        if count <= 0:
+            return False
+        edge_ids = start + np.arange(count, dtype=np.int32)
+        for edge_id in edge_ids:
+            child_id = int(arena.edge_child_node[edge_id])
+            if child_id != UNKNOWN:
+                self._publish_categorical_edge_from_child(int(edge_id), child_id, config)
+
+        outcomes = arena.edge_cat_outcome[edge_ids].astype(np.int32)
+        distances = arena.edge_cat_distance[edge_ids].astype(np.int32)
+        known = outcomes != int(NO_OUTCOME)
+        win_index = arena.num_outcomes - 1
+        win_mask = known & (outcomes == win_index)
+        if np.any(win_mask):
+            action = self._choose_categorical_distance_edge(
+                edge_ids[win_mask],
+                distances[win_mask],
+                prefer_short=True,
+            )
+            return self._publish_categorical_node(
+                node_id,
+                win_index,
+                int(arena.edge_cat_distance[action]),
+                int(arena.edge_action[action]),
+            )
+        if not np.all(known):
+            return False
+        if arena.num_outcomes == 3:
+            draw_mask = outcomes == 1
+            if np.any(draw_mask):
+                edge_id = self._choose_categorical_draw_edge(
+                    edge_ids[draw_mask],
+                    config,
+                )
+                return self._publish_categorical_node(
+                    node_id,
+                    1,
+                    int(arena.edge_cat_distance[edge_id]),
+                    int(arena.edge_action[edge_id]),
+                )
+        edge_id = self._choose_categorical_distance_edge(
+            edge_ids,
+            distances,
+            prefer_short=False,
+        )
+        return self._publish_categorical_node(
+            node_id,
+            0,
+            int(arena.edge_cat_distance[edge_id]),
+            int(arena.edge_action[edge_id]),
+        )
+
+    def _propagate_categorical(self, start_node_id: int, config: SearchConfig) -> None:
+        assert self.arena is not None
+        arena = self.arena
+        node_id = int(start_node_id)
+        seen: set[int] = set()
+        while node_id != UNKNOWN and node_id not in seen:
+            seen.add(node_id)
+            self._try_categorize_node(node_id, config)
+            if int(arena.node_cat_outcome[node_id]) == int(NO_OUTCOME):
+                return
+            parent_id = int(arena.node_parent_node[node_id])
+            if parent_id == UNKNOWN:
+                return
+            edge_id = _edge_id_for_action(arena, parent_id, int(arena.node_parent_action[node_id]))
+            if edge_id == UNKNOWN:
+                return
+            self._publish_categorical_edge_from_child(edge_id, node_id, config)
+            node_id = parent_id
+
+    def _choose_categorical_distance_edge(
+        self,
+        edge_ids: np.ndarray,
+        distances: np.ndarray,
+        *,
+        prefer_short: bool,
+    ) -> int:
+        assert self.arena is not None
+        edge_ids = np.asarray(edge_ids, dtype=np.int32)
+        distances = np.asarray(distances, dtype=np.int32)
+        if edge_ids.size == 0:
+            return UNKNOWN
+        best = np.min(distances) if prefer_short else np.max(distances)
+        candidates = edge_ids[distances == best]
+        actions = self.arena.edge_action[candidates]
+        return int(candidates[int(np.argmin(actions))])
+
+    def _choose_categorical_draw_edge(
+        self,
+        edge_ids: np.ndarray,
+        config: SearchConfig,
+    ) -> int:
+        assert self.arena is not None
+        arena = self.arena
+        edge_ids = np.asarray(edge_ids, dtype=np.int32)
+        if edge_ids.size == 0:
+            return UNKNOWN
+        distances = arena.edge_cat_distance[edge_ids].astype(np.int32)
+        if config.categorical_draw_rule == "fastest_draw":
+            return self._choose_categorical_distance_edge(edge_ids, distances, prefer_short=True)
+        if config.categorical_draw_rule == "slowest_draw":
+            return self._choose_categorical_distance_edge(edge_ids, distances, prefer_short=False)
+        if config.categorical_draw_rule == "fixed_order":
+            actions = arena.edge_action[edge_ids]
+            return int(edge_ids[int(np.argmin(actions))])
+        logits = arena.edge_logit[edge_ids]
+        return int(edge_ids[int(np.argmax(logits))])
+
     def _mark_nodes_dirty(self, node_ids: np.ndarray) -> None:
         assert self.arena is not None
         node_ids = np.unique(np.asarray(node_ids, dtype=np.int32))
@@ -1736,7 +2249,6 @@ class BatchedPosteriorArenaSearch:
         child_node_id: int,
         config: SearchConfig,
     ) -> bool:
-        del config
         assert self.arena is not None
         arena = self.arena
         child_id = int(child_node_id)
@@ -1744,6 +2256,8 @@ class BatchedPosteriorArenaSearch:
         if child_id == UNKNOWN:
             return True
         child_status = arena.node_status[child_id]
+        if self._publish_categorical_edge_from_child(edge_id, child_id, config):
+            return True
         if child_status == STATUS_TERMINAL:
             return True
         if child_status != STATUS_EXPANDED:
@@ -1783,6 +2297,9 @@ class BatchedPosteriorArenaSearch:
         node_id = int(node_id)
         if arena.node_status[node_id] != STATUS_EXPANDED:
             return False
+        if int(arena.node_cat_outcome[node_id]) != int(NO_OUTCOME):
+            arena.node_value_cache_status[node_id] = VALUE_CACHE_CLEAN
+            return True
         start = int(arena.node_first_edge[node_id])
         count = int(arena.node_num_edges[node_id])
         if count <= 0:
@@ -1803,6 +2320,8 @@ class BatchedPosteriorArenaSearch:
             if not self._refresh_edge_from_child(int(edge_id), child_id, config):
                 arena.node_value_cache_status[node_id] = VALUE_CACHE_DIRTY
                 return False
+        if self._try_categorize_node(node_id, config):
+            return True
         if int(arena.node_edge_epoch[node_id]) != epoch:
             arena.node_value_cache_status[node_id] = VALUE_CACHE_DIRTY
             return False
@@ -1815,7 +2334,14 @@ class BatchedPosteriorArenaSearch:
         samples = int(config.backup_mc_samples if backup_mc_samples is None else backup_mc_samples)
         alpha = arena.edge_post_alpha[edge_ids]
         legal = np.ones((count,), dtype=bool)
-        pi_search = posterior_best_policy_target_np(self.rng, alpha, legal, samples)
+        pi_search = native_policy_target_np(
+            self.rng,
+            alpha,
+            legal,
+            _edge_target_kind_np(arena.edge_cat_outcome[edge_ids]),
+            arena.edge_cat_outcome[edge_ids],
+            samples,
+        )
         e_v = np.sum(pi_search[:, None] * alpha, axis=0)
         n_down = int(np.sum(arena.edge_eval_count_R[edge_ids], dtype=np.uint64))
         gamma = float(n_down) / (float(config.state_posterior_kappa_n) + float(n_down))
@@ -1886,6 +2412,16 @@ class BatchedPosteriorArenaSearch:
         arena = self.arena
         final_edge_id = int(path_edges[path_len - 1])
         final_parent_id = int(path_nodes[path_len - 1])
+        if int(arena.node_cat_outcome[int(leaf_node_id)]) != int(NO_OUTCOME):
+            self._publish_categorical_edge_from_child(
+                final_edge_id,
+                int(leaf_node_id),
+                config,
+                increment_eval_count=True,
+            )
+            if config is not None:
+                self._propagate_categorical(final_parent_id, config)
+            return
         parent_player = int(arena.node_current_player[final_parent_id])
         leaf_player = int(arena.node_current_player[leaf_node_id])
         aligned = leaf_value[::-1] if parent_player != leaf_player else leaf_value
@@ -2146,6 +2682,30 @@ def _broadcast_search_result(result: SearchResult, inverse: np.ndarray) -> Searc
             if result.diagnostics is None
             else jax.tree_util.tree_map(lambda x: x[inverse_jax], result.diagnostics)
         ),
+        q_target_kind=(
+            None if result.q_target_kind is None else result.q_target_kind[inverse_jax]
+        ),
+        q_target_weight=(
+            None if result.q_target_weight is None else result.q_target_weight[inverse_jax]
+        ),
+        q_target_outcome=(
+            None if result.q_target_outcome is None else result.q_target_outcome[inverse_jax]
+        ),
+        q_target_distance=(
+            None if result.q_target_distance is None else result.q_target_distance[inverse_jax]
+        ),
+        v_target_kind=(
+            None if result.v_target_kind is None else result.v_target_kind[inverse_jax]
+        ),
+        v_target_weight=(
+            None if result.v_target_weight is None else result.v_target_weight[inverse_jax]
+        ),
+        v_target_outcome=(
+            None if result.v_target_outcome is None else result.v_target_outcome[inverse_jax]
+        ),
+        v_target_distance=(
+            None if result.v_target_distance is None else result.v_target_distance[inverse_jax]
+        ),
     )
 
 
@@ -2299,6 +2859,41 @@ def _align_rows(values: np.ndarray, flip_mask: np.ndarray) -> np.ndarray:
     aligned = values.copy()
     aligned[flip_mask] = aligned[flip_mask, ::-1]
     return aligned
+
+
+def _align_outcome_index(
+    outcome: int,
+    source_player: int,
+    target_player: int,
+    num_outcomes: int,
+) -> int:
+    outcome = int(outcome)
+    if outcome < 0 or int(source_player) == int(target_player):
+        return outcome
+    return int(num_outcomes) - 1 - outcome
+
+
+def _edge_target_kind_np(edge_cat_outcome: np.ndarray) -> np.ndarray:
+    return np.where(
+        np.asarray(edge_cat_outcome) != int(NO_OUTCOME),
+        int(TARGET_CATEGORICAL),
+        int(TARGET_DIRICHLET),
+    ).astype(np.int8)
+
+
+def _edge_id_for_action(arena: PosteriorArena, node_id: int, action: int) -> int:
+    start = int(arena.node_first_edge[node_id])
+    count = int(arena.node_num_edges[node_id])
+    if count <= 0:
+        return UNKNOWN
+    edge_ids = start + np.arange(count, dtype=np.int32)
+    matches = edge_ids[arena.edge_action[edge_ids] == int(action)]
+    return int(matches[0]) if matches.size else UNKNOWN
+
+
+def _first_legal_action(legal: np.ndarray) -> int:
+    actions = np.flatnonzero(np.asarray(legal, dtype=bool))
+    return int(actions[0]) if actions.size else 0
 
 
 def _terminal_beta(outcome: int, num_outcomes: int, config: SearchConfig) -> np.ndarray:

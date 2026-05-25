@@ -275,7 +275,9 @@ def test_arena_terminal_backup_uses_terminal_node_perspective():
     assert np.allclose(arena.edge_base_alpha[edge_id], before_base)
     assert arena.edge_has_post[edge_id]
     assert int(arena.edge_eval_count_R[edge_id]) == 1
-    assert np.allclose(arena.edge_B[edge_id], np.array([8.000001, 1e-6, 1e-6], dtype=np.float32))
+    assert int(arena.edge_cat_outcome[edge_id]) == 0
+    assert int(arena.edge_cat_distance[edge_id]) == 1
+    assert np.allclose(arena.edge_B[edge_id], np.array([0.999998, 1e-6, 1e-6], dtype=np.float32))
 
     search._backup_path(
         np.array([root_id], dtype=np.int32),
@@ -286,8 +288,9 @@ def test_arena_terminal_backup_uses_terminal_node_perspective():
         backup_mc_samples=8,
     )
 
-    assert int(arena.edge_eval_count_R[edge_id]) == 2
-    assert np.allclose(arena.edge_B[edge_id], np.array([1e-6, 1e-6, 8.000001], dtype=np.float32))
+    assert int(arena.edge_eval_count_R[edge_id]) == 1
+    assert int(arena.edge_cat_outcome[edge_id]) == 0
+    assert np.allclose(arena.edge_B[edge_id], np.array([0.999998, 1e-6, 1e-6], dtype=np.float32))
 
 
 def test_inflight_and_duplicate_scheduling_do_not_change_posterior():

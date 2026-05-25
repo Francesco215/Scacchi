@@ -353,6 +353,8 @@ class SearchConfig:
     kappa_leaf: float = 1.0
     kappa_terminal: float = 8.0
     epsilon_terminal: float = 1e-6
+    categorical_epsilon: float = 1e-4
+    categorical_draw_rule: Literal["policy_prior", "fastest_draw", "slowest_draw", "fixed_order"] = "policy_prior"
     state_posterior_kappa_n: float = 9.0
     policy_mc_samples: int = 32
     backup_mc_samples: int = 16
@@ -401,6 +403,14 @@ class TreeTrainingData(NamedTuple):
     value_loss_mask: jax.Array
     search_loss_mask: jax.Array
     outcome_mask: jax.Array
+    q_target_kind: jax.Array | None = None
+    q_target_weight: jax.Array | None = None
+    q_target_outcome: jax.Array | None = None
+    q_target_distance: jax.Array | None = None
+    v_target_kind: jax.Array | None = None
+    v_target_weight: jax.Array | None = None
+    v_target_outcome: jax.Array | None = None
+    v_target_distance: jax.Array | None = None
 
     @property
     def q_evidence_mass(self) -> jax.Array:
@@ -430,6 +440,14 @@ class SearchResult(NamedTuple):
     tree_data: TreeTrainingData | None = None
     search_loss_mask: jax.Array | None = None
     diagnostics: SearchDiagnostics | None = None
+    q_target_kind: jax.Array | None = None
+    q_target_weight: jax.Array | None = None
+    q_target_outcome: jax.Array | None = None
+    q_target_distance: jax.Array | None = None
+    v_target_kind: jax.Array | None = None
+    v_target_weight: jax.Array | None = None
+    v_target_outcome: jax.Array | None = None
+    v_target_distance: jax.Array | None = None
 
     @property
     def q_evidence_mass(self) -> jax.Array:

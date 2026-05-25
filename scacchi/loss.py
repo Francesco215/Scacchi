@@ -7,6 +7,13 @@ import jax.numpy as jnp
 from jax.scipy.special import digamma, gammaln
 import optax
 
+from .dirichlet_tree.native import (
+    TARGET_PAD,
+    TARGET_CATEGORICAL,
+    TARGET_DIRICHLET,
+    dirichlet_nll_at_categorical,
+    native_fields_from_beta,
+)
 from .network import outcome_mean
 from .play import SelfplayOutput
 
@@ -25,6 +32,14 @@ class Sample(NamedTuple):
     value_loss_mask: jax.Array | None = None
     search_loss_mask: jax.Array | None = None
     outcome_mask: jax.Array | None = None
+    q_target_kind: jax.Array | None = None
+    q_target_weight: jax.Array | None = None
+    q_target_outcome: jax.Array | None = None
+    q_target_distance: jax.Array | None = None
+    v_target_kind: jax.Array | None = None
+    v_target_weight: jax.Array | None = None
+    v_target_outcome: jax.Array | None = None
+    v_target_distance: jax.Array | None = None
 
     @property
     def q_evidence_mass(self) -> jax.Array:
@@ -106,7 +121,16 @@ def make_compute_loss_input(config):
             value_loss_mask=search_loss_mask,
             search_loss_mask=search_loss_mask,
             outcome_mask=value_mask,
+            q_target_kind=data.q_target_kind,
+            q_target_weight=data.q_target_weight,
+            q_target_outcome=data.q_target_outcome,
+            q_target_distance=data.q_target_distance,
+            v_target_kind=data.v_target_kind,
+            v_target_weight=data.v_target_weight,
+            v_target_outcome=data.v_target_outcome,
+            v_target_distance=data.v_target_distance,
         )
+        sample = _with_native_defaults(sample)
         if data.tree_data is None:
             return sample
 
@@ -134,6 +158,35 @@ def make_compute_loss_input(config):
         tree_beta_v = flatten_root(tree.beta_V_target)
         root_q_weight = flatten_root(sample.q_loss_weight)
         tree_q_weight = flatten_root(tree.q_loss_weight)
+        tree_q_defaults = _tree_native_defaults(tree.beta_Q_target, tree.beta_V_target)
+        root_q_kind = flatten_root(sample.q_target_kind)
+        tree_q_kind = flatten_root(_tree_field_or_default(tree, tree_q_defaults, "q_target_kind"))
+        root_q_target_weight = flatten_root(sample.q_target_weight)
+        tree_q_target_weight = flatten_root(
+            _tree_field_or_default(tree, tree_q_defaults, "q_target_weight")
+        )
+        root_q_outcome = flatten_root(sample.q_target_outcome)
+        tree_q_outcome = flatten_root(
+            _tree_field_or_default(tree, tree_q_defaults, "q_target_outcome")
+        )
+        root_q_distance = flatten_root(sample.q_target_distance)
+        tree_q_distance = flatten_root(
+            _tree_field_or_default(tree, tree_q_defaults, "q_target_distance")
+        )
+        root_v_kind = flatten_root(sample.v_target_kind)
+        tree_v_kind = flatten_root(_tree_field_or_default(tree, tree_q_defaults, "v_target_kind"))
+        root_v_target_weight = flatten_root(sample.v_target_weight)
+        tree_v_target_weight = flatten_root(
+            _tree_field_or_default(tree, tree_q_defaults, "v_target_weight")
+        )
+        root_v_outcome = flatten_root(sample.v_target_outcome)
+        tree_v_outcome = flatten_root(
+            _tree_field_or_default(tree, tree_q_defaults, "v_target_outcome")
+        )
+        root_v_distance = flatten_root(sample.v_target_distance)
+        tree_v_distance = flatten_root(
+            _tree_field_or_default(tree, tree_q_defaults, "v_target_distance")
+        )
         root_policy_loss_mask = flatten_root(sample.policy_loss_mask)
         tree_policy_loss_mask = flatten_root(tree.policy_loss_mask)
         root_value_loss_mask = flatten_root(sample.value_loss_mask)
@@ -163,6 +216,26 @@ def make_compute_loss_input(config):
                 jnp.concatenate([root_search_loss_mask, tree_search_loss_mask], axis=0)
             ),
             outcome_mask=wrap_rows(jnp.concatenate([root_outcome_mask, tree_outcome_mask], axis=0)),
+            q_target_kind=wrap_rows(jnp.concatenate([root_q_kind, tree_q_kind], axis=0)),
+            q_target_weight=wrap_rows(
+                jnp.concatenate([root_q_target_weight, tree_q_target_weight], axis=0)
+            ),
+            q_target_outcome=wrap_rows(
+                jnp.concatenate([root_q_outcome, tree_q_outcome], axis=0)
+            ),
+            q_target_distance=wrap_rows(
+                jnp.concatenate([root_q_distance, tree_q_distance], axis=0)
+            ),
+            v_target_kind=wrap_rows(jnp.concatenate([root_v_kind, tree_v_kind], axis=0)),
+            v_target_weight=wrap_rows(
+                jnp.concatenate([root_v_target_weight, tree_v_target_weight], axis=0)
+            ),
+            v_target_outcome=wrap_rows(
+                jnp.concatenate([root_v_outcome, tree_v_outcome], axis=0)
+            ),
+            v_target_distance=wrap_rows(
+                jnp.concatenate([root_v_distance, tree_v_distance], axis=0)
+            ),
         )
 
     return compute_loss_input
@@ -175,6 +248,57 @@ def _masked_mean(loss: jax.Array, mask: jax.Array) -> jax.Array:
 
 def _mask_or(mask: jax.Array | None, fallback: jax.Array) -> jax.Array:
     return fallback if mask is None else mask
+
+
+def _with_native_defaults(sample: Sample) -> Sample:
+    defaults = native_fields_from_beta(sample.beta_Q_target, sample.beta_V_target)
+    return sample._replace(
+        q_target_kind=(
+            defaults["q_target_kind"] if sample.q_target_kind is None else sample.q_target_kind
+        ),
+        q_target_weight=(
+            defaults["q_target_weight"]
+            if sample.q_target_weight is None
+            else sample.q_target_weight
+        ),
+        q_target_outcome=(
+            defaults["q_target_outcome"]
+            if sample.q_target_outcome is None
+            else sample.q_target_outcome
+        ),
+        q_target_distance=(
+            defaults["q_target_distance"]
+            if sample.q_target_distance is None
+            else sample.q_target_distance
+        ),
+        v_target_kind=(
+            defaults["v_target_kind"] if sample.v_target_kind is None else sample.v_target_kind
+        ),
+        v_target_weight=(
+            defaults["v_target_weight"]
+            if sample.v_target_weight is None
+            else sample.v_target_weight
+        ),
+        v_target_outcome=(
+            defaults["v_target_outcome"]
+            if sample.v_target_outcome is None
+            else sample.v_target_outcome
+        ),
+        v_target_distance=(
+            defaults["v_target_distance"]
+            if sample.v_target_distance is None
+            else sample.v_target_distance
+        ),
+    )
+
+
+def _tree_native_defaults(beta_q: jax.Array, beta_v: jax.Array) -> dict[str, jax.Array]:
+    return native_fields_from_beta(beta_q, beta_v)
+
+
+def _tree_field_or_default(tree, defaults: dict[str, jax.Array], field: str) -> jax.Array:
+    value = getattr(tree, field)
+    return defaults[field] if value is None else value
 
 
 def _compute_losses(logits: jax.Array, value: jax.Array, data: Sample) -> tuple[jax.Array, jax.Array]:
@@ -228,6 +352,30 @@ def _dirichlet_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
     )
 
 
+def _native_dirichlet_loss(
+    beta: jax.Array,
+    alpha: jax.Array,
+    target_kind: jax.Array,
+    target_outcome: jax.Array,
+    target_weight: jax.Array,
+    categorical_epsilon: float,
+) -> jax.Array:
+    target_kind = jnp.asarray(target_kind)
+    target_outcome = jnp.asarray(target_outcome)
+    target_weight = jnp.asarray(target_weight, dtype=alpha.dtype)
+    clipped_outcome = jnp.clip(target_outcome, 0, alpha.shape[-1] - 1)
+    dir_loss = _dirichlet_kl(beta, alpha)
+    cat_loss = dirichlet_nll_at_categorical(alpha, clipped_outcome, categorical_epsilon)
+    loss = jnp.where(target_kind == int(TARGET_CATEGORICAL), cat_loss, dir_loss)
+    loss = jnp.where(target_kind == int(TARGET_PAD), 0.0, loss)
+    loss = jnp.where(
+        (target_kind == int(TARGET_DIRICHLET)) | (target_kind == int(TARGET_CATEGORICAL)),
+        loss,
+        0.0,
+    )
+    return target_weight * loss
+
+
 def _gather_played_action(alpha_q: jax.Array, played_action: jax.Array) -> jax.Array:
     gather_ix = jnp.broadcast_to(
         played_action[..., None, None],
@@ -243,6 +391,7 @@ def _compute_dirichlet_losses(
     data: Sample,
     config,
 ) -> tuple[jax.Array, TrainMetrics]:
+    data = _with_native_defaults(data)
     policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
     value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
     search_loss_mask = _mask_or(data.search_loss_mask, policy_loss_mask)
@@ -253,10 +402,25 @@ def _compute_dirichlet_losses(
     policy_target_entropy = _masked_mean(policy_target_entropy, policy_loss_mask)
     policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
 
-    value_dir_kl = _dirichlet_kl(data.beta_V_target, alpha_v)
+    categorical_epsilon = float(getattr(config, "categorical_epsilon", 1e-4))
+    value_dir_kl = _native_dirichlet_loss(
+        data.beta_V_target,
+        alpha_v,
+        data.v_target_kind,
+        data.v_target_outcome,
+        data.v_target_weight,
+        categorical_epsilon,
+    )
     value_dir_kl_loss = _masked_mean(value_dir_kl, value_loss_mask)
 
-    q_dir_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
+    q_dir_kl = _native_dirichlet_loss(
+        data.beta_Q_target,
+        alpha_q,
+        data.q_target_kind,
+        data.q_target_outcome,
+        data.q_target_weight,
+        categorical_epsilon,
+    )
     q_weights = jnp.where(
         data.policy_mask & search_loss_mask[..., None],
         data.q_loss_weight,

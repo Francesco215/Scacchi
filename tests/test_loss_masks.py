@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import optax
 
 from scacchi.dirichlet_tree.types import TreeTrainingData
+from scacchi.dirichlet_tree.native import TARGET_CATEGORICAL, dirichlet_nll_at_categorical
 from scacchi.loss import (
     Sample,
     _compute_dirichlet_losses,
@@ -381,3 +382,43 @@ def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():
         metrics.policy_kl_hat,
         metrics.policy_nll_loss - metrics.policy_target_entropy,
     )
+
+
+def test_native_categorical_targets_use_dirichlet_density_nll():
+    data = Sample(
+        obs=jnp.zeros((1, 1)),
+        policy_tgt=jnp.array([[1.0, 0.0]]),
+        value_tgt=jnp.array([1.0]),
+        played_action=jnp.array([0]),
+        policy_mask=jnp.array([[True, True]]),
+        value_mask=jnp.array([True]),
+        beta_Q_target=jnp.ones((1, 2, 3)),
+        beta_V_target=jnp.ones((1, 3)),
+        q_loss_weight=jnp.array([[1.0, 0.0]]),
+        q_target_kind=jnp.array([[int(TARGET_CATEGORICAL), 0]], dtype=jnp.int8),
+        q_target_weight=jnp.ones((1, 2), dtype=jnp.float32),
+        q_target_outcome=jnp.array([[2, -1]], dtype=jnp.int8),
+        q_target_distance=jnp.array([[1, -1]], dtype=jnp.int32),
+        v_target_kind=jnp.array([int(TARGET_CATEGORICAL)], dtype=jnp.int8),
+        v_target_weight=jnp.ones((1,), dtype=jnp.float32),
+        v_target_outcome=jnp.array([2], dtype=jnp.int8),
+        v_target_distance=jnp.array([0], dtype=jnp.int32),
+    )
+    logits = jnp.zeros((1, 2))
+    alpha_v = jnp.array([[1.5, 2.0, 4.0]])
+    alpha_q = jnp.array([[[1.0, 1.5, 3.0], [3.0, 1.0, 1.0]]])
+    config = SimpleNamespace(
+        policy_loss_weight=0.0,
+        value_dir_kl_weight=1.0,
+        q_dir_kl_weight=1.0,
+        value_outcome_weight=0.0,
+        q_outcome_weight=0.0,
+        categorical_epsilon=1e-4,
+    )
+
+    _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
+
+    expected_v = dirichlet_nll_at_categorical(alpha_v[0], jnp.asarray(2), 1e-4)
+    expected_q = dirichlet_nll_at_categorical(alpha_q[0, 0], jnp.asarray(2), 1e-4)
+    assert jnp.allclose(metrics.value_dir_kl_loss, expected_v)
+    assert jnp.allclose(metrics.q_dir_kl_loss, expected_q)

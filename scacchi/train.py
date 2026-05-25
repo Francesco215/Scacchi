@@ -232,6 +232,8 @@ class Config(BaseModel):
     kappa_leaf: float = Field(default=1.0, gt=0.0)
     kappa_terminal: float = Field(default=8.0, gt=0.0)
     epsilon_terminal: float = Field(default=1e-6, gt=0.0)
+    categorical_epsilon: float = Field(default=1e-4, gt=0.0, lt=0.5)
+    categorical_draw_rule: str = "policy_prior"
     state_posterior_kappa_n: float = Field(default=9.0, gt=0.0)
     inflight_limit: int = Field(default=1, ge=1)
     search_eval_batch_size: int | None = Field(default=None, ge=1)
@@ -348,6 +350,16 @@ class Config(BaseModel):
             )
         if self.leaf_value_mode not in {"alpha", "mean"}:
             raise ValueError("leaf_value_mode must be 'alpha' or 'mean'.")
+        if self.categorical_draw_rule not in {
+            "policy_prior",
+            "fastest_draw",
+            "slowest_draw",
+            "fixed_order",
+        }:
+            raise ValueError(
+                "categorical_draw_rule must be one of "
+                "'policy_prior', 'fastest_draw', 'slowest_draw', or 'fixed_order'."
+            )
         if self.policy_target_mode not in {"search", "winner_action"}:
             raise ValueError("policy_target_mode must be 'search' or 'winner_action'.")
         if self.wavefront_backend != "arena":

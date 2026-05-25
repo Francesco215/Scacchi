@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from scacchi.dirichlet_tree.native import INF_DISTANCE, TARGET_CATEGORICAL
 from scacchi.exact_hex import exact_hex_actions, relabel_selfplay_with_exact_hex
 from scacchi.play import SelfplayOutput
 
@@ -39,9 +40,14 @@ def test_exact_hex_relabels_empty_4x4_root_with_wdl_targets():
     expected_best[[3, 6, 9, 12]] = 0.25
     assert np.allclose(np.asarray(relabeled.action_weights[0, 0]), expected_best)
     assert np.allclose(np.asarray(relabeled.q_loss_weight[0, 0]), expected_best)
-    assert np.allclose(np.asarray(relabeled.beta_V_target[0, 0]), [0.05, 0.05, 8.05])
-    assert np.allclose(np.asarray(relabeled.beta_Q_target[0, 0, 3]), [0.05, 0.05, 8.05])
-    assert np.allclose(np.asarray(relabeled.beta_Q_target[0, 0, 0]), [8.05, 0.05, 0.05])
+    assert np.allclose(np.asarray(relabeled.beta_V_target[0, 0]), [1e-4, 1e-4, 0.9998])
+    assert np.allclose(np.asarray(relabeled.beta_Q_target[0, 0, 3]), [1e-4, 1e-4, 0.9998])
+    assert np.allclose(np.asarray(relabeled.beta_Q_target[0, 0, 0]), [0.9998, 1e-4, 1e-4])
+    assert int(relabeled.v_target_kind[0, 0]) == int(TARGET_CATEGORICAL)
+    assert int(relabeled.v_target_outcome[0, 0]) == 2
+    assert int(relabeled.v_target_distance[0, 0]) == int(INF_DISTANCE)
+    assert int(relabeled.q_target_kind[0, 0, 3]) == int(TARGET_CATEGORICAL)
+    assert int(relabeled.q_target_outcome[0, 0, 3]) == 2
     assert bool(relabeled.search_loss_mask[0, 0])
     assert relabeled.tree_data is None
 

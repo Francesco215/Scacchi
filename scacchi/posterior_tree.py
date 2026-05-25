@@ -8,6 +8,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .dirichlet_tree.native import (
+    NO_DISTANCE,
+    NO_OUTCOME,
+    TARGET_CATEGORICAL,
+    TARGET_DIRICHLET,
+    align_outcome,
+    categorical_proxy_np,
+    native_policy_target_np,
+)
 from .dirichlet_tree.types import TreeTrainingData
 
 
@@ -40,6 +49,14 @@ class PosteriorTreeBatchOutput(NamedTuple):
     trees: tuple["PosteriorTree", ...]
     tree_data: TreeTrainingData | None = None
     search_loss_mask: jax.Array | None = None
+    q_target_kind: jax.Array | None = None
+    q_target_weight: jax.Array | None = None
+    q_target_outcome: jax.Array | None = None
+    q_target_distance: jax.Array | None = None
+    v_target_kind: jax.Array | None = None
+    v_target_weight: jax.Array | None = None
+    v_target_outcome: jax.Array | None = None
+    v_target_distance: jax.Array | None = None
 
     @property
     def q_evidence_mass(self) -> jax.Array:
@@ -65,12 +82,17 @@ class PosteriorNode:
     edge_eval_count_R: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.uint32))
     edge_version: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.uint32))
     edge_child_cache_version: np.ndarray = field(default_factory=lambda: np.full((0,), -1, dtype=np.int64))
+    edge_cat_outcome: np.ndarray = field(default_factory=lambda: np.full((0,), int(NO_OUTCOME), dtype=np.int8))
+    edge_cat_distance: np.ndarray = field(default_factory=lambda: np.full((0,), int(NO_DISTANCE), dtype=np.int32))
     visits: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int32))
     value_cache_C: np.ndarray | None = None
     downstream_eval_count: int = 0
     value_cache_status: str = "clean"
     value_cache_version: int = 0
     edge_epoch: int = 0
+    cat_outcome: int = int(NO_OUTCOME)
+    cat_distance: int = int(NO_DISTANCE)
+    cat_action: int = NO_CHILD
 
     @property
     def evidence(self) -> np.ndarray:
@@ -98,6 +120,7 @@ class PosteriorTree:
         policy_mc_samples: int,
         backup_mc_samples: int,
         commit: str,
+        categorical_draw_rule: str = "policy_prior",
     ):
         self.env = env
         self.tree_index = tree_index
@@ -110,6 +133,7 @@ class PosteriorTree:
         self.policy_mc_samples = int(policy_mc_samples)
         self.backup_mc_samples = int(backup_mc_samples)
         self.commit = commit
+        self.categorical_draw_rule = str(categorical_draw_rule)
         self.num_actions = int(root_alpha_q.shape[-2])
         self.num_outcomes = int(root_alpha_q.shape[-1])
         self.done = 0
@@ -160,6 +184,8 @@ class PosteriorTree:
             edge_eval_count_R=np.zeros((self.num_actions,), dtype=np.uint32),
             edge_version=np.zeros((self.num_actions,), dtype=np.uint32),
             edge_child_cache_version=np.full((self.num_actions,), -1, dtype=np.int64),
+            edge_cat_outcome=np.full((self.num_actions,), int(NO_OUTCOME), dtype=np.int8),
+            edge_cat_distance=np.full((self.num_actions,), int(NO_DISTANCE), dtype=np.int32),
             visits=np.zeros((self.num_actions,), dtype=np.int32),
             value_cache_C=(
                 None
@@ -170,7 +196,20 @@ class PosteriorTree:
             value_cache_status="clean",
             value_cache_version=0 if alpha_v is None else 1,
             edge_epoch=0,
+            cat_outcome=int(NO_OUTCOME),
+            cat_distance=int(NO_DISTANCE),
+            cat_action=NO_CHILD,
         )
+        if node.terminal:
+            node.cat_outcome = self._terminal_outcome_for_node(node)
+            node.cat_distance = 0
+            node.cat_action = NO_CHILD
+            node.value_cache_C = categorical_proxy_np(
+                node.cat_outcome,
+                self.num_outcomes,
+                epsilon=self.epsilon_terminal,
+            )
+            node.value_cache_version = 1
         self.nodes.append(node)
         return len(self.nodes) - 1
 
@@ -187,6 +226,12 @@ class PosteriorTree:
 
     def edge_posterior(self, node_id: int, action: int) -> np.ndarray:
         node = self.nodes[node_id]
+        if int(node.edge_cat_outcome[action]) != int(NO_OUTCOME):
+            return categorical_proxy_np(
+                int(node.edge_cat_outcome[action]),
+                self.num_outcomes,
+                epsilon=self.epsilon_terminal,
+            )
         if bool(node.edge_has_post[action]):
             return _positive_alpha(node.edge_B[action])
         return self.edge_base(node_id, action)
@@ -200,6 +245,7 @@ class PosteriorTree:
                 action
                 for action in legal_actions
                 if not _child_blocks_selection(self.nodes, node, int(action))
+                and int(node.edge_cat_outcome[int(action)]) == int(NO_OUTCOME)
             ],
             dtype=np.int32,
         )
@@ -216,14 +262,22 @@ class PosteriorTree:
             if node.value_cache_C is None:
                 return np.ones((self.num_outcomes,), dtype=np.float32)
             return _positive_alpha(node.value_cache_C)
+        if int(node.cat_outcome) != int(NO_OUTCOME):
+            return categorical_proxy_np(
+                int(node.cat_outcome),
+                self.num_outcomes,
+                epsilon=self.epsilon_terminal,
+            )
         alpha = np.stack(
             [self.edge_posterior(node_id, action) for action in range(self.num_actions)],
             axis=0,
         )
-        policy = posterior_best_policy_target_np(
+        policy = native_policy_target_np(
             self.rng,
             alpha,
             node.legal_action_mask,
+            _edge_target_kind(node),
+            node.edge_cat_outcome,
             self.backup_mc_samples,
         )
         e_v = np.sum(policy[:, None] * alpha, axis=0)
@@ -237,10 +291,13 @@ class PosteriorTree:
         node_id = 0
         path: list[tuple[int, int]] = []
         while True:
+            self.propagate_categorical(node_id)
             node = self.nodes[node_id]
+            if int(node.cat_outcome) != int(NO_OUTCOME):
+                self.done += 1
+                return None
             if node.terminal:
-                beta_leaf = self._terminal_beta(self._terminal_outcome(node_id))
-                self.backup_path(tuple(path), node_id, beta_leaf)
+                self.propagate_categorical(node_id)
                 self.done += 1
                 return None
             if not node.expanded:
@@ -273,8 +330,13 @@ class PosteriorTree:
         parent.children[request.action] = child_id
         child = self.nodes[child_id]
         if child.terminal:
-            beta_leaf = self._terminal_beta(self._terminal_outcome(child_id))
-            self.backup_path(request.path, child_id, beta_leaf)
+            self._publish_categorical_edge_from_child(
+                request.parent_id,
+                request.action,
+                child_id,
+                increment_eval_count=True,
+            )
+            self.propagate_categorical(request.parent_id)
             self.done += 1
             return None
 
@@ -298,6 +360,12 @@ class PosteriorTree:
         alpha_q: np.ndarray,
     ) -> None:
         node = self.nodes[request.leaf_id]
+        if self._path_has_categorical_ancestor(request.path):
+            if node.in_flight:
+                node.in_flight = False
+                self.inflight -= 1
+            self.done += 1
+            return
         node.prior_logits = _as_numpy(logits)
         node.alpha_v = _positive_alpha(_as_numpy(alpha_v))
         node.alpha_q = _positive_alpha(_as_numpy(alpha_q))
@@ -336,6 +404,7 @@ class PosteriorTree:
         final_node.visits[final_action] += 1
         self._mark_dirty(final_parent)
         self.repair_path_to_root(final_parent)
+        self.propagate_categorical(final_parent)
 
     def refresh_edge_from_child(self, parent_id: int, action: int) -> bool:
         parent = self.nodes[parent_id]
@@ -343,6 +412,8 @@ class PosteriorTree:
         if child_id == NO_CHILD:
             return True
         child = self.nodes[child_id]
+        if self._publish_categorical_edge_from_child(parent_id, action, child_id):
+            return True
         if child.terminal or not child.expanded:
             return True
         if not np.any(child.edge_has_post[child.legal_action_mask]):
@@ -365,8 +436,13 @@ class PosteriorTree:
         node = self.nodes[node_id]
         if node.terminal or not node.expanded:
             return False
+        if int(node.cat_outcome) != int(NO_OUTCOME):
+            node.value_cache_status = "clean"
+            return True
         if node.alpha_v is None:
             return False
+        if self.try_categorize_node(node_id):
+            return True
         if node.value_cache_status == "clean":
             return True
         epoch = int(node.edge_epoch)
@@ -386,10 +462,12 @@ class PosteriorTree:
             [self.edge_posterior(node_id, action) for action in range(self.num_actions)],
             axis=0,
         )
-        policy = posterior_best_policy_target_np(
+        policy = native_policy_target_np(
             self.rng,
             alpha,
             node.legal_action_mask,
+            _edge_target_kind(node),
+            node.edge_cat_outcome,
             self.backup_mc_samples,
         )
         e_v = np.sum(policy[:, None] * alpha, axis=0)
@@ -434,16 +512,78 @@ class PosteriorTree:
                 return
 
     def finish(self) -> tuple[np.ndarray, np.ndarray, int, np.ndarray, np.ndarray, np.ndarray]:
+        result = self.finish_native()
+        return result[:6]
+
+    def finish_native(
+        self,
+    ) -> tuple[
+        int,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
         self.repair_dirty_frontier()
+        self.propagate_categorical(0)
         root = self.nodes[0]
+        q_kind, q_weight, q_outcome, q_distance = self._q_native_fields(0)
+        if int(root.cat_outcome) != int(NO_OUTCOME):
+            alpha_root = self._alpha_root_compat(0)
+            policy_target = np.zeros((self.num_actions,), dtype=np.float32)
+            action = (
+                int(root.cat_action)
+                if 0 <= int(root.cat_action) < self.num_actions
+                else self._first_legal_action(root.legal_action_mask)
+            )
+            if 0 <= action < self.num_actions and bool(root.legal_action_mask[action]):
+                policy_target[action] = 1.0
+            q_loss_weight = policy_target.copy()
+            beta_q = alpha_root.copy()
+            beta_v = categorical_proxy_np(
+                int(root.cat_outcome),
+                self.num_outcomes,
+                epsilon=self.epsilon_terminal,
+            )
+            v_kind = np.asarray(int(TARGET_CATEGORICAL), dtype=np.int8)
+            v_weight = np.asarray(1.0, dtype=np.float32)
+            v_outcome = np.asarray(int(root.cat_outcome), dtype=np.int8)
+            v_distance = np.asarray(int(root.cat_distance), dtype=np.int32)
+            return (
+                action,
+                policy_target,
+                beta_q,
+                beta_v,
+                q_loss_weight,
+                alpha_root,
+                q_kind,
+                q_weight,
+                q_outcome,
+                q_distance,
+                v_kind,
+                v_weight,
+                v_outcome,
+                v_distance,
+            )
         alpha_root = np.stack(
             [self.edge_posterior(0, action) for action in range(self.num_actions)],
             axis=0,
         )
-        policy_target = posterior_best_policy_target_np(
+        policy_target = native_policy_target_np(
             self.rng,
             alpha_root,
             root.legal_action_mask,
+            _edge_target_kind(root),
+            root.edge_cat_outcome,
             self.policy_mc_samples,
         )
         action = self._commit_action(policy_target, alpha_root, root.legal_action_mask)
@@ -452,7 +592,256 @@ class PosteriorTree:
         if root.value_cache_C is None:
             raise ValueError("root is missing alpha_v")
         beta_v = _positive_alpha(root.value_cache_C)
-        return action, policy_target, beta_q, beta_v, q_loss_weight, alpha_root
+        v_kind = np.asarray(int(TARGET_DIRICHLET), dtype=np.int8)
+        v_weight = np.asarray(1.0, dtype=np.float32)
+        v_outcome = np.asarray(int(NO_OUTCOME), dtype=np.int8)
+        v_distance = np.asarray(int(NO_DISTANCE), dtype=np.int32)
+        return (
+            action,
+            policy_target,
+            beta_q,
+            beta_v,
+            q_loss_weight,
+            alpha_root,
+            q_kind,
+            q_weight,
+            q_outcome,
+            q_distance,
+            v_kind,
+            v_weight,
+            v_outcome,
+            v_distance,
+        )
+
+    def _q_native_fields(
+        self,
+        node_id: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        node = self.nodes[node_id]
+        kind = np.full((self.num_actions,), int(TARGET_DIRICHLET), dtype=np.int8)
+        weight = np.ones((self.num_actions,), dtype=np.float32)
+        outcome = np.full((self.num_actions,), int(NO_OUTCOME), dtype=np.int8)
+        distance = np.full((self.num_actions,), int(NO_DISTANCE), dtype=np.int32)
+        kind[~node.legal_action_mask] = 0
+        weight[~node.legal_action_mask] = 0.0
+        categorical = node.edge_cat_outcome != int(NO_OUTCOME)
+        kind[categorical] = int(TARGET_CATEGORICAL)
+        outcome[categorical] = node.edge_cat_outcome[categorical].astype(np.int8)
+        distance[categorical] = node.edge_cat_distance[categorical].astype(np.int32)
+        return kind, weight, outcome, distance
+
+    def _alpha_root_compat(self, node_id: int) -> np.ndarray:
+        return np.stack(
+            [self.edge_posterior(node_id, action) for action in range(self.num_actions)],
+            axis=0,
+        )
+
+    def _first_legal_action(self, legal_action_mask: np.ndarray) -> int:
+        actions = np.flatnonzero(legal_action_mask)
+        return int(actions[0]) if actions.size else 0
+
+    def _path_has_categorical_ancestor(self, path: tuple[tuple[int, int], ...]) -> bool:
+        for node_id, action in path:
+            node = self.nodes[node_id]
+            if int(node.cat_outcome) != int(NO_OUTCOME):
+                return True
+            if int(node.edge_cat_outcome[action]) != int(NO_OUTCOME):
+                return True
+        return False
+
+    def _publish_categorical_edge_from_child(
+        self,
+        parent_id: int,
+        action: int,
+        child_id: int,
+        *,
+        increment_eval_count: bool = False,
+    ) -> bool:
+        child = self.nodes[child_id]
+        if child.terminal and int(child.cat_outcome) == int(NO_OUTCOME):
+            child.cat_outcome = self._terminal_outcome_for_node(child)
+            child.cat_distance = 0
+            child.cat_action = NO_CHILD
+        if int(child.cat_outcome) == int(NO_OUTCOME):
+            self.try_categorize_node(child_id)
+        if int(child.cat_outcome) == int(NO_OUTCOME):
+            return False
+        parent = self.nodes[parent_id]
+        outcome = align_outcome(
+            int(child.cat_outcome),
+            int(child.current_player),
+            int(parent.current_player),
+        )
+        distance = int(child.cat_distance) + 1
+        self._publish_categorical_edge(
+            parent_id,
+            action,
+            outcome,
+            distance,
+            increment_eval_count=increment_eval_count,
+        )
+        return True
+
+    def _publish_categorical_edge(
+        self,
+        parent_id: int,
+        action: int,
+        outcome: int,
+        distance: int,
+        *,
+        increment_eval_count: bool = False,
+    ) -> bool:
+        parent = self.nodes[parent_id]
+        was_categorical = int(parent.edge_cat_outcome[action]) != int(NO_OUTCOME)
+        if (
+            was_categorical
+            and int(parent.edge_cat_outcome[action]) == int(outcome)
+            and int(parent.edge_cat_distance[action]) == int(distance)
+        ):
+            return False
+        parent.edge_cat_outcome[action] = np.int8(outcome)
+        parent.edge_cat_distance[action] = np.int32(distance)
+        parent.edge_B[action] = categorical_proxy_np(
+            int(outcome),
+            self.num_outcomes,
+            epsilon=self.epsilon_terminal,
+        )
+        parent.edge_has_post[action] = True
+        if increment_eval_count or not was_categorical:
+            parent.edge_eval_count_R[action] += np.uint32(1)
+            parent.visits[action] += 1
+        parent.edge_version[action] += np.uint32(1)
+        parent.edge_child_cache_version[action] = -1
+        self._mark_dirty(parent_id)
+        return True
+
+    def try_categorize_node(self, node_id: int) -> bool:
+        node = self.nodes[node_id]
+        if int(node.cat_outcome) != int(NO_OUTCOME):
+            return True
+        if node.terminal:
+            return self._publish_categorical_node(
+                node_id,
+                self._terminal_outcome_for_node(node),
+                0,
+                NO_CHILD,
+            )
+        if not node.expanded:
+            return False
+        for action in np.flatnonzero(node.legal_action_mask):
+            self.refresh_categorical_edge(node_id, int(action))
+        legal_actions = np.flatnonzero(node.legal_action_mask)
+        if legal_actions.size == 0:
+            return False
+        outcomes = node.edge_cat_outcome[legal_actions].astype(np.int32)
+        distances = node.edge_cat_distance[legal_actions].astype(np.int32)
+        known = outcomes != int(NO_OUTCOME)
+        win_index = self.num_outcomes - 1
+        draw_index = 1 if self.num_outcomes == 3 else int(NO_OUTCOME)
+        win_mask = known & (outcomes == win_index)
+        if np.any(win_mask):
+            actions = legal_actions[win_mask]
+            action = self._choose_distance_action(actions, distances[win_mask], prefer_short=True)
+            distance = int(node.edge_cat_distance[action])
+            return self._publish_categorical_node(node_id, win_index, distance, int(action))
+        if not np.all(known):
+            return False
+        if self.num_outcomes == 3:
+            draw_mask = outcomes == draw_index
+            if np.any(draw_mask):
+                actions = legal_actions[draw_mask]
+                action = self._choose_draw_action(node_id, actions)
+                distance = int(node.edge_cat_distance[action])
+                return self._publish_categorical_node(node_id, draw_index, distance, int(action))
+        loss_index = 0
+        actions = legal_actions
+        action = self._choose_distance_action(actions, distances, prefer_short=False)
+        distance = int(node.edge_cat_distance[action])
+        return self._publish_categorical_node(node_id, loss_index, distance, int(action))
+
+    def refresh_categorical_edge(self, node_id: int, action: int) -> bool:
+        node = self.nodes[node_id]
+        child_id = int(node.children[action])
+        if child_id == NO_CHILD:
+            return False
+        return self._publish_categorical_edge_from_child(node_id, action, child_id)
+
+    def propagate_categorical(self, start_node_id: int) -> None:
+        node_id = int(start_node_id)
+        seen: set[int] = set()
+        while node_id != NO_CHILD and node_id not in seen:
+            seen.add(node_id)
+            self.try_categorize_node(node_id)
+            node = self.nodes[node_id]
+            if int(node.cat_outcome) == int(NO_OUTCOME):
+                return
+            parent_id = int(node.parent)
+            if parent_id == NO_CHILD:
+                return
+            self._publish_categorical_edge_from_child(
+                parent_id,
+                int(node.action_from_parent),
+                node_id,
+            )
+            node_id = parent_id
+
+    def _publish_categorical_node(
+        self,
+        node_id: int,
+        outcome: int,
+        distance: int,
+        action: int,
+    ) -> bool:
+        node = self.nodes[node_id]
+        changed = (
+            int(node.cat_outcome) != int(outcome)
+            or int(node.cat_distance) != int(distance)
+            or int(node.cat_action) != int(action)
+        )
+        node.cat_outcome = int(outcome)
+        node.cat_distance = int(distance)
+        node.cat_action = int(action)
+        node.value_cache_C = categorical_proxy_np(
+            int(outcome),
+            self.num_outcomes,
+            epsilon=self.epsilon_terminal,
+        )
+        node.downstream_eval_count = int(
+            np.sum(node.edge_eval_count_R[node.legal_action_mask])
+        )
+        node.value_cache_status = "clean"
+        if changed:
+            node.value_cache_version += 1
+            if node.parent != NO_CHILD:
+                self._mark_dirty(node.parent)
+        return True
+
+    def _choose_distance_action(
+        self,
+        actions: np.ndarray,
+        distances: np.ndarray,
+        *,
+        prefer_short: bool,
+    ) -> int:
+        if actions.size == 0:
+            return 0
+        best_distance = np.min(distances) if prefer_short else np.max(distances)
+        candidates = actions[distances == best_distance]
+        return int(np.min(candidates))
+
+    def _choose_draw_action(self, node_id: int, actions: np.ndarray) -> int:
+        if actions.size == 0:
+            return 0
+        node = self.nodes[node_id]
+        distances = node.edge_cat_distance[actions].astype(np.int32)
+        if self.categorical_draw_rule == "fastest_draw":
+            return self._choose_distance_action(actions, distances, prefer_short=True)
+        if self.categorical_draw_rule == "slowest_draw":
+            return self._choose_distance_action(actions, distances, prefer_short=False)
+        if self.categorical_draw_rule == "fixed_order" or node.prior_logits is None:
+            return int(np.min(actions))
+        logits = node.prior_logits[actions]
+        return int(actions[int(np.argmax(logits))])
 
     def _commit_action(
         self,
@@ -478,6 +867,9 @@ class PosteriorTree:
 
     def _terminal_outcome(self, node_id: int) -> int:
         node = self.nodes[node_id]
+        return self._terminal_outcome_for_node(node)
+
+    def _terminal_outcome_for_node(self, node: PosteriorNode) -> int:
         rewards = _as_numpy(node.state.rewards)
         reward = float(rewards[node.current_player])
         return terminal_outcome_from_reward_np(reward, self.num_outcomes)
@@ -570,6 +962,7 @@ def run_posterior_tree_search(
             policy_mc_samples=getattr(config, "policy_mc_samples"),
             backup_mc_samples=getattr(config, "backup_mc_samples", getattr(config, "policy_mc_samples")),
             commit=getattr(config, "selfplay_action_source"),
+            categorical_draw_rule=getattr(config, "categorical_draw_rule", "policy_prior"),
         )
         for ix, state in enumerate(root_states)
     )
@@ -583,8 +976,23 @@ def run_posterior_tree_search(
         inflight_limit=int(getattr(config, "inflight_limit", 1)),
     )
 
-    finished = [tree.finish() for tree in trees]
-    actions, policies, beta_q, beta_v, q_weight, alpha_root = zip(*finished, strict=True)
+    finished = [tree.finish_native() for tree in trees]
+    (
+        actions,
+        policies,
+        beta_q,
+        beta_v,
+        q_weight,
+        alpha_root,
+        q_kind,
+        q_target_weight,
+        q_outcome,
+        q_distance,
+        v_kind,
+        v_target_weight,
+        v_outcome,
+        v_distance,
+    ) = zip(*finished, strict=True)
     policy_array = np.stack(policies, axis=0)
     return PosteriorTreeBatchOutput(
         action=_device_put_cpu(jnp.asarray(np.asarray(actions), dtype=jnp.int32)),
@@ -596,6 +1004,22 @@ def run_posterior_tree_search(
         trees=trees,
         tree_data=None,
         search_loss_mask=_device_put_cpu(jnp.asarray(np.sum(policy_array, axis=-1) > 0.0)),
+        q_target_kind=_device_put_cpu(jnp.asarray(np.stack(q_kind, axis=0), dtype=jnp.int8)),
+        q_target_weight=_device_put_cpu(
+            jnp.asarray(np.stack(q_target_weight, axis=0), dtype=jnp.float32)
+        ),
+        q_target_outcome=_device_put_cpu(jnp.asarray(np.stack(q_outcome, axis=0), dtype=jnp.int8)),
+        q_target_distance=_device_put_cpu(
+            jnp.asarray(np.stack(q_distance, axis=0), dtype=jnp.int32)
+        ),
+        v_target_kind=_device_put_cpu(jnp.asarray(np.stack(v_kind, axis=0), dtype=jnp.int8)),
+        v_target_weight=_device_put_cpu(
+            jnp.asarray(np.stack(v_target_weight, axis=0), dtype=jnp.float32)
+        ),
+        v_target_outcome=_device_put_cpu(jnp.asarray(np.stack(v_outcome, axis=0), dtype=jnp.int8)),
+        v_target_distance=_device_put_cpu(
+            jnp.asarray(np.stack(v_distance, axis=0), dtype=jnp.int32)
+        ),
     )
 
 
@@ -796,6 +1220,14 @@ def terminal_outcome_from_reward_np(reward: float, num_outcomes: int) -> int:
         raise ValueError(f"unsupported outcome count: {num_outcomes}")
     index = int(np.clip(index, 0, num_outcomes - 1))
     return index
+
+
+def _edge_target_kind(node: PosteriorNode) -> np.ndarray:
+    return np.where(
+        node.edge_cat_outcome != int(NO_OUTCOME),
+        int(TARGET_CATEGORICAL),
+        int(TARGET_DIRICHLET),
+    ).astype(np.int8)
 
 
 def _child_blocks_selection(nodes: list[PosteriorNode], node: PosteriorNode, action: int) -> bool:

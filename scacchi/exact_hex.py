@@ -7,6 +7,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .dirichlet_tree.native import (
+    INF_DISTANCE,
+    NO_DISTANCE,
+    NO_OUTCOME,
+    TARGET_CATEGORICAL,
+    categorical_proxy_np,
+    native_fields_from_beta,
+)
+
 
 _SOLVERS: dict[int, "_ExactHexSolver"] = {}
 
@@ -135,6 +144,10 @@ def _dirichlet_outcome(value: int, kappa: float, epsilon: float) -> np.ndarray:
     return alpha
 
 
+def _outcome_index(value: int) -> int:
+    return int(np.clip(int(value) + 1, 0, 2))
+
+
 def exact_hex_actions(
     obs: jax.Array,
     legal_action_mask: jax.Array,
@@ -203,8 +216,15 @@ def relabel_selfplay_with_exact_hex(
     beta_q = np.zeros((*action_shape, 3), dtype=np.float32)
     beta_v = np.zeros((*action_shape[:-1], 3), dtype=np.float32)
     search_loss_mask = np.zeros(action_shape[:-1], dtype=bool)
-    kappa = float(getattr(config, "kappa_terminal"))
-    epsilon = float(getattr(config, "epsilon_terminal"))
+    categorical_epsilon = float(getattr(config, "categorical_epsilon", 1e-4))
+    q_kind = np.zeros((*action_shape,), dtype=np.int8)
+    q_target_weight = np.zeros((*action_shape,), dtype=np.float32)
+    q_outcome = np.full((*action_shape,), int(NO_OUTCOME), dtype=np.int8)
+    q_distance = np.full((*action_shape,), int(NO_DISTANCE), dtype=np.int32)
+    v_kind = np.zeros(action_shape[:-1], dtype=np.int8)
+    v_target_weight = np.zeros(action_shape[:-1], dtype=np.float32)
+    v_outcome = np.full(action_shape[:-1], int(NO_OUTCOME), dtype=np.int8)
+    v_distance = np.full(action_shape[:-1], int(NO_DISTANCE), dtype=np.int32)
 
     flat_obs = obs.reshape((-1, *obs.shape[-3:]))
     flat_legal = legal.reshape((-1, num_actions))
@@ -213,6 +233,14 @@ def relabel_selfplay_with_exact_hex(
     flat_beta_q = beta_q.reshape((-1, num_actions, 3))
     flat_beta_v = beta_v.reshape((-1, 3))
     flat_search_mask = search_loss_mask.reshape((-1,))
+    flat_q_kind = q_kind.reshape((-1, num_actions))
+    flat_q_target_weight = q_target_weight.reshape((-1, num_actions))
+    flat_q_outcome = q_outcome.reshape((-1, num_actions))
+    flat_q_distance = q_distance.reshape((-1, num_actions))
+    flat_v_kind = v_kind.reshape((-1,))
+    flat_v_target_weight = v_target_weight.reshape((-1,))
+    flat_v_outcome = v_outcome.reshape((-1,))
+    flat_v_distance = v_distance.reshape((-1,))
 
     for row, (row_obs, row_legal) in enumerate(zip(flat_obs, flat_legal, strict=True)):
         legal_cells = row_legal[:num_cells]
@@ -231,14 +259,28 @@ def relabel_selfplay_with_exact_hex(
 
         flat_policy[row, :num_cells] = best.astype(np.float32) / float(best_count)
         flat_q_weight[row, :num_cells] = flat_policy[row, :num_cells]
-        flat_beta_v[row] = _dirichlet_outcome(state_value, kappa, epsilon)
+        state_outcome = _outcome_index(state_value)
+        flat_beta_v[row] = categorical_proxy_np(
+            state_outcome,
+            3,
+            epsilon=categorical_epsilon,
+        )
+        flat_v_kind[row] = int(TARGET_CATEGORICAL)
+        flat_v_target_weight[row] = 1.0
+        flat_v_outcome[row] = np.int8(state_outcome)
+        flat_v_distance[row] = np.int32(INF_DISTANCE)
         flat_search_mask[row] = True
         for action in np.nonzero(legal_cells)[0]:
-            flat_beta_q[row, action] = _dirichlet_outcome(
-                int(action_values[action]),
-                kappa,
-                epsilon,
+            action_outcome = _outcome_index(int(action_values[action]))
+            flat_beta_q[row, action] = categorical_proxy_np(
+                action_outcome,
+                3,
+                epsilon=categorical_epsilon,
             )
+            flat_q_kind[row, action] = int(TARGET_CATEGORICAL)
+            flat_q_target_weight[row, action] = 1.0
+            flat_q_outcome[row, action] = np.int8(action_outcome)
+            flat_q_distance[row, action] = np.int32(INF_DISTANCE)
 
     relabeled = data._replace(
         action_weights=jnp.asarray(policy, dtype=data.action_weights.dtype),
@@ -247,6 +289,14 @@ def relabel_selfplay_with_exact_hex(
         q_loss_weight=jnp.asarray(q_weight, dtype=data.q_loss_weight.dtype),
         search_loss_mask=jnp.asarray(search_loss_mask),
         tree_data=None,
+        q_target_kind=jnp.asarray(q_kind, dtype=jnp.int8),
+        q_target_weight=jnp.asarray(q_target_weight, dtype=data.q_loss_weight.dtype),
+        q_target_outcome=jnp.asarray(q_outcome, dtype=jnp.int8),
+        q_target_distance=jnp.asarray(q_distance, dtype=jnp.int32),
+        v_target_kind=jnp.asarray(v_kind, dtype=jnp.int8),
+        v_target_weight=jnp.asarray(v_target_weight, dtype=data.beta_V_target.dtype),
+        v_target_outcome=jnp.asarray(v_outcome, dtype=jnp.int8),
+        v_target_distance=jnp.asarray(v_distance, dtype=jnp.int32),
     )
     extra_batch_size = int(getattr(config, "exact_hex_solver_extra_batch_size", 0))
     if extra_batch_size <= 0:
@@ -293,8 +343,23 @@ def _append_random_exact_samples(
     q_weight = np.zeros((time_steps, extra_batch_size, num_actions), dtype=np.float32)
     search_loss_mask = np.zeros((time_steps, extra_batch_size), dtype=bool)
     played_action = np.zeros((time_steps, extra_batch_size), dtype=np.int32)
-    kappa = float(getattr(config, "kappa_terminal"))
-    epsilon = float(getattr(config, "epsilon_terminal"))
+    categorical_epsilon = float(getattr(config, "categorical_epsilon", 1e-4))
+    q_kind = np.zeros((time_steps, extra_batch_size, num_actions), dtype=np.int8)
+    q_target_weight = np.zeros((time_steps, extra_batch_size, num_actions), dtype=np.float32)
+    q_outcome = np.full(
+        (time_steps, extra_batch_size, num_actions),
+        int(NO_OUTCOME),
+        dtype=np.int8,
+    )
+    q_distance = np.full(
+        (time_steps, extra_batch_size, num_actions),
+        int(NO_DISTANCE),
+        dtype=np.int32,
+    )
+    v_kind = np.zeros((time_steps, extra_batch_size), dtype=np.int8)
+    v_target_weight = np.zeros((time_steps, extra_batch_size), dtype=np.float32)
+    v_outcome = np.full((time_steps, extra_batch_size), int(NO_OUTCOME), dtype=np.int8)
+    v_distance = np.full((time_steps, extra_batch_size), int(NO_DISTANCE), dtype=np.int32)
 
     for t in range(time_steps):
         for b in range(extra_batch_size):
@@ -318,22 +383,44 @@ def _append_random_exact_samples(
                 continue
             policy[t, b, :num_cells] = best.astype(np.float32) / float(best_count)
             q_weight[t, b, :num_cells] = policy[t, b, :num_cells]
-            beta_v[t, b] = _dirichlet_outcome(state_value, kappa, epsilon)
+            state_outcome = _outcome_index(state_value)
+            beta_v[t, b] = categorical_proxy_np(
+                state_outcome,
+                3,
+                epsilon=categorical_epsilon,
+            )
+            v_kind[t, b] = int(TARGET_CATEGORICAL)
+            v_target_weight[t, b] = 1.0
+            v_outcome[t, b] = np.int8(state_outcome)
+            v_distance[t, b] = np.int32(INF_DISTANCE)
             search_loss_mask[t, b] = True
             best_actions = np.nonzero(best)[0]
             played_action[t, b] = int(best_actions[rng.integers(best_actions.shape[0])])
             for action in np.nonzero(legal_cells)[0]:
-                beta_q[t, b, action] = _dirichlet_outcome(
-                    int(action_values[action]),
-                    kappa,
-                    epsilon,
+                action_outcome = _outcome_index(int(action_values[action]))
+                beta_q[t, b, action] = categorical_proxy_np(
+                    action_outcome,
+                    3,
+                    epsilon=categorical_epsilon,
                 )
+                q_kind[t, b, action] = int(TARGET_CATEGORICAL)
+                q_target_weight[t, b, action] = 1.0
+                q_outcome[t, b, action] = np.int8(action_outcome)
+                q_distance[t, b, action] = np.int32(INF_DISTANCE)
 
     def concat_batch(original: jax.Array, extra: np.ndarray) -> jax.Array:
         return jnp.concatenate(
             [original, jnp.asarray(extra, dtype=original.dtype)],
             axis=1,
         )
+
+    native_defaults = native_fields_from_beta(data.beta_Q_target, data.beta_V_target)
+
+    def concat_optional_native(name: str, extra: np.ndarray) -> jax.Array:
+        original = getattr(data, name)
+        if original is None:
+            original = native_defaults[name]
+        return concat_batch(original, extra)
 
     return data._replace(
         obs=concat_batch(data.obs, obs.astype(np.asarray(jax.device_get(data.obs)).dtype)).astype(obs_dtype),
@@ -354,6 +441,14 @@ def _append_random_exact_samples(
         ),
         search_loss_mask=concat_batch(data.search_loss_mask, search_loss_mask),
         search_diagnostics=None,
+        q_target_kind=concat_optional_native("q_target_kind", q_kind),
+        q_target_weight=concat_optional_native("q_target_weight", q_target_weight),
+        q_target_outcome=concat_optional_native("q_target_outcome", q_outcome),
+        q_target_distance=concat_optional_native("q_target_distance", q_distance),
+        v_target_kind=concat_optional_native("v_target_kind", v_kind),
+        v_target_weight=concat_optional_native("v_target_weight", v_target_weight),
+        v_target_outcome=concat_optional_native("v_target_outcome", v_outcome),
+        v_target_distance=concat_optional_native("v_target_distance", v_distance),
     )
 
 

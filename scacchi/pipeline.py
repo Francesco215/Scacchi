@@ -84,6 +84,12 @@ def _concat_selfplay_outputs(outputs: list[SelfplayOutput]) -> SelfplayOutput:
             *(output.search_diagnostics for output in outputs),
         )
 
+    def concat_optional(name: str):
+        first = getattr(outputs[0], name)
+        if first is None:
+            return None
+        return concat_batch(*(getattr(output, name) for output in outputs))
+
     return SelfplayOutput(
         obs=concat_batch(*(output.obs for output in outputs)),
         reward=concat_batch(*(output.reward for output in outputs)),
@@ -98,6 +104,14 @@ def _concat_selfplay_outputs(outputs: list[SelfplayOutput]) -> SelfplayOutput:
         tree_data=tree_data,
         search_loss_mask=search_loss_mask,
         search_diagnostics=search_diagnostics,
+        q_target_kind=concat_optional("q_target_kind"),
+        q_target_weight=concat_optional("q_target_weight"),
+        q_target_outcome=concat_optional("q_target_outcome"),
+        q_target_distance=concat_optional("q_target_distance"),
+        v_target_kind=concat_optional("v_target_kind"),
+        v_target_weight=concat_optional("v_target_weight"),
+        v_target_outcome=concat_optional("v_target_outcome"),
+        v_target_distance=concat_optional("v_target_distance"),
     )
 
 

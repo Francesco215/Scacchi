@@ -46,6 +46,14 @@ class WavefrontPosteriorTreeBatchOutput(NamedTuple):
     tree_data: TreeTrainingData | None = None
     search_loss_mask: jax.Array | None = None
     diagnostics: SearchDiagnostics | None = None
+    q_target_kind: jax.Array | None = None
+    q_target_weight: jax.Array | None = None
+    q_target_outcome: jax.Array | None = None
+    q_target_distance: jax.Array | None = None
+    v_target_kind: jax.Array | None = None
+    v_target_weight: jax.Array | None = None
+    v_target_outcome: jax.Array | None = None
+    v_target_distance: jax.Array | None = None
 
     @property
     def q_evidence_mass(self) -> jax.Array:
@@ -471,6 +479,14 @@ def run_wavefront_posterior_tree_search(
             tree_data=result.tree_data,
             search_loss_mask=result.search_loss_mask,
             diagnostics=result.diagnostics,
+            q_target_kind=result.q_target_kind,
+            q_target_weight=result.q_target_weight,
+            q_target_outcome=result.q_target_outcome,
+            q_target_distance=result.q_target_distance,
+            v_target_kind=result.v_target_kind,
+            v_target_weight=result.v_target_weight,
+            v_target_outcome=result.v_target_outcome,
+            v_target_distance=result.v_target_distance,
         )
 
     search_config = search_config_from_any(config, num_roots=len(root_states))
@@ -487,6 +503,14 @@ def run_wavefront_posterior_tree_search(
         tree_data=result.tree_data,
         search_loss_mask=result.search_loss_mask,
         diagnostics=result.diagnostics,
+        q_target_kind=result.q_target_kind,
+        q_target_weight=result.q_target_weight,
+        q_target_outcome=result.q_target_outcome,
+        q_target_distance=result.q_target_distance,
+        v_target_kind=result.v_target_kind,
+        v_target_weight=result.v_target_weight,
+        v_target_outcome=result.v_target_outcome,
+        v_target_distance=result.v_target_distance,
     )
 
 
@@ -523,6 +547,14 @@ def run_wavefront_posterior_tree_search_state_batch(
             tree_data=result.tree_data,
             search_loss_mask=result.search_loss_mask,
             diagnostics=result.diagnostics,
+            q_target_kind=result.q_target_kind,
+            q_target_weight=result.q_target_weight,
+            q_target_outcome=result.q_target_outcome,
+            q_target_distance=result.q_target_distance,
+            v_target_kind=result.v_target_kind,
+            v_target_weight=result.v_target_weight,
+            v_target_outcome=result.v_target_outcome,
+            v_target_distance=result.v_target_distance,
         )
 
     return run_wavefront_posterior_tree_search(
@@ -549,6 +581,8 @@ def search_config_from_any(config: Any, *, num_roots: int = 1) -> SearchConfig:
         kappa_leaf=float(getattr(config, "kappa_leaf", 1.0)),
         kappa_terminal=float(getattr(config, "kappa_terminal", 8.0)),
         epsilon_terminal=float(getattr(config, "epsilon_terminal", 1e-6)),
+        categorical_epsilon=float(getattr(config, "categorical_epsilon", 1e-4)),
+        categorical_draw_rule=getattr(config, "categorical_draw_rule", "policy_prior"),
         state_posterior_kappa_n=float(getattr(config, "state_posterior_kappa_n", 9.0)),
         policy_mc_samples=int(getattr(config, "policy_mc_samples")),
         backup_mc_samples=int(getattr(config, "backup_mc_samples", getattr(config, "policy_mc_samples"))),

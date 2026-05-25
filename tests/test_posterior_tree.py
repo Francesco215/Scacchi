@@ -285,7 +285,9 @@ def test_terminal_leaf_is_backed_up_without_calling_leaf_evaluator():
     assert tree.inflight == 0
     assert tree.nodes[0].edge_has_post[0]
     assert int(tree.nodes[0].edge_eval_count_R[0]) == 1
-    assert np.allclose(tree.nodes[0].edge_B[0], np.array([1e-6, 1e-6, 8.000001]))
+    assert int(tree.nodes[0].edge_cat_outcome[0]) == 2
+    assert int(tree.nodes[0].edge_cat_distance[0]) == 1
+    assert np.allclose(tree.nodes[0].edge_B[0], np.array([1e-6, 1e-6, 0.999998]))
     assert tree.nodes[0].visits[0] == 1
 
 
