@@ -4,7 +4,7 @@ import numpy as np
 import pgx
 
 from scacchi.dirichlet_tree.search import run_wavefront_posterior_tree_search_state_batch
-from scacchi.train import SearchConfig, SearchConstantsConfig, SearchMonteCarloConfig
+from scacchi.config import SearchConfig, SearchConstantsConfig, SearchMonteCarloConfig
 
 
 _LINES = (

@@ -13,7 +13,7 @@ from tqdm import tqdm
 Scalar = float | int
 
 if TYPE_CHECKING:
-    from .train import Config, LoggingConfig, RunConfig
+    from .config import Config, LoggingConfig, RunConfig
 
 
 def _to_scalar(value: Any) -> Scalar:

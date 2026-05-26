@@ -4,7 +4,7 @@ from typing import cast
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
-from scacchi.train import ConfigError, SearchPolicy, load_config
+from scacchi.config import ConfigError, SearchPolicy, load_config
 
 
 def _load_config(name: str):
@@ -61,9 +61,8 @@ def test_invalid_and_legacy_config_values_are_rejected():
         {"search": {"policy": "posterior_tree"}},
         {"selfplay": {"action_source": "posterior_sample"}},
         {"search": {"final_action_mode": "scalar_q_argmax"}},
-        {"search": {"max_depth": 0}},
-        {"search": {"inflight_limit": 0}},
-        {"training": {"grad_clip_norm": 0.0}},
+        {"search": {"categorical": {"epsilon": 0.0}}},
+        {"search": {"categorical": {"epsilon": 0.5}}},
     ]
     for case in cases:
         with pytest.raises(ConfigError):

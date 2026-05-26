@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 if TYPE_CHECKING:
-    from .train import ModelConfig
+    from .config import ModelConfig
 
 
 def _unit_dirichlet_concentration_logit(num_outcomes: int) -> float:
@@ -332,4 +332,3 @@ def build_model(
         dirichlet_concentration_clip=dirichlet_concentration_clip,
         rngs=rngs,
     )
-

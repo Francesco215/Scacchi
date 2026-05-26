@@ -14,7 +14,7 @@ from flax import nnx
 from .network import AZNet, BoardlawDirichletNet, BoardlawNet
 
 if TYPE_CHECKING:
-    from .train import CheckpointingConfig, Config, RunConfig
+    from .config import CheckpointingConfig, Config, RunConfig
 
 
 def _suppress_orbax_logs() -> None:

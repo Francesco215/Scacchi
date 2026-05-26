@@ -35,7 +35,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from ..train import SearchConfig as RuntimeSearchConfig
+    from ..config import SearchConfig as RuntimeSearchConfig
 
 
 UNKNOWN = -1

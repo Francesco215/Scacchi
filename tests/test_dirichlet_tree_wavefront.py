@@ -9,7 +9,7 @@ from scacchi.dirichlet_tree.search import (
     run_wavefront_posterior_tree_search_state_batch,
 )
 from scacchi.dirichlet_tree.store import InMemoryNodeStore
-from scacchi.train import SearchConfig, SearchConstantsConfig, SearchMonteCarloConfig
+from scacchi.config import SearchConfig, SearchConstantsConfig, SearchMonteCarloConfig
 
 
 class ToyState(NamedTuple):
