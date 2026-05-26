@@ -4,8 +4,7 @@ from typing import cast
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
-from scacchi.posterior_tree import is_posterior_tree_policy
-from scacchi.train import ConfigError, load_config
+from scacchi.train import ConfigError, SearchPolicy, load_config
 
 
 def _load_config(name: str):
@@ -72,6 +71,4 @@ def test_invalid_and_legacy_config_values_are_rejected():
 
 
 def test_search_policy_surface_is_only_native_posterior_tree():
-    assert not is_posterior_tree_policy("dirichlet_thompson")
-    assert not is_posterior_tree_policy("posterior_tree")
-    assert is_posterior_tree_policy("posterior_tree_wavefront")
+    assert tuple(SearchPolicy) == (SearchPolicy.posterior_tree_wavefront,)

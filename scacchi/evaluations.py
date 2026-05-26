@@ -8,7 +8,7 @@ import numpy as np
 
 from .network import policy_value_from_output
 from .play import make_recurrent_fn
-from .posterior_tree import run_posterior_tree_search_state_batch
+from .dirichlet_tree.search import run_wavefront_posterior_tree_search_state_batch
 
 
 def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations):
@@ -56,7 +56,7 @@ def make_mcts_evaluate(env, eval_config, search_config, baseline_model):
         def leaf_evaluator(obs: jax.Array):
             return evaluate_leaves(model, obs)
 
-        return run_posterior_tree_search_state_batch(
+        return run_wavefront_posterior_tree_search_state_batch(
             env=env,
             root_state_batch=env_state,
             leaf_evaluator=leaf_evaluator,

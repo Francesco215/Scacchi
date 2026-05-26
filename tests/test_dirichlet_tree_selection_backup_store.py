@@ -1,12 +1,11 @@
 import numpy as np
-import pytest
 import jax
 import jax.numpy as jnp
 
 from scacchi.dirichlet_tree.backup import backup_path, terminal_dirichlet, update_edge_base_from_child
 from scacchi.dirichlet_tree.arena_search import BatchedPosteriorArenaSearch, PosteriorArena
 from scacchi.dirichlet_tree.selection import thompson_select_jax, thompson_select_np
-from scacchi.dirichlet_tree.store import InMemoryNodeStore, RedisNodeStore
+from scacchi.dirichlet_tree.store import InMemoryNodeStore
 from scacchi.dirichlet_tree.types import NodeBlob, PathStep, StateKey, outcome_mean
 
 
@@ -477,24 +476,3 @@ def test_in_memory_claim_missing_once_and_reports_existing_status():
     assert first.claimed == (key,)
     assert second.inflight == (key,)
     assert third.expanded == (key,)
-
-
-def test_redis_store_claim_and_round_trip_with_fakeredis():
-    fakeredis = pytest.importorskip("fakeredis")
-    store = RedisNodeStore(fakeredis.FakeRedis(), namespace="dqaz:test")
-    key = StateKey((1, 2, 3, 4))
-
-    assert store.claim_many_inflight([key]).claimed == (key,)
-    assert store.claim_many_inflight([key]).inflight == (key,)
-    node = NodeBlob.expanded_node(
-        key=key,
-        current_player=0,
-        legal_action_mask=np.array([True]),
-        value_alpha=np.ones((3,), dtype=np.float32),
-        policy_logits=np.zeros((1,), dtype=np.float32),
-        q_alpha=np.ones((1, 3), dtype=np.float32),
-    )
-    store.put_many([node])
-
-    assert store.claim_many_inflight([key]).expanded == (key,)
-    assert store.get_many([key])[key].expanded

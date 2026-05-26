@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import time
 import weakref
 
@@ -33,6 +33,9 @@ from .types import (
     outcome_utility,
     terminal_outcome_from_reward,
 )
+
+if TYPE_CHECKING:
+    from ..train import SearchConfig as RuntimeSearchConfig
 
 
 UNKNOWN = -1
@@ -2444,18 +2447,16 @@ def run_arena_posterior_tree_search(
     root_states: list[Any],
     leaf_evaluator: LeafEvaluator,
     rng_key: jax.Array,
-    config: Any,
+    config: RuntimeSearchConfig,
 ) -> SearchResult:
-    from .search import search_config_from_any
+    from .search import search_config_from_runtime
 
-    search_config = search_config_from_any(config, num_roots=len(root_states))
+    search_config = search_config_from_runtime(config, num_roots=len(root_states))
     search = BatchedPosteriorArenaSearch(env=env, rng_key=rng_key)
     return search.search_batch(
         root_states,
         leaf_evaluator,
         search_config,
-        max_nodes=getattr(config, "wavefront_max_nodes", None),
-        max_edges=getattr(config, "wavefront_max_edges", None),
     )
 
 

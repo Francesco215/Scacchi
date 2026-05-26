@@ -5,7 +5,7 @@ from .search import (
     run_wavefront_posterior_tree_search,
     run_wavefront_posterior_tree_search_state_batch,
 )
-from .store import InMemoryNodeStore, RedisNodeStore
+from .store import InMemoryNodeStore
 from .types import NodeBlob, SearchConfig, SearchDiagnostics, SearchResult, StateKey
 
 __all__ = [
@@ -14,7 +14,6 @@ __all__ = [
     "InMemoryNodeStore",
     "NodeBlob",
     "PosteriorArena",
-    "RedisNodeStore",
     "SearchConfig",
     "SearchDiagnostics",
     "SearchResult",

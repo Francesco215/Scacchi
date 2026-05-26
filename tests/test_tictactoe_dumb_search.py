@@ -1,11 +1,10 @@
-from types import SimpleNamespace
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pgx
 
-from scacchi.posterior_tree import run_posterior_tree_search_state_batch
+from scacchi.dirichlet_tree.search import run_wavefront_posterior_tree_search_state_batch
+from scacchi.train import SearchConfig, SearchConstantsConfig, SearchMonteCarloConfig
 
 
 _LINES = (
@@ -21,17 +20,16 @@ _LINES = (
 
 
 def _config():
-    return SimpleNamespace(
-        search_policy="posterior_tree_wavefront",
+    return SearchConfig(
         num_simulations=128,
         inflight_limit=8,
-        search_max_depth=9,
-        search_eval_batch_size=64,
-        leaf_value_mode="alpha",
-        kappa_leaf=1.0,
-        state_posterior_kappa_n=16.0,
-        policy_mc_samples=512,
-        final_action_mode="posterior_argmax",
+        max_depth=9,
+        eval_batch_size=64,
+        monte_carlo=SearchMonteCarloConfig(policy_samples=512),
+        constants=SearchConstantsConfig(
+            kappa_leaf=1.0,
+            state_posterior_kappa_n=16.0,
+        ),
     )
 
 
@@ -102,7 +100,7 @@ def test_uniform_model_posterior_tree_finds_tictactoe_tactical_moves():
         _state_after(env, [0, 4, 8, 2, 6, 3]),  # X preserves the draw with 7.
     ]
 
-    output = run_posterior_tree_search_state_batch(
+    output = run_wavefront_posterior_tree_search_state_batch(
         env=env,
         root_state_batch=_stack_states(states),
         leaf_evaluator=_uniform_leaf_evaluator,

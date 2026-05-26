@@ -226,8 +226,6 @@ def repair_dirty_frontier(
     state_posterior_kappa_n: float = 9.0,
     max_passes: int = 8,
 ) -> None:
-    # The in-memory store is the only store-backed backend used in tests. Redis
-    # does not expose a node iterator, so callers still repair paths as they write.
     if not hasattr(store, "nodes"):
         return
     for _ in range(max(1, int(max_passes))):
@@ -320,7 +318,7 @@ def _mark_parent_dirty_if_present(store: NodeStore, node: NodeBlob) -> None:
 def _require_node(store: NodeStore, key: StateKey) -> NodeBlob:
     node = store.get_many([key])[key]
     if node is None:
-        raise KeyError(f"missing node for key {key.redis_hex}")
+        raise KeyError(f"missing node for key {key.hex}")
     return node
 
 
@@ -328,7 +326,7 @@ def _action_index(node: NodeBlob, action: int) -> int:
     try:
         return node.action_to_index[int(action)]
     except KeyError as exc:
-        raise KeyError(f"action {action} is not legal at node {node.key.redis_hex}") from exc
+        raise KeyError(f"action {action} is not legal at node {node.key.hex}") from exc
 
 
 def _positive(alpha: np.ndarray) -> np.ndarray:

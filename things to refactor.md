@@ -14,13 +14,13 @@
 - `DuplicateLeafMode`: removed. In-flight leaves are scheduler state only; duplicate leaf handling should not be a Bayesian/search semantic option.
 - `training.tree.*`: removed from runtime config. Section 17 defines the export set directly: clean non-terminal interior nodes plus categorical non-terminal nodes, with terminal leaves excluded.
 - The non-posterior self-play branch and Pydantic-era evaluation config mutation path have been removed.
+- The dirichlet-tree search boundary now consumes the nested runtime `SearchConfig` directly. The flat `search_config_from_any()` compatibility bridge and `SimpleNamespace` test configs are removed.
+- Deleted the old jitted Dirichlet-Q search, list-backed posterior-tree wrapper, exact Hex helper, and their tests. Runtime self-play/evaluation now call the native dirichlet-tree driver directly.
+- External key-value storage, its tests, benchmark scripts, and package dependencies are removed. The retained search path is the in-process wavefront arena.
 
 ## Remaining implementation refactors
 
-- Delete or quarantine `scacchi/dirichlet_q_search.py`; it implements the old jitted Dirichlet-Q/Gumbel-style search and still exposes `num_search_blocks`.
-- Delete or isolate the old list-backed `scacchi/posterior_tree.py` implementation. It still has terminal Dirichlet proxy code and the old non-arena `posterior_tree` entry point.
 - Remove terminal Dirichlet proxy functions and fields from `scacchi/dirichlet_tree/arena_search.py`, `scacchi/dirichlet_tree/search.py`, and `scacchi/dirichlet_tree/backup.py`; terminal outcomes must stay native categorical objects.
 - Replace internal `backup_mc_samples` plumbing with the single posterior-best sample count `policy_mc_samples`/`M_pi`.
 - Rename remaining `wavefront_*` function/type names once the old non-wavefront path is gone. The algorithm is now the native posterior-tree driver, not a selectable wavefront variant.
 - Remove scalar network branches (`AZNet`, `BoardlawNet`) from normal training code after migrated/evaluation checkpoints no longer need them.
-- Delete `scacchi/exact_hex.py` and its tests, or convert it into native categorical proof input; it is no longer part of the configured training pipeline.

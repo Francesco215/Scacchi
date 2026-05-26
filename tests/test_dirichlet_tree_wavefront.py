@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 from typing import NamedTuple
 
 import jax
@@ -10,6 +9,7 @@ from scacchi.dirichlet_tree.search import (
     run_wavefront_posterior_tree_search_state_batch,
 )
 from scacchi.dirichlet_tree.store import InMemoryNodeStore
+from scacchi.train import SearchConfig, SearchConstantsConfig, SearchMonteCarloConfig
 
 
 class ToyState(NamedTuple):
@@ -74,19 +74,20 @@ def _stack_states(states):
 
 
 def _config(**overrides):
-    values = dict(
-        search_policy="posterior_tree_wavefront",
-        num_simulations=1,
-        inflight_limit=1,
-        search_max_depth=8,
-        search_eval_batch_size=16,
-        kappa_leaf=1.0,
-        state_posterior_kappa_n=1.0,
-        policy_mc_samples=8,
-        final_action_mode="posterior_argmax",
+    return SearchConfig(
+        num_simulations=overrides.pop("num_simulations", 1),
+        inflight_limit=overrides.pop("inflight_limit", 1),
+        max_depth=overrides.pop("max_depth", 8),
+        eval_batch_size=overrides.pop("eval_batch_size", 16),
+        monte_carlo=SearchMonteCarloConfig(
+            policy_samples=overrides.pop("policy_samples", 8),
+        ),
+        constants=SearchConstantsConfig(
+            kappa_leaf=overrides.pop("kappa_leaf", 1.0),
+            state_posterior_kappa_n=overrides.pop("state_posterior_kappa_n", 1.0),
+        ),
+        **overrides,
     )
-    values.update(overrides)
-    return SimpleNamespace(**values)
 
 
 def test_wavefront_steps_multiple_roots_in_one_batched_call_and_finishes_targets():

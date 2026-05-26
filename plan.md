@@ -125,20 +125,17 @@ Implement:
   - root and tree-node rows export native Q/V target arrays,
   - `alpha_root` remains diagnostic/compatibility only.
 
-## 4. Store-Backed And Redis Scope
+## 4. Store-Backed Scope
 
-Per the current implementation direction, Redis/store-backed blob migration is out
-of scope for this plan.
+Per the current implementation direction, store-backed blob migration is out of
+scope for this plan. The active search path is the in-process arena.
 
 Do not edit:
 
 - `scacchi/dirichlet_tree/codec.py`
-- Redis serialization details in `scacchi/dirichlet_tree/store.py`
-- Redis-specific schema or migration code
 
 Keep the store-backed tests compatible where they touch the arena or shared
-helpers, but do not implement categorical codec persistence or Redis PGX-state
-handling in this pass.
+helpers, but do not implement categorical codec persistence in this pass.
 
 ## 5. Training Loss And Data Plumbing
 

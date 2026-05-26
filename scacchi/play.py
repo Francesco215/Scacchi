@@ -11,8 +11,8 @@ from pgx.experimental import auto_reset
 
 from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
 from .dirichlet_tree.native import native_fields_from_beta
+from .dirichlet_tree.search import run_wavefront_posterior_tree_search_state_batch
 from .network import policy_value_from_output
-from .posterior_tree import run_posterior_tree_search_state_batch
 
 
 BatchedEnvInit = Callable[[jax.Array], Any]
@@ -192,7 +192,7 @@ def make_posterior_tree_selfplay(env, selfplay_config, search_config):
             observation = env_state.observation
             legal_action_mask = env_state.legal_action_mask
             actor = env_state.current_player
-            search_output = run_posterior_tree_search_state_batch(
+            search_output = run_wavefront_posterior_tree_search_state_batch(
                 env=env,
                 root_state_batch=env_state,
                 leaf_evaluator=leaf_evaluator,

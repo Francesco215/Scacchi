@@ -47,7 +47,7 @@ class StateKey:
         return f"{hi:016x}", f"{lo:016x}"
 
     @property
-    def redis_hex(self) -> str:
+    def hex(self) -> str:
         hi, lo = self.hi_lo_hex
         return hi + lo
 
@@ -366,7 +366,6 @@ class SearchConfig:
     lane_indexed_step: bool = True
     stable_lane_batch: bool = True
     pad_pending_observation_gather: bool = True
-    redis_inflight_ttl_ms: int = 30000
     train_tree_nodes: bool = False
     train_tree_include_root: bool = False
     train_tree_include_terminal: bool = False
