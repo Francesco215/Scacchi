@@ -82,7 +82,7 @@ class TrainMetrics(NamedTuple):
         return self.q_loss_weight_mean
 
 
-def make_compute_loss_input(config):
+def make_compute_loss_input(max_num_steps: int):
     def compute_loss_input(data: SelfplayOutput) -> Sample:
         value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
         legal_policy_mask = jnp.any(data.legal_action_mask, axis=-1)
@@ -95,24 +95,17 @@ def make_compute_loss_input(config):
 
         @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
         def body_fn(carry: jax.Array, i: jax.Array) -> tuple[jax.Array, jax.Array]:
-            ix = config.max_num_steps - i - 1
+            ix = max_num_steps - i - 1
             value = data.reward[ix] + data.discount[ix] * carry
             return value, value
 
         _, value_tgt = body_fn(
             jnp.zeros(data.reward.shape[1], dtype=data.reward.dtype),
-            jnp.arange(config.max_num_steps),
+            jnp.arange(max_num_steps),
         )
         value_tgt = value_tgt[::-1, :]
         policy_tgt = jnp.asarray(data.action_weights)
         policy_loss_mask = legal_policy_mask & search_loss_mask
-        if getattr(config, "policy_target_mode", "search") == "winner_action":
-            policy_tgt = jax.nn.one_hot(
-                data.played_action,
-                data.action_weights.shape[-1],
-                dtype=data.action_weights.dtype,
-            )
-            policy_loss_mask = legal_policy_mask & value_mask & (value_tgt > 0)
 
         sample = Sample(
             obs=data.obs,
@@ -391,7 +384,8 @@ def _compute_dirichlet_losses(
     alpha_v: jax.Array,
     alpha_q: jax.Array,
     data: Sample,
-    config,
+    loss_config,
+    categorical_epsilon: float,
 ) -> tuple[jax.Array, TrainMetrics]:
     native_fields = _native_target_fields(data)
     data = _with_native_defaults(data, native_fields)
@@ -404,7 +398,6 @@ def _compute_dirichlet_losses(
     policy_target_entropy = _masked_mean(policy_target_entropy, policy_loss_mask)
     policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
 
-    categorical_epsilon = float(getattr(config, "categorical_epsilon", 1e-4))
     value_dir_kl = _native_dirichlet_loss(
         data.beta_V_target,
         alpha_v,
@@ -439,9 +432,9 @@ def _compute_dirichlet_losses(
     q_loss_weight_mean = _masked_mean(data.q_loss_weight, q_weights > 0)
 
     total_loss = (
-        config.policy_loss_weight * policy_loss
-        + config.value_dir_kl_weight * value_dir_kl_loss
-        + config.q_dir_kl_weight * q_dir_kl_loss
+        loss_config.policy_weight * policy_loss
+        + loss_config.value_dir_kl_weight * value_dir_kl_loss
+        + loss_config.q_dir_kl_weight * q_dir_kl_loss
     )
     metrics = TrainMetrics(
         policy_loss=policy_loss,
@@ -468,7 +461,13 @@ def _compute_dirichlet_losses(
     return total_loss, metrics
 
 
-def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
+def train(
+    model: Any,
+    optimizer: nnx.Optimizer,
+    data: Sample,
+    loss_config,
+    categorical_epsilon: float,
+):
     def loss_fn(model: Any):
         output = model(data.obs, train=True)
         if len(output) == 2:
@@ -499,7 +498,14 @@ def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
             return policy_loss + value_loss, metrics
 
         logits, alpha_v, alpha_q = output
-        return _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
+        return _compute_dirichlet_losses(
+            logits,
+            alpha_v,
+            alpha_q,
+            data,
+            loss_config,
+            categorical_epsilon,
+        )
 
     (_, metrics), grads = nnx.value_and_grad(
         loss_fn,

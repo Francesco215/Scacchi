@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -14,7 +15,7 @@ from flax import nnx
 from .network import build_model
 
 if TYPE_CHECKING:
-    from .train import Config
+    from .train import CheckpointingConfig, Config, RunConfig
 
 
 def _suppress_orbax_logs() -> None:
@@ -38,18 +39,19 @@ class NoOpCheckpointManager(ocp.CheckpointManager):
 
 
 def build_checkpoint_manager(
-    config: Config,
+    checkpointing: CheckpointingConfig,
+    run: RunConfig,
     ckpt_dir: Path,
 ) -> ocp.CheckpointManager:
     _suppress_orbax_logs()
     options = ocp.CheckpointManagerOptions(
-        max_to_keep=config.ckpt_max_to_keep,
-        save_interval_steps=config.ckpt_save_interval_steps,
-        save_on_steps=[config.max_num_iters - 1],
+        max_to_keep=checkpointing.max_to_keep,
+        save_interval_steps=checkpointing.save_interval_steps,
+        save_on_steps=[run.max_num_iters - 1],
         enable_async_checkpointing=True,
     )
     item_names = ("model", "optimizer", "rngs", "meta")
-    if config.ckpt_max_to_keep == 0:
+    if checkpointing.max_to_keep == 0:
         return NoOpCheckpointManager(ckpt_dir, options=options, item_names=item_names)
     return ocp.CheckpointManager(ckpt_dir, options=options, item_names=item_names)
 
@@ -67,7 +69,7 @@ def maybe_save(
     if not manager.should_save(step):
         return
     meta: dict[str, Any] = {
-        "config": config.model_dump(),
+        "config": config.to_dict(),
         "step": step,
         "hours": hours,
         "frames": frames,
@@ -121,8 +123,6 @@ def from_pretrained(
         rngs = nnx.Rngs(0)
     checkpoint_path = str(Path(checkpoint_path).resolve())
 
-    from .train import Config, normalize_config_dict  # local import avoids circular
-
     with ocp.CheckpointManager(checkpoint_path) as manager:
         step = manager.latest_step()
         if step is None:
@@ -131,13 +131,13 @@ def from_pretrained(
         meta_restored = manager.restore(
             step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
         )
-        config = Config.model_validate(
-            normalize_config_dict(meta_restored["meta"]["config"]),
-            extra="ignore",
-            context={"model_construction_only": True},
+        model_config, num_outcomes, dirichlet_clip = _checkpoint_model_parts(
+            meta_restored["meta"].get("config", {})
         )
         model = build_model(
-            config,
+            model_config,
+            num_outcomes=num_outcomes,
+            dirichlet_concentration_clip=dirichlet_clip,
             num_actions=env.num_actions,
             observation_shape=env.observation_shape,
             rngs=rngs,
@@ -149,3 +149,20 @@ def from_pretrained(
 
     nnx.update(model, restored["model"])
     return model
+
+
+def _checkpoint_model_parts(config: Any) -> tuple[Any, int | None, float | None]:
+    root = config if isinstance(config, dict) else {}
+    model = root.get("model", root)
+    env = root.get("env", root)
+    regularization = root.get("training", {}).get("regularization", root)
+    return (
+        SimpleNamespace(
+            network=model.get("network", "boardlaw_dirichlet"),
+            num_channels=model.get("num_channels", 128),
+            num_layers=model.get("num_layers", 6),
+            resnet_v2=model.get("resnet_v2", True),
+        ),
+        env.get("num_outcomes"),
+        regularization.get("dirichlet_concentration_clip", 8.0),
+    )

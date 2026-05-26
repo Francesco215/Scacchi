@@ -162,7 +162,7 @@ def exact_hex_actions(
     flat_obs = obs_host.reshape((-1, *obs_host.shape[-3:]))
     flat_legal = legal_host.reshape((-1, legal_host.shape[-1]))
     actions = np.zeros((flat_obs.shape[0],), dtype=np.int32)
-    sample = getattr(config, "wavefront_final_action_mode", "posterior_argmax") == "posterior_sample"
+    sample = getattr(config, "final_action_mode", "posterior_argmax") == "posterior_sample"
     rng = None
     if sample and rng_key is not None:
         seed = int(

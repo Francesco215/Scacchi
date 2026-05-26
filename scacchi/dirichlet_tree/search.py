@@ -458,7 +458,7 @@ def run_wavefront_posterior_tree_search(
     config: Any,
     store: NodeStore | None = None,
 ) -> WavefrontPosteriorTreeBatchOutput:
-    if store is None and getattr(config, "wavefront_backend", "arena") == "arena":
+    if store is None:
         from .arena_search import run_arena_posterior_tree_search
 
         result = run_arena_posterior_tree_search(
@@ -524,7 +524,7 @@ def run_wavefront_posterior_tree_search_state_batch(
     store: NodeStore | None = None,
 ) -> WavefrontPosteriorTreeBatchOutput:
     num_roots = int(np.asarray(jax.device_get(root_state_batch.current_player)).shape[0])
-    if store is None and getattr(config, "wavefront_backend", "arena") == "arena":
+    if store is None:
         from .arena_search import BatchedPosteriorArenaSearch
 
         search_config = search_config_from_any(config, num_roots=num_roots)
@@ -568,40 +568,39 @@ def run_wavefront_posterior_tree_search_state_batch(
 
 
 def search_config_from_any(config: Any, *, num_roots: int = 1) -> SearchConfig:
-    eval_batch_size = getattr(config, "search_eval_batch_size", None)
+    eval_batch_size = getattr(config, "eval_batch_size", None)
+    if eval_batch_size is None:
+        eval_batch_size = getattr(config, "search_eval_batch_size", None)
     if eval_batch_size is None:
         eval_batch_size = max(1, int(num_roots))
-    final_action_mode = getattr(config, "wavefront_final_action_mode", "posterior_argmax")
+    final_action_mode = getattr(config, "final_action_mode", "posterior_argmax")
+    monte_carlo = getattr(config, "monte_carlo", config)
+    constants = getattr(config, "constants", config)
+    categorical = getattr(config, "categorical", config)
+    policy_mc_samples = getattr(config, "policy_mc_samples", None)
+    if policy_mc_samples is None:
+        policy_mc_samples = getattr(monte_carlo, "policy_samples")
+    policy_mc_samples = int(policy_mc_samples)
     return SearchConfig(
         num_simulations=int(getattr(config, "num_simulations")),
-        max_depth=int(getattr(config, "wavefront_max_depth", getattr(config, "max_depth", 128))),
-        num_lanes_per_root=int(getattr(config, "wavefront_num_lanes_per_root", 1)),
+        max_depth=int(getattr(config, "max_depth", getattr(config, "search_max_depth", 128))),
+        num_lanes_per_root=int(getattr(config, "inflight_limit", 1)),
         eval_batch_size=max(1, int(eval_batch_size)),
         leaf_value_mode=getattr(config, "leaf_value_mode", "alpha"),
-        kappa_leaf=float(getattr(config, "kappa_leaf", 1.0)),
-        kappa_terminal=float(getattr(config, "kappa_terminal", 8.0)),
-        epsilon_terminal=float(getattr(config, "epsilon_terminal", 1e-6)),
-        categorical_epsilon=float(getattr(config, "categorical_epsilon", 1e-4)),
-        categorical_draw_rule=getattr(config, "categorical_draw_rule", "policy_prior"),
-        state_posterior_kappa_n=float(getattr(config, "state_posterior_kappa_n", 9.0)),
-        policy_mc_samples=int(getattr(config, "policy_mc_samples")),
-        backup_mc_samples=int(getattr(config, "backup_mc_samples", getattr(config, "policy_mc_samples"))),
-        duplicate_leaf_mode=getattr(config, "duplicate_leaf_mode", "recycle_lane"),
-        final_action_mode=final_action_mode,
-        pad_eval_batches=bool(getattr(config, "wavefront_pad_eval_batches", True)),
-        pad_jax_select=bool(getattr(config, "wavefront_pad_jax_select", False)),
-        np_select_below=max(0, int(getattr(config, "wavefront_np_select_below", 1024))),
-        grouped_expansion=bool(getattr(config, "wavefront_grouped_expansion", True)),
-        lane_indexed_step=bool(getattr(config, "wavefront_lane_indexed_step", True)),
-        stable_lane_batch=bool(getattr(config, "wavefront_stable_lane_batch", True)),
-        pad_pending_observation_gather=bool(
-            getattr(config, "wavefront_pad_pending_observation_gather", True)
+        kappa_leaf=float(getattr(constants, "kappa_leaf", 1.0)),
+        categorical_epsilon=float(getattr(categorical, "epsilon", 1e-4)),
+        categorical_draw_rule=getattr(categorical, "draw_rule", "policy_prior"),
+        state_posterior_kappa_n=float(
+            getattr(constants, "state_posterior_kappa_n", 9.0)
         ),
-        train_tree_nodes=bool(getattr(config, "train_tree_nodes", False)),
-        train_tree_include_root=bool(getattr(config, "train_tree_include_root", False)),
-        train_tree_include_terminal=bool(getattr(config, "train_tree_include_terminal", False)),
-        train_tree_min_q_evidence=float(getattr(config, "train_tree_min_q_evidence", 0.0)),
-        train_tree_max_nodes_per_step=getattr(config, "train_tree_max_nodes_per_step", None),
+        policy_mc_samples=policy_mc_samples,
+        backup_mc_samples=policy_mc_samples,
+        final_action_mode=final_action_mode,
+        train_tree_nodes=True,
+        train_tree_include_root=True,
+        train_tree_include_terminal=False,
+        train_tree_min_q_evidence=0.0,
+        train_tree_max_nodes_per_step=None,
     )
 
 

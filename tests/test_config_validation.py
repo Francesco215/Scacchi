@@ -1,247 +1,77 @@
 from pathlib import Path
+from typing import cast
 
 import pytest
-from omegaconf import OmegaConf
-from pydantic import ValidationError
+from omegaconf import DictConfig, OmegaConf
 
 from scacchi.posterior_tree import is_posterior_tree_policy
-from scacchi.train import Config, normalize_config_dict
+from scacchi.train import ConfigError, load_config
 
 
-def test_nested_hex_config_loads_into_runtime_config():
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex.yaml"
-    container = OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True)
-
-    assert isinstance(container, dict)
-    config = Config(**normalize_config_dict(container))
-
-    assert config.env_id == "hex"
-    assert config.board_size == 5
-    assert config.network == "boardlaw_dirichlet"
-    assert config.max_num_iters == 80
-    assert config.num_channels == 512
-    assert config.selfplay_batch_size == 4096
-    assert config.max_num_steps == 25
-    assert config.selfplay_action_source == "posterior_argmax"
-    assert config.search_policy == "gumbel"
-    assert config.num_simulations == 32
-    assert config.search_eval_batch_size == 1024
-    assert config.wavefront_num_lanes_per_root == 1
-    assert config.wavefront_final_action_mode == "posterior_sample"
-    assert config.leaf_value_mode == "alpha"
-    assert config.kappa_leaf == 1.0
-    assert config.kappa_terminal == 8.0
-    assert config.epsilon_terminal == 5e-2
-    assert config.state_posterior_kappa_n == 16.0
-    assert config.train_tree_nodes is False
-    assert config.train_tree_include_root is False
-    assert config.exact_hex_solver_enabled is False
-    assert config.exact_hex_solver_extra_batch_size == 0
-    assert config.training_batch_size == 1024
-    assert config.replay_buffer_size == 1
-    assert config.learning_rate == 1e-3
-    assert config.grad_clip_norm == 1.0
-    assert config.policy_loss_weight == 0.05
-    assert config.value_dir_kl_weight == 5.0
-    assert config.q_dir_kl_weight == 5.0
-    assert config.policy_target_mode == "search"
-    assert config.dirichlet_concentration_clip == 8.0
-    assert config.eval_interval == 1
-    assert config.eval_batch_size == 512
-    assert config.wandb_enabled is True
-    assert config.ckpt_max_to_keep == 0
+def _load_config(name: str):
+    path = Path(__file__).parents[1] / "scacchi" / "configs" / name
+    return load_config(cast(DictConfig, OmegaConf.load(path)))
 
 
-def test_flat_config_keys_take_precedence_over_nested_values():
-    normalized = normalize_config_dict(
-        {
-            "env": {"board_size": 6},
-            "model": {"num_channels": 64},
-            "board_size": 7,
-            "num_channels": 128,
-        }
-    )
+def test_hex_config_loads_native_posterior_tree_runtime_config():
+    config = _load_config("hex.yaml")
 
-    assert normalized["board_size"] == 7
-    assert normalized["num_channels"] == 128
-
-
-def test_deprecated_search_constants_are_rejected():
-    with pytest.raises(ValueError, match="c_leaf"):
-        normalize_config_dict({"search": {"constants": {"c_leaf": 1.0}}})
-
-    with pytest.raises(ValidationError, match="c_state"):
-        Config(network="boardlaw_dirichlet", c_state=0.1)
-
-
-def test_scalar_network_rejects_dirichlet_loss_weights():
-    with pytest.raises(ValidationError, match="network='boardlaw_dirichlet'"):
-        Config(
-            network="boardlaw",
-            value_dir_kl_weight=1.0,
-            q_dir_kl_weight=0.0,
-        )
-
-
-def test_scalar_network_allows_zero_dirichlet_loss_weights():
-    config = Config(
-        network="boardlaw",
-        value_dir_kl_weight=0.0,
-        q_dir_kl_weight=0.0,
-    )
-
-    assert config.network == "boardlaw"
+    assert config.env.id == "hex"
+    assert config.env.board_size == 5
+    assert config.model.network == "boardlaw_dirichlet"
+    assert config.search.policy == "posterior_tree_wavefront"
+    assert config.selfplay.action_source == "search_action"
+    assert config.env.num_outcomes == 3
+    assert config.search.num_simulations == 32
+    assert config.search.eval_batch_size == 1024
+    assert config.search.inflight_limit == 4
+    assert config.search.max_depth == 25
+    assert config.search.final_action_mode == "posterior_argmax"
+    assert config.search.leaf_value_mode == "alpha"
+    assert config.search.constants.kappa_leaf == 1.0
+    assert config.search.constants.state_posterior_kappa_n == 16.0
+    assert config.search.categorical.epsilon == 1e-4
+    assert config.search.categorical.draw_rule == "policy_prior"
+    assert config.training.batch_size == 1024
+    assert config.training.replay_buffer_size == 1
+    assert config.training.learning_rate == 1e-3
+    assert config.training.grad_clip_norm == 1.0
+    assert config.training.losses.policy_weight == 0.05
+    assert config.training.losses.value_dir_kl_weight == 5.0
+    assert config.training.losses.q_dir_kl_weight == 5.0
+    assert config.training.regularization.dirichlet_concentration_clip == 8.0
+    assert config.eval.interval == 1
+    assert config.eval.batch_size == 512
+    assert config.logging.wandb.enabled is True
+    assert config.checkpointing.max_to_keep == 0
 
 
-def test_dirichlet_network_allows_dirichlet_loss_weights():
-    config = Config(network="boardlaw_dirichlet", value_dir_kl_weight=1.0)
-
-    assert config.network == "boardlaw_dirichlet"
-
-
-def test_num_search_blocks_must_be_positive():
-    with pytest.raises(ValidationError):
-        Config(network="boardlaw_dirichlet", num_search_blocks=0)
+def test_native_posterior_prototype_config_loads_like_default_hex():
+    assert _load_config("hex_native_posterior_prototype.yaml").to_dict() == _load_config(
+        "hex.yaml"
+    ).to_dict()
 
 
-def test_grad_clip_norm_must_be_positive_when_set():
-    with pytest.raises(ValidationError):
-        Config(network="boardlaw_dirichlet", grad_clip_norm=0.0)
+def test_invalid_and_legacy_config_values_are_rejected():
+    cases = [
+        {"search": {"constants": {"c_leaf": 1.0}}},
+        {"model": {"network": "boardlaw"}},
+        {"model": {"network": "aznet"}},
+        {"env": {"num_outcomes": 2}},
+        {"search": {"policy": "gumbel"}},
+        {"search": {"policy": "posterior_tree"}},
+        {"selfplay": {"action_source": "posterior_sample"}},
+        {"search": {"final_action_mode": "scalar_q_argmax"}},
+        {"search": {"max_depth": 0}},
+        {"search": {"inflight_limit": 0}},
+        {"training": {"grad_clip_norm": 0.0}},
+    ]
+    for case in cases:
+        with pytest.raises(ConfigError):
+            load_config(case)
 
 
-def test_grad_clip_norm_can_be_disabled():
-    config = Config(network="boardlaw_dirichlet", grad_clip_norm=None)
-
-    assert config.grad_clip_norm is None
-
-
-def test_posterior_sample_action_source_is_valid():
-    config = Config(
-        network="boardlaw_dirichlet",
-        selfplay_action_source="posterior_sample",
-    )
-
-    assert config.selfplay_action_source == "posterior_sample"
-
-
-def test_scalar_q_argmax_action_source_is_rejected():
-    with pytest.raises(ValidationError, match="selfplay_action_source"):
-        Config(
-            network="boardlaw_dirichlet",
-            selfplay_action_source="scalar_q_argmax",
-        )
-
-
-def test_selfplay_action_source_must_be_known():
-    with pytest.raises(ValidationError, match="selfplay_action_source"):
-        Config(network="boardlaw_dirichlet", selfplay_action_source="unknown")
-
-
-def test_search_policy_must_be_known():
-    with pytest.raises(ValidationError, match="search_policy"):
-        Config(network="boardlaw_dirichlet", search_policy="unknown")
-
-
-def test_dirichlet_thompson_uses_jitted_dirichlet_q_path():
+def test_search_policy_surface_is_only_native_posterior_tree():
     assert not is_posterior_tree_policy("dirichlet_thompson")
-    assert is_posterior_tree_policy("posterior_tree")
+    assert not is_posterior_tree_policy("posterior_tree")
     assert is_posterior_tree_policy("posterior_tree_wavefront")
-
-
-def test_policy_target_mode_must_be_known():
-    with pytest.raises(ValidationError, match="policy_target_mode"):
-        Config(network="boardlaw_dirichlet", policy_target_mode="unknown")
-
-
-def test_posterior_tree_search_requires_dirichlet_network_and_wdl3():
-    with pytest.raises(ValidationError, match="boardlaw_dirichlet"):
-        Config(
-            network="boardlaw",
-            search_policy="posterior_tree",
-            value_dir_kl_weight=0.0,
-            q_dir_kl_weight=0.0,
-        )
-    with pytest.raises(ValidationError, match="WDL3"):
-        Config(
-            network="boardlaw_dirichlet",
-            search_policy="posterior_tree",
-            num_outcomes=2,
-        )
-
-
-def test_wavefront_posterior_tree_search_policy_is_valid():
-    config = Config(network="boardlaw_dirichlet", search_policy="posterior_tree_wavefront")
-
-    assert config.search_policy == "posterior_tree_wavefront"
-    assert config.wavefront_backend == "arena"
-
-
-def test_tree_node_training_requires_wavefront_policy():
-    config = Config(
-        network="boardlaw_dirichlet",
-        search_policy="posterior_tree_wavefront",
-        train_tree_nodes=True,
-    )
-
-    assert config.train_tree_nodes is True
-
-    with pytest.raises(ValidationError, match="train_tree_nodes"):
-        Config(
-            network="boardlaw_dirichlet",
-            search_policy="gumbel",
-            train_tree_nodes=True,
-        )
-
-
-def test_wavefront_knobs_are_validated():
-    config = Config(
-        network="boardlaw_dirichlet",
-        search_policy="posterior_tree_wavefront",
-        wavefront_num_lanes_per_root=2,
-        wavefront_max_depth=32,
-        wavefront_final_action_mode="posterior_sample",
-    )
-
-    assert config.wavefront_num_lanes_per_root == 2
-    assert config.wavefront_max_depth == 32
-    assert config.wavefront_final_action_mode == "posterior_sample"
-    assert config.wavefront_pad_eval_batches is True
-    assert config.wavefront_pad_jax_select is False
-    assert config.wavefront_np_select_below == 1024
-    assert config.wavefront_grouped_expansion is True
-    assert config.wavefront_lane_indexed_step is True
-    assert config.wavefront_stable_lane_batch is True
-    assert config.wavefront_pad_pending_observation_gather is True
-
-    with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
-        Config(
-            network="boardlaw_dirichlet",
-            search_policy="posterior_tree_wavefront",
-            wavefront_final_action_mode="scalar_q_argmax",
-        )
-    with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
-        Config(
-            network="boardlaw_dirichlet",
-            search_policy="posterior_tree_wavefront",
-            wavefront_final_action_mode="argmax_q_mean",
-        )
-
-    with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
-        Config(
-            network="boardlaw_dirichlet",
-            search_policy="posterior_tree_wavefront",
-            wavefront_final_action_mode="unknown",
-        )
-
-
-def test_model_construction_context_allows_legacy_checkpoint_loss_weights():
-    config = Config.model_validate(
-        {
-            "network": "boardlaw",
-            "value_dir_kl_weight": 1.0,
-            "q_dir_kl_weight": 1.0,
-        },
-        context={"model_construction_only": True},
-    )
-
-    assert config.network == "boardlaw"

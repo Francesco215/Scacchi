@@ -2,11 +2,9 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 
-from .exact_hex import relabel_selfplay_with_exact_hex
 from .loss import Sample, TrainMetrics, make_compute_loss_input, train
 from .play import make_selfplay
 from .play import SelfplayOutput
-from .posterior_tree import is_posterior_tree_policy
 
 
 def make_minibatches(
@@ -163,57 +161,50 @@ def train_minibatches(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
     minibatches: Sample,
-    config,
+    loss_config,
+    categorical_epsilon: float,
 ) -> TrainMetrics:
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def scan_step(state, minibatch):
         model, optimizer = state
-        metrics = train(model, optimizer, minibatch, config)
+        metrics = train(
+            model,
+            optimizer,
+            minibatch,
+            loss_config,
+            categorical_epsilon,
+        )
         return (model, optimizer), metrics
 
     _, metrics = scan_step((model, optimizer), minibatches)
     return metrics
 
 
-def make_training_iteration(env, config):
-    selfplay = make_selfplay(env, config)
-    compute_loss_input = make_compute_loss_input(config)
-    replay_buffer_size = int(getattr(config, "replay_buffer_size", 1))
-
-    if is_posterior_tree_policy(config.search_policy):
-        @nnx.jit
-        def train_from_selfplay_data(
-            model: nnx.Module,
-            optimizer: nnx.Optimizer,
-            data,
-            perm_key: jax.Array,
-        ) -> TrainMetrics:
-            samples = compute_loss_input(data)
-            minibatches = make_minibatches(samples, perm_key, config.training_batch_size)
-            return train_minibatches(model, optimizer, minibatches, config)
-
-        replay_buffer: list[SelfplayOutput] = []
-
-        def training_iteration(
-            model: nnx.Module,
-            optimizer: nnx.Optimizer,
-            rng_key: jax.Array,
-        ) -> TrainMetrics:
-            selfplay_key, perm_key, exact_key = jax.random.split(rng_key, 3)
-            data = selfplay(model, selfplay_key)
-            if getattr(config, "exact_hex_solver_enabled", False):
-                data = relabel_selfplay_with_exact_hex(data, config, exact_key)
-            replay_buffer.append(data)
-            del replay_buffer[:-replay_buffer_size]
-            replay_data = _concat_selfplay_outputs(
-                _fixed_replay_window(replay_buffer, replay_buffer_size)
-            )
-            metrics = train_from_selfplay_data(model, optimizer, replay_data, perm_key)
-            return _with_search_diagnostics(metrics, data)
-
-        return training_iteration
+def make_training_iteration(env, selfplay_config, search_config, training_config):
+    selfplay = make_selfplay(env, selfplay_config, search_config)
+    compute_loss_input = make_compute_loss_input(selfplay_config.max_num_steps)
+    replay_buffer_size = training_config.replay_buffer_size
+    categorical_epsilon = search_config.categorical.epsilon
 
     @nnx.jit
+    def train_from_selfplay_data(
+        model: nnx.Module,
+        optimizer: nnx.Optimizer,
+        data,
+        perm_key: jax.Array,
+    ) -> TrainMetrics:
+        samples = compute_loss_input(data)
+        minibatches = make_minibatches(samples, perm_key, training_config.batch_size)
+        return train_minibatches(
+            model,
+            optimizer,
+            minibatches,
+            training_config.losses,
+            categorical_epsilon,
+        )
+
+    replay_buffer: list[SelfplayOutput] = []
+
     def training_iteration(
         model: nnx.Module,
         optimizer: nnx.Optimizer,
@@ -221,8 +212,12 @@ def make_training_iteration(env, config):
     ) -> TrainMetrics:
         selfplay_key, perm_key = jax.random.split(rng_key)
         data = selfplay(model, selfplay_key)
-        samples = compute_loss_input(data)
-        minibatches = make_minibatches(samples, perm_key, config.training_batch_size)
-        return train_minibatches(model, optimizer, minibatches, config)
+        replay_buffer.append(data)
+        del replay_buffer[:-replay_buffer_size]
+        replay_data = _concat_selfplay_outputs(
+            _fixed_replay_window(replay_buffer, replay_buffer_size)
+        )
+        metrics = train_from_selfplay_data(model, optimizer, replay_data, perm_key)
+        return _with_search_diagnostics(metrics, data)
 
     return training_iteration

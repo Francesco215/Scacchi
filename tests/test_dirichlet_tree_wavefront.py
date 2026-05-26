@@ -77,14 +77,13 @@ def _config(**overrides):
     values = dict(
         search_policy="posterior_tree_wavefront",
         num_simulations=1,
-        wavefront_num_lanes_per_root=1,
-        wavefront_max_depth=8,
+        inflight_limit=1,
+        search_max_depth=8,
         search_eval_batch_size=16,
         kappa_leaf=1.0,
-        kappa_terminal=8.0,
         state_posterior_kappa_n=1.0,
         policy_mc_samples=8,
-        wavefront_final_action_mode="posterior_argmax",
+        final_action_mode="posterior_argmax",
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -134,7 +133,7 @@ def test_wavefront_search_result_includes_stability_diagnostics():
         root_state_batch=_stack_states([_state(0.0), _state(10.0)]),
         leaf_evaluator=leaf_evaluator,
         rng_key=jax.random.PRNGKey(13),
-        config=_config(num_simulations=2, wavefront_pad_eval_batches=False),
+        config=_config(num_simulations=2),
     )
 
     diagnostics = output.diagnostics
@@ -242,7 +241,7 @@ def test_wavefront_duplicate_lanes_evaluate_unique_leaf_once():
         root_states=[_state(0.0)],
         leaf_evaluator=leaf_evaluator,
         rng_key=jax.random.PRNGKey(2),
-        config=_config(wavefront_num_lanes_per_root=2),
+        config=_config(inflight_limit=2),
     )
 
     assert calls == [1, 16]
@@ -278,31 +277,6 @@ def test_wavefront_state_batch_entrypoint_avoids_root_state_list():
     assert np.all(np.asarray(output.q_loss_weight[:, 0]) > 0.0)
 
 
-def test_wavefront_eval_padding_can_be_disabled():
-    env = CountingToyEnv()
-    calls = []
-
-    def leaf_evaluator(obs):
-        calls.append(int(obs.shape[0]))
-        batch = obs.shape[0]
-        logits = jnp.zeros((batch, 2), dtype=jnp.float32)
-        alpha_v = jnp.tile(jnp.array([[1.0, 1.0, 3.0]], dtype=jnp.float32), (batch, 1))
-        alpha_q = jnp.ones((batch, 2, 3), dtype=jnp.float32)
-        return logits, alpha_v, alpha_q
-
-    output = run_wavefront_posterior_tree_search_state_batch(
-        env=env,
-        root_state_batch=_stack_states([_state(0.0), _state(10.0), _state(20.0)]),
-        leaf_evaluator=leaf_evaluator,
-        rng_key=jax.random.PRNGKey(33),
-        config=_config(wavefront_pad_eval_batches=False),
-    )
-
-    assert calls == [3, 3]
-    assert output.action.shape == (3,)
-    assert np.all(np.asarray(output.q_loss_weight[:, 0]) > 0.0)
-
-
 def test_wavefront_state_batch_deduplicates_identical_roots():
     env = CountingToyEnv()
     calls = []
@@ -329,7 +303,7 @@ def test_wavefront_state_batch_deduplicates_identical_roots():
     assert np.allclose(np.asarray(output.q_loss_weight[:, 0]), 1.0)
 
 
-def test_wavefront_tree_training_exports_internal_nodes_with_evidence():
+def test_wavefront_tree_training_exports_algorithm_eligible_nodes():
     env = CountingToyEnv()
 
     def leaf_evaluator(obs):
@@ -344,26 +318,20 @@ def test_wavefront_tree_training_exports_internal_nodes_with_evidence():
         root_state_batch=_stack_states([_state(0.0)]),
         leaf_evaluator=leaf_evaluator,
         rng_key=jax.random.PRNGKey(5),
-        config=_config(
-            num_simulations=2,
-            train_tree_nodes=True,
-            train_tree_include_root=False,
-            train_tree_include_terminal=True,
-            wavefront_pad_eval_batches=False,
-        ),
+        config=_config(num_simulations=2),
     )
 
     assert output.tree_data is not None
     assert output.tree_data.obs.shape[0] == 3
-    assert int(np.sum(np.asarray(output.tree_data.policy_loss_mask))) == 1
-    assert int(np.sum(np.asarray(output.tree_data.value_loss_mask))) == 1
+    assert int(np.sum(np.asarray(output.tree_data.policy_loss_mask))) == 2
+    assert int(np.sum(np.asarray(output.tree_data.value_loss_mask))) == 2
     assert int(np.sum(np.asarray(output.tree_data.outcome_mask))) == 0
-    row = int(np.argmax(np.asarray(output.tree_data.policy_loss_mask)))
-    assert np.allclose(np.asarray(output.tree_data.obs[row]), np.array([1.0], dtype=np.float32))
-    assert np.asarray(output.tree_data.q_loss_weight[row, 0]) > 0.0
+    active_rows = np.flatnonzero(np.asarray(output.tree_data.policy_loss_mask))
+    assert set(np.asarray(output.tree_data.obs[active_rows]).reshape((-1,)).tolist()) == {0.0, 1.0}
+    assert np.all(np.asarray(output.tree_data.q_loss_weight[active_rows, 0]) > 0.0)
 
 
-def test_wavefront_tree_training_includes_root_when_configured():
+def test_wavefront_tree_training_includes_eligible_root():
     env = CountingToyEnv()
 
     def leaf_evaluator(obs):
@@ -378,13 +346,7 @@ def test_wavefront_tree_training_includes_root_when_configured():
         root_state_batch=_stack_states([_state(0.0)]),
         leaf_evaluator=leaf_evaluator,
         rng_key=jax.random.PRNGKey(7),
-        config=_config(
-            num_simulations=1,
-            train_tree_nodes=True,
-            train_tree_include_root=True,
-            train_tree_include_terminal=True,
-            wavefront_pad_eval_batches=False,
-        ),
+        config=_config(num_simulations=1),
     )
 
     assert output.tree_data is not None
@@ -409,16 +371,12 @@ def test_wavefront_tree_training_excludes_terminal_leaves():
         root_state_batch=_stack_states([_state(0.0), _state(10.0)]),
         leaf_evaluator=leaf_evaluator,
         rng_key=jax.random.PRNGKey(6),
-        config=_config(
-            train_tree_nodes=True,
-            train_tree_include_root=False,
-            train_tree_include_terminal=True,
-            wavefront_pad_eval_batches=False,
-        ),
+        config=_config(),
     )
 
     assert output.tree_data is not None
     assert output.tree_data.obs.shape[0] == 4
-    assert int(np.sum(np.asarray(output.tree_data.policy_loss_mask))) == 0
-    assert int(np.sum(np.asarray(output.tree_data.value_loss_mask))) == 0
+    assert int(np.sum(np.asarray(output.tree_data.policy_loss_mask))) == 2
+    assert int(np.sum(np.asarray(output.tree_data.value_loss_mask))) == 2
     assert int(np.sum(np.asarray(output.tree_data.outcome_mask))) == 0
+    assert int(np.sum(np.asarray(output.tree_data.v_target_kind == 2))) == 2

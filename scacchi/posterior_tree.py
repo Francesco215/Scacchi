@@ -21,7 +21,7 @@ from .dirichlet_tree.types import TreeTrainingData
 
 
 NO_CHILD = -1
-POSTERIOR_TREE_POLICIES = {"posterior_tree", "posterior_tree_wavefront"}
+POSTERIOR_TREE_POLICIES = {"posterior_tree_wavefront"}
 
 
 class EvalRequest(NamedTuple):
@@ -911,6 +911,10 @@ def is_posterior_tree_policy(search_policy: str) -> bool:
     return search_policy in POSTERIOR_TREE_POLICIES
 
 
+def _search_policy(config: Any) -> str:
+    return str(getattr(config, "policy", getattr(config, "search_policy", "")))
+
+
 def run_posterior_tree_search(
     *,
     env: Any,
@@ -919,7 +923,7 @@ def run_posterior_tree_search(
     rng_key: jax.Array,
     config: Any,
 ) -> PosteriorTreeBatchOutput:
-    if getattr(config, "search_policy", "posterior_tree") == "posterior_tree_wavefront":
+    if _search_policy(config) == "posterior_tree_wavefront":
         from .dirichlet_tree.search import run_wavefront_posterior_tree_search
 
         return run_wavefront_posterior_tree_search(
@@ -1031,7 +1035,7 @@ def run_posterior_tree_search_state_batch(
     rng_key: jax.Array,
     config: Any,
 ) -> PosteriorTreeBatchOutput:
-    if getattr(config, "search_policy", "posterior_tree") == "posterior_tree_wavefront":
+    if _search_policy(config) == "posterior_tree_wavefront":
         from .dirichlet_tree.search import run_wavefront_posterior_tree_search_state_batch
 
         return run_wavefront_posterior_tree_search_state_batch(

@@ -1458,7 +1458,7 @@ class BatchedPosteriorArenaSearch:
                         path_len=path_len,
                         missing_rows=selectable_rows.astype(np.int32, copy=False),
                         missing_state_indices=output_indices.astype(np.int32, copy=False),
-                        recycle_duplicates=config.duplicate_leaf_mode == "recycle_lane",
+                        recycle_duplicates=True,
                         observation_pad_size=(
                             config.eval_batch_size
                             if config.pad_eval_batches and config.pad_pending_observation_gather
@@ -1574,7 +1574,7 @@ class BatchedPosteriorArenaSearch:
                         path_len=path_len,
                         missing_rows=np.asarray(missing_rows, dtype=np.int32),
                         missing_state_indices=np.asarray(missing_state_indices, dtype=np.int32),
-                        recycle_duplicates=config.duplicate_leaf_mode == "recycle_lane",
+                        recycle_duplicates=True,
                         observation_pad_size=(
                             config.eval_batch_size
                             if config.pad_eval_batches and config.pad_pending_observation_gather

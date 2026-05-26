@@ -1,3 +1,5 @@
+# Prototype config for the algorithms.tex native posterior-tree search.
+
 run:
   seed: 0
   max_num_iters: 80
@@ -31,7 +33,6 @@ search:
     policy_samples: 64
 
   constants:
-    kappa_leaf: 1.0
     state_posterior_kappa_n: 16.0
 
   categorical:

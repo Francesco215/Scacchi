@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import re
 import time
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol, Self, TypeGuard
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, TypeGuard
 
 from tqdm import tqdm
 
 Scalar = float | int
+
+if TYPE_CHECKING:
+    from .train import Config, LoggingConfig, RunConfig
 
 
 def _to_scalar(value: Any) -> Scalar:
@@ -21,10 +25,10 @@ def _to_scalar(value: Any) -> Scalar:
 
 
 def _config_to_dict(config: Any) -> dict[str, Any]:
-    if hasattr(config, "model_dump"):
-        return dict(config.model_dump())
-    if hasattr(config, "dict"):
-        return dict(config.dict())
+    if is_dataclass(config):
+        return asdict(config)
+    if hasattr(config, "to_dict"):
+        return dict(config.to_dict())
     return dict(config)
 
 
@@ -177,7 +181,7 @@ class WandbLogger(Logger):
             save_code=True,
         )
         if self._run is not None and getattr(self._run, "name", None):
-            self.run_name = self._run.name
+            self.run_name = str(self._run.name)
         self._initialized = True
         return self
 
@@ -238,21 +242,21 @@ class WandbLogger(Logger):
 
 
 def build_logger(
-    training_config: Any,
+    logging_config: LoggingConfig,
+    run_config: RunConfig,
+    config: Config,
     dir: str | None = None,
 ) -> Logger:
-    wandb_enabled = bool(getattr(training_config, "wandb_enabled", False))
-    wandb_project = str(getattr(training_config, "wandb_project", "scacchi-az"))
-    log_every = int(getattr(training_config, "log_interval", 1))
-    max_steps = int(getattr(training_config, "max_num_iters"))
-    config = _config_to_dict(training_config)
+    log_every = logging_config.interval
+    max_steps = run_config.max_num_iters
+    wandb = logging_config.wandb
 
-    if wandb_enabled:
+    if wandb.enabled:
         return WandbLogger(
-            wandb_project,
+            wandb.project,
             log_every=log_every,
             max_steps=max_steps,
-            config=config,
+            config=_config_to_dict(config),
             dir=dir,
         )
     return Logger(log_every=log_every, max_steps=max_steps)

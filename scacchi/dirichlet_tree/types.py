@@ -25,7 +25,6 @@ FinalActionMode = Literal[
     "posterior_argmax",
     "posterior_sample",
 ]
-DuplicateLeafMode = Literal["recycle_lane", "park_lane"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +358,6 @@ class SearchConfig:
     policy_mc_samples: int = 32
     backup_mc_samples: int = 16
     tau_internal: float = 1.0
-    duplicate_leaf_mode: DuplicateLeafMode = "recycle_lane"
     final_action_mode: FinalActionMode = "posterior_argmax"
     pad_eval_batches: bool = True
     pad_jax_select: bool = False

@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 if TYPE_CHECKING:
-    from .train import Config
+    from .train import ModelConfig
 
 
 def _unit_dirichlet_concentration_logit(num_outcomes: int) -> float:
@@ -314,8 +314,10 @@ class BoardlawDirichletNet(nnx.Module):
 
 
 def build_model(
-    config: Config,
+    config: ModelConfig,
     *,
+    num_outcomes: int | None,
+    dirichlet_concentration_clip: float | None,
     num_actions: int,
     observation_shape: Sequence[int],
     rngs: nnx.Rngs,
@@ -338,24 +340,15 @@ def build_model(
             rngs=rngs,
         )
     if config.network == "boardlaw_dirichlet":
-        num_outcomes = config.num_outcomes
         if num_outcomes is None:
-            posterior_tree_search = getattr(config, "search_policy", "gumbel") in (
-                "dirichlet_thompson",
-                "posterior_tree",
-                "posterior_tree_wavefront",
-            )
-            if posterior_tree_search:
-                num_outcomes = 3
-            else:
-                num_outcomes = 2 if config.env_id == "hex" else 3
+            num_outcomes = 3
         return BoardlawDirichletNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
             num_outcomes=num_outcomes,
             width=config.num_channels,
             depth=config.num_layers,
-            dirichlet_concentration_clip=config.dirichlet_concentration_clip,
+            dirichlet_concentration_clip=dirichlet_concentration_clip,
             rngs=rngs,
         )
     raise ValueError(f"unknown network: {config.network!r}")

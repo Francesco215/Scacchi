@@ -15,6 +15,8 @@
 import os
 import time
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
@@ -29,9 +31,8 @@ from hydra.utils import get_original_cwd
 import jax
 import numpy as np
 import optax
-import pgx
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
+from omegaconf.errors import OmegaConfBaseException
 from tqdm import tqdm
 
 from .checkpoint import build_checkpoint_manager, from_pretrained, maybe_save, restore
@@ -40,6 +41,39 @@ from .evaluations import make_mcts_evaluate
 from .logger import build_logger, returns_metrics
 from .network import build_model
 from .pipeline import make_training_iteration
+
+
+class NetworkName(StrEnum):
+    boardlaw_dirichlet = "boardlaw_dirichlet"
+
+
+class SelfplayActionSource(StrEnum):
+    search_action = "search_action"
+
+
+class SearchPolicy(StrEnum):
+    posterior_tree_wavefront = "posterior_tree_wavefront"
+
+
+class LeafValueMode(StrEnum):
+    alpha = "alpha"
+    mean = "mean"
+
+
+class FinalActionMode(StrEnum):
+    posterior_argmax = "posterior_argmax"
+    posterior_sample = "posterior_sample"
+
+
+class CategoricalDrawRule(StrEnum):
+    policy_prior = "policy_prior"
+    fastest_draw = "fastest_draw"
+    slowest_draw = "slowest_draw"
+    fixed_order = "fixed_order"
+
+
+class ConfigError(ValueError):
+    """Raised when runtime configuration values are invalid."""
 
 
 def report_jax_backend() -> None:
@@ -54,399 +88,320 @@ def report_jax_backend() -> None:
         )
 
 
-_NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("run", "seed"), "seed"),
-    (("run", "max_num_iters"), "max_num_iters"),
-    (("env", "id"), "env_id"),
-    (("env", "board_size"), "board_size"),
-    (("env", "num_outcomes"), "num_outcomes"),
-    (("model", "network"), "network"),
-    (("model", "num_channels"), "num_channels"),
-    (("model", "num_layers"), "num_layers"),
-    (("model", "resnet_v2"), "resnet_v2"),
-    (("selfplay", "batch_size"), "selfplay_batch_size"),
-    (("selfplay", "max_num_steps"), "max_num_steps"),
-    (("selfplay", "action_source"), "selfplay_action_source"),
-    (("search", "policy"), "search_policy"),
-    (("search", "num_simulations"), "num_simulations"),
-    (("search", "num_blocks"), "num_search_blocks"),
-    (("search", "eval_batch_size"), "search_eval_batch_size"),
-    (("search", "inflight_limit"), "inflight_limit"),
-    (("search", "monte_carlo", "policy_samples"), "policy_mc_samples"),
-    (("search", "monte_carlo", "backup_samples"), "backup_mc_samples"),
-    (("search", "constants", "kappa_leaf"), "kappa_leaf"),
-    (("search", "constants", "kappa_terminal"), "kappa_terminal"),
-    (("search", "constants", "epsilon_terminal"), "epsilon_terminal"),
-    (("search", "constants", "state_posterior_kappa_n"), "state_posterior_kappa_n"),
-    (("search", "leaf_value_mode"), "leaf_value_mode"),
-    (("search", "wavefront", "backend"), "wavefront_backend"),
-    (("search", "wavefront", "num_lanes_per_root"), "wavefront_num_lanes_per_root"),
-    (("search", "wavefront", "max_depth"), "wavefront_max_depth"),
-    (("search", "wavefront", "final_action_mode"), "wavefront_final_action_mode"),
-    (("search", "wavefront", "pad_eval_batches"), "wavefront_pad_eval_batches"),
-    (("search", "wavefront", "pad_jax_select"), "wavefront_pad_jax_select"),
-    (("search", "wavefront", "np_select_below"), "wavefront_np_select_below"),
-    (("search", "wavefront", "grouped_expansion"), "wavefront_grouped_expansion"),
-    (("search", "wavefront", "lane_indexed_step"), "wavefront_lane_indexed_step"),
-    (("search", "wavefront", "stable_lane_batch"), "wavefront_stable_lane_batch"),
-    (
-        ("search", "wavefront", "pad_pending_observation_gather"),
-        "wavefront_pad_pending_observation_gather",
-    ),
-    (("training", "batch_size"), "training_batch_size"),
-    (("training", "replay_buffer_size"), "replay_buffer_size"),
-    (("training", "learning_rate"), "learning_rate"),
-    (("training", "grad_clip_norm"), "grad_clip_norm"),
-    (("training", "tree", "enabled"), "train_tree_nodes"),
-    (("training", "tree", "include_root"), "train_tree_include_root"),
-    (("training", "tree", "include_terminal"), "train_tree_include_terminal"),
-    (("training", "tree", "min_q_evidence"), "train_tree_min_q_evidence"),
-    (("training", "tree", "max_nodes_per_step"), "train_tree_max_nodes_per_step"),
-    (("training", "exact_hex_solver", "enabled"), "exact_hex_solver_enabled"),
-    (
-        ("training", "exact_hex_solver", "extra_batch_size"),
-        "exact_hex_solver_extra_batch_size",
-    ),
-    (("training", "losses", "policy_weight"), "policy_loss_weight"),
-    (("training", "losses", "value_dir_kl_weight"), "value_dir_kl_weight"),
-    (("training", "losses", "q_dir_kl_weight"), "q_dir_kl_weight"),
-    (("training", "losses", "policy_target_mode"), "policy_target_mode"),
-    (
-        ("training", "regularization", "dirichlet_concentration_clip"),
-        "dirichlet_concentration_clip",
-    ),
-    (("eval", "interval"), "eval_interval"),
-    (("eval", "batch_size"), "eval_batch_size"),
-    (("logging", "interval"), "log_interval"),
-    (("logging", "wandb", "enabled"), "wandb_enabled"),
-    (("logging", "wandb", "project"), "wandb_project"),
-    (("checkpointing", "max_to_keep"), "ckpt_max_to_keep"),
-    (("checkpointing", "save_interval_steps"), "ckpt_save_interval_steps"),
-)
-_NESTED_CONFIG_GROUPS = frozenset(path[0] for path, _ in _NESTED_CONFIG_FIELDS)
-_NESTED_CONFIG_PATHS = frozenset(path for path, _ in _NESTED_CONFIG_FIELDS)
-_DEPRECATED_CONFIG_KEYS = frozenset(
-    {
-        "c_leaf",
-        "c_terminal",
-        "c_state",
-        "c_value_search",
-    }
-)
-_DEPRECATED_NESTED_CONFIG_PATHS = frozenset(
-    ("search", "constants", key) for key in _DEPRECATED_CONFIG_KEYS
-)
-
-
-def _raise_deprecated_config(key: str) -> None:
-    replacements = {
-        "c_leaf": "kappa_leaf",
-        "c_terminal": "kappa_terminal",
-        "c_state": "state_posterior_kappa_n",
-        "c_value_search": None,
-    }
-    leaf = key.rsplit(".", 1)[-1]
-    replacement = replacements.get(leaf)
-    if replacement is None:
-        message = f"{key!r} is deprecated and no longer used by posterior-tree search."
-    else:
-        message = f"{key!r} is deprecated; use {replacement!r} instead."
-    raise ValueError(message)
-
-
-def _nested_value(
-    config: Mapping[str, Any],
-    path: tuple[str, ...],
-) -> tuple[bool, Any]:
-    value: Any = config
-    for part in path:
-        if not isinstance(value, Mapping) or part not in value:
-            return False, None
-        value = value[part]
-    return True, value
-
-
-def _iter_nested_leaves(
-    value: Any,
-    prefix: tuple[str, ...],
-) -> tuple[tuple[tuple[str, ...], Any], ...]:
-    if not isinstance(value, Mapping):
-        return ((prefix, value),)
-    if not value:
-        return ((prefix, value),)
-    leaves: list[tuple[tuple[str, ...], Any]] = []
-    for key, child in value.items():
-        leaves.extend(_iter_nested_leaves(child, (*prefix, str(key))))
-    return tuple(leaves)
-
-
-def normalize_config_dict(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Flatten the readable nested YAML shape into the runtime Config fields."""
-
-    normalized: dict[str, Any] = {}
-    for key, value in config.items():
-        key = str(key)
-        if key in _DEPRECATED_CONFIG_KEYS:
-            _raise_deprecated_config(key)
-        if key not in _NESTED_CONFIG_GROUPS:
-            normalized[key] = value
-            continue
-        if not isinstance(value, Mapping):
-            normalized[key] = value
-            continue
-        for path, leaf_value in _iter_nested_leaves(value, (key,)):
-            if path in _DEPRECATED_NESTED_CONFIG_PATHS:
-                _raise_deprecated_config(".".join(path))
-            if path not in _NESTED_CONFIG_PATHS:
-                normalized[".".join(path)] = leaf_value
-
-    for path, target in _NESTED_CONFIG_FIELDS:
-        found, value = _nested_value(config, path)
-        if found and target not in normalized:
-            normalized[target] = value
-
-    return normalized
-
-
-class Config(BaseModel):
-    env_id: pgx.EnvId = "go_9x9"
-    board_size: int | None = None
+@dataclass(slots=True)
+class RunConfig:
     seed: int = 0
     max_num_iters: int = 400
-    # network params
-    network: str = "aznet"  # "aznet" | "boardlaw" | "boardlaw_dirichlet"
+
+    def __post_init__(self) -> None:
+        _at_least(self.max_num_iters, "run.max_num_iters", 1)
+
+
+@dataclass(slots=True)
+class EnvConfig:
+    id: str = "go_9x9"
+    board_size: int | None = None
     num_outcomes: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.board_size is not None:
+            _at_least(self.board_size, "env.board_size", 1)
+
+
+@dataclass(slots=True)
+class ModelConfig:
+    network: NetworkName = NetworkName.boardlaw_dirichlet
     num_channels: int = 128
     num_layers: int = 6
     resnet_v2: bool = True
-    # selfplay params
-    selfplay_batch_size: int = 1024
-    num_simulations: int = 32
-    num_search_blocks: int = Field(default=1, ge=1)
+
+    def __post_init__(self) -> None:
+        self.network = _choice(NetworkName, self.network, "model.network")
+        _at_least(self.num_channels, "model.num_channels", 1)
+        _at_least(self.num_layers, "model.num_layers", 1)
+
+
+@dataclass(slots=True)
+class SelfplayConfig:
+    batch_size: int = 1024
     max_num_steps: int = 256
-    policy_mc_samples: int = 32
-    backup_mc_samples: int = Field(default=16, ge=1)
-    leaf_value_mode: str = "alpha"
-    kappa_leaf: float = Field(default=1.0, gt=0.0)
-    kappa_terminal: float = Field(default=8.0, gt=0.0)
-    epsilon_terminal: float = Field(default=1e-6, gt=0.0)
-    categorical_epsilon: float = Field(default=1e-4, gt=0.0, lt=0.5)
-    categorical_draw_rule: str = "policy_prior"
-    state_posterior_kappa_n: float = Field(default=9.0, gt=0.0)
-    inflight_limit: int = Field(default=1, ge=1)
-    search_eval_batch_size: int | None = Field(default=None, ge=1)
-    selfplay_action_source: str = "posterior_best"
-    search_policy: str = "gumbel"
-    wavefront_num_lanes_per_root: int = Field(default=1, ge=1)
-    wavefront_max_depth: int = Field(default=128, ge=1)
-    wavefront_final_action_mode: str = "posterior_argmax"
-    wavefront_pad_eval_batches: bool = True
-    wavefront_pad_jax_select: bool = False
-    wavefront_np_select_below: int = Field(default=1024, ge=0)
-    wavefront_grouped_expansion: bool = True
-    wavefront_lane_indexed_step: bool = True
-    wavefront_stable_lane_batch: bool = True
-    wavefront_pad_pending_observation_gather: bool = True
-    wavefront_backend: str = "arena"
-    train_tree_nodes: bool = False
-    train_tree_include_root: bool = False
-    train_tree_include_terminal: bool = False
-    train_tree_min_q_evidence: float = Field(default=0.0, ge=0.0)
-    train_tree_max_nodes_per_step: int | None = Field(default=None, ge=1)
-    exact_hex_solver_enabled: bool = False
-    exact_hex_solver_extra_batch_size: int = Field(default=0, ge=0)
-    # training params
-    training_batch_size: int = 4096
-    replay_buffer_size: int = Field(default=1, ge=1)
-    learning_rate: float = 0.001
-    grad_clip_norm: float | None = Field(default=None, gt=0)
-    policy_loss_weight: float = 1.0
+    action_source: SelfplayActionSource = SelfplayActionSource.search_action
+
+    def __post_init__(self) -> None:
+        self.action_source = _choice(
+            SelfplayActionSource,
+            self.action_source,
+            "selfplay.action_source",
+        )
+        _at_least(self.batch_size, "selfplay.batch_size", 1)
+        _at_least(self.max_num_steps, "selfplay.max_num_steps", 1)
+
+
+@dataclass(slots=True)
+class SearchMonteCarloConfig:
+    policy_samples: int = 32
+
+    def __post_init__(self) -> None:
+        _at_least(self.policy_samples, "search.monte_carlo.policy_samples", 1)
+
+
+@dataclass(slots=True)
+class SearchConstantsConfig:
+    kappa_leaf: float = 1.0
+    state_posterior_kappa_n: float = 9.0
+
+    def __post_init__(self) -> None:
+        _greater_than(self.kappa_leaf, "search.constants.kappa_leaf", 0.0)
+        _greater_than(
+            self.state_posterior_kappa_n,
+            "search.constants.state_posterior_kappa_n",
+            0.0,
+        )
+
+
+@dataclass(slots=True)
+class SearchCategoricalConfig:
+    epsilon: float = 1e-4
+    draw_rule: CategoricalDrawRule = CategoricalDrawRule.policy_prior
+
+    def __post_init__(self) -> None:
+        self.draw_rule = _choice(
+            CategoricalDrawRule,
+            self.draw_rule,
+            "search.categorical.draw_rule",
+        )
+        _greater_than(self.epsilon, "search.categorical.epsilon", 0.0)
+        if self.epsilon >= 0.5:
+            raise ConfigError("search.categorical.epsilon must be less than 0.5.")
+
+
+@dataclass(slots=True)
+class SearchConfig:
+    policy: SearchPolicy = SearchPolicy.posterior_tree_wavefront
+    num_simulations: int = 32
+    eval_batch_size: int | None = None
+    inflight_limit: int = 1
+    max_depth: int = 128
+    final_action_mode: FinalActionMode = FinalActionMode.posterior_argmax
+    leaf_value_mode: LeafValueMode = LeafValueMode.alpha
+    monte_carlo: SearchMonteCarloConfig = field(default_factory=SearchMonteCarloConfig)
+    constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
+    categorical: SearchCategoricalConfig = field(default_factory=SearchCategoricalConfig)
+
+    def __post_init__(self) -> None:
+        self.policy = _choice(SearchPolicy, self.policy, "search.policy")
+        self.final_action_mode = _choice(
+            FinalActionMode,
+            self.final_action_mode,
+            "search.final_action_mode",
+        )
+        self.leaf_value_mode = _choice(
+            LeafValueMode,
+            self.leaf_value_mode,
+            "search.leaf_value_mode",
+        )
+        _at_least(self.num_simulations, "search.num_simulations", 1)
+        _at_least(self.inflight_limit, "search.inflight_limit", 1)
+        _at_least(self.max_depth, "search.max_depth", 1)
+        if self.eval_batch_size is not None:
+            _at_least(self.eval_batch_size, "search.eval_batch_size", 1)
+
+
+@dataclass(slots=True)
+class LossConfig:
+    policy_weight: float = 1.0
     value_dir_kl_weight: float = 1.0
     q_dir_kl_weight: float = 1.0
-    policy_target_mode: str = "search"
+
+    def __post_init__(self) -> None:
+        _at_least(self.policy_weight, "training.losses.policy_weight", 0.0)
+        _at_least(self.value_dir_kl_weight, "training.losses.value_dir_kl_weight", 0.0)
+        _at_least(self.q_dir_kl_weight, "training.losses.q_dir_kl_weight", 0.0)
+
+
+@dataclass(slots=True)
+class RegularizationConfig:
     dirichlet_concentration_clip: float | None = 8.0
-    log_interval: int = 1
-    # eval params
-    eval_interval: int = 5
-    eval_batch_size: int = 16
-    # logging params
-    wandb_enabled: bool = True
-    wandb_project: str = "scacchi-az"
-    # checkpoint params
-    ckpt_max_to_keep: int = 3
-    ckpt_save_interval_steps: int = 50
 
-    model_config = ConfigDict(extra="forbid")
+    def __post_init__(self) -> None:
+        if self.dirichlet_concentration_clip is not None:
+            _greater_than(
+                self.dirichlet_concentration_clip,
+                "training.regularization.dirichlet_concentration_clip",
+                0.0,
+            )
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_search_config(cls, values: Any):
-        if not isinstance(values, Mapping):
-            return values
-        values = dict(values)
-        for key in sorted(_DEPRECATED_CONFIG_KEYS):
-            if key in values:
-                _raise_deprecated_config(key)
-        return values
 
-    @model_validator(mode="after")
-    def require_dirichlet_network_for_dirichlet_losses(self, info: ValidationInfo):
-        if isinstance(info.context, dict) and info.context.get("model_construction_only"):
-            return self
-        dirichlet_loss_weights = (
-            "value_dir_kl_weight",
-            "q_dir_kl_weight",
-        )
-        active_weights = [
-            f"{name}={getattr(self, name)}"
-            for name in dirichlet_loss_weights
-            if getattr(self, name) != 0.0
-        ]
-        if self.network != "boardlaw_dirichlet" and active_weights:
-            weights = ", ".join(active_weights)
-            raise ValueError(
-                "Dirichlet loss weights require network='boardlaw_dirichlet'; "
-                f"got network={self.network!r} with {weights}. Set these "
-                "weights to 0.0 or use network='boardlaw_dirichlet'."
-            )
-        valid_action_sources = {
-            "posterior_best",
-            "posterior_argmax",
-            "posterior_sample",
-            "search_action",
-        }
-        if self.selfplay_action_source not in valid_action_sources:
-            allowed = ", ".join(sorted(valid_action_sources))
-            raise ValueError(
-                "selfplay_action_source must be one of "
-                f"{allowed}; got {self.selfplay_action_source!r}."
-            )
-        valid_search_policies = {
-            "gumbel",
-            "dirichlet_thompson",
-            "posterior_tree",
-            "posterior_tree_wavefront",
-        }
-        if self.search_policy not in valid_search_policies:
-            allowed = ", ".join(sorted(valid_search_policies))
-            raise ValueError(
-                f"search_policy must be one of {allowed}; got {self.search_policy!r}."
-            )
-        valid_wavefront_action_modes = {
-            "posterior_argmax",
-            "posterior_sample",
-        }
-        if self.wavefront_final_action_mode not in valid_wavefront_action_modes:
-            allowed = ", ".join(sorted(valid_wavefront_action_modes))
-            raise ValueError(
-                "wavefront_final_action_mode must be one of "
-                f"{allowed}; got {self.wavefront_final_action_mode!r}."
-            )
-        if self.leaf_value_mode not in {"alpha", "mean"}:
-            raise ValueError("leaf_value_mode must be 'alpha' or 'mean'.")
-        if self.categorical_draw_rule not in {
-            "policy_prior",
-            "fastest_draw",
-            "slowest_draw",
-            "fixed_order",
-        }:
-            raise ValueError(
-                "categorical_draw_rule must be one of "
-                "'policy_prior', 'fastest_draw', 'slowest_draw', or 'fixed_order'."
-            )
-        if self.policy_target_mode not in {"search", "winner_action"}:
-            raise ValueError("policy_target_mode must be 'search' or 'winner_action'.")
-        if self.wavefront_backend != "arena":
-            raise ValueError("wavefront_backend currently supports only 'arena'.")
-        if self.train_tree_nodes and self.search_policy != "posterior_tree_wavefront":
-            raise ValueError(
-                "train_tree_nodes currently supports only "
-                "search_policy='posterior_tree_wavefront'."
-            )
-        if self.exact_hex_solver_enabled:
-            if self.env_id != "hex" or self.board_size is None or self.board_size > 4:
-                raise ValueError(
-                    "exact_hex_solver_enabled requires env_id='hex' and "
-                    "board_size <= 4."
-                )
-            if self.num_outcomes not in (None, 3):
-                raise ValueError("exact_hex_solver_enabled requires WDL3 targets.")
-        if self.search_policy in {
-            "dirichlet_thompson",
-            "posterior_tree",
-            "posterior_tree_wavefront",
-        }:
-            if self.network != "boardlaw_dirichlet":
-                raise ValueError(
-                    "posterior-tree Dirichlet search requires "
-                    "network='boardlaw_dirichlet'."
-                )
-            if self.num_outcomes not in (None, 3):
-                raise ValueError(
-                    "posterior-tree Dirichlet search uses WDL3 targets; set "
-                    "num_outcomes to null or 3."
-                )
-        return self
+@dataclass(slots=True)
+class TrainingConfig:
+    batch_size: int = 4096
+    replay_buffer_size: int = 1
+    learning_rate: float = 0.001
+    grad_clip_norm: float | None = None
+    losses: LossConfig = field(default_factory=LossConfig)
+    regularization: RegularizationConfig = field(default_factory=RegularizationConfig)
+
+    def __post_init__(self) -> None:
+        _at_least(self.batch_size, "training.batch_size", 1)
+        _at_least(self.replay_buffer_size, "training.replay_buffer_size", 1)
+        _greater_than(self.learning_rate, "training.learning_rate", 0.0)
+        if self.grad_clip_norm is not None:
+            _greater_than(self.grad_clip_norm, "training.grad_clip_norm", 0.0)
+
+
+@dataclass(slots=True)
+class EvalConfig:
+    interval: int = 5
+    batch_size: int = 16
+
+    def __post_init__(self) -> None:
+        _at_least(self.interval, "eval.interval", 0)
+        _at_least(self.batch_size, "eval.batch_size", 1)
+
+
+@dataclass(slots=True)
+class WandbConfig:
+    enabled: bool = True
+    project: str = "scacchi-az"
+
+
+@dataclass(slots=True)
+class LoggingConfig:
+    interval: int = 1
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+
+    def __post_init__(self) -> None:
+        _at_least(self.interval, "logging.interval", 1)
+
+
+@dataclass(slots=True)
+class CheckpointingConfig:
+    max_to_keep: int = 3
+    save_interval_steps: int = 50
+
+    def __post_init__(self) -> None:
+        _at_least(self.max_to_keep, "checkpointing.max_to_keep", 0)
+        _at_least(self.save_interval_steps, "checkpointing.save_interval_steps", 1)
+
+
+@dataclass(slots=True)
+class Config:
+    run: RunConfig = field(default_factory=RunConfig)
+    env: EnvConfig = field(default_factory=EnvConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    selfplay: SelfplayConfig = field(default_factory=SelfplayConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
+
+    def __post_init__(self) -> None:
+        if self.env.num_outcomes not in (None, 3):
+            raise ConfigError("native posterior-tree search uses WDL3 targets.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def load_config(values: DictConfig | Mapping[str, Any]) -> Config:
+    try:
+        return cast(Config, OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(Config), values)))
+    except ConfigError:
+        raise
+    except OmegaConfBaseException as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _choice(enum: Any, value: Any, key: str) -> Any:
+    try:
+        return value if isinstance(value, enum) else enum(value)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in enum)
+        raise ConfigError(f"{key} must be one of {allowed}; got {value!r}.") from exc
+
+
+def _at_least(value: float | int, key: str, minimum: float | int) -> None:
+    if value < minimum:
+        raise ConfigError(f"{key} must be >= {minimum}; got {value!r}.")
+
+
+def _greater_than(value: float | int, key: str, minimum: float | int) -> None:
+    if value <= minimum:
+        raise ConfigError(f"{key} must be > {minimum}; got {value!r}.")
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="hex")
 def main(cfg: DictConfig) -> None:
-    container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
-    config = Config(**normalize_config_dict(container))
+    config = load_config(cfg)
     report_jax_backend()
 
-    env = make_env(config.env_id, config.board_size)
-    checkpoint_path = f"checkpoints/{config.board_size}_solved"
+    env = make_env(config.env.id, config.env.board_size)
+    checkpoint_path = f"checkpoints/{config.env.board_size}_solved"
     baseline_model = from_pretrained(checkpoint_path, env, rngs=nnx.Rngs(0))
 
     model = build_model(
-        config,
+        config.model,
+        num_outcomes=config.env.num_outcomes,
+        dirichlet_concentration_clip=(
+            config.training.regularization.dirichlet_concentration_clip
+        ),
         num_actions=env.num_actions,
         observation_shape=env.observation_shape,
-        rngs=nnx.Rngs(config.seed),
+        rngs=nnx.Rngs(config.run.seed),
     )
     optimizer_transforms: list[optax.GradientTransformation] = []
-    if config.grad_clip_norm is not None:
-        optimizer_transforms.append(optax.clip_by_global_norm(config.grad_clip_norm))
-    optimizer_transforms.append(optax.adam(learning_rate=config.learning_rate))
+    if config.training.grad_clip_norm is not None:
+        optimizer_transforms.append(
+            optax.clip_by_global_norm(config.training.grad_clip_norm)
+        )
+    optimizer_transforms.append(optax.adam(learning_rate=config.training.learning_rate))
     optimizer = nnx.Optimizer(
         model,
         optax.chain(*optimizer_transforms),
         wrt=nnx.Param,
     )
 
-    training_iteration = make_training_iteration(env, config)
+    training_iteration = make_training_iteration(
+        env,
+        config.selfplay,
+        config.search,
+        config.training,
+    )
     
     
-    evaluate = make_mcts_evaluate(env, config, baseline_model)
+    evaluate = make_mcts_evaluate(env, config.eval, config.search, baseline_model)
 
     hours: float = 0.0
     frames: int = 0
 
-    rng_key = jax.random.PRNGKey(config.seed)
-    with build_logger(config) as logger:
+    rng_key = jax.random.PRNGKey(config.run.seed)
+    with build_logger(config.logging, config.run, config) as logger:
         eval_avg_return_history: list[float] = []
         previous_eval_avg_return: float | None = None
-        board_size = "none" if config.board_size is None else str(config.board_size)
+        board_size = (
+            "none" if config.env.board_size is None else str(config.env.board_size)
+        )
         ckpt_dir = (
             Path(get_original_cwd())
             / "checkpoints"
             / (
-                f"{config.env_id}_bs{board_size}_{config.network}"
-                f"_c{config.num_channels}_l{config.num_layers}_seed{config.seed}"
+                f"{config.env.id}_bs{board_size}_{config.model.network}"
+                f"_c{config.model.num_channels}_l{config.model.num_layers}"
+                f"_seed{config.run.seed}"
             )
         ).resolve()
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        with build_checkpoint_manager(config, ckpt_dir) as ckpt_mgr:
+        with build_checkpoint_manager(config.checkpointing, config.run, ckpt_dir) as ckpt_mgr:
             start_iter, rng_key, hours, frames = restore(ckpt_mgr, model, optimizer, rng_key)
-            pbar = tqdm(range(start_iter, config.max_num_iters), desc="training", dynamic_ncols=True, total=config.max_num_iters, initial=start_iter)
+            pbar = tqdm(range(start_iter, config.run.max_num_iters), desc="training", dynamic_ncols=True, total=config.run.max_num_iters, initial=start_iter)
             pbar.refresh()
             for iteration in pbar:
                 dict_to_log = {}
                 rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
-                if config.eval_interval > 0 and (
-                    iteration == config.max_num_iters - 1
-                    or iteration % config.eval_interval == 0
+                if config.eval.interval > 0 and (
+                    iteration == config.run.max_num_iters - 1
+                    or iteration % config.eval.interval == 0
                 ):
                     returns = evaluate(eval_key, model)
                     dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
@@ -471,7 +426,7 @@ def main(cfg: DictConfig) -> None:
 
                 st = time.time()
                 train_metrics = training_iteration(model, optimizer, train_key)
-                frames += config.selfplay_batch_size * config.max_num_steps
+                frames += config.selfplay.batch_size * config.selfplay.max_num_steps
 
                 et = time.time()
                 hours += (et - st) / 3600
