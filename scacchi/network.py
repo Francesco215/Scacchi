@@ -83,7 +83,7 @@ class BlockV2(nnx.Module):
 
 
 class AZNet(nnx.Module):
-    """AlphaZero NN architecture."""
+    """AlphaZero NN architecture retained for scalar baseline evaluation."""
 
     def __init__(
         self,
@@ -181,8 +181,7 @@ class ReZeroResidual(nnx.Module):
 
 
 class BoardlawNet(nnx.Module):
-    """Fully-connected ReZero residual net from Jones (2021),
-    "Scaling Scaling Laws with Board Games" (arXiv:2104.03113)."""
+    """Scalar Boardlaw net retained for scalar baseline evaluation."""
 
     def __init__(
         self,
@@ -322,33 +321,15 @@ def build_model(
     observation_shape: Sequence[int],
     rngs: nnx.Rngs,
 ) -> nnx.Module:
-    if config.network == "aznet":
-        return AZNet(
-            num_actions=num_actions,
-            observation_shape=observation_shape,
-            num_channels=config.num_channels,
-            num_blocks=config.num_layers,
-            resnet_v2=config.resnet_v2,
-            rngs=rngs,
-        )
-    if config.network == "boardlaw":
-        return BoardlawNet(
-            num_actions=num_actions,
-            observation_shape=observation_shape,
-            width=config.num_channels,
-            depth=config.num_layers,
-            rngs=rngs,
-        )
-    if config.network == "boardlaw_dirichlet":
-        if num_outcomes is None:
-            num_outcomes = 3
-        return BoardlawDirichletNet(
-            num_actions=num_actions,
-            observation_shape=observation_shape,
-            num_outcomes=num_outcomes,
-            width=config.num_channels,
-            depth=config.num_layers,
-            dirichlet_concentration_clip=dirichlet_concentration_clip,
-            rngs=rngs,
-        )
-    raise ValueError(f"unknown network: {config.network!r}")
+    if num_outcomes is None:
+        num_outcomes = 3
+    return BoardlawDirichletNet(
+        num_actions=num_actions,
+        observation_shape=observation_shape,
+        num_outcomes=num_outcomes,
+        width=config.num_channels,
+        depth=config.num_layers,
+        dirichlet_concentration_clip=dirichlet_concentration_clip,
+        rngs=rngs,
+    )
+

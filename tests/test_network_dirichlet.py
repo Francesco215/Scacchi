@@ -74,7 +74,7 @@ def test_boardlaw_dirichlet_heads_initialize_to_uniform_policy_and_unit_alphas()
     assert jnp.allclose(alpha_q, jnp.ones_like(alpha_q))
 
 
-def test_scalar_policy_heads_initialize_to_uniform_logits():
+def test_eval_only_scalar_policy_heads_initialize_to_uniform_logits():
     obs = jnp.ones((2, 3, 3, 4))
     az_model = AZNet(
         num_actions=10,
@@ -98,7 +98,7 @@ def test_scalar_policy_heads_initialize_to_uniform_logits():
     assert jnp.allclose(boardlaw_logits, jnp.zeros_like(boardlaw_logits))
 
 
-def test_policy_value_adapter_supports_scalar_and_dirichlet_boardlaw():
+def test_policy_value_adapter_supports_scalar_eval_and_dirichlet_models():
     obs = jnp.zeros((2, 3, 3, 4))
     scalar_model = BoardlawNet(
         num_actions=10,

@@ -1681,7 +1681,7 @@ class BatchedPosteriorArenaSearch:
                     path_edges=pending_batch.path_edges,
                     path_len=pending_batch.path_len,
                     done=done,
-                    backup_mc_samples=config.backup_mc_samples,
+                    policy_mc_samples=config.policy_mc_samples,
                     num_simulations=config.num_simulations,
                     config=config,
                 )
@@ -1749,7 +1749,7 @@ class BatchedPosteriorArenaSearch:
                     path_edges=pending_batch.path_edges[request_slice],
                     path_len=pending_batch.path_len[request_slice],
                     done=done,
-                    backup_mc_samples=config.backup_mc_samples,
+                    policy_mc_samples=config.policy_mc_samples,
                     num_simulations=config.num_simulations,
                     config=config,
                 )
@@ -1763,7 +1763,7 @@ class BatchedPosteriorArenaSearch:
         path_edges: np.ndarray,
         path_len: np.ndarray,
         done: np.ndarray,
-        backup_mc_samples: int,
+        policy_mc_samples: int,
         num_simulations: int,
         config: SearchConfig,
     ) -> None:
@@ -1846,13 +1846,13 @@ class BatchedPosteriorArenaSearch:
             self._repair_path_to_root(
                 int(parent_id),
                 config,
-                backup_mc_samples=backup_mc_samples,
+                policy_mc_samples=policy_mc_samples,
             )
 
     def _state_search_posterior_batch(
         self,
         node_ids: np.ndarray,
-        backup_mc_samples: int,
+        policy_mc_samples: int,
         state_posterior_kappa_n: float = 9.0,
     ) -> np.ndarray:
         assert self.arena is not None
@@ -1882,7 +1882,7 @@ class BatchedPosteriorArenaSearch:
                         legal[ix],
                         _edge_target_kind_np(arena.edge_cat_outcome[edge_ids[ix]]),
                         arena.edge_cat_outcome[edge_ids[ix]],
-                        int(backup_mc_samples),
+                        int(policy_mc_samples),
                     )
                     for ix in range(group_ids.shape[0])
                 ],
@@ -2293,7 +2293,7 @@ class BatchedPosteriorArenaSearch:
         node_id: int,
         config: SearchConfig,
         *,
-        backup_mc_samples: int | None = None,
+        policy_mc_samples: int | None = None,
     ) -> bool:
         assert self.arena is not None
         arena = self.arena
@@ -2334,7 +2334,7 @@ class BatchedPosteriorArenaSearch:
             arena.node_value_cache_status[node_id] = VALUE_CACHE_CLEAN
             arena.node_summary_alpha[node_id] = arena.node_value_cache_C[node_id]
             return True
-        samples = int(config.backup_mc_samples if backup_mc_samples is None else backup_mc_samples)
+        samples = int(config.policy_mc_samples if policy_mc_samples is None else policy_mc_samples)
         alpha = arena.edge_post_alpha[edge_ids]
         legal = np.ones((count,), dtype=bool)
         pi_search = native_policy_target_np(
@@ -2367,7 +2367,7 @@ class BatchedPosteriorArenaSearch:
         start_node_id: int,
         config: SearchConfig,
         *,
-        backup_mc_samples: int | None = None,
+        policy_mc_samples: int | None = None,
     ) -> None:
         assert self.arena is not None
         node_id = int(start_node_id)
@@ -2375,7 +2375,7 @@ class BatchedPosteriorArenaSearch:
         while node_id != UNKNOWN and node_id not in seen:
             seen.add(node_id)
             if self.arena.node_value_cache_status[node_id] != VALUE_CACHE_CLEAN:
-                if not self._try_repair_node(node_id, config, backup_mc_samples=backup_mc_samples):
+                if not self._try_repair_node(node_id, config, policy_mc_samples=policy_mc_samples):
                     return
             node_id = int(self.arena.node_parent_node[node_id])
 
@@ -2406,7 +2406,7 @@ class BatchedPosteriorArenaSearch:
         *,
         leaf_node_id: int,
         leaf_value: np.ndarray,
-        backup_mc_samples: int,
+        policy_mc_samples: int,
         config: SearchConfig | None = None,
     ) -> None:
         if path_nodes is None or path_edges is None or path_len <= 0:
@@ -2438,7 +2438,7 @@ class BatchedPosteriorArenaSearch:
             self._repair_path_to_root(
                 final_parent_id,
                 config,
-                backup_mc_samples=backup_mc_samples,
+                policy_mc_samples=policy_mc_samples,
             )
 
 def run_arena_posterior_tree_search(
@@ -2895,12 +2895,6 @@ def _edge_id_for_action(arena: PosteriorArena, node_id: int, action: int) -> int
 def _first_legal_action(legal: np.ndarray) -> int:
     actions = np.flatnonzero(np.asarray(legal, dtype=bool))
     return int(actions[0]) if actions.size else 0
-
-
-def _terminal_beta(outcome: int, num_outcomes: int, config: SearchConfig) -> np.ndarray:
-    beta = np.full((num_outcomes,), float(config.epsilon_terminal), dtype=np.float32)
-    beta[int(outcome)] += np.float32(config.kappa_terminal)
-    return _positive(beta)
 
 
 def _leaf_beta(alpha_v: np.ndarray, config: SearchConfig) -> np.ndarray:

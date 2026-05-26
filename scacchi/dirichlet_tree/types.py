@@ -356,7 +356,6 @@ class SearchConfig:
     categorical_draw_rule: Literal["policy_prior", "fastest_draw", "slowest_draw", "fixed_order"] = "policy_prior"
     state_posterior_kappa_n: float = 9.0
     policy_mc_samples: int = 32
-    backup_mc_samples: int = 16
     tau_internal: float = 1.0
     final_action_mode: FinalActionMode = "posterior_argmax"
     pad_eval_batches: bool = True

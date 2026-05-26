@@ -175,7 +175,7 @@ class BatchedPosteriorSearch:
         repair_dirty_frontier(
             self.store,
             rng=self.rng,
-            num_samples=config.backup_mc_samples,
+            num_samples=config.policy_mc_samples,
             state_posterior_kappa_n=config.state_posterior_kappa_n,
         )
         actions = []
@@ -284,7 +284,7 @@ class BatchedPosteriorSearch:
                                 epsilon_terminal=config.epsilon_terminal,
                             ),
                             rng=self.rng,
-                            backup_mc_samples=config.backup_mc_samples,
+                            policy_mc_samples=config.policy_mc_samples,
                             state_posterior_kappa_n=config.state_posterior_kappa_n,
                         )
                     done[lane.root_id] += 1
@@ -353,7 +353,7 @@ class BatchedPosteriorSearch:
                             epsilon_terminal=config.epsilon_terminal,
                         ),
                         rng=self.rng,
-                        backup_mc_samples=config.backup_mc_samples,
+                        policy_mc_samples=config.policy_mc_samples,
                         state_posterior_kappa_n=config.state_posterior_kappa_n,
                     )
                     done[lane.root_id] += 1
@@ -383,7 +383,7 @@ class BatchedPosteriorSearch:
                             epsilon_terminal=config.epsilon_terminal,
                         ),
                         rng=self.rng,
-                        backup_mc_samples=config.backup_mc_samples,
+                        policy_mc_samples=config.policy_mc_samples,
                         state_posterior_kappa_n=config.state_posterior_kappa_n,
                     )
                     done[lane.root_id] += 1
@@ -445,7 +445,7 @@ class BatchedPosteriorSearch:
                     leaf_node=node,
                     leaf_value=_leaf_beta(node.value_alpha, config),
                     rng=self.rng,
-                    backup_mc_samples=config.backup_mc_samples,
+                    policy_mc_samples=config.policy_mc_samples,
                     state_posterior_kappa_n=config.state_posterior_kappa_n,
                 )
                 done[request.root_id] += 1
@@ -587,7 +587,6 @@ def search_config_from_runtime(
         categorical_draw_rule=config.categorical.draw_rule.value,
         state_posterior_kappa_n=float(config.constants.state_posterior_kappa_n),
         policy_mc_samples=policy_mc_samples,
-        backup_mc_samples=policy_mc_samples,
         final_action_mode=config.final_action_mode.value,
         train_tree_nodes=True,
         train_tree_include_root=True,

@@ -17,10 +17,10 @@
 - The dirichlet-tree search boundary now consumes the nested runtime `SearchConfig` directly. The flat `search_config_from_any()` compatibility bridge and `SimpleNamespace` test configs are removed.
 - Deleted the old jitted Dirichlet-Q search, list-backed posterior-tree wrapper, exact Hex helper, and their tests. Runtime self-play/evaluation now call the native dirichlet-tree driver directly.
 - External key-value storage, its tests, benchmark scripts, and package dependencies are removed. The retained search path is the in-process wavefront arena.
+- Runtime training model construction is native `boardlaw_dirichlet` only, and the old `model.resnet_v2` training knob is removed. Scalar `AZNet`/`BoardlawNet` and MCTX search stay isolated to baseline checkpoint evaluation.
+- Internal `backup_mc_samples` naming is removed; posterior-best policy and state repair now use the single `policy_mc_samples`/`M_pi` count.
 
 ## Remaining implementation refactors
 
 - Remove terminal Dirichlet proxy functions and fields from `scacchi/dirichlet_tree/arena_search.py`, `scacchi/dirichlet_tree/search.py`, and `scacchi/dirichlet_tree/backup.py`; terminal outcomes must stay native categorical objects.
-- Replace internal `backup_mc_samples` plumbing with the single posterior-best sample count `policy_mc_samples`/`M_pi`.
 - Rename remaining `wavefront_*` function/type names once the old non-wavefront path is gone. The algorithm is now the native posterior-tree driver, not a selectable wavefront variant.
-- Remove scalar network branches (`AZNet`, `BoardlawNet`) from normal training code after migrated/evaluation checkpoints no longer need them.

@@ -113,7 +113,6 @@ class ModelConfig:
     network: NetworkName = NetworkName.boardlaw_dirichlet
     num_channels: int = 128
     num_layers: int = 6
-    resnet_v2: bool = True
 
     def __post_init__(self) -> None:
         self.network = _choice(NetworkName, self.network, "model.network")

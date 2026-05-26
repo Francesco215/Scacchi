@@ -59,7 +59,7 @@ def backup_path(
     leaf_value: np.ndarray,
     leaf_weight: float | None = None,
     rng: np.random.Generator | None = None,
-    backup_mc_samples: int = 16,
+    policy_mc_samples: int = 16,
     state_posterior_kappa_n: float = 9.0,
     normalize_ancestor_summary: bool = True,
 ) -> None:
@@ -90,13 +90,13 @@ def backup_path(
             store,
             step.key,
             rng=rng,
-            num_samples=backup_mc_samples,
+            num_samples=policy_mc_samples,
             state_posterior_kappa_n=state_posterior_kappa_n,
         )
     repair_dirty_frontier(
         store,
         rng=rng,
-        num_samples=backup_mc_samples,
+        num_samples=policy_mc_samples,
         state_posterior_kappa_n=state_posterior_kappa_n,
     )
 
@@ -275,12 +275,6 @@ def compute_state_search_posterior(
     gamma = 0.0 if denom <= 0.0 else float(n_down) / denom
     cache = (1.0 - gamma) * np.asarray(node.value_alpha, dtype=np.float32) + gamma * e_v
     return _positive(cache), n_down, pi_search
-
-
-def terminal_one_hot(outcome_index: int, num_outcomes: int = 3) -> np.ndarray:
-    out = np.zeros((num_outcomes,), dtype=np.float32)
-    out[int(outcome_index)] = 1.0
-    return out
 
 
 def terminal_dirichlet(

@@ -96,7 +96,7 @@ def test_backup_publishes_snapshot_and_gamma_state_cache_to_ancestor():
         leaf_value=outcome_mean(leaf.value_alpha),
         leaf_weight=2.0,
         rng=np.random.default_rng(0),
-        backup_mc_samples=8,
+        policy_mc_samples=8,
     )
 
     assert child.edge_has_post[0]
@@ -198,7 +198,7 @@ def test_ancestor_refresh_uses_child_clean_cache_not_value_alpha():
         leaf_value=outcome_mean(leaf.value_alpha),
         leaf_weight=1.0,
         rng=np.random.default_rng(0),
-        backup_mc_samples=8,
+        policy_mc_samples=8,
     )
 
     assert grandchild.edge_has_post[0]
@@ -268,7 +268,7 @@ def test_arena_terminal_backup_uses_terminal_node_perspective():
         1,
         leaf_node_id=terminal_id,
         leaf_value=terminal_dirichlet(2, kappa_terminal=8.0),
-        backup_mc_samples=8,
+        policy_mc_samples=8,
     )
 
     assert np.allclose(arena.edge_base_alpha[edge_id], before_base)
@@ -284,7 +284,7 @@ def test_arena_terminal_backup_uses_terminal_node_perspective():
         1,
         leaf_node_id=terminal_id,
         leaf_value=terminal_dirichlet(0, kappa_terminal=8.0),
-        backup_mc_samples=8,
+        policy_mc_samples=8,
     )
 
     assert int(arena.edge_eval_count_R[edge_id]) == 1
@@ -448,7 +448,7 @@ def test_repair_dirty_frontier_groups_parents_with_different_legal_counts():
     search = BatchedPosteriorArenaSearch(env=object())
     search.arena = arena
     search._repair_dirty_frontier(
-        type("Cfg", (), {"backup_mc_samples": 8, "state_posterior_kappa_n": 9.0})()
+        type("Cfg", (), {"policy_mc_samples": 8, "state_posterior_kappa_n": 9.0})()
     )
 
     assert np.all(arena.node_summary_alpha[node_ids] > 0.0)

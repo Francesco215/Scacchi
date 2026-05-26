@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -12,7 +11,7 @@ import orbax.checkpoint as ocp
 import pgx
 from flax import nnx
 
-from .network import build_model
+from .network import AZNet, BoardlawDirichletNet, BoardlawNet
 
 if TYPE_CHECKING:
     from .train import CheckpointingConfig, Config, RunConfig
@@ -131,17 +130,7 @@ def from_pretrained(
         meta_restored = manager.restore(
             step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
         )
-        model_config, num_outcomes, dirichlet_clip = _checkpoint_model_parts(
-            meta_restored["meta"].get("config", {})
-        )
-        model = build_model(
-            model_config,
-            num_outcomes=num_outcomes,
-            dirichlet_concentration_clip=dirichlet_clip,
-            num_actions=env.num_actions,
-            observation_shape=env.observation_shape,
-            rngs=rngs,
-        )
+        model = _build_checkpoint_model(meta_restored["meta"].get("config", {}), env, rngs)
         restored = manager.restore(
             step,
             args=ocp.args.Composite(model=ocp.args.StandardRestore(nnx.state(model))),
@@ -151,18 +140,42 @@ def from_pretrained(
     return model
 
 
-def _checkpoint_model_parts(config: Any) -> tuple[Any, int | None, float | None]:
+def _build_checkpoint_model(config: Any, env: pgx.Env, rngs: nnx.Rngs) -> nnx.Module:
     root = config if isinstance(config, dict) else {}
     model = root.get("model", root)
-    env = root.get("env", root)
+    env_config = root.get("env", root)
     regularization = root.get("training", {}).get("regularization", root)
-    return (
-        SimpleNamespace(
-            network=model.get("network", "boardlaw_dirichlet"),
-            num_channels=model.get("num_channels", 128),
-            num_layers=model.get("num_layers", 6),
-            resnet_v2=model.get("resnet_v2", True),
-        ),
-        env.get("num_outcomes"),
-        regularization.get("dirichlet_concentration_clip", 8.0),
-    )
+    network = str(model.get("network", "boardlaw_dirichlet"))
+    width = int(model.get("num_channels", 128))
+    depth = int(model.get("num_layers", 6))
+    if network == "aznet":
+        return AZNet(
+            num_actions=env.num_actions,
+            observation_shape=env.observation_shape,
+            num_channels=width,
+            num_blocks=depth,
+            resnet_v2=bool(model.get("resnet_v2", True)),
+            rngs=rngs,
+        )
+    if network == "boardlaw":
+        return BoardlawNet(
+            num_actions=env.num_actions,
+            observation_shape=env.observation_shape,
+            width=width,
+            depth=depth,
+            rngs=rngs,
+        )
+    if network == "boardlaw_dirichlet":
+        return BoardlawDirichletNet(
+            num_actions=env.num_actions,
+            observation_shape=env.observation_shape,
+            num_outcomes=int(env_config.get("num_outcomes") or 3),
+            width=width,
+            depth=depth,
+            dirichlet_concentration_clip=regularization.get(
+                "dirichlet_concentration_clip",
+                8.0,
+            ),
+            rngs=rngs,
+        )
+    raise ValueError(f"unknown checkpoint network: {network!r}")
