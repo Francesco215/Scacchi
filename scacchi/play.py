@@ -15,24 +15,17 @@ from .dirichlet_q_search import (
     flip_outcome,
     outcome_mean,
     outcome_utility,
-    dirichlet_q_policy,
-    posterior_best_action,
-    posterior_best_policy_target,
-    posterior_sample_action,
-    posterior_targets,
-    q_evidence_sum_from_tree,
-    root_action_value_priors_from_tree,
     terminal_outcome_from_reward,
 )
 from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
-from .dirichlet_tree.native import native_fields_from_beta
 from .network import policy_value_from_output
-from .posterior_tree import (
-    is_posterior_tree_policy,
-    run_posterior_tree_search,
-    run_posterior_tree_search_state_batch,
-    split_batched_state,
+from .play_search import (
+    _SearchStepOutput,
+    _run_model_search,
+    _run_posterior_tree_search_step,
+    _select_played_action,
 )
+from .posterior_tree import is_posterior_tree_policy
 
 
 BatchedEnvInit = Callable[[jax.Array], Any]
@@ -68,6 +61,13 @@ class SelfplayOutput(NamedTuple):
     @property
     def q_evidence_mass(self) -> jax.Array:
         return self.q_loss_weight
+
+
+_STACKED_FRAME_FIELD_NAMES = tuple(
+    field
+    for field in SelfplayOutput._fields
+    if field not in ("tree_data", "search_diagnostics")
+)
 
 
 def _cpu_device() -> jax.Device:
@@ -237,18 +237,47 @@ def make_dirichlet_recurrent_fn(env, predict_fn, config):
     return recurrent_fn
 
 
-def _empty_posterior_targets(
-    policy_target: jax.Array,
-    num_outcomes: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    batch_size, num_actions = policy_target.shape
-    beta_q = jnp.zeros(
-        (batch_size, num_actions, num_outcomes),
-        dtype=policy_target.dtype,
+def _selfplay_frame(
+    *,
+    observation: jax.Array,
+    legal_action_mask: jax.Array,
+    reward: jax.Array,
+    terminated: jax.Array,
+    discount: jax.Array,
+    search_output: _SearchStepOutput,
+) -> SelfplayOutput:
+    return SelfplayOutput(
+        obs=observation,
+        reward=reward,
+        terminated=terminated,
+        legal_action_mask=legal_action_mask,
+        discount=discount,
+        **search_output._asdict(),
     )
-    beta_v = jnp.zeros((batch_size, num_outcomes), dtype=policy_target.dtype)
-    q_loss_weight = jnp.zeros((batch_size, num_actions), dtype=policy_target.dtype)
-    return beta_q, beta_v, q_loss_weight
+
+
+def _stack_optional_tree(values: list[Any]) -> Any:
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *present)
+
+
+def _stack_selfplay_frames(frames: list[SelfplayOutput]) -> SelfplayOutput:
+    def stack_or_none(name: str) -> jax.Array | None:
+        values = [getattr(frame, name) for frame in frames]
+        if values[0] is None:
+            return None
+        return jnp.stack(values, axis=0)
+
+    stacked = {name: stack_or_none(name) for name in _STACKED_FRAME_FIELD_NAMES}
+    return SelfplayOutput(
+        **stacked,
+        tree_data=_stack_optional_tree([frame.tree_data for frame in frames]),
+        search_diagnostics=_stack_optional_tree(
+            [frame.search_diagnostics for frame in frames]
+        ),
+    )
 
 
 def _select_posterior_tree_played_action(
@@ -258,13 +287,13 @@ def _select_posterior_tree_played_action(
     legal_action_mask: jax.Array,
     search_action: jax.Array,
 ) -> jax.Array:
-    if action_source in ("posterior_best", "posterior_argmax"):
-        return posterior_best_action(action_weights, legal_action_mask)
-    if action_source == "posterior_sample":
-        return posterior_sample_action(rng_key, action_weights, legal_action_mask)
-    if action_source == "search_action":
-        return search_action
-    raise ValueError(f"unknown selfplay_action_source: {action_source!r}")
+    return _select_played_action(
+        action_source,
+        rng_key,
+        action_weights,
+        legal_action_mask,
+        search_action,
+    )
 
 
 def make_posterior_tree_selfplay(env, config):
@@ -289,180 +318,51 @@ def make_posterior_tree_selfplay(env, config):
             env_init = _cached_default_env_init(env)
             env_step = _cached_default_env_step(env)
         else:
-            init_keys = _device_put_cpu(jax.random.split(init_key, config.selfplay_batch_size))
+            init_keys = _device_put_cpu(
+                jax.random.split(init_key, config.selfplay_batch_size)
+            )
             env_init = _cached_cpu_env_init(env)
             env_step = _cached_cpu_env_step(env)
         env_state = env_init(init_keys)
 
-        obs_seq = []
-        reward_seq = []
-        terminated_seq = []
-        action_weights_seq = []
-        played_action_seq = []
-        legal_action_mask_seq = []
-        beta_q_seq = []
-        beta_v_seq = []
-        q_loss_weight_seq = []
-        q_target_kind_seq = []
-        q_target_weight_seq = []
-        q_target_outcome_seq = []
-        q_target_distance_seq = []
-        v_target_kind_seq = []
-        v_target_weight_seq = []
-        v_target_outcome_seq = []
-        v_target_distance_seq = []
-        search_loss_mask_seq = []
-        discount_seq = []
-        tree_data_seq = []
-        search_diagnostics_seq = []
+        frames = []
 
         for _ in range(config.max_num_steps):
             rng_key, search_key, action_key, reset_key = jax.random.split(rng_key, 4)
             observation = env_state.observation
             legal_action_mask = env_state.legal_action_mask
             actor = env_state.current_player
-            if use_wavefront_arena:
-                search_output = run_posterior_tree_search_state_batch(
-                    env=env,
-                    root_state_batch=env_state,
-                    leaf_evaluator=leaf_evaluator,
-                    rng_key=search_key,
-                    config=config,
-                )
-            else:
-                root_states = split_batched_state(env_state)
-                search_output = run_posterior_tree_search(
-                    env=env,
-                    root_states=root_states,
-                    leaf_evaluator=leaf_evaluator,
-                    rng_key=search_key,
-                    config=config,
-                )
-            search_action = (
-                search_output.action
-                if use_wavefront_arena
-                else _device_put_cpu(search_output.action)
-            )
-            played_action = (
-                _select_posterior_tree_played_action(
-                    config.selfplay_action_source,
-                    action_key,
-                    search_output.action_weights,
-                    legal_action_mask,
-                    search_action,
-                )
-                if use_wavefront_arena
-                else search_action
+            search_output = _run_posterior_tree_search_step(
+                env=env,
+                config=config,
+                env_state=env_state,
+                leaf_evaluator=leaf_evaluator,
+                search_key=search_key,
+                action_key=action_key,
+                use_wavefront_arena=use_wavefront_arena,
+                device_put_cpu=_device_put_cpu,
             )
 
             reset_keys = jax.random.split(reset_key, config.selfplay_batch_size)
             if not use_wavefront_arena:
                 reset_keys = _device_put_cpu(reset_keys)
-            env_state = env_step(env_state, played_action, reset_keys)
+            env_state = env_step(env_state, search_output.played_action, reset_keys)
             reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
             discount = -jnp.ones((config.selfplay_batch_size,), dtype=reward.dtype)
             discount = jnp.where(env_state.terminated, 0.0, discount)
 
-            obs_seq.append(observation)
-            action_weights_seq.append(search_output.action_weights)
-            played_action_seq.append(played_action)
-            legal_action_mask_seq.append(legal_action_mask)
-            beta_q_seq.append(search_output.beta_Q_target)
-            beta_v_seq.append(search_output.beta_V_target)
-            q_loss_weight_seq.append(search_output.q_loss_weight)
-            native_defaults = native_fields_from_beta(
-                search_output.beta_Q_target,
-                search_output.beta_V_target,
-            )
-            q_target_kind_seq.append(
-                search_output.q_target_kind
-                if search_output.q_target_kind is not None
-                else native_defaults["q_target_kind"]
-            )
-            q_target_weight_seq.append(
-                search_output.q_target_weight
-                if search_output.q_target_weight is not None
-                else native_defaults["q_target_weight"]
-            )
-            q_target_outcome_seq.append(
-                search_output.q_target_outcome
-                if search_output.q_target_outcome is not None
-                else native_defaults["q_target_outcome"]
-            )
-            q_target_distance_seq.append(
-                search_output.q_target_distance
-                if search_output.q_target_distance is not None
-                else native_defaults["q_target_distance"]
-            )
-            v_target_kind_seq.append(
-                search_output.v_target_kind
-                if search_output.v_target_kind is not None
-                else native_defaults["v_target_kind"]
-            )
-            v_target_weight_seq.append(
-                search_output.v_target_weight
-                if search_output.v_target_weight is not None
-                else native_defaults["v_target_weight"]
-            )
-            v_target_outcome_seq.append(
-                search_output.v_target_outcome
-                if search_output.v_target_outcome is not None
-                else native_defaults["v_target_outcome"]
-            )
-            v_target_distance_seq.append(
-                search_output.v_target_distance
-                if search_output.v_target_distance is not None
-                else native_defaults["v_target_distance"]
-            )
-            root_search_mask = search_output.search_loss_mask
-            if root_search_mask is None:
-                root_search_mask = jnp.sum(search_output.action_weights, axis=-1) > 0
-            search_loss_mask_seq.append(root_search_mask)
-            if search_output.tree_data is not None:
-                tree_data_seq.append(search_output.tree_data)
-            diagnostics = getattr(search_output, "diagnostics", None)
-            if diagnostics is not None:
-                search_diagnostics_seq.append(diagnostics)
-            reward_seq.append(reward)
-            terminated_seq.append(env_state.terminated)
-            discount_seq.append(discount)
-
-        tree_data = None
-        if tree_data_seq:
-            tree_data = jax.tree_util.tree_map(
-                lambda *xs: jnp.stack(xs, axis=0),
-                *tree_data_seq,
-            )
-        search_diagnostics = None
-        if search_diagnostics_seq:
-            search_diagnostics = jax.tree_util.tree_map(
-                lambda *xs: jnp.stack(xs, axis=0),
-                *search_diagnostics_seq,
+            frames.append(
+                _selfplay_frame(
+                    observation=observation,
+                    legal_action_mask=legal_action_mask,
+                    reward=reward,
+                    terminated=env_state.terminated,
+                    discount=discount,
+                    search_output=search_output,
+                )
             )
 
-        return SelfplayOutput(
-            obs=jnp.stack(obs_seq, axis=0),
-            reward=jnp.stack(reward_seq, axis=0),
-            terminated=jnp.stack(terminated_seq, axis=0),
-            action_weights=jnp.stack(action_weights_seq, axis=0),
-            played_action=jnp.stack(played_action_seq, axis=0),
-            legal_action_mask=jnp.stack(legal_action_mask_seq, axis=0),
-            beta_Q_target=jnp.stack(beta_q_seq, axis=0),
-            beta_V_target=jnp.stack(beta_v_seq, axis=0),
-            q_loss_weight=jnp.stack(q_loss_weight_seq, axis=0),
-            discount=jnp.stack(discount_seq, axis=0),
-            tree_data=tree_data,
-            search_loss_mask=jnp.stack(search_loss_mask_seq, axis=0),
-            search_diagnostics=search_diagnostics,
-            q_target_kind=jnp.stack(q_target_kind_seq, axis=0),
-            q_target_weight=jnp.stack(q_target_weight_seq, axis=0),
-            q_target_outcome=jnp.stack(q_target_outcome_seq, axis=0),
-            q_target_distance=jnp.stack(q_target_distance_seq, axis=0),
-            v_target_kind=jnp.stack(v_target_kind_seq, axis=0),
-            v_target_weight=jnp.stack(v_target_weight_seq, axis=0),
-            v_target_outcome=jnp.stack(v_target_outcome_seq, axis=0),
-            v_target_distance=jnp.stack(v_target_distance_seq, axis=0),
-        )
+        return _stack_selfplay_frames(frames)
 
     return selfplay
 
@@ -486,144 +386,34 @@ def make_selfplay(env, config):
             observation = env_state.observation
             legal_action_mask = env_state.legal_action_mask
             model_output = predict_fn(observation)
-
-            if len(model_output) == 2:
-                logits, value = policy_value_from_output(model_output)
-                root = mctx.RootFnOutput(
-                    prior_logits=logits,
-                    value=value,
-                    embedding=env_state,
-                )
-                policy_output = mctx.gumbel_muzero_policy(
-                    params=(),
-                    rng_key=search_key,
-                    root=root,
-                    recurrent_fn=recurrent_fn,
-                    num_simulations=config.num_simulations,
-                    invalid_actions=~env_state.legal_action_mask,
-                    qtransform=mctx.qtransform_completed_by_mix_value,
-                    gumbel_scale=1.0,
-                )
-                policy_target = policy_output.action_weights
-                played_action = policy_output.action
-                num_outcomes = config.num_outcomes
-                if num_outcomes is None:
-                    num_outcomes = 2 if config.env_id == "hex" else 3
-                beta_Q_target, beta_V_target, q_loss_weight = (
-                    _empty_posterior_targets(policy_target, num_outcomes)
-                )
-            else:
-                logits, alpha_v, alpha_q = model_output
-                root_outcome = outcome_mean(alpha_v)
-                value = outcome_utility(root_outcome)
-                root_embedding = NodeEmbedding(
-                    state=env_state,
-                    outcome_dist=root_outcome,
-                    alpha_V_prior=alpha_v,
-                    evidence_weight=jnp.zeros_like(value),
-                    root_action=jnp.full_like(env_state.current_player, NO_PARENT),
-                    depth_parity=jnp.zeros_like(env_state.current_player),
-                    alpha_Q_prior=alpha_q,
-                )
-                root = mctx.RootFnOutput(
-                    prior_logits=logits,
-                    value=value,
-                    embedding=root_embedding,
-                )
-                action_value_prior = alpha_q
-                if config.search_policy == "dirichlet_thompson":
-                    policy_output = dirichlet_q_policy(
-                        params=(),
-                        rng_key=search_key,
-                        root=root,
-                        recurrent_fn=dirichlet_recurrent_fn,
-                        action_value_prior=action_value_prior,
-                        num_simulations=config.num_simulations,
-                        invalid_actions=~env_state.legal_action_mask,
-                        num_search_blocks=getattr(config, "num_search_blocks", 1),
-                    )
-                    q_evidence_sum = policy_output.q_evidence_sum
-                    action_alpha_post = policy_output.alpha_search
-                    action_value_target_prior = action_alpha_post - q_evidence_sum
-                else:
-                    policy_output = mctx.gumbel_muzero_policy(
-                        params=(),
-                        rng_key=search_key,
-                        root=root,
-                        recurrent_fn=dirichlet_recurrent_fn,
-                        num_simulations=config.num_simulations,
-                        invalid_actions=~env_state.legal_action_mask,
-                        qtransform=mctx.qtransform_completed_by_mix_value,
-                        gumbel_scale=1.0,
-                    )
-                    q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
-                    action_value_target_prior = root_action_value_priors_from_tree(
-                        policy_output.search_tree,
-                        action_value_prior,
-                    )
-                    action_alpha_post = action_value_target_prior + q_evidence_sum
-                posterior_policy_target = posterior_best_policy_target(
-                    posterior_key,
-                    action_alpha_post,
-                    legal_action_mask,
-                    config.policy_mc_samples,
-                )
-                if config.search_policy == "gumbel":
-                    policy_target = policy_output.action_weights
-                else:
-                    policy_target = posterior_policy_target
-                beta_Q_target, beta_V_target = (
-                    posterior_targets(
-                        alpha_v,
-                        action_value_target_prior,
-                        q_evidence_sum,
-                        posterior_policy_target,
-                    )
-                )
-                q_loss_weight_mode = getattr(config, "q_loss_weight_mode", "policy")
-                if q_loss_weight_mode == "evidence_mass":
-                    q_loss_weight = jnp.sum(q_evidence_sum, axis=-1)
-                elif q_loss_weight_mode == "policy":
-                    q_loss_weight = posterior_policy_target
-                else:
-                    raise ValueError(f"unknown q_loss_weight_mode: {q_loss_weight_mode!r}")
-                if config.selfplay_action_source in ("posterior_best", "posterior_argmax"):
-                    posterior_action = posterior_best_action(
-                        posterior_policy_target,
-                        legal_action_mask,
-                    )
-                    played_action = posterior_action
-                elif config.selfplay_action_source == "posterior_sample":
-                    posterior_action = posterior_sample_action(
-                        action_key,
-                        posterior_policy_target,
-                        legal_action_mask,
-                    )
-                    played_action = posterior_action
-                else:
-                    played_action = policy_output.action
+            search_output = _run_model_search(
+                env_state=env_state,
+                model_output=model_output,
+                scalar_recurrent_fn=recurrent_fn,
+                dirichlet_recurrent_fn=dirichlet_recurrent_fn,
+                search_key=search_key,
+                posterior_key=posterior_key,
+                action_key=action_key,
+                config=config,
+            )
 
             actor = env_state.current_player
             reset_keys = jax.random.split(reset_key, config.selfplay_batch_size)
             env_state = jax.vmap(auto_reset(env.step, env.init))(
                 env_state,
-                played_action,
+                search_output.played_action,
                 reset_keys,
             )
-            discount = -jnp.ones_like(value)
+            reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
+            discount = -jnp.ones_like(reward)
             discount = jnp.where(env_state.terminated, 0.0, discount)
-            return env_state, SelfplayOutput(
-                obs=observation,
-                action_weights=policy_target,
-                played_action=played_action,
+            return env_state, _selfplay_frame(
+                observation=observation,
                 legal_action_mask=legal_action_mask,
-                beta_Q_target=beta_Q_target,
-                beta_V_target=beta_V_target,
-                q_loss_weight=q_loss_weight,
-                reward=env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor],
+                reward=reward,
                 terminated=env_state.terminated,
                 discount=discount,
-                search_loss_mask=jnp.sum(policy_target, axis=-1) > 0,
+                search_output=search_output,
             )
 
         rng_key, init_key = jax.random.split(rng_key)
