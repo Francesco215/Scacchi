@@ -35,8 +35,6 @@ def test_nested_hex_config_loads_into_runtime_config():
     assert config.state_posterior_kappa_n == 16.0
     assert config.train_tree_nodes is False
     assert config.train_tree_include_root is False
-    assert config.exact_hex_solver_enabled is False
-    assert config.exact_hex_solver_extra_batch_size == 0
     assert config.training_batch_size == 1024
     assert config.replay_buffer_size == 1
     assert config.learning_rate == 1e-3

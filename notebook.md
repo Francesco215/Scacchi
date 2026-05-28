@@ -21,8 +21,7 @@ Theory constraints checked against `latex/algorithms.tex`:
 Current code/config state:
 
 - `scacchi/configs/hex.yaml` uses `network: boardlaw_dirichlet`,
-  `search.policy: posterior_tree_wavefront`, WDL3 outcomes, and no exact solver
-  for 5x5.
+  `search.policy: posterior_tree_wavefront`, and WDL3 outcomes for 5x5.
 - Training initializes the train model from `build_model(... rngs=config.seed)`.
   The only solved checkpoint load is `baseline_model = from_pretrained(...)` for
   evaluation.

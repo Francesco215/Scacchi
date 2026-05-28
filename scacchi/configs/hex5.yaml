@@ -67,10 +67,6 @@ training:
     min_q_evidence: 0.0
     max_nodes_per_step: null
 
-  exact_hex_solver:
-    enabled: false
-    extra_batch_size: 0
-
   losses:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0

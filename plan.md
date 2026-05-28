@@ -177,22 +177,7 @@ Implement:
   - keep existing `value_dir_kl_loss` and `q_dir_kl_loss`,
   - add or repurpose categorical/native metrics such as `value_cat_nll_loss`, `q_cat_nll_loss`, `value_native_loss`, and `q_native_loss`.
 
-## 6. Exact Hex Relabeler
-
-Edit:
-
-- `scacchi/exact_hex.py` (about 140 lines)
-- `tests/test_exact_hex.py` (about 80 lines)
-
-Implement:
-
-- Emit exact solved WDL labels as native categorical V/Q targets.
-- Do not call `_dirichlet_outcome` for posterior-tree native data.
-- Use `INF_DISTANCE` unless the exact solver is extended to provide proof depth.
-- Keep exact policy targets and Q weights unchanged.
-- Preserve compatibility for any non-native legacy data path by using the native upgrade helper.
-
-## 7. Tests And Acceptance Criteria
+## 6. Tests And Acceptance Criteria
 
 Edit:
 
@@ -213,8 +198,6 @@ Add tests for:
 - All-Dirichlet behavior remains compatible with previous posterior-tree tests.
 - Arena tree export includes categorical non-terminal rows and excludes dirty/in-flight rows.
 - Codec roundtrip preserves categorical fields.
-- Exact Hex relabeling emits categorical targets.
-
 Run:
 
 ```bash
@@ -222,7 +205,6 @@ uv run pytest tests/test_posterior_tree.py \
   tests/test_dirichlet_tree_selection_backup_store.py \
   tests/test_dirichlet_tree_wavefront.py \
   tests/test_loss_masks.py \
-  tests/test_exact_hex.py \
   tests/test_config_validation.py
 ```
 

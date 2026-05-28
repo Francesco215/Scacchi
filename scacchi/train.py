@@ -106,11 +106,6 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("training", "tree", "include_terminal"), "train_tree_include_terminal"),
     (("training", "tree", "min_q_evidence"), "train_tree_min_q_evidence"),
     (("training", "tree", "max_nodes_per_step"), "train_tree_max_nodes_per_step"),
-    (("training", "exact_hex_solver", "enabled"), "exact_hex_solver_enabled"),
-    (
-        ("training", "exact_hex_solver", "extra_batch_size"),
-        "exact_hex_solver_extra_batch_size",
-    ),
     (("training", "losses", "policy_weight"), "policy_loss_weight"),
     (("training", "losses", "value_dir_kl_weight"), "value_dir_kl_weight"),
     (("training", "losses", "q_dir_kl_weight"), "q_dir_kl_weight"),
@@ -275,8 +270,6 @@ class Config(BaseModel):
     train_tree_include_terminal: bool = False
     train_tree_min_q_evidence: float = Field(default=0.0, ge=0.0)
     train_tree_max_nodes_per_step: int | None = Field(default=None, ge=1)
-    exact_hex_solver_enabled: bool = False
-    exact_hex_solver_extra_batch_size: int = Field(default=0, ge=0)
     # training params
     training_batch_size: int = 4096
     replay_buffer_size: int = Field(default=1, ge=1)
@@ -419,14 +412,6 @@ class Config(BaseModel):
                 "train_tree_nodes currently supports only "
                 "search_policy='posterior_tree_wavefront'."
             )
-        if self.exact_hex_solver_enabled:
-            if self.env_id != "hex" or self.board_size is None or self.board_size > 4:
-                raise ValueError(
-                    "exact_hex_solver_enabled requires env_id='hex' and "
-                    "board_size <= 4."
-                )
-            if self.num_outcomes not in (None, 3):
-                raise ValueError("exact_hex_solver_enabled requires WDL3 targets.")
         if self.search_policy in {
             "dirichlet_thompson",
             "posterior_tree",

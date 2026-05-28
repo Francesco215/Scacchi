@@ -73,8 +73,8 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 0
-  save_interval_steps: 50
+  max_to_keep: 50
+  save_interval_steps: 100
 
 compatibility:
   rng_split_mode: legacy_eval_train

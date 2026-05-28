@@ -73,10 +73,6 @@ training:
     min_q_evidence: 0.0  # Minimum Q target weight required for exported tree rows.
     max_nodes_per_step: null  # Optional cap on exported tree rows per self-play step.
 
-  exact_hex_solver:
-    enabled: false  # Exact helper is intentionally limited to <=4x4 and disabled for 5x5.
-    extra_batch_size: 0  # Extra exact-solver relabel rows per batch when exact solving is enabled.
-
   losses:
     policy_weight: 0.05  # Keep noisy early policy targets auxiliary during bootstrap.
     value_dir_kl_weight: 5.0  # Keep the WDL state posterior as a primary signal.

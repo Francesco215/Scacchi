@@ -2,7 +2,6 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 
-from .exact_hex import relabel_selfplay_with_exact_hex
 from .loss import Sample, TrainMetrics, make_compute_loss_input, train
 from .play import make_selfplay
 from .play import SelfplayOutput
@@ -214,10 +213,8 @@ def make_training_iteration(env, config):
             optimizer: nnx.Optimizer,
             rng_key: jax.Array,
         ) -> TrainMetrics:
-            selfplay_key, perm_key, exact_key = jax.random.split(rng_key, 3)
+            selfplay_key, perm_key = jax.random.split(rng_key)
             data = selfplay(model, selfplay_key)
-            if getattr(config, "exact_hex_solver_enabled", False):
-                data = relabel_selfplay_with_exact_hex(data, config, exact_key)
             replay_buffer.append(data)
             del replay_buffer[:-replay_buffer_size]
             replay_data = _concat_selfplay_outputs(

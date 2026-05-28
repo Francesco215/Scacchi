@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Any
 
 from flax import nnx
 import jax
@@ -16,7 +17,6 @@ from .dirichlet_q_search import (
     posterior_best_action,
     posterior_best_policy_target,
 )
-from .exact_hex import exact_hex_actions
 from .network import policy_value_from_output
 from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
 from .posterior_tree import (
@@ -121,11 +121,11 @@ def make_mcts_evaluate(env, config, baseline_model):
 
     if is_posterior_tree_policy(getattr(config, "search_policy", "gumbel")):
         @nnx.jit
-        def evaluate_leaves(model: nnx.Module, obs: jax.Array):
+        def evaluate_leaves(model: Any, obs: jax.Array):
             return model(obs, train=False)
 
         @nnx.jit
-        def scalar_mcts_actions(model: nnx.Module, rng_key: jax.Array, env_state):
+        def scalar_mcts_actions(model: Any, rng_key: jax.Array, env_state):
             predict = lambda obs: model(obs, train=False)
             return _make_mcts_policy(
                 predict,
@@ -135,14 +135,7 @@ def make_mcts_evaluate(env, config, baseline_model):
                 config.num_simulations,
             ).action
 
-        def model_actions(model: nnx.Module, rng_key: jax.Array, env_state):
-            if getattr(search_config, "exact_hex_solver_enabled", False):
-                return exact_hex_actions(
-                    env_state.observation,
-                    env_state.legal_action_mask,
-                    search_config,
-                    rng_key,
-                )
+        def model_actions(model: Any, rng_key: jax.Array, env_state):
             sample_output = evaluate_leaves(
                 model,
                 env_state.observation[:1],
@@ -170,7 +163,7 @@ def make_mcts_evaluate(env, config, baseline_model):
                 config=search_config,
             ).action
 
-        def evaluate(rng_key: jax.Array, model: nnx.Module):
+        def evaluate(rng_key: jax.Array, model: Any):
             my_player = 0
             key, init_key = jax.random.split(rng_key)
             init_keys = jax.random.split(init_key, eval_batch_size)
