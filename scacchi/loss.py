@@ -16,6 +16,9 @@ from .dirichlet_tree.native import (
 from .play import SelfplayOutput
 
 
+DIRICHLET_KL_LOSS_CUTOFF = 1000.0
+
+
 class Sample(NamedTuple):
     obs: jax.Array
     policy_tgt: jax.Array
@@ -63,6 +66,8 @@ class TrainMetrics(NamedTuple):
     policy_target_entropy: jax.Array
     value_dir_kl_loss: jax.Array
     q_dir_kl_loss: jax.Array
+    value_outcome_loss: jax.Array
+    q_outcome_loss: jax.Array
     alpha_V_concentration: jax.Array
     alpha_Q_concentration: jax.Array
     q_loss_weight_mean: jax.Array
@@ -106,6 +111,13 @@ def make_compute_loss_input(config):
         value_tgt = value_tgt[::-1, :]
         policy_tgt = jnp.asarray(data.action_weights)
         policy_loss_mask = legal_policy_mask & search_loss_mask
+        value_loss_mask = search_loss_mask
+        loss_mask_mode = getattr(config, "loss_mask_mode", "search")
+        if loss_mask_mode == "value":
+            policy_loss_mask = value_mask
+            value_loss_mask = value_mask
+        elif loss_mask_mode != "search":
+            raise ValueError(f"unknown loss_mask_mode: {loss_mask_mode!r}")
         if getattr(config, "policy_target_mode", "search") == "winner_action":
             policy_tgt = jax.nn.one_hot(
                 data.played_action,
@@ -114,6 +126,130 @@ def make_compute_loss_input(config):
             )
             policy_loss_mask = legal_policy_mask & value_mask & (value_tgt > 0)
 
+        beta_q_target = data.beta_Q_target
+        beta_v_target = data.beta_V_target
+        q_loss_weight = data.q_loss_weight
+        q_target_kind = data.q_target_kind
+        q_target_weight = data.q_target_weight
+        q_target_outcome = data.q_target_outcome
+        q_target_distance = data.q_target_distance
+        v_target_kind = data.v_target_kind
+        v_target_weight = data.v_target_weight
+        v_target_outcome = data.v_target_outcome
+        v_target_distance = data.v_target_distance
+
+        terminal_edge_targets = getattr(config, "terminal_edge_targets", False)
+        terminal_parent_targets = getattr(config, "terminal_parent_targets", False)
+        if terminal_edge_targets or terminal_parent_targets:
+            native_defaults = native_fields_from_beta(beta_q_target, beta_v_target)
+            q_target_kind = (
+                native_defaults["q_target_kind"] if q_target_kind is None else q_target_kind
+            )
+            q_target_weight = (
+                native_defaults["q_target_weight"]
+                if q_target_weight is None
+                else q_target_weight
+            )
+            q_target_outcome = (
+                native_defaults["q_target_outcome"]
+                if q_target_outcome is None
+                else q_target_outcome
+            )
+            q_target_distance = (
+                native_defaults["q_target_distance"]
+                if q_target_distance is None
+                else q_target_distance
+            )
+            v_target_kind = (
+                native_defaults["v_target_kind"] if v_target_kind is None else v_target_kind
+            )
+            v_target_weight = (
+                native_defaults["v_target_weight"]
+                if v_target_weight is None
+                else v_target_weight
+            )
+            v_target_outcome = (
+                native_defaults["v_target_outcome"]
+                if v_target_outcome is None
+                else v_target_outcome
+            )
+            v_target_distance = (
+                native_defaults["v_target_distance"]
+                if v_target_distance is None
+                else v_target_distance
+            )
+            num_outcomes = beta_v_target.shape[-1]
+            rounded_reward = jnp.round(data.reward).astype(jnp.int32)
+            if num_outcomes == 2:
+                outcome_index = (rounded_reward + 1) // 2
+            elif num_outcomes == 3:
+                outcome_index = rounded_reward + 1
+            else:
+                raise ValueError(f"unsupported outcome count: {num_outcomes}")
+            played_action_mask = jax.nn.one_hot(
+                data.played_action,
+                beta_q_target.shape[-2],
+                dtype=bool,
+            )
+            terminal_action_mask = data.terminated[..., None] & played_action_mask
+
+        if terminal_edge_targets:
+            q_target_kind = jnp.where(
+                terminal_action_mask,
+                jnp.asarray(int(TARGET_CATEGORICAL), dtype=q_target_kind.dtype),
+                q_target_kind,
+            )
+            q_target_weight = jnp.where(
+                terminal_action_mask,
+                jnp.ones((), dtype=q_target_weight.dtype),
+                q_target_weight,
+            )
+            q_target_outcome = jnp.where(
+                terminal_action_mask,
+                outcome_index[..., None].astype(q_target_outcome.dtype),
+                q_target_outcome,
+            )
+            q_target_distance = jnp.where(
+                terminal_action_mask,
+                jnp.ones((), dtype=q_target_distance.dtype),
+                q_target_distance,
+            )
+            q_loss_weight = jnp.where(
+                terminal_action_mask,
+                jnp.maximum(q_loss_weight, jnp.ones((), dtype=q_loss_weight.dtype)),
+                q_loss_weight,
+            )
+
+        if terminal_parent_targets:
+            terminal_win_mask = data.terminated & (data.reward > 0)
+            policy_tgt = jnp.where(
+                terminal_win_mask[..., None],
+                played_action_mask.astype(policy_tgt.dtype),
+                policy_tgt,
+            )
+            policy_loss_mask = policy_loss_mask | (terminal_win_mask & legal_policy_mask)
+            value_loss_mask = value_loss_mask | terminal_win_mask
+            v_target_kind = jnp.where(
+                terminal_win_mask,
+                jnp.asarray(int(TARGET_CATEGORICAL), dtype=v_target_kind.dtype),
+                v_target_kind,
+            )
+            v_target_weight = jnp.where(
+                terminal_win_mask,
+                jnp.ones((), dtype=v_target_weight.dtype),
+                v_target_weight,
+            )
+            v_target_outcome = jnp.where(
+                terminal_win_mask,
+                outcome_index.astype(v_target_outcome.dtype),
+                v_target_outcome,
+            )
+            v_target_distance = jnp.where(
+                terminal_win_mask,
+                jnp.ones((), dtype=v_target_distance.dtype),
+                v_target_distance,
+            )
+
         sample = Sample(
             obs=data.obs,
             policy_tgt=policy_tgt,
@@ -121,21 +257,21 @@ def make_compute_loss_input(config):
             played_action=data.played_action,
             policy_mask=data.legal_action_mask,
             value_mask=value_mask,
-            beta_Q_target=data.beta_Q_target,
-            beta_V_target=data.beta_V_target,
-            q_loss_weight=data.q_loss_weight,
+            beta_Q_target=beta_q_target,
+            beta_V_target=beta_v_target,
+            q_loss_weight=q_loss_weight,
             policy_loss_mask=policy_loss_mask,
-            value_loss_mask=search_loss_mask,
+            value_loss_mask=value_loss_mask,
             search_loss_mask=search_loss_mask,
             outcome_mask=value_mask,
-            q_target_kind=data.q_target_kind,
-            q_target_weight=data.q_target_weight,
-            q_target_outcome=data.q_target_outcome,
-            q_target_distance=data.q_target_distance,
-            v_target_kind=data.v_target_kind,
-            v_target_weight=data.v_target_weight,
-            v_target_outcome=data.v_target_outcome,
-            v_target_distance=data.v_target_distance,
+            q_target_kind=q_target_kind,
+            q_target_weight=q_target_weight,
+            q_target_outcome=q_target_outcome,
+            q_target_distance=q_target_distance,
+            v_target_kind=v_target_kind,
+            v_target_weight=v_target_weight,
+            v_target_outcome=v_target_outcome,
+            v_target_distance=v_target_distance,
         )
         native_fields = _native_target_fields(sample)
         sample = _with_native_defaults(sample, native_fields)
@@ -197,7 +333,7 @@ def make_compute_loss_input(config):
         )
         root_policy_loss_mask = flatten_root(policy_loss_mask)
         tree_policy_loss_mask = flatten_root(tree.policy_loss_mask)
-        root_value_loss_mask = flatten_root(search_loss_mask)
+        root_value_loss_mask = flatten_root(sample.value_loss_mask)
         tree_value_loss_mask = flatten_root(tree.value_loss_mask)
         root_search_loss_mask = flatten_root(search_loss_mask)
         tree_search_loss_mask = flatten_root(tree.search_loss_mask)
@@ -250,8 +386,42 @@ def make_compute_loss_input(config):
 
 
 def _masked_mean(loss: jax.Array, mask: jax.Array) -> jax.Array:
-    mask = mask.astype(loss.dtype)
-    return jnp.sum(loss * mask) / jnp.maximum(jnp.sum(mask), 1)
+    mask_bool = mask.astype(jnp.bool_)
+    mask_float = mask_bool.astype(loss.dtype)
+    safe_loss = jnp.where(mask_bool, loss, jnp.zeros_like(loss))
+    return jnp.sum(safe_loss) / jnp.maximum(jnp.sum(mask_float), 1)
+
+
+def _bounded_loss_mask(
+    loss: jax.Array,
+    mask: jax.Array,
+    *,
+    cutoff: float = DIRICHLET_KL_LOSS_CUTOFF,
+) -> jax.Array:
+    return mask.astype(jnp.bool_) & jnp.isfinite(loss) & (loss <= cutoff)
+
+
+def _bounded_masked_mean(
+    loss: jax.Array,
+    mask: jax.Array,
+    *,
+    cutoff: float = DIRICHLET_KL_LOSS_CUTOFF,
+) -> jax.Array:
+    active_mask = mask.astype(jnp.bool_)
+    bounded_mask = _bounded_loss_mask(loss, active_mask, cutoff=cutoff)
+    safe_loss = jnp.where(
+        bounded_mask,
+        jnp.nan_to_num(loss),
+        jnp.zeros_like(loss),
+    )
+    mean = _masked_mean(safe_loss, bounded_mask)
+    active_count = jnp.sum(active_mask.astype(loss.dtype))
+    kept_count = jnp.sum(bounded_mask.astype(loss.dtype))
+    return jnp.where(
+        (active_count > 0) & (kept_count == 0),
+        jnp.asarray(jnp.nan, dtype=loss.dtype),
+        mean,
+    )
 
 
 def _mask_or(mask: jax.Array | None, fallback: jax.Array) -> jax.Array:
@@ -343,6 +513,37 @@ def _categorical_entropy_from_probs(probs: jax.Array, mask: jax.Array) -> jax.Ar
     return -jnp.sum(entropy_terms, axis=-1)
 
 
+def _outcome_index(value_tgt: jax.Array, num_outcomes: int) -> jax.Array:
+    rounded = jnp.round(value_tgt).astype(jnp.int32)
+    if num_outcomes == 2:
+        return (rounded + 1) // 2
+    if num_outcomes == 3:
+        return rounded + 1
+    raise ValueError(f"unsupported outcome count: {num_outcomes}")
+
+
+def _gather_played_action(alpha_q: jax.Array, played_action: jax.Array) -> jax.Array:
+    gather_ix = jnp.broadcast_to(
+        played_action[..., None, None],
+        (*played_action.shape, 1, alpha_q.shape[-1]),
+    )
+    return jnp.take_along_axis(alpha_q, gather_ix, axis=-2).squeeze(axis=-2)
+
+
+def _dirichlet_mean_categorical_nll(alpha: jax.Array, outcome: jax.Array) -> jax.Array:
+    dtype = jnp.result_type(alpha, jnp.float32)
+    eps = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
+    alpha = jnp.maximum(alpha.astype(dtype), eps)
+    probs = alpha / jnp.sum(alpha, axis=-1, keepdims=True)
+    clipped_outcome = jnp.clip(jnp.asarray(outcome, dtype=jnp.int32), 0, alpha.shape[-1] - 1)
+    outcome_prob = jnp.take_along_axis(
+        probs,
+        clipped_outcome[..., None],
+        axis=-1,
+    ).squeeze(axis=-1)
+    return -jnp.log(jnp.maximum(outcome_prob, eps))
+
+
 def _dirichlet_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
     dtype = jnp.result_type(beta, alpha)
     eps = jnp.asarray(1e-6, dtype=dtype)
@@ -413,7 +614,7 @@ def _compute_dirichlet_losses(
         native_fields.v_target_weight,
         categorical_epsilon,
     )
-    value_dir_kl_loss = _masked_mean(value_dir_kl, value_loss_mask)
+    value_dir_kl_loss = _bounded_masked_mean(value_dir_kl, value_loss_mask)
 
     q_dir_kl = _native_dirichlet_loss(
         data.beta_Q_target,
@@ -423,25 +624,62 @@ def _compute_dirichlet_losses(
         native_fields.q_target_weight,
         categorical_epsilon,
     )
+    q_row_mask = (
+        value_loss_mask
+        if getattr(config, "loss_mask_mode", "search") == "value"
+        else search_loss_mask
+    )
     q_weights = jnp.where(
-        data.policy_mask & search_loss_mask[..., None],
+        data.policy_mask & q_row_mask[..., None],
         data.q_loss_weight,
         0.0,
     )
-    q_eps = jnp.asarray(jnp.finfo(q_dir_kl.dtype).eps, dtype=q_dir_kl.dtype)
-    q_dir_kl_loss = jnp.sum(q_weights * q_dir_kl) / jnp.maximum(jnp.sum(q_weights), q_eps)
+    q_metric_mask = q_weights > 0
+    q_dir_kl_mask = _bounded_loss_mask(q_dir_kl, q_metric_mask)
+    q_dir_kl_reduction = getattr(config, "q_dir_kl_reduction", "weighted")
+    if q_dir_kl_reduction == "masked_mean":
+        q_dir_kl_loss = _bounded_masked_mean(q_dir_kl, q_metric_mask)
+    elif q_dir_kl_reduction == "weighted":
+        q_weights = jnp.where(q_dir_kl_mask, q_weights, 0.0)
+        q_dir_kl = jnp.where(
+            q_dir_kl_mask,
+            jnp.nan_to_num(q_dir_kl),
+            jnp.zeros_like(q_dir_kl),
+        )
+        q_eps = jnp.asarray(jnp.finfo(q_dir_kl.dtype).eps, dtype=q_dir_kl.dtype)
+        q_dir_kl_loss = jnp.sum(q_weights * q_dir_kl) / jnp.maximum(
+            jnp.sum(q_weights),
+            q_eps,
+        )
+        q_dir_kl_loss = jnp.where(
+            jnp.any(q_metric_mask) & ~jnp.any(q_dir_kl_mask),
+            jnp.asarray(jnp.nan, dtype=q_dir_kl_loss.dtype),
+            q_dir_kl_loss,
+        )
+    else:
+        raise ValueError(f"unknown q_dir_kl_reduction: {q_dir_kl_reduction!r}")
+
+    outcome_mask = _mask_or(data.outcome_mask, data.value_mask)
+    outcome_index = _outcome_index(data.value_tgt, alpha_v.shape[-1])
+    value_outcome = _dirichlet_mean_categorical_nll(alpha_v, outcome_index)
+    value_outcome_loss = _masked_mean(value_outcome, outcome_mask)
+    played_alpha_q = _gather_played_action(alpha_q, data.played_action)
+    q_outcome = _dirichlet_mean_categorical_nll(played_alpha_q, outcome_index)
+    q_outcome_loss = _masked_mean(q_outcome, outcome_mask)
 
     alpha_v_concentration = _masked_mean(jnp.sum(alpha_v, axis=-1), value_loss_mask)
     alpha_q_concentration = _masked_mean(
         jnp.sum(alpha_q, axis=-1),
-        q_weights > 0,
+        q_metric_mask,
     )
-    q_loss_weight_mean = _masked_mean(data.q_loss_weight, q_weights > 0)
+    q_loss_weight_mean = _masked_mean(data.q_loss_weight, q_metric_mask)
 
     total_loss = (
         config.policy_loss_weight * policy_loss
         + config.value_dir_kl_weight * value_dir_kl_loss
         + config.q_dir_kl_weight * q_dir_kl_loss
+        + getattr(config, "value_outcome_weight", 0.0) * value_outcome_loss
+        + getattr(config, "q_outcome_weight", 0.0) * q_outcome_loss
     )
     metrics = TrainMetrics(
         policy_loss=policy_loss,
@@ -451,6 +689,8 @@ def _compute_dirichlet_losses(
         policy_target_entropy=policy_target_entropy,
         value_dir_kl_loss=value_dir_kl_loss,
         q_dir_kl_loss=q_dir_kl_loss,
+        value_outcome_loss=value_outcome_loss,
+        q_outcome_loss=q_outcome_loss,
         alpha_V_concentration=alpha_v_concentration,
         alpha_Q_concentration=alpha_q_concentration,
         q_loss_weight_mean=q_loss_weight_mean,
@@ -482,6 +722,8 @@ def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
                 policy_target_entropy=jnp.zeros_like(policy_loss),
                 value_dir_kl_loss=jnp.zeros_like(value_loss),
                 q_dir_kl_loss=jnp.zeros_like(value_loss),
+                value_outcome_loss=jnp.zeros_like(value_loss),
+                q_outcome_loss=jnp.zeros_like(value_loss),
                 alpha_V_concentration=jnp.zeros_like(value_loss),
                 alpha_Q_concentration=jnp.zeros_like(value_loss),
                 q_loss_weight_mean=jnp.zeros_like(value_loss),

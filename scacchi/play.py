@@ -580,7 +580,13 @@ def make_selfplay(env, config):
                         posterior_policy_target,
                     )
                 )
-                q_loss_weight = posterior_policy_target
+                q_loss_weight_mode = getattr(config, "q_loss_weight_mode", "policy")
+                if q_loss_weight_mode == "evidence_mass":
+                    q_loss_weight = jnp.sum(q_evidence_sum, axis=-1)
+                elif q_loss_weight_mode == "policy":
+                    q_loss_weight = posterior_policy_target
+                else:
+                    raise ValueError(f"unknown q_loss_weight_mode: {q_loss_weight_mode!r}")
                 if config.selfplay_action_source in ("posterior_best", "posterior_argmax"):
                     posterior_action = posterior_best_action(
                         posterior_policy_target,

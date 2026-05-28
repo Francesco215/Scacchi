@@ -23,7 +23,7 @@ def test_nested_hex_config_loads_into_runtime_config():
     assert config.selfplay_batch_size == 4096
     assert config.max_num_steps == 25
     assert config.selfplay_action_source == "posterior_argmax"
-    assert config.search_policy == "gumbel"
+    assert config.search_policy == "posterior_tree_wavefront"
     assert config.num_simulations == 32
     assert config.search_eval_batch_size == 1024
     assert config.wavefront_num_lanes_per_root == 1
@@ -48,8 +48,20 @@ def test_nested_hex_config_loads_into_runtime_config():
     assert config.dirichlet_concentration_clip == 8.0
     assert config.eval_interval == 1
     assert config.eval_batch_size == 512
-    assert config.wandb_enabled is True
+    assert config.wandb_enabled is False
     assert config.ckpt_max_to_keep == 0
+
+
+def test_hex8_terminal_targets_use_total_concentration_clip():
+    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex8.yaml"
+    container = OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True)
+
+    assert isinstance(container, dict)
+    config = Config(**normalize_config_dict(container))
+
+    assert config.terminal_edge_targets is True
+    assert config.terminal_parent_targets is True
+    assert config.dirichlet_concentration_clip == 100.0
 
 
 def test_flat_config_keys_take_precedence_over_nested_values():
@@ -115,6 +127,16 @@ def test_grad_clip_norm_can_be_disabled():
     assert config.grad_clip_norm is None
 
 
+def test_dirichlet_concentration_clip_mode_is_rejected():
+    with pytest.raises(ValueError, match="concentration logits are no longer clipped"):
+        normalize_config_dict({"dirichlet_concentration_clip_mode": "logit"})
+
+    with pytest.raises(ValueError, match="concentration logits are no longer clipped"):
+        normalize_config_dict(
+            {"model": {"dirichlet_concentration_clip_mode": "logit"}}
+        )
+
+
 def test_posterior_sample_action_source_is_valid():
     config = Config(
         network="boardlaw_dirichlet",
@@ -146,6 +168,17 @@ def test_dirichlet_thompson_uses_jitted_dirichlet_q_path():
     assert not is_posterior_tree_policy("dirichlet_thompson")
     assert is_posterior_tree_policy("posterior_tree")
     assert is_posterior_tree_policy("posterior_tree_wavefront")
+
+
+def test_dirichlet_thompson_allows_legacy_two_outcome_hex_heads():
+    config = Config(
+        env_id="hex",
+        network="boardlaw_dirichlet",
+        search_policy="dirichlet_thompson",
+        num_outcomes=2,
+    )
+
+    assert config.num_outcomes == 2
 
 
 def test_policy_target_mode_must_be_known():

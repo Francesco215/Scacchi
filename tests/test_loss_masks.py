@@ -7,9 +7,11 @@ import optax
 from scacchi.dirichlet_tree.types import TreeTrainingData
 from scacchi.dirichlet_tree.native import TARGET_CATEGORICAL, dirichlet_nll_at_categorical
 from scacchi.loss import (
+    DIRICHLET_KL_LOSS_CUTOFF,
     Sample,
     _compute_dirichlet_losses,
     _compute_losses,
+    _masked_mean,
     _dirichlet_kl,
     make_compute_loss_input,
 )
@@ -143,6 +145,73 @@ def test_compute_loss_input_trains_root_search_targets_before_terminal_result():
     assert jnp.array_equal(sample.outcome_mask, jnp.zeros((2, 3), dtype=jnp.bool_))
 
 
+def test_compute_loss_input_can_mark_played_terminal_edge_categorical():
+    data = SelfplayOutput(
+        obs=jnp.zeros((2, 1, 1)),
+        reward=jnp.array([[0.0], [1.0]]),
+        terminated=jnp.array([[False], [True]]),
+        action_weights=jnp.ones((2, 1, 3)) / 3.0,
+        played_action=jnp.array([[0], [2]]),
+        legal_action_mask=jnp.ones((2, 1, 3), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((2, 1, 3, 3)),
+        beta_V_target=jnp.ones((2, 1, 3)),
+        q_loss_weight=jnp.zeros((2, 1, 3)),
+        discount=jnp.array([[-1.0], [0.0]]),
+    )
+    config = SimpleNamespace(
+        max_num_steps=2,
+        selfplay_batch_size=1,
+        terminal_edge_targets=True,
+    )
+
+    sample = make_compute_loss_input(config)(data)
+
+    assert sample.q_target_kind[1, 0, 2] == int(TARGET_CATEGORICAL)
+    assert sample.q_target_outcome[1, 0, 2] == 2
+    assert sample.q_target_distance[1, 0, 2] == 1
+    assert sample.q_loss_weight[1, 0, 2] == 1.0
+    assert not bool(jnp.any(sample.q_target_kind[0] == int(TARGET_CATEGORICAL)))
+    assert not bool(jnp.any(sample.q_target_kind[1, 0, :2] == int(TARGET_CATEGORICAL)))
+
+
+def test_compute_loss_input_can_mark_terminal_winning_parent_categorical():
+    data = SelfplayOutput(
+        obs=jnp.zeros((2, 1, 1)),
+        reward=jnp.array([[0.0], [1.0]]),
+        terminated=jnp.array([[False], [True]]),
+        action_weights=jnp.ones((2, 1, 3)) / 3.0,
+        played_action=jnp.array([[0], [2]]),
+        legal_action_mask=jnp.ones((2, 1, 3), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((2, 1, 3, 3)),
+        beta_V_target=jnp.ones((2, 1, 3)),
+        q_loss_weight=jnp.zeros((2, 1, 3)),
+        discount=jnp.array([[-1.0], [0.0]]),
+    )
+    config = SimpleNamespace(
+        max_num_steps=2,
+        selfplay_batch_size=1,
+        terminal_parent_targets=True,
+    )
+
+    sample = make_compute_loss_input(config)(data)
+
+    assert jnp.array_equal(sample.policy_tgt[1, 0], jnp.array([0.0, 0.0, 1.0]))
+    assert bool(sample.policy_loss_mask[1, 0])
+    assert bool(sample.value_loss_mask[1, 0])
+    assert sample.v_target_kind[1, 0] == int(TARGET_CATEGORICAL)
+    assert sample.v_target_outcome[1, 0] == 2
+    assert sample.v_target_distance[1, 0] == 1
+    assert not bool(jnp.any(sample.q_target_kind == int(TARGET_CATEGORICAL)))
+
+
+def test_masked_mean_surfaces_active_nonfinite_terms():
+    assert not bool(jnp.isfinite(_masked_mean(jnp.array([jnp.nan]), jnp.array([True]))))
+    assert jnp.allclose(
+        _masked_mean(jnp.array([jnp.nan, 2.0]), jnp.array([False, True])),
+        2.0,
+    )
+
+
 def test_make_minibatches_replays_active_rows_and_keeps_compute_shape():
     active_mask = jnp.array([[False, True, False, False, False, False, True, False]])
     sample = Sample(
@@ -167,6 +236,33 @@ def test_make_minibatches_replays_active_rows_and_keeps_compute_shape():
         jnp.all((minibatches.obs[..., 0] == 1.0) | (minibatches.obs[..., 0] == 6.0))
     )
     assert bool(jnp.all(minibatches.policy_loss_mask))
+
+
+def test_make_minibatches_legacy_permutation_uses_each_row_once():
+    sample = Sample(
+        obs=jnp.arange(8, dtype=jnp.float32).reshape(1, 8, 1),
+        policy_tgt=jnp.ones((1, 8, 2)) / 2,
+        value_tgt=jnp.zeros((1, 8)),
+        played_action=jnp.zeros((1, 8), dtype=jnp.int32),
+        policy_mask=jnp.ones((1, 8, 2), dtype=jnp.bool_),
+        value_mask=jnp.ones((1, 8), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((1, 8, 2, 2)),
+        beta_V_target=jnp.ones((1, 8, 2)),
+        q_loss_weight=jnp.zeros((1, 8, 2)),
+    )
+
+    minibatches = make_minibatches(
+        sample,
+        jax.random.PRNGKey(0),
+        4,
+        sampling="permutation",
+    )
+
+    assert minibatches.obs.shape == (2, 4, 1)
+    assert jnp.array_equal(
+        jnp.sort(minibatches.obs[..., 0].reshape(-1)),
+        jnp.arange(8, dtype=jnp.float32),
+    )
 
 
 def test_fixed_replay_window_pads_early_batches_to_stable_shape():
@@ -306,6 +402,65 @@ def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
     assert jnp.allclose(metrics.q_loss_weight_mean, 1.0)
 
 
+def test_dirichlet_kl_losses_ignore_huge_and_nonfinite_terms():
+    data = Sample(
+        obs=jnp.zeros((3, 1)),
+        policy_tgt=jnp.array(
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ]
+        ),
+        value_tgt=jnp.array([1.0, 1.0, 1.0]),
+        played_action=jnp.array([0, 0, 0]),
+        policy_mask=jnp.ones((3, 3), dtype=jnp.bool_),
+        value_mask=jnp.ones((3,), dtype=jnp.bool_),
+        beta_Q_target=jnp.array(
+            [
+                [[2.0, 3.0], [1e6, 1.0], [jnp.nan, 1.0]],
+                [[1e6, 1.0], [1e6, 1.0], [1e6, 1.0]],
+                [[jnp.nan, 1.0], [jnp.nan, 1.0], [jnp.nan, 1.0]],
+            ]
+        ),
+        beta_V_target=jnp.array(
+            [
+                [2.0, 3.0],
+                [1e6, 1.0],
+                [jnp.nan, 1.0],
+            ]
+        ),
+        q_loss_weight=jnp.ones((3, 3)),
+    )
+    logits = jnp.zeros((3, 3))
+    alpha_v = jnp.array([[2.0, 3.0], [1.0, 1e6], [1.0, 1.0]])
+    alpha_q = jnp.array(
+        [
+            [[2.0, 3.0], [1.0, 1e6], [1.0, 1.0]],
+            [[1.0, 1e6], [1.0, 1e6], [1.0, 1e6]],
+            [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+        ]
+    )
+    config = SimpleNamespace(
+        policy_loss_weight=0.0,
+        value_dir_kl_weight=1.0,
+        q_dir_kl_weight=1.0,
+        value_outcome_weight=0.0,
+        q_outcome_weight=0.0,
+    )
+
+    raw_value_kl = _dirichlet_kl(data.beta_V_target, alpha_v)
+    raw_q_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
+    _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
+
+    assert raw_value_kl[1] > DIRICHLET_KL_LOSS_CUTOFF
+    assert not bool(jnp.isfinite(raw_value_kl[2]))
+    assert raw_q_kl[0, 1] > DIRICHLET_KL_LOSS_CUTOFF
+    assert not bool(jnp.isfinite(raw_q_kl[0, 2]))
+    assert jnp.allclose(metrics.value_dir_kl_loss, 0.0, atol=1e-6)
+    assert jnp.allclose(metrics.q_dir_kl_loss, 0.0, atol=1e-6)
+
+
 def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():
     data = Sample(
         obs=jnp.zeros((1, 1)),
@@ -373,3 +528,51 @@ def test_native_categorical_targets_use_dirichlet_density_nll():
     expected_q = dirichlet_nll_at_categorical(alpha_q[0, 0], jnp.asarray(2), 1e-4)
     assert jnp.allclose(metrics.value_dir_kl_loss, expected_v)
     assert jnp.allclose(metrics.q_dir_kl_loss, expected_q)
+
+
+def test_debug_outcome_losses_use_dirichlet_mean_nll_not_density():
+    data = Sample(
+        obs=jnp.zeros((1, 1)),
+        policy_tgt=jnp.array([[1.0, 0.0]]),
+        value_tgt=jnp.array([1.0]),
+        played_action=jnp.array([0]),
+        policy_mask=jnp.array([[True, True]]),
+        value_mask=jnp.array([True]),
+        outcome_mask=jnp.array([True]),
+        beta_Q_target=jnp.ones((1, 2, 3)),
+        beta_V_target=jnp.ones((1, 3)),
+        q_loss_weight=jnp.array([[1.0, 0.0]]),
+    )
+    logits = jnp.zeros((1, 2))
+    alpha_v = jnp.array([[0.2, 0.2, 0.6]])
+    alpha_q = jnp.array([[[0.1, 0.2, 0.7], [0.3, 0.3, 0.4]]])
+    concentrated_alpha_v = alpha_v * 10.0
+    concentrated_alpha_q = alpha_q * 10.0
+    config = SimpleNamespace(
+        policy_loss_weight=0.0,
+        value_dir_kl_weight=0.0,
+        q_dir_kl_weight=0.0,
+        value_outcome_weight=0.0,
+        q_outcome_weight=0.0,
+        categorical_epsilon=1e-4,
+    )
+
+    _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
+    _, concentrated_metrics = _compute_dirichlet_losses(
+        logits,
+        concentrated_alpha_v,
+        concentrated_alpha_q,
+        data,
+        config,
+    )
+
+    assert jnp.allclose(metrics.value_outcome_loss, -jnp.log(jnp.asarray(0.6)))
+    assert jnp.allclose(metrics.q_outcome_loss, -jnp.log(jnp.asarray(0.7)))
+    assert jnp.allclose(
+        concentrated_metrics.value_outcome_loss,
+        metrics.value_outcome_loss,
+    )
+    assert jnp.allclose(
+        concentrated_metrics.q_outcome_loss,
+        metrics.q_outcome_loss,
+    )

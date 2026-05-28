@@ -53,7 +53,6 @@ def report_jax_backend() -> None:
             "intentional CPU runs."
         )
 
-
 _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("run", "seed"), "seed"),
     (("run", "max_num_iters"), "max_num_iters"),
@@ -64,6 +63,8 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("model", "num_channels"), "num_channels"),
     (("model", "num_layers"), "num_layers"),
     (("model", "resnet_v2"), "resnet_v2"),
+    (("model", "legacy_dirichlet_head_init"), "legacy_dirichlet_head_init"),
+    (("model", "rezero_kernel_init"), "rezero_kernel_init"),
     (("selfplay", "batch_size"), "selfplay_batch_size"),
     (("selfplay", "max_num_steps"), "max_num_steps"),
     (("selfplay", "action_source"), "selfplay_action_source"),
@@ -95,7 +96,10 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     ),
     (("training", "batch_size"), "training_batch_size"),
     (("training", "replay_buffer_size"), "replay_buffer_size"),
+    (("training", "minibatch_sampling"), "minibatch_sampling"),
     (("training", "learning_rate"), "learning_rate"),
+    (("training", "lr_decay_after_iters"), "lr_decay_after_iters"),
+    (("training", "lr_decay_factor"), "lr_decay_factor"),
     (("training", "grad_clip_norm"), "grad_clip_norm"),
     (("training", "tree", "enabled"), "train_tree_nodes"),
     (("training", "tree", "include_root"), "train_tree_include_root"),
@@ -110,6 +114,13 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("training", "losses", "policy_weight"), "policy_loss_weight"),
     (("training", "losses", "value_dir_kl_weight"), "value_dir_kl_weight"),
     (("training", "losses", "q_dir_kl_weight"), "q_dir_kl_weight"),
+    (("training", "losses", "value_outcome_weight"), "value_outcome_weight"),
+    (("training", "losses", "q_outcome_weight"), "q_outcome_weight"),
+    (("training", "losses", "q_loss_weight_mode"), "q_loss_weight_mode"),
+    (("training", "losses", "q_dir_kl_reduction"), "q_dir_kl_reduction"),
+    (("training", "losses", "loss_mask_mode"), "loss_mask_mode"),
+    (("training", "losses", "terminal_edge_targets"), "terminal_edge_targets"),
+    (("training", "losses", "terminal_parent_targets"), "terminal_parent_targets"),
     (("training", "losses", "policy_target_mode"), "policy_target_mode"),
     (
         ("training", "regularization", "dirichlet_concentration_clip"),
@@ -122,6 +133,7 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("logging", "wandb", "project"), "wandb_project"),
     (("checkpointing", "max_to_keep"), "ckpt_max_to_keep"),
     (("checkpointing", "save_interval_steps"), "ckpt_save_interval_steps"),
+    (("compatibility", "rng_split_mode"), "rng_split_mode"),
 )
 _NESTED_CONFIG_GROUPS = frozenset(path[0] for path, _ in _NESTED_CONFIG_FIELDS)
 _NESTED_CONFIG_PATHS = frozenset(path for path, _ in _NESTED_CONFIG_FIELDS)
@@ -131,10 +143,12 @@ _DEPRECATED_CONFIG_KEYS = frozenset(
         "c_terminal",
         "c_state",
         "c_value_search",
+        "dirichlet_concentration_clip_mode",
     }
 )
 _DEPRECATED_NESTED_CONFIG_PATHS = frozenset(
-    ("search", "constants", key) for key in _DEPRECATED_CONFIG_KEYS
+    [("search", "constants", key) for key in _DEPRECATED_CONFIG_KEYS]
+    + [("model", "dirichlet_concentration_clip_mode")]
 )
 
 
@@ -144,10 +158,16 @@ def _raise_deprecated_config(key: str) -> None:
         "c_terminal": "kappa_terminal",
         "c_state": "state_posterior_kappa_n",
         "c_value_search": None,
+        "dirichlet_concentration_clip_mode": "dirichlet_concentration_clip",
     }
     leaf = key.rsplit(".", 1)[-1]
     replacement = replacements.get(leaf)
-    if replacement is None:
+    if leaf == "dirichlet_concentration_clip_mode":
+        message = (
+            f"{key!r} is deprecated; concentration logits are no longer clipped. "
+            "Use 'dirichlet_concentration_clip' to cap total concentration."
+        )
+    elif replacement is None:
         message = f"{key!r} is deprecated and no longer used by posterior-tree search."
     else:
         message = f"{key!r} is deprecated; use {replacement!r} instead."
@@ -219,6 +239,8 @@ class Config(BaseModel):
     num_channels: int = 128
     num_layers: int = 6
     resnet_v2: bool = True
+    legacy_dirichlet_head_init: bool = False
+    rezero_kernel_init: str = "variance_scaling"
     # selfplay params
     selfplay_batch_size: int = 1024
     num_simulations: int = 32
@@ -258,11 +280,21 @@ class Config(BaseModel):
     # training params
     training_batch_size: int = 4096
     replay_buffer_size: int = Field(default=1, ge=1)
+    minibatch_sampling: str = "active_with_replacement"
     learning_rate: float = 0.001
+    lr_decay_after_iters: int | None = Field(default=None, ge=1)
+    lr_decay_factor: float = Field(default=1.0, gt=0.0)
     grad_clip_norm: float | None = Field(default=None, gt=0)
     policy_loss_weight: float = 1.0
     value_dir_kl_weight: float = 1.0
     q_dir_kl_weight: float = 1.0
+    value_outcome_weight: float = 0.0
+    q_outcome_weight: float = 0.0
+    q_loss_weight_mode: str = "policy"
+    q_dir_kl_reduction: str = "weighted"
+    loss_mask_mode: str = "search"
+    terminal_edge_targets: bool = False
+    terminal_parent_targets: bool = False
     policy_target_mode: str = "search"
     dirichlet_concentration_clip: float | None = 8.0
     log_interval: int = 1
@@ -275,6 +307,7 @@ class Config(BaseModel):
     # checkpoint params
     ckpt_max_to_keep: int = 3
     ckpt_save_interval_steps: int = 50
+    rng_split_mode: str = "three_way"
 
     model_config = ConfigDict(extra="forbid")
 
@@ -296,6 +329,8 @@ class Config(BaseModel):
         dirichlet_loss_weights = (
             "value_dir_kl_weight",
             "q_dir_kl_weight",
+            "value_outcome_weight",
+            "q_outcome_weight",
         )
         active_weights = [
             f"{name}={getattr(self, name)}"
@@ -344,6 +379,27 @@ class Config(BaseModel):
             )
         if self.leaf_value_mode not in {"alpha", "mean"}:
             raise ValueError("leaf_value_mode must be 'alpha' or 'mean'.")
+        if self.rezero_kernel_init not in {"variance_scaling", "orthogonal"}:
+            raise ValueError(
+                "rezero_kernel_init must be 'variance_scaling' or 'orthogonal'."
+            )
+        if self.minibatch_sampling not in {
+            "active_with_replacement",
+            "permutation",
+        }:
+            raise ValueError(
+                "minibatch_sampling must be 'active_with_replacement' or 'permutation'."
+            )
+        if self.q_loss_weight_mode not in {"policy", "evidence_mass"}:
+            raise ValueError("q_loss_weight_mode must be 'policy' or 'evidence_mass'.")
+        if self.q_dir_kl_reduction not in {"weighted", "masked_mean"}:
+            raise ValueError("q_dir_kl_reduction must be 'weighted' or 'masked_mean'.")
+        if self.loss_mask_mode not in {"search", "value"}:
+            raise ValueError("loss_mask_mode must be 'search' or 'value'.")
+        if self.rng_split_mode not in {"three_way", "legacy_eval_train"}:
+            raise ValueError(
+                "rng_split_mode must be 'three_way' or 'legacy_eval_train'."
+            )
         if self.categorical_draw_rule not in {
             "policy_prior",
             "fastest_draw",
@@ -381,6 +437,7 @@ class Config(BaseModel):
                     "posterior-tree Dirichlet search requires "
                     "network='boardlaw_dirichlet'."
                 )
+        if self.search_policy in {"posterior_tree", "posterior_tree_wavefront"}:
             if self.num_outcomes not in (None, 3):
                 raise ValueError(
                     "posterior-tree Dirichlet search uses WDL3 targets; set "
@@ -408,7 +465,20 @@ def main(cfg: DictConfig) -> None:
     optimizer_transforms: list[optax.GradientTransformation] = []
     if config.grad_clip_norm is not None:
         optimizer_transforms.append(optax.clip_by_global_norm(config.grad_clip_norm))
-    optimizer_transforms.append(optax.adam(learning_rate=config.learning_rate))
+    learning_rate: float | optax.Schedule = config.learning_rate
+    if config.lr_decay_after_iters is not None and config.lr_decay_factor != 1.0:
+        rows_per_iter = max(
+            1,
+            config.selfplay_batch_size * config.max_num_steps,
+        )
+        updates_per_iter = max(1, rows_per_iter // config.training_batch_size)
+        learning_rate = optax.piecewise_constant_schedule(
+            init_value=config.learning_rate,
+            boundaries_and_scales={
+                config.lr_decay_after_iters * updates_per_iter: config.lr_decay_factor,
+            },
+        )
+    optimizer_transforms.append(optax.adam(learning_rate=learning_rate))
     optimizer = nnx.Optimizer(
         model,
         optax.chain(*optimizer_transforms),
@@ -443,11 +513,15 @@ def main(cfg: DictConfig) -> None:
             pbar.refresh()
             for iteration in pbar:
                 dict_to_log = {}
-                rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
+                legacy_rng_split = config.rng_split_mode == "legacy_eval_train"
+                if not legacy_rng_split:
+                    rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
                 if config.eval_interval > 0 and (
                     iteration == config.max_num_iters - 1
                     or iteration % config.eval_interval == 0
                 ):
+                    if legacy_rng_split:
+                        rng_key, eval_key = jax.random.split(rng_key)
                     returns = evaluate(eval_key, model)
                     dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
                     eval_avg_return = float(jax.device_get(returns.mean()))
@@ -470,6 +544,8 @@ def main(cfg: DictConfig) -> None:
                     )
 
                 st = time.time()
+                if legacy_rng_split:
+                    rng_key, train_key = jax.random.split(rng_key)
                 train_metrics = training_iteration(model, optimizer, train_key)
                 frames += config.selfplay_batch_size * config.max_num_steps
 
@@ -484,8 +560,11 @@ def main(cfg: DictConfig) -> None:
                         "train/policy_target_entropy": train_metrics.policy_target_entropy.mean().item(),
                         "train/value_dir_kl_loss": train_metrics.value_dir_kl_loss.mean().item(),
                         "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
+                        "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
+                        "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
                         "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
                         "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
+                        "train/q_evidence_mass_mean": train_metrics.q_evidence_mass_mean.mean().item(),
                         "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
                         "search/path_depth_mean": train_metrics.search_path_depth_mean.mean().item(),
                         "search/path_depth_p50": train_metrics.search_path_depth_p50.mean().item(),

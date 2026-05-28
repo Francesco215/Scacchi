@@ -13,6 +13,7 @@ def make_minibatches(
     samples: Sample,
     rng_key: jax.Array,
     training_batch_size: int,
+    sampling: str = "active_with_replacement",
 ) -> Sample:
     samples = jax.tree_util.tree_map(
         lambda x: x.reshape((-1, *x.shape[2:])),
@@ -21,6 +22,15 @@ def make_minibatches(
     num_rows = samples.obs.shape[0]
     num_updates = num_rows // training_batch_size
     num_train_samples = num_updates * training_batch_size
+    if sampling == "permutation":
+        ixs = jax.random.permutation(rng_key, jnp.arange(num_rows))
+        samples = jax.tree_util.tree_map(lambda x: x[ixs[:num_train_samples]], samples)
+        return jax.tree_util.tree_map(
+            lambda x: x.reshape((num_updates, training_batch_size) + x.shape[1:]),
+            samples,
+        )
+    if sampling != "active_with_replacement":
+        raise ValueError(f"unknown minibatch sampling mode: {sampling!r}")
     active_mask = _active_sample_rows(samples)
     active_indices = jnp.nonzero(active_mask, size=num_rows, fill_value=0)[0]
     active_count = jnp.sum(active_mask.astype(jnp.int32))
@@ -189,7 +199,12 @@ def make_training_iteration(env, config):
             perm_key: jax.Array,
         ) -> TrainMetrics:
             samples = compute_loss_input(data)
-            minibatches = make_minibatches(samples, perm_key, config.training_batch_size)
+            minibatches = make_minibatches(
+                samples,
+                perm_key,
+                config.training_batch_size,
+                getattr(config, "minibatch_sampling", "active_with_replacement"),
+            )
             return train_minibatches(model, optimizer, minibatches, config)
 
         replay_buffer: list[SelfplayOutput] = []
@@ -222,7 +237,12 @@ def make_training_iteration(env, config):
         selfplay_key, perm_key = jax.random.split(rng_key)
         data = selfplay(model, selfplay_key)
         samples = compute_loss_input(data)
-        minibatches = make_minibatches(samples, perm_key, config.training_batch_size)
+        minibatches = make_minibatches(
+            samples,
+            perm_key,
+            config.training_batch_size,
+            getattr(config, "minibatch_sampling", "active_with_replacement"),
+        )
         return train_minibatches(model, optimizer, minibatches, config)
 
     return training_iteration

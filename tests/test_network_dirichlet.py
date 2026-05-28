@@ -6,11 +6,13 @@ from scacchi.network import (
     AZNet,
     BoardlawDirichletNet,
     BoardlawNet,
+    build_model,
     dirichlet_from_logits,
     outcome_mean,
     outcome_utility,
     policy_value_from_output,
 )
+from scacchi.train import Config
 
 
 def test_dirichlet_from_logits_uses_squared_softplus_concentration():
@@ -72,6 +74,52 @@ def test_boardlaw_dirichlet_heads_initialize_to_uniform_policy_and_unit_alphas()
     assert jnp.allclose(jax.nn.softmax(logits, axis=-1), jnp.full_like(logits, 0.1))
     assert jnp.allclose(alpha_v, jnp.ones_like(alpha_v))
     assert jnp.allclose(alpha_q, jnp.ones_like(alpha_q))
+
+
+def test_dirichlet_thompson_null_hex_outcomes_builds_legacy_two_outcome_head():
+    config = Config(
+        env_id="hex",
+        network="boardlaw_dirichlet",
+        search_policy="dirichlet_thompson",
+        num_outcomes=None,
+        num_channels=16,
+        num_layers=2,
+    )
+
+    model = build_model(
+        config,
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        rngs=nnx.Rngs(0),
+    )
+
+    assert isinstance(model, BoardlawDirichletNet)
+    assert model.num_outcomes == 2
+
+
+def test_legacy_dirichlet_head_init_matches_runstate_initial_concentration():
+    config = Config(
+        env_id="hex",
+        network="boardlaw_dirichlet",
+        search_policy="dirichlet_thompson",
+        num_outcomes=2,
+        num_channels=16,
+        num_layers=2,
+        legacy_dirichlet_head_init=True,
+        rezero_kernel_init="orthogonal",
+    )
+    model = build_model(
+        config,
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        rngs=nnx.Rngs(0),
+    )
+
+    _, alpha_v, alpha_q = model(jnp.zeros((1, 3, 3, 4)), train=False)
+
+    expected_total = jax.nn.softplus(jnp.array(0.0)) ** 2
+    assert jnp.allclose(jnp.sum(alpha_v, axis=-1), expected_total)
+    assert jnp.allclose(jnp.sum(alpha_q, axis=-1), expected_total)
 
 
 def test_scalar_policy_heads_initialize_to_uniform_logits():

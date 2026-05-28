@@ -163,15 +163,27 @@ class AZNet(nnx.Module):
 class ReZeroResidual(nnx.Module):
     """ReZero residual block: x + α · Linear(ReLU(x)) with α initialized to 0."""
 
-    def __init__(self, width: int, *, rngs: nnx.Rngs):
-        self.linear = nnx.Linear(
-            width,
-            width,
-            kernel_init=jax.nn.initializers.variance_scaling(
+    def __init__(
+        self,
+        width: int,
+        *,
+        kernel_init_mode: str = "variance_scaling",
+        rngs: nnx.Rngs,
+    ):
+        if kernel_init_mode == "orthogonal":
+            kernel_init = jax.nn.initializers.orthogonal(scale=math.sqrt(2.0))
+        elif kernel_init_mode == "variance_scaling":
+            kernel_init = jax.nn.initializers.variance_scaling(
                 scale=2.0,
                 mode="fan_in",
                 distribution="truncated_normal",
-            ),
+            )
+        else:
+            raise ValueError(f"unknown ReZero kernel init mode: {kernel_init_mode!r}")
+        self.linear = nnx.Linear(
+            width,
+            width,
+            kernel_init=kernel_init,
             rngs=rngs,
         )
         self.alpha = nnx.Param(jnp.zeros(()))
@@ -191,6 +203,7 @@ class BoardlawNet(nnx.Module):
         *,
         width: int = 512,
         depth: int = 8,
+        rezero_kernel_init: str = "variance_scaling",
         rngs: nnx.Rngs,
     ):
         self.num_actions = num_actions
@@ -199,7 +212,12 @@ class BoardlawNet(nnx.Module):
 
         input_dim = math.prod(observation_shape)
         self.intake = nnx.Linear(input_dim, width, rngs=rngs)
-        self.blocks = nnx.List([ReZeroResidual(width, rngs=rngs) for _ in range(depth)])
+        self.blocks = nnx.List(
+            [
+                ReZeroResidual(width, kernel_init_mode=rezero_kernel_init, rngs=rngs)
+                for _ in range(depth)
+            ]
+        )
         self.policy_head = nnx.Linear(
             width,
             num_actions,
@@ -233,6 +251,8 @@ class BoardlawDirichletNet(nnx.Module):
         width: int = 512,
         depth: int = 8,
         dirichlet_concentration_clip: float | None = 8.0,
+        legacy_dirichlet_head_init: bool = False,
+        rezero_kernel_init: str = "variance_scaling",
         rngs: nnx.Rngs,
     ):
         self.num_actions = num_actions
@@ -243,45 +263,57 @@ class BoardlawDirichletNet(nnx.Module):
 
         input_dim = math.prod(observation_shape)
         self.intake = nnx.Linear(input_dim, width, rngs=rngs)
-        self.blocks = nnx.List([ReZeroResidual(width, rngs=rngs) for _ in range(depth)])
-        self.policy_head = nnx.Linear(
-            width,
-            num_actions,
-            kernel_init=jax.nn.initializers.zeros,
-            bias_init=jax.nn.initializers.zeros,
-            rngs=rngs,
+        self.blocks = nnx.List(
+            [
+                ReZeroResidual(width, kernel_init_mode=rezero_kernel_init, rngs=rngs)
+                for _ in range(depth)
+            ]
         )
-        self.value_dir_head = nnx.Linear(
-            width,
-            num_outcomes,
-            kernel_init=jax.nn.initializers.zeros,
-            bias_init=jax.nn.initializers.zeros,
-            rngs=rngs,
-        )
-        concentration_bias_init = jax.nn.initializers.constant(
-            _unit_dirichlet_concentration_logit(num_outcomes)
-        )
-        self.value_conc_head = nnx.Linear(
-            width,
-            1,
-            kernel_init=jax.nn.initializers.zeros,
-            bias_init=concentration_bias_init,
-            rngs=rngs,
-        )
-        self.q_dir_head = nnx.Linear(
-            width,
-            num_actions * num_outcomes,
-            kernel_init=jax.nn.initializers.zeros,
-            bias_init=jax.nn.initializers.zeros,
-            rngs=rngs,
-        )
-        self.q_conc_head = nnx.Linear(
-            width,
-            num_actions,
-            kernel_init=jax.nn.initializers.zeros,
-            bias_init=concentration_bias_init,
-            rngs=rngs,
-        )
+        if legacy_dirichlet_head_init:
+            self.policy_head = nnx.Linear(width, num_actions, rngs=rngs)
+            self.value_dir_head = nnx.Linear(width, num_outcomes, rngs=rngs)
+            self.value_conc_head = nnx.Linear(width, 1, rngs=rngs)
+            self.q_dir_head = nnx.Linear(width, num_actions * num_outcomes, rngs=rngs)
+            self.q_conc_head = nnx.Linear(width, num_actions, rngs=rngs)
+        else:
+            self.policy_head = nnx.Linear(
+                width,
+                num_actions,
+                kernel_init=jax.nn.initializers.zeros,
+                bias_init=jax.nn.initializers.zeros,
+                rngs=rngs,
+            )
+            self.value_dir_head = nnx.Linear(
+                width,
+                num_outcomes,
+                kernel_init=jax.nn.initializers.zeros,
+                bias_init=jax.nn.initializers.zeros,
+                rngs=rngs,
+            )
+            concentration_bias_init = jax.nn.initializers.constant(
+                _unit_dirichlet_concentration_logit(num_outcomes)
+            )
+            self.value_conc_head = nnx.Linear(
+                width,
+                1,
+                kernel_init=jax.nn.initializers.zeros,
+                bias_init=concentration_bias_init,
+                rngs=rngs,
+            )
+            self.q_dir_head = nnx.Linear(
+                width,
+                num_actions * num_outcomes,
+                kernel_init=jax.nn.initializers.zeros,
+                bias_init=jax.nn.initializers.zeros,
+                rngs=rngs,
+            )
+            self.q_conc_head = nnx.Linear(
+                width,
+                num_actions,
+                kernel_init=jax.nn.initializers.zeros,
+                bias_init=concentration_bias_init,
+                rngs=rngs,
+            )
 
     def __call__(self, x: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array, jax.Array]:
         del train
@@ -335,13 +367,13 @@ def build_model(
             observation_shape=observation_shape,
             width=config.num_channels,
             depth=config.num_layers,
+            rezero_kernel_init=getattr(config, "rezero_kernel_init", "variance_scaling"),
             rngs=rngs,
         )
     if config.network == "boardlaw_dirichlet":
         num_outcomes = config.num_outcomes
         if num_outcomes is None:
             posterior_tree_search = getattr(config, "search_policy", "gumbel") in (
-                "dirichlet_thompson",
                 "posterior_tree",
                 "posterior_tree_wavefront",
             )
@@ -356,6 +388,8 @@ def build_model(
             width=config.num_channels,
             depth=config.num_layers,
             dirichlet_concentration_clip=config.dirichlet_concentration_clip,
+            legacy_dirichlet_head_init=getattr(config, "legacy_dirichlet_head_init", False),
+            rezero_kernel_init=getattr(config, "rezero_kernel_init", "variance_scaling"),
             rngs=rngs,
         )
     raise ValueError(f"unknown network: {config.network!r}")

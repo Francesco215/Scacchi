@@ -1,0 +1,99 @@
+# Best completed 5x5 non-Gumbel Boardlaw-Dirichlet recipe from notebook.md.
+# Mirrors W&B run azcxc9xp / hex5_dqthompson_outcome_seed9101.
+# This is dirichlet_thompson, not strict posterior_tree_wavefront.
+
+run:
+  seed: 9101
+  max_num_iters: 100
+
+env:
+  id: hex
+  board_size: 5
+  num_outcomes: 3
+
+model:
+  network: boardlaw_dirichlet
+  num_channels: 128
+  num_layers: 8
+  resnet_v2: true
+
+selfplay:
+  batch_size: 8192
+  max_num_steps: 25
+  action_source: posterior_best
+
+search:
+  policy: posterior_tree_wavefront
+  num_simulations: 4
+  num_blocks: 8
+  eval_batch_size: 1024
+  inflight_limit: 1
+
+  monte_carlo:
+    policy_samples: 32
+    backup_samples: 4
+
+  leaf_value_mode: alpha
+
+  constants:
+    kappa_leaf: 1.0
+    kappa_terminal: 8.0
+    epsilon_terminal: 5e-2
+    state_posterior_kappa_n: 16.0
+
+  wavefront:
+    backend: arena
+    num_lanes_per_root: 1
+    max_depth: 128
+    final_action_mode: posterior_sample
+    pad_eval_batches: true
+    pad_jax_select: false
+    np_select_below: 1024
+    grouped_expansion: true
+    lane_indexed_step: true
+    stable_lane_batch: true
+    pad_pending_observation_gather: true
+
+training:
+  batch_size: 1024
+  replay_buffer_size: 1
+  learning_rate: 1e-3
+  grad_clip_norm: 1.0
+
+  tree:
+    enabled: false
+    include_root: false
+    include_terminal: false
+    min_q_evidence: 0.0
+    max_nodes_per_step: null
+
+  exact_hex_solver:
+    enabled: false
+    extra_batch_size: 0
+
+  losses:
+    policy_weight: 1.0
+    value_dir_kl_weight: 1.0
+    q_dir_kl_weight: 1.0
+    value_outcome_weight: 1.0
+    q_outcome_weight: 0.25
+    terminal_edge_targets: false
+    terminal_parent_targets: false
+    policy_target_mode: search
+
+  regularization:
+    dirichlet_concentration_clip: 8.0
+
+eval:
+  interval: 5
+  batch_size: 256
+
+logging:
+  interval: 1
+  wandb:
+    enabled: true
+    project: scacchi-az
+
+checkpointing:
+  max_to_keep: 0
+  save_interval_steps: 50
