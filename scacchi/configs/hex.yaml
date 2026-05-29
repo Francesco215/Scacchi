@@ -1,10 +1,7 @@
-# Paper-compliant search config:
-# Use the native posterior-tree search space described in latex/algorithms.tex:
-# WDL Dirichlet value/Q heads, native categorical leaves, Thompson-style
-# posterior-best policy targets, state-posterior repair, and final target export.
-# Keep search.policy on posterior_tree_wavefront for practical runs; posterior_tree
-# is the slower reference path. Do not use gumbel or dirichlet_thompson for runs
-# intended to match that algorithm spec.
+# Posterior-tree reference config:
+# The old Python wavefront backend has been removed from scacchi/dirichlet_tree.
+# Keep this on the slower object posterior_tree path until the Rust dqaz backend
+# described in plan.md is wired into training.
 # Action-selection symbols are explicit enum values. Use posterior_argmax or
 # posterior_sample where those modes are accepted; there is no posterior_mean mode.
 
@@ -29,11 +26,11 @@ selfplay:
   action_source: posterior_argmax  # Self-play action source: posterior_argmax/posterior_best, posterior_sample, or search_action.
 
 search:
-  policy: posterior_tree_wavefront  # Paper-compliant native posterior-tree wavefront driver from algorithms.tex.
+  policy: posterior_tree  # Reference Python posterior-tree path; Rust dqaz will replace it.
   num_simulations: 32  # Posterior-tree leaf-request budget per root.
   num_blocks: 8  # Compatibility knob for dirichlet_thompson; kept so older overrides still parse.
-  eval_batch_size: 1024  # Maximum neural leaf evaluations per batched CPU/GPU wavefront.
-  inflight_limit: 1  # Legacy posterior_tree request limit; wavefront uses lane/eval-batch knobs below.
+  eval_batch_size: 1024  # Maximum neural leaf evaluations per batch.
+  inflight_limit: 1  # Legacy object posterior_tree request limit.
 
   monte_carlo:
     policy_samples: 64  # Samples used to estimate posterior-best policy targets.
@@ -47,31 +44,11 @@ search:
     epsilon_terminal: 5e-2  # Legacy terminal Dirichlet smoothing; categorical targets use categorical_epsilon in the loss.
     state_posterior_kappa_n: 16.0  # Half-trust count for blending neural value priors with downstream search evidence.
 
-  wavefront:
-    backend: arena  # CPU arena implementation for native posterior-tree state.
-    num_lanes_per_root: 1  # Parallel tree-descent lanes allocated to each root.
-    max_depth: 128  # Maximum selected path depth before stopping a request.
-    final_action_mode: posterior_sample  # Root commit mode: posterior_argmax or posterior_sample.
-    pad_eval_batches: true  # Pad neural leaf batches to eval_batch_size for stable compiled shapes.
-    pad_jax_select: false  # Pad JAX selection batches; useful only for shape-stability experiments.
-    np_select_below: 1024  # Use NumPy selection below this batch-size threshold.
-    grouped_expansion: true  # Batch node insertion for leaves with compatible shapes.
-    lane_indexed_step: true  # Step lane-indexed state batches in the wavefront driver.
-    stable_lane_batch: true  # Keep lane batch shapes stable across wavefront iterations.
-    pad_pending_observation_gather: true  # Pad pending leaf-observation gathers for stable compiled shapes.
-
 training:
   batch_size: 1024  # Learner minibatch size; multiple updates per fresh self-play batch.
   replay_buffer_size: 1  # Train on the latest self-play batch only.
   learning_rate: 1e-3  # Adam learning rate used by solved scalar Boardlaw runs.
   grad_clip_norm: 1.0  # Keep Dirichlet-head fine tuning stable.
-
-  tree:
-    enabled: false  # Also train on flattened posterior-tree nodes, not just self-play roots.
-    include_root: false  # Include root rows when tree.enabled is true.
-    include_terminal: false  # Include terminal/categorical rows when tree.enabled is true.
-    min_q_evidence: 0.0  # Minimum Q target weight required for exported tree rows.
-    max_nodes_per_step: null  # Optional cap on exported tree rows per self-play step.
 
   losses:
     policy_weight: 0.05  # Keep noisy early policy targets auxiliary during bootstrap.

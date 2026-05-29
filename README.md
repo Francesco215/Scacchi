@@ -35,8 +35,8 @@ driver, policy target export, and tree-derived training targets.
 - `scacchi/pipeline.py`: replay/minibatch handling and per-iteration training.
 - `scacchi/loss.py`: policy, scalar value, Dirichlet KL, and outcome losses.
 - `scacchi/posterior_tree.py`: Python posterior-tree search implementation.
-- `scacchi/dirichlet_tree/`: arena/wavefront posterior-tree implementation and
-  supporting selection, backup, storage, packing, and hashing utilities.
+- `scacchi/dirichlet_tree/`: compatibility helpers for native categorical
+  target metadata and shared training-output containers.
 - `scacchi/configs/`: Hydra YAML configs, currently centered on Hex.
 - `scripts/`: benchmarks, sweeps, and plotting utilities.
 - `tests/`: unit tests for config validation, losses, network behavior, search,

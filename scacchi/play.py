@@ -311,24 +311,18 @@ def make_posterior_tree_selfplay(env, config):
                 )
             return output
 
-        use_wavefront_arena = config.search_policy == "posterior_tree_wavefront"
         rng_key, init_key = jax.random.split(rng_key)
-        if use_wavefront_arena:
-            init_keys = jax.random.split(init_key, config.selfplay_batch_size)
-            env_init = _cached_default_env_init(env)
-            env_step = _cached_default_env_step(env)
-        else:
-            init_keys = _device_put_cpu(
-                jax.random.split(init_key, config.selfplay_batch_size)
-            )
-            env_init = _cached_cpu_env_init(env)
-            env_step = _cached_cpu_env_step(env)
+        init_keys = _device_put_cpu(
+            jax.random.split(init_key, config.selfplay_batch_size)
+        )
+        env_init = _cached_cpu_env_init(env)
+        env_step = _cached_cpu_env_step(env)
         env_state = env_init(init_keys)
 
         frames = []
 
         for _ in range(config.max_num_steps):
-            rng_key, search_key, action_key, reset_key = jax.random.split(rng_key, 4)
+            rng_key, search_key, reset_key = jax.random.split(rng_key, 3)
             observation = env_state.observation
             legal_action_mask = env_state.legal_action_mask
             actor = env_state.current_player
@@ -338,14 +332,11 @@ def make_posterior_tree_selfplay(env, config):
                 env_state=env_state,
                 leaf_evaluator=leaf_evaluator,
                 search_key=search_key,
-                action_key=action_key,
-                use_wavefront_arena=use_wavefront_arena,
                 device_put_cpu=_device_put_cpu,
             )
 
             reset_keys = jax.random.split(reset_key, config.selfplay_batch_size)
-            if not use_wavefront_arena:
-                reset_keys = _device_put_cpu(reset_keys)
+            reset_keys = _device_put_cpu(reset_keys)
             env_state = env_step(env_state, search_output.played_action, reset_keys)
             reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
             discount = -jnp.ones((config.selfplay_batch_size,), dtype=reward.dtype)

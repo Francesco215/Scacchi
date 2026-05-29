@@ -23,7 +23,6 @@ from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
 from .network import policy_value_from_output
 from .posterior_tree import (
     run_posterior_tree_search,
-    run_posterior_tree_search_state_batch,
     split_batched_state,
 )
 
@@ -344,44 +343,17 @@ def _run_posterior_tree_search_step(
     env_state: pgx.State,
     leaf_evaluator,
     search_key: jax.Array,
-    action_key: jax.Array,
-    use_wavefront_arena: bool,
     device_put_cpu: Callable[[Any], Any],
-    action_source: str | None = None,
 ) -> _SearchStepOutput:
-    if use_wavefront_arena:
-        search_output = run_posterior_tree_search_state_batch(
-            env=env,
-            root_state_batch=env_state,
-            leaf_evaluator=leaf_evaluator,
-            rng_key=search_key,
-            config=config,
-        )
-    else:
-        search_output = run_posterior_tree_search(
-            env=env,
-            root_states=split_batched_state(env_state),
-            leaf_evaluator=leaf_evaluator,
-            rng_key=search_key,
-            config=config,
-        )
-
-    search_action = (
-        search_output.action
-        if use_wavefront_arena
-        else device_put_cpu(search_output.action)
+    search_output = run_posterior_tree_search(
+        env=env,
+        root_states=split_batched_state(env_state),
+        leaf_evaluator=leaf_evaluator,
+        rng_key=search_key,
+        config=config,
     )
-    played_action = (
-        _select_played_action(
-            config.selfplay_action_source if action_source is None else action_source,
-            action_key,
-            search_output.action_weights,
-            env_state.legal_action_mask,
-            search_action,
-        )
-        if use_wavefront_arena
-        else search_action
-    )
+    search_action = device_put_cpu(search_output.action)
+    played_action = search_action
     root_search_mask = search_output.search_loss_mask
     if root_search_mask is None:
         root_search_mask = _search_loss_mask(search_output.action_weights)

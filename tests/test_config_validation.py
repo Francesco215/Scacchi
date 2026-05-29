@@ -23,18 +23,14 @@ def test_nested_hex_config_loads_into_runtime_config():
     assert config.selfplay_batch_size == 4096
     assert config.max_num_steps == 25
     assert config.selfplay_action_source == "posterior_argmax"
-    assert config.search_policy == "posterior_tree_wavefront"
+    assert config.search_policy == "posterior_tree"
     assert config.num_simulations == 32
     assert config.search_eval_batch_size == 1024
-    assert config.wavefront_num_lanes_per_root == 1
-    assert config.wavefront_final_action_mode == "posterior_sample"
     assert config.leaf_value_mode == "alpha"
     assert config.kappa_leaf == 1.0
     assert config.kappa_terminal == 8.0
     assert config.epsilon_terminal == 5e-2
     assert config.state_posterior_kappa_n == 16.0
-    assert config.train_tree_nodes is False
-    assert config.train_tree_include_root is False
     assert config.training_batch_size == 1024
     assert config.replay_buffer_size == 1
     assert config.learning_rate == 1e-3
@@ -165,7 +161,7 @@ def test_search_policy_must_be_known():
 def test_dirichlet_thompson_uses_jitted_dirichlet_q_path():
     assert not is_posterior_tree_policy("dirichlet_thompson")
     assert is_posterior_tree_policy("posterior_tree")
-    assert is_posterior_tree_policy("posterior_tree_wavefront")
+    assert not is_posterior_tree_policy("posterior_tree_wavefront")
 
 
 def test_dirichlet_thompson_allows_legacy_two_outcome_hex_heads():
@@ -200,69 +196,9 @@ def test_posterior_tree_search_requires_dirichlet_network_and_wdl3():
         )
 
 
-def test_wavefront_posterior_tree_search_policy_is_valid():
-    config = Config(network="boardlaw_dirichlet", search_policy="posterior_tree_wavefront")
-
-    assert config.search_policy == "posterior_tree_wavefront"
-    assert config.wavefront_backend == "arena"
-
-
-def test_tree_node_training_requires_wavefront_policy():
-    config = Config(
-        network="boardlaw_dirichlet",
-        search_policy="posterior_tree_wavefront",
-        train_tree_nodes=True,
-    )
-
-    assert config.train_tree_nodes is True
-
-    with pytest.raises(ValidationError, match="train_tree_nodes"):
-        Config(
-            network="boardlaw_dirichlet",
-            search_policy="gumbel",
-            train_tree_nodes=True,
-        )
-
-
-def test_wavefront_knobs_are_validated():
-    config = Config(
-        network="boardlaw_dirichlet",
-        search_policy="posterior_tree_wavefront",
-        wavefront_num_lanes_per_root=2,
-        wavefront_max_depth=32,
-        wavefront_final_action_mode="posterior_sample",
-    )
-
-    assert config.wavefront_num_lanes_per_root == 2
-    assert config.wavefront_max_depth == 32
-    assert config.wavefront_final_action_mode == "posterior_sample"
-    assert config.wavefront_pad_eval_batches is True
-    assert config.wavefront_pad_jax_select is False
-    assert config.wavefront_np_select_below == 1024
-    assert config.wavefront_grouped_expansion is True
-    assert config.wavefront_lane_indexed_step is True
-    assert config.wavefront_stable_lane_batch is True
-    assert config.wavefront_pad_pending_observation_gather is True
-
-    with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
-        Config(
-            network="boardlaw_dirichlet",
-            search_policy="posterior_tree_wavefront",
-            wavefront_final_action_mode="scalar_q_argmax",
-        )
-    with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
-        Config(
-            network="boardlaw_dirichlet",
-            search_policy="posterior_tree_wavefront",
-            wavefront_final_action_mode="argmax_q_mean",
-        )
-
-    with pytest.raises(ValidationError, match="wavefront_final_action_mode"):
-        Config(
-            network="boardlaw_dirichlet",
-            search_policy="posterior_tree_wavefront",
-            wavefront_final_action_mode="unknown",
-        )
+def test_wavefront_posterior_tree_policy_is_removed():
+    with pytest.raises(ValidationError, match="search_policy"):
+        Config(network="boardlaw_dirichlet", search_policy="posterior_tree_wavefront")
 
 
 def test_model_construction_context_allows_legacy_checkpoint_loss_weights():

@@ -157,8 +157,6 @@ def _with_eval_settings(
             "eval_batch_size": eval_batch_size,
             "num_simulations": tree_size,
             "num_search_blocks": num_search_blocks,
-            "train_tree_nodes": False,
-            "wavefront_final_action_mode": "posterior_sample",
         }
     )
 

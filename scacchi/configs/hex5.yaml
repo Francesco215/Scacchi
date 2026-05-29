@@ -1,6 +1,6 @@
 # Best completed 5x5 non-Gumbel Boardlaw-Dirichlet recipe from notebook.md.
 # Mirrors W&B run azcxc9xp / hex5_dqthompson_outcome_seed9101.
-# This is dirichlet_thompson, not strict posterior_tree_wavefront.
+# This is dirichlet_thompson, not the removed Python wavefront backend.
 
 run:
   seed: 9101
@@ -23,7 +23,7 @@ selfplay:
   action_source: posterior_best
 
 search:
-  policy: posterior_tree_wavefront
+  policy: dirichlet_thompson
   num_simulations: 4
   num_blocks: 8
   eval_batch_size: 1024
@@ -41,31 +41,11 @@ search:
     epsilon_terminal: 5e-2
     state_posterior_kappa_n: 16.0
 
-  wavefront:
-    backend: arena
-    num_lanes_per_root: 1
-    max_depth: 128
-    final_action_mode: posterior_sample
-    pad_eval_batches: true
-    pad_jax_select: false
-    np_select_below: 1024
-    grouped_expansion: true
-    lane_indexed_step: true
-    stable_lane_batch: true
-    pad_pending_observation_gather: true
-
 training:
   batch_size: 1024
   replay_buffer_size: 1
   learning_rate: 1e-3
   grad_clip_norm: 1.0
-
-  tree:
-    enabled: false
-    include_root: false
-    include_terminal: false
-    min_q_evidence: 0.0
-    max_nodes_per_step: null
 
   losses:
     policy_weight: 1.0

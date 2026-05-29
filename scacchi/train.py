@@ -80,20 +80,6 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("search", "constants", "epsilon_terminal"), "epsilon_terminal"),
     (("search", "constants", "state_posterior_kappa_n"), "state_posterior_kappa_n"),
     (("search", "leaf_value_mode"), "leaf_value_mode"),
-    (("search", "wavefront", "backend"), "wavefront_backend"),
-    (("search", "wavefront", "num_lanes_per_root"), "wavefront_num_lanes_per_root"),
-    (("search", "wavefront", "max_depth"), "wavefront_max_depth"),
-    (("search", "wavefront", "final_action_mode"), "wavefront_final_action_mode"),
-    (("search", "wavefront", "pad_eval_batches"), "wavefront_pad_eval_batches"),
-    (("search", "wavefront", "pad_jax_select"), "wavefront_pad_jax_select"),
-    (("search", "wavefront", "np_select_below"), "wavefront_np_select_below"),
-    (("search", "wavefront", "grouped_expansion"), "wavefront_grouped_expansion"),
-    (("search", "wavefront", "lane_indexed_step"), "wavefront_lane_indexed_step"),
-    (("search", "wavefront", "stable_lane_batch"), "wavefront_stable_lane_batch"),
-    (
-        ("search", "wavefront", "pad_pending_observation_gather"),
-        "wavefront_pad_pending_observation_gather",
-    ),
     (("training", "batch_size"), "training_batch_size"),
     (("training", "replay_buffer_size"), "replay_buffer_size"),
     (("training", "minibatch_sampling"), "minibatch_sampling"),
@@ -101,11 +87,6 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("training", "lr_decay_after_iters"), "lr_decay_after_iters"),
     (("training", "lr_decay_factor"), "lr_decay_factor"),
     (("training", "grad_clip_norm"), "grad_clip_norm"),
-    (("training", "tree", "enabled"), "train_tree_nodes"),
-    (("training", "tree", "include_root"), "train_tree_include_root"),
-    (("training", "tree", "include_terminal"), "train_tree_include_terminal"),
-    (("training", "tree", "min_q_evidence"), "train_tree_min_q_evidence"),
-    (("training", "tree", "max_nodes_per_step"), "train_tree_max_nodes_per_step"),
     (("training", "losses", "policy_weight"), "policy_loss_weight"),
     (("training", "losses", "value_dir_kl_weight"), "value_dir_kl_weight"),
     (("training", "losses", "q_dir_kl_weight"), "q_dir_kl_weight"),
@@ -254,22 +235,6 @@ class Config(BaseModel):
     search_eval_batch_size: int | None = Field(default=None, ge=1)
     selfplay_action_source: str = "posterior_best"
     search_policy: str = "gumbel"
-    wavefront_num_lanes_per_root: int = Field(default=1, ge=1)
-    wavefront_max_depth: int = Field(default=128, ge=1)
-    wavefront_final_action_mode: str = "posterior_argmax"
-    wavefront_pad_eval_batches: bool = True
-    wavefront_pad_jax_select: bool = False
-    wavefront_np_select_below: int = Field(default=1024, ge=0)
-    wavefront_grouped_expansion: bool = True
-    wavefront_lane_indexed_step: bool = True
-    wavefront_stable_lane_batch: bool = True
-    wavefront_pad_pending_observation_gather: bool = True
-    wavefront_backend: str = "arena"
-    train_tree_nodes: bool = False
-    train_tree_include_root: bool = False
-    train_tree_include_terminal: bool = False
-    train_tree_min_q_evidence: float = Field(default=0.0, ge=0.0)
-    train_tree_max_nodes_per_step: int | None = Field(default=None, ge=1)
     # training params
     training_batch_size: int = 4096
     replay_buffer_size: int = Field(default=1, ge=1)
@@ -353,22 +318,11 @@ class Config(BaseModel):
             "gumbel",
             "dirichlet_thompson",
             "posterior_tree",
-            "posterior_tree_wavefront",
         }
         if self.search_policy not in valid_search_policies:
             allowed = ", ".join(sorted(valid_search_policies))
             raise ValueError(
                 f"search_policy must be one of {allowed}; got {self.search_policy!r}."
-            )
-        valid_wavefront_action_modes = {
-            "posterior_argmax",
-            "posterior_sample",
-        }
-        if self.wavefront_final_action_mode not in valid_wavefront_action_modes:
-            allowed = ", ".join(sorted(valid_wavefront_action_modes))
-            raise ValueError(
-                "wavefront_final_action_mode must be one of "
-                f"{allowed}; got {self.wavefront_final_action_mode!r}."
             )
         if self.leaf_value_mode not in {"alpha", "mean"}:
             raise ValueError("leaf_value_mode must be 'alpha' or 'mean'.")
@@ -405,24 +359,16 @@ class Config(BaseModel):
             )
         if self.policy_target_mode not in {"search", "winner_action"}:
             raise ValueError("policy_target_mode must be 'search' or 'winner_action'.")
-        if self.wavefront_backend != "arena":
-            raise ValueError("wavefront_backend currently supports only 'arena'.")
-        if self.train_tree_nodes and self.search_policy != "posterior_tree_wavefront":
-            raise ValueError(
-                "train_tree_nodes currently supports only "
-                "search_policy='posterior_tree_wavefront'."
-            )
         if self.search_policy in {
             "dirichlet_thompson",
             "posterior_tree",
-            "posterior_tree_wavefront",
         }:
             if self.network != "boardlaw_dirichlet":
                 raise ValueError(
                     "posterior-tree Dirichlet search requires "
                     "network='boardlaw_dirichlet'."
                 )
-        if self.search_policy in {"posterior_tree", "posterior_tree_wavefront"}:
+        if self.search_policy == "posterior_tree":
             if self.num_outcomes not in (None, 3):
                 raise ValueError(
                     "posterior-tree Dirichlet search uses WDL3 targets; set "

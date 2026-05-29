@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 from typing import Any
 
 from flax import nnx
@@ -14,22 +13,13 @@ from .play_search import (
 from .posterior_tree import is_posterior_tree_policy
 
 
-def _without_tree_training(config):
-    if not getattr(config, "train_tree_nodes", False):
-        return config
-    if hasattr(config, "model_copy"):
-        return config.model_copy(update={"train_tree_nodes": False})
-    values = dict(vars(config))
-    values["train_tree_nodes"] = False
-    return SimpleNamespace(**values)
-
-
 def _with_eval_num_simulations(config, num_simulations: int | None):
-    config = _without_tree_training(config)
     if num_simulations is None or num_simulations == config.num_simulations:
         return config
     if hasattr(config, "model_copy"):
         return config.model_copy(update={"num_simulations": num_simulations})
+    from types import SimpleNamespace
+
     values = dict(vars(config))
     values["num_simulations"] = num_simulations
     return SimpleNamespace(**values)
@@ -66,7 +56,6 @@ def _posterior_tree_eval_action(
     env_state,
     leaf_evaluator,
     rng_key: jax.Array,
-    use_wavefront_arena: bool,
 ) -> jax.Array:
     return _run_posterior_tree_search_step(
         env=env,
@@ -74,15 +63,12 @@ def _posterior_tree_eval_action(
         env_state=env_state,
         leaf_evaluator=leaf_evaluator,
         search_key=rng_key,
-        action_key=rng_key,
-        use_wavefront_arena=use_wavefront_arena,
         device_put_cpu=lambda value: value,
-        action_source="search_action",
     ).played_action
 
 
 def make_mcts_evaluate(env, config, baseline_model):
-    search_config = _without_tree_training(config)
+    search_config = config
     eval_batch_size = int(
         getattr(config, "eval_batch_size", config.selfplay_batch_size)
     )
@@ -113,10 +99,6 @@ def make_mcts_evaluate(env, config, baseline_model):
                 env_state=env_state,
                 leaf_evaluator=leaf_evaluator,
                 rng_key=rng_key,
-                use_wavefront_arena=(
-                    getattr(search_config, "search_policy", "gumbel")
-                    == "posterior_tree_wavefront"
-                ),
             )
 
         def evaluate(rng_key: jax.Array, model: Any):

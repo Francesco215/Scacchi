@@ -21,7 +21,7 @@ from .dirichlet_tree.types import TreeTrainingData
 
 
 NO_CHILD = -1
-POSTERIOR_TREE_POLICIES = {"posterior_tree", "posterior_tree_wavefront"}
+POSTERIOR_TREE_POLICIES = {"posterior_tree"}
 
 
 class EvalRequest(NamedTuple):
@@ -919,17 +919,6 @@ def run_posterior_tree_search(
     rng_key: jax.Array,
     config: Any,
 ) -> PosteriorTreeBatchOutput:
-    if getattr(config, "search_policy", "posterior_tree") == "posterior_tree_wavefront":
-        from .dirichlet_tree.search import run_wavefront_posterior_tree_search
-
-        return run_wavefront_posterior_tree_search(
-            env=env,
-            root_states=root_states,
-            leaf_evaluator=leaf_evaluator,
-            rng_key=rng_key,
-            config=config,
-        )
-
     if not root_states:
         raise ValueError("root_states must not be empty")
 
@@ -1031,17 +1020,6 @@ def run_posterior_tree_search_state_batch(
     rng_key: jax.Array,
     config: Any,
 ) -> PosteriorTreeBatchOutput:
-    if getattr(config, "search_policy", "posterior_tree") == "posterior_tree_wavefront":
-        from .dirichlet_tree.search import run_wavefront_posterior_tree_search_state_batch
-
-        return run_wavefront_posterior_tree_search_state_batch(
-            env=env,
-            root_state_batch=root_state_batch,
-            leaf_evaluator=leaf_evaluator,
-            rng_key=rng_key,
-            config=config,
-        )
-
     return run_posterior_tree_search(
         env=env,
         root_states=split_batched_state(root_state_batch),

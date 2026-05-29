@@ -5,7 +5,7 @@
 # Boardlaw-Dirichlet heads to 2 outcomes. Keep this explicit under current code.
 # Original flat W&B keys c_leaf and c_terminal are mapped to the current
 # kappa_leaf and kappa_terminal schema names. This is dirichlet_thompson,
-# not strict posterior_tree_wavefront.
+# not the removed Python wavefront backend.
 
 run:
   seed: 0
