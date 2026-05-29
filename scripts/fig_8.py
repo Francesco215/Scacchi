@@ -1,9 +1,11 @@
 """Reproduce the Fig. 8 test-time search sweep for the 8x8 Hex checkpoints.
 
+
 Jones (2021) Fig. 8 varies the evaluation-time tree size for fixed agents.
 This version keeps the 8x8 Boardlaw-Dirichlet architecture fixed and uses the
 saved training checkpoints as the curves. Elo is reported relative to the
-latest ``checkpoints/8_solved`` model, which is anchored at Elo 0.
+latest ``checkpoints/8_solved`` model, which is anchored at Elo 0 and always
+uses a fixed 512-simulation test-time search.
 """
 
 from __future__ import annotations
@@ -172,7 +174,12 @@ def _normalize_action_weights(
     return jnp.where(total > 0, weights / jnp.maximum(total, 1e-8), fallback)
 
 
-def make_stochastic_mcts_evaluate(env: Any, config: Config, target_model: nnx.Module):
+def make_stochastic_mcts_evaluate(
+    env: Any,
+    config: Config,
+    target_config: Config,
+    target_model: nnx.Module,
+):
     """Evaluate ``model`` against ``target_model`` with sampled final actions.
 
     The search implementation is reused from ``scacchi.evaluations``. We ignore
@@ -206,11 +213,11 @@ def make_stochastic_mcts_evaluate(env: Any, config: Config, target_model: nnx.Mo
             )
             target_policy = _make_model_mcts_policy(
                 env,
-                config,
+                target_config,
                 target_model,
                 target_search_key,
                 env_state,
-                config.num_simulations,
+                target_config.num_simulations,
             )
 
             my_weights = _normalize_action_weights(
@@ -260,24 +267,43 @@ def score_to_elo(score: float, *, eps: float = 1e-3) -> float:
     return 400.0 * math.log10(clipped / (1.0 - clipped))
 
 
-def _result_key(row: dict[str, Any]) -> tuple[int, int, int]:
+def _result_key(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
     return (
         int(row["checkpoint_step"]),
         int(row["tree_size"]),
         int(row["num_search_blocks"]),
+        int(row["target_tree_size"]),
+        int(row["target_num_search_blocks"]),
     )
 
 
-def _load_existing_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
+def _load_existing_results(
+    path: Path,
+    *,
+    target_tree_size: int,
+    target_num_search_blocks: int,
+) -> dict[tuple[int, int, int, int, int], dict[str, Any]]:
     if not path.exists():
         return {}
-    results: dict[tuple[int, int, int], dict[str, Any]] = {}
+    results: dict[tuple[int, int, int, int, int], dict[str, Any]] = {}
+    incompatible = 0
     with path.open() as f:
         for line in f:
             if not line.strip():
                 continue
             row = json.loads(line)
+            if (
+                int(row.get("target_tree_size", -1)) != target_tree_size
+                or int(row.get("target_num_search_blocks", -1)) != target_num_search_blocks
+            ):
+                incompatible += 1
+                continue
             results[_result_key(row)] = row
+    if incompatible:
+        raise ValueError(
+            f"{path} contains {incompatible} rows from a different target-search "
+            "configuration; rerun with --overwrite or choose a new --out-dir"
+        )
     return results
 
 
@@ -333,8 +359,17 @@ def _plot_curves(rows: list[dict[str, Any]], out_path: Path) -> None:
     ax.set_xticks(sorted({int(row["tree_size"]) for row in rows}))
     ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
     ax.set_xlabel("Test-time tree size (search simulations)")
+    target_tree_sizes = sorted({int(row["target_tree_size"]) for row in rows})
+    target_label = (
+        str(target_tree_sizes[0])
+        if len(target_tree_sizes) == 1
+        else ",".join(str(v) for v in target_tree_sizes)
+    )
     ax.set_ylabel("Elo vs. checkpoints/8_solved (target = 0)")
-    ax.set_title("Fig. 8 reproduction: checkpoint curves, stochastic search actions")
+    ax.set_title(
+        "Fig. 8 reproduction: checkpoint curves, "
+        f"target search fixed at {target_label}"
+    )
     ax.grid(True, which="both", alpha=0.22)
     ax.margins(x=0.08, y=0.08)
 
@@ -378,6 +413,12 @@ def _plot_curves(rows: list[dict[str, Any]], out_path: Path) -> None:
 def _plot_heatmap(rows: list[dict[str, Any]], out_path: Path) -> None:
     steps = sorted({int(row["checkpoint_step"]) for row in rows})
     tree_sizes = sorted({int(row["tree_size"]) for row in rows})
+    target_tree_sizes = sorted({int(row["target_tree_size"]) for row in rows})
+    target_label = (
+        str(target_tree_sizes[0])
+        if len(target_tree_sizes) == 1
+        else ",".join(str(v) for v in target_tree_sizes)
+    )
     lookup = {
         (int(row["checkpoint_step"]), int(row["tree_size"])): float(row["elo_vs_target"])
         for row in rows
@@ -395,7 +436,7 @@ def _plot_heatmap(rows: list[dict[str, Any]], out_path: Path) -> None:
     ax.set_yticklabels([str(v) for v in steps])
     ax.set_xlabel("Test-time tree size")
     ax.set_ylabel("Checkpoint step")
-    ax.set_title("Elo vs. checkpoints/8_solved")
+    ax.set_title(f"Elo vs. checkpoints/8_solved, target search fixed at {target_label}")
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("Elo")
     fig.tight_layout()
@@ -409,6 +450,8 @@ def _summarize_returns(
     checkpoint: LoadedCheckpoint,
     tree_size: int,
     num_search_blocks: int,
+    target_tree_size: int,
+    target_num_search_blocks: int,
     seed: int,
 ) -> dict[str, Any]:
     avg_return = float(np.mean(returns))
@@ -422,6 +465,8 @@ def _summarize_returns(
         "checkpoint_hours": checkpoint.hours,
         "tree_size": int(tree_size),
         "num_search_blocks": int(num_search_blocks),
+        "target_tree_size": int(target_tree_size),
+        "target_num_search_blocks": int(target_num_search_blocks),
         "eval_games": int(returns.size),
         "seed": int(seed),
         "avg_return": avg_return,
@@ -450,7 +495,11 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     csv_path = out_dir / "fig_8_results.csv"
     if args.overwrite and results_path.exists():
         results_path.unlink()
-    results = _load_existing_results(results_path)
+    results = _load_existing_results(
+        results_path,
+        target_tree_size=args.target_tree_size,
+        target_num_search_blocks=args.target_num_search_blocks,
+    )
 
     base_config = _load_config_at_step(checkpoint_dir, steps[0])
     env = make_env(base_config.env_id, base_config.board_size)
@@ -461,7 +510,14 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         for step in steps
         if any(
             args.overwrite
-            or (step, tree_size, args.num_search_blocks) not in results
+            or (
+                step,
+                tree_size,
+                args.num_search_blocks,
+                args.target_tree_size,
+                args.target_num_search_blocks,
+            )
+            not in results
             for tree_size in args.tree_sizes
         )
     ]
@@ -477,9 +533,26 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             tree_size=tree_size,
             num_search_blocks=args.num_search_blocks,
         )
-        evaluate = make_stochastic_mcts_evaluate(env, eval_config, target_model)
+        target_eval_config = _with_eval_settings(
+            base_config,
+            eval_batch_size=args.eval_games,
+            tree_size=args.target_tree_size,
+            num_search_blocks=args.target_num_search_blocks,
+        )
+        evaluate = make_stochastic_mcts_evaluate(
+            env,
+            eval_config,
+            target_eval_config,
+            target_model,
+        )
         for step in tqdm(steps, desc=f"tree {tree_size}", leave=False):
-            key = (step, tree_size, args.num_search_blocks)
+            key = (
+                step,
+                tree_size,
+                args.num_search_blocks,
+                args.target_tree_size,
+                args.target_num_search_blocks,
+            )
             if key in results and not args.overwrite:
                 continue
             checkpoint = checkpoints[step]
@@ -492,6 +565,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 checkpoint=checkpoint,
                 tree_size=tree_size,
                 num_search_blocks=args.num_search_blocks,
+                target_tree_size=args.target_tree_size,
+                target_num_search_blocks=args.target_num_search_blocks,
                 seed=eval_seed,
             )
             row["target"] = str(target_dir)
@@ -508,6 +583,8 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "checkpoint_dir": str(checkpoint_dir),
                 "target_dir": str(target_dir),
                 "target_elo": 0,
+                "target_tree_size": args.target_tree_size,
+                "target_num_search_blocks": args.target_num_search_blocks,
                 "tree_sizes": list(args.tree_sizes),
                 "num_search_blocks": args.num_search_blocks,
                 "eval_games": args.eval_games,
@@ -535,6 +612,18 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Use 1 so the plotted tree size equals num_simulations.",
     )
+    parser.add_argument(
+        "--target-tree-size",
+        type=int,
+        default=512,
+        help="Fixed test-time tree size for the target model.",
+    )
+    parser.add_argument(
+        "--target-num-search-blocks",
+        type=int,
+        default=1,
+        help="Use 1 so the target tree size equals target num_simulations.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -542,6 +631,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--eval-games must be positive")
     if args.num_search_blocks <= 0:
         parser.error("--num-search-blocks must be positive")
+    if args.target_tree_size <= 0:
+        parser.error("--target-tree-size must be positive")
+    if args.target_num_search_blocks <= 0:
+        parser.error("--target-num-search-blocks must be positive")
     return args
 
 

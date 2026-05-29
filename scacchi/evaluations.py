@@ -24,16 +24,38 @@ def _without_tree_training(config):
     return SimpleNamespace(**values)
 
 
-def _model_eval_action(env, config, model, rng_key, env_state):
+def _with_eval_num_simulations(config, num_simulations: int | None):
+    config = _without_tree_training(config)
+    if num_simulations is None or num_simulations == config.num_simulations:
+        return config
+    if hasattr(config, "model_copy"):
+        return config.model_copy(update={"num_simulations": num_simulations})
+    values = dict(vars(config))
+    values["num_simulations"] = num_simulations
+    return SimpleNamespace(**values)
+
+
+def _make_model_mcts_policy(env, config, model, rng_key, env_state, num_simulations=None):
+    search_config = _with_eval_num_simulations(config, num_simulations)
     predict = lambda obs: model(obs, train=False)
     model_output = predict(env_state.observation)
     return _run_model_eval_search(
         env_state=env_state,
         model_output=model_output,
         scalar_recurrent_fn=make_recurrent_fn(env, predict),
-        dirichlet_recurrent_fn=make_dirichlet_recurrent_fn(env, predict, config),
+        dirichlet_recurrent_fn=make_dirichlet_recurrent_fn(env, predict, search_config),
         rng_key=rng_key,
-        config=config,
+        config=search_config,
+    )
+
+
+def _model_eval_action(env, config, model, rng_key, env_state):
+    return _make_model_mcts_policy(
+        env,
+        config,
+        model,
+        rng_key,
+        env_state,
     ).played_action
 
 
