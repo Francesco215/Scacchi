@@ -1,6 +1,6 @@
 Read it. Here is the rewritten spec.
 
-I kept the core boundary from the older spec: Rust owns the mutable search forest, while Python only sends and receives batched tensors. I also kept the posterior-best policy target semantics from the math reference: the policy target is the Monte Carlo estimate of the probability that each legal action is optimal under Dirichlet WDL samples, and the committed move mode is separate from the target used for training.  
+I kept the core boundary from the older spec: Rust owns the mutable search forest, while Python only sends and receives opaque state batches and tensors. I also kept the posterior-best policy target semantics from the math reference: the policy target is the Monte Carlo estimate of the probability that each legal action is optimal under Dirichlet WDL samples, and the committed move mode is separate from the target used for training.
 
 ---
 
@@ -14,26 +14,28 @@ The MVP is intentionally simpler than the older Rust-side tree-search spec:
 
 ```text
 Rust owns the full mutable search forest.
-Python owns neural network evaluation.
+Python owns PGX/environment stepping and neural network evaluation.
 Python never manipulates tree nodes, paths, locks, or edge data.
-Python only exchanges batched tensors with Rust.
+Python only exchanges opaque state batches and batched tensors with Rust.
 ```
 
 The backend searches a batch of trees. Each individual tree search is single-threaded. This removes the need for duplicate-request suppression, in-tree race handling, virtual loss, in-flight posterior mass, dirty concurrent repair, atomic edge snapshots, and similar complexity.
 
-The MVP must natively support three node kinds:
+The MVP must natively support two node kinds:
 
 ```text
 Decision node:
   A player-to-move node with legal actions and neural policy/value/Q outputs.
 
-Categorical node:
-  A stochastic/environment/chance node with explicit categorical outcomes and probabilities.
-  It is not a policy node and is not trained as a policy/Q row.
-
 Terminal node:
-  A completed game state with a positive terminal WDL Dirichlet alpha supplied by the game adapter.
+  A completed game state with a positive terminal WDL Dirichlet alpha supplied
+  by Python when it submits a fused transition/evaluation result.
 ```
+
+Categorical/chance nodes are explicitly out of scope for the Scacchi MVP.
+If a future stochastic environment needs them, Python must still own all
+environment stepping and submit explicit outcome data; Rust should not grow a
+game adapter.
 
 The design must also be future-proof for subtree reuse. When an actual game move is played by the player or opponent, Rust should be able to prune the current tree to the already-created child subtree rather than rebuilding from scratch.
 
@@ -76,13 +78,14 @@ posterior_best_samples
 kappa_n
 seed
 debug
-root eval requests through the normal request API
-token-based submit_evaluations
+token-based fused transition/evaluation submission
 posterior-best policy target
 Dirichlet WDL edge posteriors
 Q fallback before child expansion
 child value / child cache after child expansion
 clean interior-node training export
+opaque state handles
+padded transition batches
 ```
 
 The old concurrent design required request records, in-flight state, duplicate suppression, and atomics because many workers could touch the same tree concurrently. In this MVP, every tree is mutated by only one Rust control path at a time, so duplicate requests and intra-tree races are structurally impossible.
@@ -151,36 +154,60 @@ Forest
   Tree B-1
 ```
 
-Each tree is searched independently. `request_evaluations(max_batch_size)` walks across trees, advances each eligible tree single-threadedly, and returns a batch of neural leaf requests to Python.
+Each tree is searched independently. Rust performs posterior traversal and
+selects state-action transitions to evaluate. Python then executes one padded,
+fused batch:
+
+```text
+child_states = env.step(parent_states, actions)
+policy_logits, value_alpha, q_alpha = model(child_states.observation)
+```
+
+and submits both the child-state metadata and neural outputs back to Rust.
 
 The Python loop should look like:
 
 ```python
-tree_ids = engine.add_roots(root_states)
+root_eval = model_apply(root_states.observation)
+tree_ids = engine.add_roots(
+    root_states=root_states,
+    observations=root_states.observation,
+    legal_masks=root_states.legal_action_mask,
+    current_players=root_states.current_player,
+    policy_logits=root_eval.policy_logits,
+    value_alpha=root_eval.value_alpha,
+    q_alpha=root_eval.q_alpha,
+)
 
 while not engine.is_done(tree_ids):
-    batch = engine.request_evaluations(max_batch_size=256)
+    batch = engine.request_transitions(max_batch_size=256, pad_to=256)
 
     if batch.size == 0:
         continue
 
-    policy_logits, value_alpha, q_alpha = model_apply(
-        batch.observations,
-        batch.legal_masks,
-    )
+    child_states = env_step(batch.parent_states, batch.actions)
+    child_eval = model_apply(child_states.observation)
 
-    engine.submit_evaluations(
+    engine.submit_transitions(
         batch.token,
-        policy_logits,
-        value_alpha,
-        q_alpha,
+        child_states=child_states,
+        observations=child_states.observation,
+        legal_masks=child_states.legal_action_mask,
+        current_players=child_states.current_player,
+        terminated=child_states.terminated,
+        terminal_alpha=terminal_alpha_from_rewards(child_states),
+        policy_logits=child_eval.policy_logits,
+        value_alpha=child_eval.value_alpha,
+        q_alpha=child_eval.q_alpha,
     )
 
 results = engine.finish(tree_ids, commit="posterior_sample")
 targets = engine.export_targets(tree_ids)
 ```
 
-No Python callback is allowed inside traversal, backup, repair, target construction, pruning, or export.
+No Python callback is allowed inside traversal, backup, repair, target
+construction, pruning, or export. Python is called only by the outer driver when
+Rust returns a `TransitionBatch`.
 
 ---
 
@@ -207,7 +234,8 @@ action_size:
   Number of discrete decision actions.
 
 observation_shape:
-  Shape of one decision-node observation returned to Python for neural evaluation.
+  Shape of one decision-node observation supplied by Python for root, leaf, and
+  target export rows.
 
 simulations_per_root:
   Target number of completed leaf evaluations under the current root.
@@ -221,102 +249,73 @@ kappa_n:
       gamma = N_down / (kappa_n + N_down)
 
 seed:
-  RNG seed for Thompson sampling, posterior-best sampling, categorical sampling, and
-  posterior_sample committed actions.
+  RNG seed for Thompson sampling, posterior-best sampling, and posterior_sample
+  committed actions.
 
 debug:
   Enables extra validation and debug arrays.
 ```
 
-Do not include terminal concentration or smoothing fields in the search config. Terminal WDL alpha is supplied by the game adapter and must already be strictly positive.
+Do not include terminal concentration or smoothing fields in the search config.
+Terminal WDL alpha is supplied by Python in transition submissions and must
+already be strictly positive for terminated rows.
 
 ---
 
-## 5. Game/environment boundary
+## 5. Environment and Evaluation Boundary
 
-Rust must be able to do all game operations without Python callbacks:
+Do not implement a Rust game adapter for Scacchi/PGX. Rust should not know how
+to step Hex, encode observations, enumerate legal actions, or compute terminal
+rewards. Python already has the PGX state and the model, so the only boundary
+crossing needed during search is a padded fused transition/evaluation batch.
 
-```text
-classify node kind
-legal actions
-step decision action
-enumerate categorical outcomes
-terminal WDL alpha
-observation encoding
-WDL perspective alignment
-```
-
-Define a Rust trait like:
-
-```rust
-pub trait Game: Send + Sync + 'static {
-    type State: Clone + Send + Sync + 'static;
-
-    fn action_size(&self) -> usize;
-
-    fn node_kind(&self, state: &Self::State) -> GameNodeKind<Self::State>;
-
-    fn legal_mask(&self, state: &Self::State, out: &mut [bool]);
-
-    fn step_action(
-        &self,
-        state: &Self::State,
-        action: usize,
-    ) -> GameTransition<Self::State>;
-
-    fn encode_observation(&self, state: &Self::State, out: &mut [f32]);
-
-    fn align_wdl(
-        &self,
-        from_state: &Self::State,
-        to_state: &Self::State,
-        alpha: [f32; 3],
-    ) -> [f32; 3];
-}
-```
-
-Supporting types:
-
-```rust
-pub enum GameNodeKind<S> {
-    Decision,
-    Categorical(Vec<CategoricalOutcome<S>>),
-    Terminal { alpha: [f32; 3] },
-}
-
-pub enum GameTransition<S> {
-    Decision(S),
-    Categorical(Vec<CategoricalOutcome<S>>),
-    Terminal { state: S, alpha: [f32; 3] },
-}
-
-pub struct CategoricalOutcome<S> {
-    pub outcome_id: u32,
-    pub probability: f32,
-    pub state: S,
-}
-```
-
-Rules:
+Rust owns:
 
 ```text
-1. Decision nodes have legal actions and neural network outputs.
-
-2. Categorical nodes have explicit outcomes with probabilities.
-   They do not have policy logits, Q alpha, legal action masks, or policy targets.
-
-3. Terminal nodes have a positive terminal Dirichlet alpha supplied by the game adapter.
-   The engine must validate alpha > 0 in debug mode.
-
-4. Categorical outcome probabilities must be nonnegative and sum to 1 within tolerance.
-
-5. For ordinary alternating-turn zero-sum games, align_wdl usually flips:
-      [L, D, W] -> [W, D, L]
-   when moving between players.
-   For chance nodes that do not change the player-to-move perspective, align_wdl may be identity.
+tree topology
+node/edge posterior state
+Thompson traversal
+backup and cache recomputation
+target export
+subtree reuse for children that already exist
 ```
 
-For deterministic two-player board games, most states are `Decision` or `Terminal`. `Categorical` is used for dice, card draws, stochastic environment transitions, simultaneous hidden resolutions, or other chance-like events.
+Python owns:
+
+```text
+PGX state objects
+env.step / auto-reset policy outside the search tree
+observation tensors
+legal action masks
+current-player metadata
+terminal detection and terminal WDL alpha construction
+neural network evaluation
+```
+
+A non-root leaf evaluation is therefore:
+
+```text
+Rust returns: parent_state, action, request metadata
+Python runs:   child_state = env.step(parent_state, action)
+Python runs:   logits, alpha_v, alpha_q = model(child_state.observation)
+Python submits:
+  child_state
+  child observation
+  child legal mask
+  child current player
+  terminated flag
+  terminal alpha for terminated rows
+  logits/value/q outputs for non-terminal rows
+```
+
+WDL perspective alignment is derived from submitted `current_player` metadata:
+if the child current player differs from the parent current player, Rust flips
+`[L, D, W] -> [W, D, L]`; otherwise it keeps the alpha unchanged.
+
+Categorical/chance nodes are not part of the Scacchi MVP. If stochastic
+environments are added later, Python should submit explicit chance outcomes and
+probabilities through a separate transition-result shape; Rust still should not
+contain a game adapter.
 
 ---
 
@@ -327,85 +326,128 @@ For deterministic two-player board games, most states are `Decision` or `Termina
 Expose:
 
 ```python
-tree_ids = engine.add_roots(root_states)
+tree_ids = engine.add_roots(
+    root_states,
+    observations,
+    legal_masks,
+    current_players,
+    policy_logits,
+    value_alpha,
+    q_alpha,
+    terminated=None,
+    terminal_alpha=None,
+)
 ```
 
-`root_states` is a batch of serialized states expected by the configured Rust game adapter.
+`root_states` is a Python-owned opaque batch of environment states. Rust stores
+opaque handles and returns them in later transition requests, but never inspects
+or mutates their contents.
 
-`add_roots` creates roots but does not run the neural network. If a root is a decision node, its first neural evaluation must be requested through `request_evaluations`.
+`add_roots` creates already-evaluated decision roots. Python is responsible for
+running the root model evaluation before calling `add_roots`, because the root
+does not require an environment transition.
 
-If a root is terminal, it is immediately known and cannot be finished into an action.
+For non-terminal rows:
 
-If a root is categorical, Rust may advance/evaluate its categorical outcome children, but `finish` is only valid once the current root is a decision node.
+```text
+observations:     [B, *observation_shape], float32
+legal_masks:      [B, action_size], bool
+current_players:  [B], int32
+policy_logits:    [B, action_size], float32
+value_alpha:      [B, 3], float32, strictly positive
+q_alpha:          [B, action_size, 3], float32, strictly positive
+```
+
+If `terminated` is provided and true for a row, `terminal_alpha[row]` must be
+strictly positive. Terminal roots are tracked as complete but cannot be finished
+into an action.
 
 ---
 
-### 6.2 Request evaluations
+### 6.2 Request transitions
 
 Expose:
 
 ```python
-batch = engine.request_evaluations(
+batch = engine.request_transitions(
     max_batch_size: int,
-) -> EvalBatch
+    pad_to: int | None = None,
+) -> TransitionBatch
 ```
 
 Returned object:
 
 ```python
 @dataclass
-class EvalBatch:
+class TransitionBatch:
     token: int
     size: int
-    observations: np.ndarray      # [size, *observation_shape], float32
-    legal_masks: np.ndarray       # [size, action_size], bool
+    padded_size: int
+
+    parent_states: object         # Python state batch, length padded_size
+    actions: np.ndarray           # [padded_size], int32
+    active_mask: np.ndarray       # [padded_size], bool
 
     # Debug only:
-    tree_ids: np.ndarray          # [size], uint64
-    node_ids: np.ndarray          # [size], uint32
-    request_ids: np.ndarray       # [size], uint64
-    tree_generations: np.ndarray  # [size], uint32
+    tree_ids: np.ndarray          # [padded_size], uint64
+    parent_node_ids: np.ndarray   # [padded_size], uint32
+    request_ids: np.ndarray       # [padded_size], uint64
+    tree_generations: np.ndarray  # [padded_size], uint32
 ```
 
 Rules:
 
 ```text
-1. Each returned row is one unevaluated decision node.
+1. Each active row is one selected decision transition `(parent_state, action)`.
 
-2. A tree may have at most one pending neural request in the MVP.
+2. A tree may have at most one pending transition request in the MVP.
 
-3. request_evaluations should iterate trees round-robin for fairness.
+3. request_transitions should iterate trees round-robin for fairness.
 
-4. request_evaluations may complete terminal simulations without returning rows.
+4. Traversal may complete terminal simulations without returning rows.
 
-5. request_evaluations returns when:
+5. If `pad_to` is provided, Rust pads `parent_states/actions` to exactly
+   `pad_to` rows by repeating any active row and sets `active_mask=False` for
+   padding rows. Python may run the fused `env.step + model` over the full
+   padded batch.
+
+6. request_transitions returns when:
    - max_batch_size requests are collected, or
    - no eligible tree can currently produce a request, or
    - all selected trees are done.
 
-6. The token is opaque and must be passed to submit_evaluations.
+7. The token is opaque and must be passed to submit_transitions.
 
-7. Python must not see paths, edge IDs, child IDs, or mutable tree objects.
+8. Python must not see paths, edge IDs, child IDs, or mutable tree objects.
 ```
 
-Because each tree is single-threaded and has at most one pending request, duplicate leaf requests are impossible in the MVP.
+Because each tree is single-threaded and has at most one pending request,
+duplicate leaf requests are impossible in the MVP.
 
 ---
 
-### 6.3 Submit evaluations
+### 6.3 Submit transitions
 
 Expose:
 
 ```python
-engine.submit_evaluations(
+engine.submit_transitions(
     token: int,
-    policy_logits: np.ndarray,    # [B, A], float32
-    value_alpha: np.ndarray,      # [B, 3], float32, strictly positive
-    q_alpha: np.ndarray,          # [B, A, 3], float32, strictly positive
+    child_states,                 # opaque Python state batch, [padded_size]
+    observations: np.ndarray,     # [padded_size, *obs_shape], float32
+    legal_masks: np.ndarray,      # [padded_size, A], bool
+    current_players: np.ndarray,  # [padded_size], int32
+    terminated: np.ndarray,       # [padded_size], bool
+    terminal_alpha: np.ndarray,   # [padded_size, 3], float32, positive for terminals
+    policy_logits: np.ndarray,    # [padded_size, A], float32
+    value_alpha: np.ndarray,      # [padded_size, 3], float32, positive for nonterminals
+    q_alpha: np.ndarray,          # [padded_size, A, 3], float32, positive for nonterminals
 )
 ```
 
-`B` must equal the `size` from the matching `EvalBatch`.
+Rows where `active_mask=False` in the matching `TransitionBatch` are ignored
+after shape validation. This lets Python always run one statically-shaped fused
+transition/evaluation call.
 
 On submit, Rust must:
 
@@ -415,14 +457,14 @@ On submit, Rust must:
 3. Remove token from request table so it cannot be submitted twice.
 4. Match outputs by row order.
 5. Ignore stale requests whose tree generation no longer matches.
-6. For root requests:
+6. For terminal child rows:
+   - create/store the terminal child state and terminal alpha;
+   - back up terminal_alpha along the stored path;
+   - count one completed simulation under the current root.
+7. For non-terminal child rows:
+   - create/store the child state, observation, legal mask, and current player;
    - store policy logits, value alpha, and Q alpha;
-   - mark decision node expanded;
-   - initialize C^V to value_alpha;
-   - do not count this as a completed simulation.
-7. For non-root leaf requests:
-   - store policy logits, value alpha, and Q alpha;
-   - mark decision node expanded;
+   - create a decision child with submitted model outputs;
    - initialize C^V to value_alpha;
    - back up value_alpha along the stored path;
    - count one completed simulation under the current root.
@@ -446,9 +488,8 @@ A tree is done when:
 
 ```text
 current root is a decision node
-root is expanded
 root_completed_count >= simulations_per_root
-tree has no pending neural request
+tree has no pending transition request
 ```
 
 Where:
@@ -459,9 +500,7 @@ root_completed_count = root.n_down
 
 for a clean current root.
 
-Root neural evaluation does not count as a completed simulation.
-
-If the root is categorical, the tree is not finishable into an action. It may still be searchable so that categorical outcome children can be evaluated or cached.
+Root model evaluation does not count as a completed simulation.
 
 If the root is terminal, it is complete but has no action to finish.
 
@@ -509,14 +548,13 @@ class SearchResults:
 Before finishing each tree, Rust must:
 
 ```text
-1. Require no pending neural request.
+1. Require no pending transition request.
 2. Require current root kind == Decision.
-3. Require root expanded.
-4. Require root_completed_count >= simulations_per_root,
+3. Require root_completed_count >= simulations_per_root,
    unless a future partial_finish mode is added.
-5. Compute EdgePosterior(root, a) for every legal action.
-6. Estimate pi_search using posterior_best_samples.
-7. Select committed action according to commit mode.
+4. Compute EdgePosterior(root, a) for every legal action.
+5. Estimate pi_search using posterior_best_samples.
+6. Select committed action according to commit mode.
 ```
 
 The policy head is trained toward `pi_search` regardless of which committed-action mode is used. The math reference separates the posterior-best target from the committed action mode. 
@@ -558,7 +596,7 @@ Export only decision nodes satisfying:
 
 ```text
 node kind == Decision
-node is expanded
+node has submitted model outputs
 state is non-terminal
 has_child_evidence == true
 state cache C^V is available
@@ -568,9 +606,8 @@ Exclude:
 
 ```text
 terminal nodes
-categorical nodes
-pending neural leaves
-newly expanded decision leaves with no child evidence
+pending transition leaves
+newly evaluated decision leaves with no child evidence
 nodes outside the current retained subtree
 padding rows
 ```
@@ -600,7 +637,7 @@ q_loss_weight[a] = 0
 q_target_alpha[a] = [1, 1, 1] or any other positive dummy alpha
 ```
 
-Categorical nodes do not produce policy or Q rows. If a decision action leads to a categorical child, the decision action’s Q target is the posterior of that action edge, which may summarize the categorical child’s clean `C^V`.
+Terminal nodes do not produce policy or Q rows.
 
 ---
 
@@ -637,11 +674,9 @@ Rules:
 
 2. The action must be legal at the current root.
 
-3. If the root already has a child for that action:
-     promote that child to be the new root.
+3. The root must already have a child for that action.
 
-4. If the root does not have a child for that action:
-     use Game::step_action to create the new root state.
+4. Promote that child to be the new root.
 
 5. Preserve all nodes, edge posteriors, network outputs, and caches in the promoted child subtree.
 
@@ -653,34 +688,10 @@ Rules:
 8. Recompute root depth and parent pointers as needed.
 ```
 
-If the resulting new root is a categorical node and the real environment immediately reveals the categorical outcome, expose:
-
-```python
-engine.advance_categorical_roots(
-    tree_ids: np.ndarray,          # [G], uint64
-    outcome_ids: np.ndarray,       # [G], uint32
-)
-```
-
-Rules:
-
-```text
-1. Current root must be a categorical node.
-
-2. outcome_id must match one of the root’s categorical outcomes.
-
-3. If the outcome child exists:
-     promote it to root.
-
-4. If the outcome child does not exist:
-     create it from the stored categorical outcome state.
-
-5. Preserve the selected outcome subtree.
-
-6. Drop or detach other outcome branches.
-
-7. Increment tree_generation.
-```
+If the real game advances along an action that was not searched and no child
+exists, Python must create a fresh root with `add_roots` after evaluating that
+state. Rust should not call back into the environment to synthesize missing
+children.
 
 After pruning, the new root may already have child evidence. The search budget for the new root should count reused evidence:
 
@@ -691,7 +702,10 @@ remaining = max(0, simulations_per_root - root_completed_count)
 
 This is the key reuse behavior: already visited nodes under the played move are not recalculated.
 
-For the MVP, either require no pending request before pruning, or cancel the pending request by incrementing `tree_generation` and clearing `tree.pending_request`. If the old GPU result later arrives, `submit_evaluations` must ignore it as stale.
+For the MVP, either require no pending request before pruning, or cancel the
+pending request by incrementing `tree_generation` and clearing
+`tree.pending_request`. If the old fused result later arrives,
+`submit_transitions` must ignore it as stale.
 
 ---
 
@@ -705,17 +719,15 @@ type NodeId = u32;
 type RequestId = u64;
 type BatchToken = u64;
 type Action = u16;
-type OutcomeId = u32;
 ```
 
 ### 7.1 Forest
 
 ```rust
-struct Forest<G: Game> {
+struct Forest {
     config: SearchConfig,
-    game: G,
 
-    trees: Vec<Tree<G::State>>,
+    trees: Vec<Tree>,
     free_tree_slots: Vec<usize>,
 
     next_tree_id: TreeId,
@@ -736,11 +748,11 @@ Future forest-level parallelism is allowed only if each worker owns disjoint tre
 ### 7.2 Tree
 
 ```rust
-struct Tree<S> {
+struct Tree {
     id: TreeId,
     generation: u32,
 
-    nodes: Vec<Node<S>>,
+    nodes: Vec<Node>,
     root: NodeId,
 
     pending_request: Option<RequestId>,
@@ -762,7 +774,7 @@ This allows subtree reuse after pruning.
 ### 7.3 Node
 
 ```rust
-struct Node<S> {
+struct Node {
     id: NodeId,
     generation: u32,
 
@@ -770,7 +782,10 @@ struct Node<S> {
     parent_link: Option<ParentLink>,
     depth: u32,
 
-    state: S,
+    state: PyObject,              // opaque Python/PGX state handle
+    observation: Vec<f32>,         // [*observation_shape]
+    legal_mask: Vec<bool>,         // [A]
+    current_player: i32,
     kind: NodeKind,
 
     c_v: Option<[f32; 3]>,
@@ -782,7 +797,6 @@ struct Node<S> {
 ```rust
 enum NodeKind {
     Decision(DecisionData),
-    Categorical(CategoricalData),
     Terminal(TerminalData),
 }
 ```
@@ -790,7 +804,6 @@ enum NodeKind {
 ```rust
 enum ParentLink {
     DecisionAction { action: Action },
-    CategoricalOutcome { outcome_id: OutcomeId },
 }
 ```
 
@@ -800,26 +813,17 @@ enum ParentLink {
 
 ```rust
 struct DecisionData {
-    eval_status: DecisionEvalStatus,
-
     policy_logits: Vec<f32>,       // [A]
     value_alpha: [f32; 3],
     q_alpha: Vec<[f32; 3]>,        // [A, 3]
 
-    legal_mask: Vec<bool>,         // [A]
     edges: Vec<DecisionEdge>,      // [A]
 }
 ```
 
-```rust
-enum DecisionEvalStatus {
-    Unexpanded,
-    PendingEval { request_id: RequestId },
-    Expanded,
-}
-```
-
-A decision node is the only node kind that can be sent to the neural network.
+A decision node always has submitted model outputs. Transition requests are
+pending on parent actions, not on unevaluated child nodes. The legal mask lives
+on `Node` because it is supplied by Python for both roots and child states.
 
 ---
 
@@ -847,7 +851,7 @@ b:
   Full WDL Dirichlet posterior snapshot for this state-action edge.
 
 r_count:
-  Number of completed leaf/categorical-child summaries that have contributed to this edge.
+  Number of completed child summaries that have contributed to this edge.
 
 child_cache_version:
   Version of child C^V that was last used to refresh this edge.
@@ -857,40 +861,11 @@ child_cache_version:
 
 ---
 
-### 7.6 CategoricalData
-
-```rust
-struct CategoricalData {
-    outcomes: Vec<CategoricalEdge>,
-    complete: bool,
-}
-```
-
-```rust
-struct CategoricalEdge {
-    outcome_id: OutcomeId,
-    probability: f32,
-    child: NodeId,
-
-    completed: bool,
-    b: [f32; 3],
-    r_count: u32,
-
-    child_cache_version: Option<u32>,
-}
-```
-
-Categorical nodes are native. They do not use policy logits, legal masks, or Q alpha.
-
-For the MVP, categorical outcome sets should be small enough to enumerate. Later versions may add sampled categorical approximation for large chance spaces.
-
----
-
-### 7.7 TerminalData
+### 7.6 TerminalData
 
 ```rust
 struct TerminalData {
-    alpha: [f32; 3],
+    alpha: [f32; 3],               // supplied by Python transition submission
 }
 ```
 
@@ -900,7 +875,7 @@ No `terminal_epsilon` or `terminal_kappa` exists in the engine config.
 
 ---
 
-### 7.8 RequestRecord
+### 7.7 RequestRecord
 
 ```rust
 struct RequestRecord {
@@ -912,8 +887,6 @@ struct RequestRecord {
     node_generation: u32,
 
     path: Vec<PathStep>,
-
-    is_root_request: bool,
 }
 ```
 
@@ -922,10 +895,6 @@ enum PathStep {
     DecisionAction {
         node_id: NodeId,
         action: Action,
-    },
-    CategoricalOutcome {
-        node_id: NodeId,
-        outcome_id: OutcomeId,
     },
 }
 ```
@@ -936,7 +905,8 @@ A batch token maps to:
 Vec<RequestRecord>
 ```
 
-For the MVP, each tree has at most one pending request. The request table still exists because Python submits batched results by token.
+For the MVP, each tree has at most one pending transition request. The request
+table still exists because Python submits padded batched results by token.
 
 ---
 
@@ -950,7 +920,7 @@ For a decision node `v` and action `a`:
 DecisionEdgeBase(v, a):
   if edge(v,a) has child u and u is summarizable:
       return align_wdl(from_state=s_u, to_state=s_v, alpha=C^V_u)
-  else if edge(v,a) has expanded decision child u:
+  else if edge(v,a) has decision child u:
       return align_wdl(from_state=s_u, to_state=s_v, alpha=value_alpha[u])
   else:
       return q_alpha[v,a]
@@ -962,14 +932,11 @@ A child is summarizable when:
 Terminal:
   always summarizable using terminal alpha.
 
-Categorical:
-  summarizable when its categorical cache C^V is complete.
-
 Decision:
   summarizable when it has child evidence and clean C^V.
 ```
 
-A newly expanded decision leaf with no child evidence is not summarizable. Its value alpha is used by the direct leaf backup, but it should not automatically overwrite the parent edge through child-cache refresh.
+A newly evaluated decision leaf with no child evidence is not summarizable. Its value alpha is used by the direct leaf backup, but it should not automatically overwrite the parent edge through child-cache refresh.
 
 ---
 
@@ -985,27 +952,9 @@ DecisionEdgePosterior(v, a):
 
 ---
 
-### 8.3 Categorical EdgePosterior
+### 8.3 Decision ThompsonSelect
 
-For a categorical node `c` and outcome `i`:
-
-```text
-CategoricalEdgePosterior(c, i):
-  if edge(c,i).completed:
-      return edge(c,i).b
-  else if child u is summarizable:
-      return align_wdl(from_state=s_u, to_state=s_c, alpha=C^V_u)
-  else:
-      unavailable
-```
-
-A categorical node is complete only when every nonzero-probability outcome has an available posterior.
-
----
-
-### 8.4 Decision ThompsonSelect
-
-For an expanded decision node:
+For a decision node:
 
 ```text
 ThompsonSelect(v):
@@ -1020,33 +969,7 @@ No virtual loss or in-flight masking is required, because a tree has at most one
 
 ---
 
-### 8.5 Categorical outcome selection
-
-Categorical nodes are not selected by Thompson sampling.
-
-For the MVP:
-
-```text
-CategoricalSelect(c):
-  if any nonzero-probability outcome edge lacks an available posterior:
-      choose one missing outcome to complete
-      preferred order: descending probability, then stable outcome_id
-  else:
-      sample outcome according to categorical probabilities
-```
-
-This has two desirable properties:
-
-```text
-1. Small categorical nodes become exactly summarizable because all outcomes are eventually evaluated.
-2. After all outcomes are known, additional simulations follow the environment probabilities.
-```
-
-Later versions may add sampled categorical approximations for large outcome spaces.
-
----
-
-### 8.6 PosteriorBestPolicyTarget
+### 8.4 PosteriorBestPolicyTarget
 
 For a decision node:
 
@@ -1067,15 +990,13 @@ PosteriorBestPolicyTarget(v):
   pi[a] = 0 for illegal actions
 ```
 
-Categorical nodes do not have posterior-best policy targets.
-
 ---
 
 ## 9. State-posterior cache semantics
 
 ### 9.1 Decision node cache
 
-For an expanded decision node with child evidence:
+For a decision node with child evidence:
 
 ```text
 pi = PosteriorBestPolicyTarget(v)
@@ -1095,7 +1016,7 @@ C^V_v =
   (1 - gamma) * value_alpha[v] + gamma * E_v
 ```
 
-If an expanded decision node has no child evidence:
+If a decision node has no child evidence:
 
 ```text
 C^V_v = value_alpha[v]
@@ -1106,34 +1027,7 @@ Such a node is not exported as a training target row because it has no child evi
 
 ---
 
-### 9.2 Categorical node cache
-
-For a complete categorical node:
-
-```text
-C^V_c =
-  sum over outcomes i:
-      probability[i] * CategoricalEdgePosterior(c, i)
-
-N_down =
-  sum over outcomes i:
-      edge(c,i).r_count
-```
-
-No posterior-best target is computed.
-
-No `kappa_n` blend is applied at categorical nodes. A categorical node is an environment expectation, not a policy-improvement node.
-
-If any nonzero-probability outcome lacks an available posterior:
-
-```text
-C^V_c = None
-complete = false
-```
-
----
-
-### 9.3 Terminal node cache
+### 9.2 Terminal node cache
 
 For a terminal node:
 
@@ -1151,13 +1045,13 @@ Terminal nodes are not exported.
 Implement internal:
 
 ```rust
-fn next_request(tree: &mut Tree, game: &G, config: &SearchConfig)
+fn next_transition_request(tree: &mut Tree, config: &SearchConfig)
     -> NextRequestResult;
 ```
 
 ```rust
 enum NextRequestResult {
-    NeuralRequest(RequestRecord),
+    TransitionRequest(RequestRecord),
     CompletedOneSimulation,
     BlockedByPendingRequest,
     TreeDone,
@@ -1168,7 +1062,7 @@ enum NextRequestResult {
 Core traversal:
 
 ```text
-next_request(tree):
+next_transition_request(tree):
   if tree has pending_request:
       return BlockedByPendingRequest
 
@@ -1186,43 +1080,29 @@ next_request(tree):
         backup(path, beta)
         return CompletedOneSimulation
 
-      Categorical:
-        outcome = CategoricalSelect(v)
-        path.push((v, outcome_id))
-        v = outcome child
-        continue
-
       Decision:
-        if decision eval_status == Unexpanded:
-            create request for v with current path
-            mark v PendingEval
-            tree.pending_request = request_id
-            return NeuralRequest(record)
-
-        if decision eval_status == PendingEval:
+        if decision has pending transition:
             return BlockedByPendingRequest
 
-        if decision eval_status == Expanded:
-            action = ThompsonSelect(v)
-            child = get_or_create_decision_action_child(v, action)
+        action = ThompsonSelect(v)
+
+        if edge(v, action).child exists:
+            child = edge child
             path.push((v, action))
             v = child
             continue
+
+        create transition request for parent state[v] and action
+        mark tree pending_request = request_id
+        return TransitionRequest(record)
 ```
 
-For root decision evaluation:
+For transition requests:
 
 ```text
-path is empty
-is_root_request = true
-submit_evaluations initializes the root but does not count a simulation
-```
-
-For non-root decision evaluation:
-
-```text
-path is non-empty
-submit_evaluations backs up value_alpha along path
+path is non-empty and ends with the requested parent/action
+submit_transitions creates the child from Python's fused result
+submit_transitions backs up terminal_alpha or value_alpha along path
 counts one completed simulation
 ```
 
@@ -1233,39 +1113,15 @@ counts one completed simulation
 ### 11.1 Decision action child
 
 ```text
-get_or_create_decision_action_child(v, a):
-  if edge(v,a).child exists:
-      return child
-
-  transition = game.step_action(state[v], a)
-
-  child = create_node_from_transition(transition)
+create_decision_action_child(v, a, submitted_child):
+  child = create_node_from_submitted_transition(submitted_child)
   edge(v,a).child = child
   return child
 ```
 
 No CAS is needed in the MVP because one tree is not concurrently modified.
-
----
-
-### 11.2 Categorical outcome children
-
-When creating a categorical node, create all outcome edges immediately:
-
-```text
-create_categorical_node(outcomes):
-  for each outcome:
-      child = create_node_from_state_or_terminal(outcome.state)
-      edge = CategoricalEdge {
-          outcome_id,
-          probability,
-          child,
-          completed=false,
-          r_count=0,
-      }
-```
-
-This makes categorical nodes explicit and pruneable by `outcome_id`.
+Rust never calls `env.step`; child creation happens only when Python submits a
+transition result for a previously issued request.
 
 ---
 
@@ -1330,36 +1186,23 @@ Behavior:
 ```text
 1. After a backup publishes an edge, recompute the parent node cache immediately.
 
-2. If the parent is a categorical node:
-     - if all outcome posteriors are available, compute C^V as probability-weighted mixture;
-     - otherwise leave C^V unavailable.
+2. If the parent is a decision node:
+     - if it has child evidence, compute posterior-best policy target and C^V;
+     - if it has no child evidence, C^V = value_alpha.
 
-3. If the parent is a decision node:
-     - if expanded and has child evidence, compute posterior-best policy target and C^V;
-     - if expanded and has no child evidence, C^V = value_alpha;
-     - if unexpanded or pending, C^V unavailable except for direct leaf backup use.
+3. Increment cache_version whenever C^V changes.
 
-4. Increment cache_version whenever C^V changes.
-
-5. Continue upward only when the recomputed node is summarizable.
+4. Continue upward only when the recomputed node is summarizable.
 ```
 
 A decision node is summarizable by its parent only if:
 
 ```text
-expanded == true
 has_child_evidence == true
 C^V is available
 ```
 
-This avoids overwriting a parent edge from a newly expanded neural leaf with no child evidence.
-
-A categorical node is summarizable by its parent when:
-
-```text
-complete == true
-C^V is available
-```
+This avoids overwriting a parent edge from a newly evaluated neural leaf with no child evidence.
 
 A terminal node is always summarizable.
 
@@ -1373,7 +1216,6 @@ For each selected tree:
 finish(tree):
   require no pending request
   require root kind == Decision
-  require root expanded
   require root_completed_count >= simulations_per_root
 
   root_alpha[a] = DecisionEdgePosterior(root, a) for legal actions
@@ -1385,7 +1227,7 @@ finish(tree):
   pi_search = PosteriorBestPolicyTarget(root)
 
   if commit == posterior_sample:
-      action ~ Categorical(pi_search)
+      action is sampled from pi_search
 
   if commit == posterior_argmax:
       action = argmax pi_search
@@ -1412,7 +1254,6 @@ Export only decision nodes that satisfy:
 
 ```text
 kind == Decision
-eval_status == Expanded
 has_child_evidence == true
 C^V is available
 node is still in retained current-root subtree
@@ -1421,18 +1262,15 @@ node is still in retained current-root subtree
 Do not export:
 
 ```text
-categorical nodes
 terminal nodes
-unexpanded decision nodes
-pending decision nodes
-expanded decision leaves with no child evidence
+decision leaves with no child evidence
 detached/pruned-away nodes
 ```
 
 For each exported decision node:
 
 ```text
-observation = game.encode_observation(node.state)
+observation = node.observation
 
 legal_mask = node.legal_mask
 
@@ -1449,10 +1287,6 @@ v_target_alpha =
   node.C^V
 ```
 
-Categorical evidence influences exported decision targets only through decision edges that lead into categorical subtrees.
-
----
-
 ## 16. Root pruning and reuse
 
 ### 16.1 Advance by decision action
@@ -1465,10 +1299,8 @@ advance_roots(tree_ids, actions):
       require root kind == Decision
       require action legal
 
-      if root edge(action) has child:
-          new_root = child
-      else:
-          new_root = create child from game.step_action(root.state, action)
+      require root edge(action) has child
+      new_root = root edge(action).child
 
       detach old parent/siblings
       set tree.root = new_root
@@ -1481,44 +1313,18 @@ advance_roots(tree_ids, actions):
 After pruning:
 
 ```text
-If new_root was already expanded:
-  reuse its policy logits, value alpha, Q alpha, edges, categorical children, and caches.
+If new_root is a decision node:
+  reuse its policy logits, value alpha, Q alpha, edges, and caches.
 
-If new_root was unexpanded:
-  next request_evaluations will request its neural evaluation if it is a decision node.
-
-If new_root is categorical:
-  request_evaluations may evaluate its outcome subtrees, or the caller may provide an observed
-  outcome via advance_categorical_roots.
+If the chosen action was not searched and no child exists:
+  Python must advance the environment externally, evaluate the resulting state,
+  and create a fresh root with add_roots. Rust must not synthesize the child.
 
 If new_root is terminal:
   no further action is available.
 ```
 
-### 16.2 Advance by categorical outcome
-
-```text
-advance_categorical_roots(tree_ids, outcome_ids):
-  for each tree:
-      root = current root
-
-      require root kind == Categorical
-      find outcome edge by outcome_id
-
-      if outcome child exists:
-          new_root = child
-      else:
-          create child from stored outcome state
-
-      detach old categorical siblings
-      set tree.root = new_root
-      set new_root.parent = None
-      set new_root.depth = 0
-      increment tree.generation
-      clear/cancel pending request if any
-```
-
-### 16.3 Search budget after pruning
+### 16.2 Search budget after pruning
 
 The search budget after pruning must account for reused evidence:
 
@@ -1537,10 +1343,11 @@ This is the mechanism that avoids recalculating already visited nodes.
 
 ## 17. Scheduling over the forest
 
-`request_evaluations(max_batch_size)` should be implemented as a round-robin forest scheduler:
+`request_transitions(max_batch_size, pad_to=None)` should be implemented as a
+round-robin forest scheduler:
 
 ```text
-request_evaluations:
+request_transitions:
   records = []
 
   while records.len < max_batch_size:
@@ -1556,10 +1363,10 @@ request_evaluations:
           if tree is done:
               continue
 
-          result = next_request(tree)
+          result = next_transition_request(tree)
 
           match result:
-              NeuralRequest(record):
+              TransitionRequest(record):
                   records.push(record)
                   made_progress = true
 
@@ -1580,12 +1387,22 @@ request_evaluations:
           break
 
   if records empty:
-      return EvalBatch(size=0)
+      return TransitionBatch(size=0, padded_size=0)
 
   token = next_batch_token
   request_table[token] = records
-  materialize observations and legal masks
-  return EvalBatch
+  materialize parent_states and actions
+
+  if pad_to is provided:
+      require pad_to >= records.len
+      padded_size = pad_to
+      pad parent_states/actions by repeating an active row
+      active_mask = true for active rows, false for padding rows
+  else:
+      padded_size = records.len
+      active_mask = true for every row
+
+  return TransitionBatch
 ```
 
 Because each tree may have at most one pending request, batching comes from many trees, not from many concurrent lanes in one tree.
@@ -1616,20 +1433,27 @@ Raise clear Python exceptions for:
 ```text
 invalid config
 unknown tree id
-wrong batch token
+wrong transition batch token
 submitting same token twice
-output shape mismatch
-alpha <= 0 in debug mode
+transition output shape mismatch
+pad_to smaller than collected active rows
+opaque state batch length mismatch
+current_player shape mismatch
+alpha <= 0 for active rows in debug mode
+terminal row missing positive terminal_alpha
+non-terminal row missing positive value_alpha or q_alpha
 invalid legal action in advance_roots
-invalid outcome id in advance_categorical_roots
+advance_roots called for an action without an existing child
 finish called on non-decision root
 finish called with pending request
 finish called before simulations_per_root reached
 export called with pending request
 unsupported commit mode
-categorical probabilities invalid
 terminal alpha invalid
 ```
+
+Stale transition rows caused by root pruning should be ignored after token
+lookup and generation checks. They should not mutate the tree.
 
 In non-debug mode, validate shapes and critical invariants. Avoid expensive full-array validation unless debug is enabled.
 
@@ -1647,31 +1471,23 @@ posterior-best target sums to 1 over legal actions
 illegal actions get zero policy probability
 DecisionEdgeBase uses Q alpha before child expansion
 DecisionEdgeBase uses aligned child value alpha after child expansion
-newly expanded decision leaf with no child evidence does not overwrite parent edge via refresh
+newly evaluated decision leaf with no child evidence does not overwrite parent edge via refresh
 terminal alpha must be strictly positive
 align_wdl flip is correct
 ```
 
-### 20.2 Categorical node tests
+### 20.2 Fused transition request tests
 
-Construct a toy game with a chance node:
-
-```text
-Decision action -> Categorical node with two outcomes
-Outcome 0 probability 0.25
-Outcome 1 probability 0.75
-```
-
-Assert:
+Use a deterministic mock Python environment and model. Assert:
 
 ```text
-categorical node has no policy logits
-categorical node has no Q alpha
-categorical node is not exported
-categorical outcome probabilities are stored
-missing categorical outcomes are evaluated before node becomes complete
-categorical C^V equals probability-weighted mixture of outcome posteriors
-decision edge leading to categorical child uses categorical C^V once complete
+request_transitions returns parent_states and actions, not observations
+request_transitions returns active_mask and padded_size
+padding rows repeat an active parent/action and are marked inactive
+submit_transitions ignores inactive padded rows after shape validation
+Python can run one fixed-size env.step + model call over padded_size rows
+terminal child rows back up terminal_alpha without requiring NN outputs
+non-terminal child rows store observations/legal masks/current players/NN outputs
 ```
 
 ### 20.3 MVP no-duplicate tests
@@ -1680,7 +1496,7 @@ Because each tree is single-threaded and has one pending request, assert:
 
 ```text
 one tree cannot emit a second request while pending_request is set
-request_evaluations returns at most one pending row per tree
+request_transitions returns at most one pending row per tree
 submitting the matching token clears pending_request
 submitting stale token after prune is ignored safely
 ```
@@ -1695,12 +1511,11 @@ backup increments r_count
 backup does not add EdgeBase + beta_leaf
 repeated backups replace B rather than component-wise accumulating B
 decision C^V recomputes synchronously after backup
-categorical C^V recomputes synchronously after all outcomes are available
 ```
 
 ### 20.5 Pruning/reuse tests
 
-Construct a tree where root action `a` has an expanded child with evidence.
+Construct a tree where root action `a` has an evaluated child with evidence.
 
 Call:
 
@@ -1717,15 +1532,8 @@ existing child edges are preserved
 existing child C^V is preserved
 old siblings are detached or dropped
 root_completed_count uses reused n_down
-next request_evaluations does not re-request already expanded root
-```
-
-For categorical pruning:
-
-```text
-root -> categorical outcome_id -> child
-advance_categorical_roots promotes the selected child
-unselected outcome branches are detached or dropped
+next request_transitions does not request a root model eval
+advance_roots raises if the selected action has no existing child
 ```
 
 ### 20.6 Export tests
@@ -1734,7 +1542,7 @@ Assert exported rows satisfy:
 
 ```text
 kind == Decision
-expanded
+has submitted model outputs
 non-terminal
 has_child_evidence
 C^V available
@@ -1754,16 +1562,18 @@ v_target_alpha: [N, 3]
 Assert:
 
 ```text
-categorical nodes are not exported
 terminal nodes are not exported
 all exported target alphas are positive
 ```
 
 ### 20.7 Python integration test
 
-Use a mock Python model:
+Use a mock Python environment and model:
 
 ```python
+def env_step(states, actions):
+    return states.step(actions)
+
 def model(obs, legal):
     B = obs.shape[0]
     A = legal.shape[1]
@@ -1779,14 +1589,32 @@ Run:
 
 ```python
 engine = dqaz.SearchEngine(config)
-tree_ids = engine.add_roots(root_states)
+
+root_eval = model(root_states.observation, root_states.legal_action_mask)
+tree_ids = engine.add_roots(
+    root_states,
+    root_states.observation,
+    root_states.legal_action_mask,
+    root_states.current_player,
+    *root_eval,
+)
 
 while not engine.is_done(tree_ids):
-    batch = engine.request_evaluations(max_batch_size=128)
+    batch = engine.request_transitions(max_batch_size=128, pad_to=128)
 
     if batch.size:
-        outputs = model(batch.observations, batch.legal_masks)
-        engine.submit_evaluations(batch.token, *outputs)
+        child_states = env_step(batch.parent_states, batch.actions)
+        child_eval = model(child_states.observation, child_states.legal_action_mask)
+        engine.submit_transitions(
+            batch.token,
+            child_states,
+            child_states.observation,
+            child_states.legal_action_mask,
+            child_states.current_player,
+            child_states.terminated,
+            terminal_alpha_from_rewards(child_states),
+            *child_eval,
+        )
 
 results = engine.finish(tree_ids)
 targets = engine.export_targets(tree_ids)
@@ -1799,7 +1627,7 @@ no panics
 no leaks
 valid shapes
 valid actions
-all target alphas positive
+all exported target alphas positive
 ```
 
 ---
@@ -1815,11 +1643,11 @@ The MVP is acceptable when:
 
 3. Python never receives node pointers, paths, locks, or mutable tree objects.
 
-4. request_evaluations returns batched decision-node neural requests.
+4. request_transitions returns padded parent-state/action transition requests.
 
 5. Each individual tree search is single-threaded.
 
-6. Each tree has at most one pending neural request.
+6. Each tree has at most one pending transition request.
 
 7. Duplicate leaf requests are structurally impossible in the MVP.
 
@@ -1830,13 +1658,13 @@ The MVP is acceptable when:
 
 10. Decision nodes use Thompson selection over Dirichlet WDL edge posteriors.
 
-11. Categorical nodes are represented natively and are not encoded as fake legal actions.
+11. Rust contains no Scacchi/PGX game adapter and never calls env.step.
 
-12. Categorical nodes are not exported as policy/Q training rows.
+12. Python owns PGX states, env.step, legal masks, terminal alpha, and NN eval.
 
-13. Terminal nodes use positive terminal alpha supplied by the game adapter.
+13. Terminal nodes use positive terminal alpha supplied by Python.
 
-14. submit_evaluations backs up neural value_alpha correctly.
+14. submit_transitions backs up neural value_alpha or terminal_alpha correctly.
 
 15. Edge posterior B is a full snapshot replacement, not component-wise accumulated B.
 
@@ -1846,7 +1674,7 @@ The MVP is acceptable when:
 
 18. advance_roots can prune to an existing child subtree after a played move.
 
-19. advance_categorical_roots can prune to an existing categorical outcome child.
+19. advance_roots does not synthesize missing children; Python creates fresh roots for unsearched moves.
 
 20. Reused subtree evidence counts toward the next root’s search budget.
 ```
@@ -1867,11 +1695,11 @@ dqaz/
     config.rs
     ids.rs
 
-    game.rs
     forest.rs
     tree.rs
     node.rs
     edge.rs
+    state_batch.rs
 
     request.rs
     scheduler.rs
@@ -1882,16 +1710,11 @@ dqaz/
     prune.rs
     rng.rs
 
-    games/
-      mod.rs
-      connect_four.rs
-      toy_categorical.rs
-
   tests/
     test_python_api.py
+    test_fused_transitions.py
     test_mock_search.py
     test_prune_reuse.py
-    test_categorical_nodes.py
 
   README.md
 ```
@@ -1917,24 +1740,45 @@ config = dqaz.SearchConfig(
 engine = dqaz.SearchEngine(config)
 
 root_states = make_initial_states(batch_size=64)
-tree_ids = engine.add_roots(root_states)
+
+root_eval = model_apply(
+    root_states.observation,
+    root_states.legal_action_mask,
+)
+
+tree_ids = engine.add_roots(
+    root_states,
+    root_states.observation,
+    root_states.legal_action_mask,
+    root_states.current_player,
+    root_eval.policy_logits,
+    root_eval.value_alpha,
+    root_eval.q_alpha,
+)
 
 while not engine.is_done(tree_ids):
-    batch = engine.request_evaluations(max_batch_size=128)
+    batch = engine.request_transitions(max_batch_size=128, pad_to=128)
 
     if batch.size == 0:
         continue
 
-    policy_logits, value_alpha, q_alpha = model_apply(
-        batch.observations,
-        batch.legal_masks,
+    child_states = env_step(batch.parent_states, batch.actions)
+    child_eval = model_apply(
+        child_states.observation,
+        child_states.legal_action_mask,
     )
 
-    engine.submit_evaluations(
+    engine.submit_transitions(
         batch.token,
-        policy_logits,
-        value_alpha,
-        q_alpha,
+        child_states,
+        child_states.observation,
+        child_states.legal_action_mask,
+        child_states.current_player,
+        child_states.terminated,
+        terminal_alpha_from_rewards(child_states),
+        child_eval.policy_logits,
+        child_eval.value_alpha,
+        child_eval.q_alpha,
     )
 
 results = engine.finish(tree_ids, commit="posterior_sample")
@@ -1943,7 +1787,7 @@ results = engine.finish(tree_ids, commit="posterior_sample")
 actions = results.actions
 next_env_states = env_step(root_states, actions)
 
-# Reuse Rust tree subtrees instead of recalculating them.
+# Reuse Rust tree subtrees only for actions that were searched.
 engine.advance_roots(tree_ids, actions)
 
 # Continue search from the pruned roots.

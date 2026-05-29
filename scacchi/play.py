@@ -301,6 +301,11 @@ def make_posterior_tree_selfplay(env, config):
     def evaluate_leaves(model: nnx.Module, obs: jax.Array):
         return model(obs, train=False)
 
+    @nnx.jit
+    def evaluate_transitions(model: nnx.Module, states, actions: jax.Array):
+        child_states = jax.vmap(env.step)(states, actions)
+        return child_states, model(child_states.observation, train=False)
+
     def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
         def leaf_evaluator(obs: jax.Array):
             output = evaluate_leaves(model, obs)
@@ -310,6 +315,15 @@ def make_posterior_tree_selfplay(env, config):
                     "returning (logits, alpha_V, alpha_Q)."
                 )
             return output
+
+        def transition_evaluator(states, actions: jax.Array):
+            child_states, output = evaluate_transitions(model, states, actions)
+            if len(output) != 3:
+                raise ValueError(
+                    "posterior-tree search requires a Dirichlet model "
+                    "returning (logits, alpha_V, alpha_Q)."
+                )
+            return child_states, output
 
         rng_key, init_key = jax.random.split(rng_key)
         init_keys = _device_put_cpu(
@@ -331,6 +345,7 @@ def make_posterior_tree_selfplay(env, config):
                 config=config,
                 env_state=env_state,
                 leaf_evaluator=leaf_evaluator,
+                transition_evaluator=transition_evaluator,
                 search_key=search_key,
                 device_put_cpu=_device_put_cpu,
             )

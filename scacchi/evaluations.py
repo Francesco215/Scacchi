@@ -55,6 +55,7 @@ def _posterior_tree_eval_action(
     config,
     env_state,
     leaf_evaluator,
+    transition_evaluator=None,
     rng_key: jax.Array,
 ) -> jax.Array:
     return _run_posterior_tree_search_step(
@@ -62,6 +63,7 @@ def _posterior_tree_eval_action(
         config=config,
         env_state=env_state,
         leaf_evaluator=leaf_evaluator,
+        transition_evaluator=transition_evaluator,
         search_key=rng_key,
         device_put_cpu=lambda value: value,
     ).played_action
@@ -79,6 +81,11 @@ def make_mcts_evaluate(env, config, baseline_model):
             return model(obs, train=False)
 
         @nnx.jit
+        def evaluate_transitions(model: Any, states, actions: jax.Array):
+            child_states = jax.vmap(env.step)(states, actions)
+            return child_states, model(child_states.observation, train=False)
+
+        @nnx.jit
         def scalar_mcts_actions(model: Any, rng_key: jax.Array, env_state):
             return _model_eval_action(env, search_config, model, rng_key, env_state)
 
@@ -93,11 +100,15 @@ def make_mcts_evaluate(env, config, baseline_model):
             def leaf_evaluator(obs: jax.Array):
                 return evaluate_leaves(model, obs)
 
+            def transition_evaluator(states, actions: jax.Array):
+                return evaluate_transitions(model, states, actions)
+
             return _posterior_tree_eval_action(
                 env=env,
                 config=search_config,
                 env_state=env_state,
                 leaf_evaluator=leaf_evaluator,
+                transition_evaluator=transition_evaluator,
                 rng_key=rng_key,
             )
 

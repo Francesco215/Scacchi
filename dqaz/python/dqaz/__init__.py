@@ -1,9 +1,9 @@
-from ._dqaz import EvalBatch, SearchConfig, SearchEngine, SearchResults, SearchTargets
+from ._dqaz import SearchConfig, SearchEngine, SearchResults, SearchTargets, TransitionBatch
 
 __all__ = [
-    "EvalBatch",
     "SearchConfig",
     "SearchEngine",
     "SearchResults",
     "SearchTargets",
+    "TransitionBatch",
 ]
