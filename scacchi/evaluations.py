@@ -4,27 +4,14 @@ from typing import Any
 from flax import nnx
 import jax
 import jax.numpy as jnp
-import mctx
 import numpy as np
 
-from .dirichlet_q_search import (
-    DirichletQSearchOutput,
-    NO_PARENT,
-    NodeEmbedding,
-    dirichlet_q_policy,
-    outcome_mean,
-    outcome_utility,
-    posterior_best_action,
-    posterior_best_policy_target,
-)
-from .network import policy_value_from_output
 from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
-from .posterior_tree import (
-    is_posterior_tree_policy,
-    run_posterior_tree_search,
-    run_posterior_tree_search_state_batch,
-    split_batched_state,
+from .play_search import (
+    _run_model_eval_search,
+    _run_posterior_tree_search_step,
 )
+from .posterior_tree import is_posterior_tree_policy
 
 
 def _without_tree_training(config):
@@ -37,87 +24,46 @@ def _without_tree_training(config):
     return SimpleNamespace(**values)
 
 
-def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations):
-    logits, value = policy_value_from_output(predict(env_state.observation))
-    root = mctx.RootFnOutput(
-        prior_logits=logits,
-        value=value,
-        embedding=env_state,
-    )
-    return mctx.gumbel_muzero_policy(
-        params=(),
-        rng_key=rng_key,
-        root=root,
-        recurrent_fn=recurrent_fn,
-        num_simulations=num_simulations,
-        invalid_actions=~env_state.legal_action_mask,
-        qtransform=mctx.qtransform_completed_by_mix_value,
-        gumbel_scale=1.,
-    )
-
-
-def _make_model_mcts_policy(env, config, model, rng_key, env_state, num_simulations):
+def _model_eval_action(env, config, model, rng_key, env_state):
     predict = lambda obs: model(obs, train=False)
     model_output = predict(env_state.observation)
-    if (
-        len(model_output) == 3
-        and getattr(config, "search_policy", "gumbel") == "dirichlet_thompson"
-    ):
-        search_key, posterior_key = jax.random.split(rng_key)
-        logits, alpha_v, alpha_q = model_output
-        root_outcome = outcome_mean(alpha_v)
-        value = outcome_utility(root_outcome)
-        root_embedding = NodeEmbedding(
-            state=env_state,
-            outcome_dist=root_outcome,
-            alpha_V_prior=alpha_v,
-            evidence_weight=jnp.zeros_like(value),
-            root_action=jnp.full_like(env_state.current_player, NO_PARENT),
-            depth_parity=jnp.zeros_like(env_state.current_player),
-            alpha_Q_prior=alpha_q,
-        )
-        root = mctx.RootFnOutput(
-            prior_logits=logits,
-            value=value,
-            embedding=root_embedding,
-        )
-        action_value_prior = alpha_q
-        policy = dirichlet_q_policy(
-            params=(),
-            rng_key=search_key,
-            root=root,
-            recurrent_fn=make_dirichlet_recurrent_fn(env, predict, config),
-            action_value_prior=action_value_prior,
-            num_simulations=num_simulations,
-            invalid_actions=~env_state.legal_action_mask,
-            num_search_blocks=getattr(config, "num_search_blocks", 1),
-        )
-        policy_target = posterior_best_policy_target(
-            posterior_key,
-            policy.alpha_search,
-            env_state.legal_action_mask,
-            config.policy_mc_samples,
-        )
-        return DirichletQSearchOutput(
-            action=posterior_best_action(policy_target, env_state.legal_action_mask),
-            action_weights=policy_target,
-            search_tree=policy.search_tree,
-            q_evidence_sum=policy.q_evidence_sum,
-            alpha_search=policy.alpha_search,
-            explored_action_mask=policy.explored_action_mask,
-        )
-    return _make_mcts_policy(
-        predict,
-        make_recurrent_fn(env, predict),
-        rng_key,
-        env_state,
-        num_simulations,
-    )
+    return _run_model_eval_search(
+        env_state=env_state,
+        model_output=model_output,
+        scalar_recurrent_fn=make_recurrent_fn(env, predict),
+        dirichlet_recurrent_fn=make_dirichlet_recurrent_fn(env, predict, config),
+        rng_key=rng_key,
+        config=config,
+    ).played_action
+
+
+def _posterior_tree_eval_action(
+    *,
+    env,
+    config,
+    env_state,
+    leaf_evaluator,
+    rng_key: jax.Array,
+    use_wavefront_arena: bool,
+) -> jax.Array:
+    return _run_posterior_tree_search_step(
+        env=env,
+        config=config,
+        env_state=env_state,
+        leaf_evaluator=leaf_evaluator,
+        search_key=rng_key,
+        action_key=rng_key,
+        use_wavefront_arena=use_wavefront_arena,
+        device_put_cpu=lambda value: value,
+        action_source="search_action",
+    ).played_action
 
 
 def make_mcts_evaluate(env, config, baseline_model):
     search_config = _without_tree_training(config)
-    eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
+    eval_batch_size = int(
+        getattr(config, "eval_batch_size", config.selfplay_batch_size)
+    )
 
     if is_posterior_tree_policy(getattr(config, "search_policy", "gumbel")):
         @nnx.jit
@@ -126,14 +72,7 @@ def make_mcts_evaluate(env, config, baseline_model):
 
         @nnx.jit
         def scalar_mcts_actions(model: Any, rng_key: jax.Array, env_state):
-            predict = lambda obs: model(obs, train=False)
-            return _make_mcts_policy(
-                predict,
-                make_recurrent_fn(env, predict),
-                rng_key,
-                env_state,
-                config.num_simulations,
-            ).action
+            return _model_eval_action(env, search_config, model, rng_key, env_state)
 
         def model_actions(model: Any, rng_key: jax.Array, env_state):
             sample_output = evaluate_leaves(
@@ -146,22 +85,17 @@ def make_mcts_evaluate(env, config, baseline_model):
             def leaf_evaluator(obs: jax.Array):
                 return evaluate_leaves(model, obs)
 
-            if getattr(search_config, "search_policy", "gumbel") == "posterior_tree_wavefront":
-                return run_posterior_tree_search_state_batch(
-                    env=env,
-                    root_state_batch=env_state,
-                    leaf_evaluator=leaf_evaluator,
-                    rng_key=rng_key,
-                    config=search_config,
-                ).action
-
-            return run_posterior_tree_search(
+            return _posterior_tree_eval_action(
                 env=env,
-                root_states=split_batched_state(env_state),
+                config=search_config,
+                env_state=env_state,
                 leaf_evaluator=leaf_evaluator,
                 rng_key=rng_key,
-                config=search_config,
-            ).action
+                use_wavefront_arena=(
+                    getattr(search_config, "search_policy", "gumbel")
+                    == "posterior_tree_wavefront"
+                ),
+            )
 
         def evaluate(rng_key: jax.Array, model: Any):
             my_player = 0
@@ -174,9 +108,16 @@ def make_mcts_evaluate(env, config, baseline_model):
                 key, my_key, opp_key = jax.random.split(key, 3)
                 my_action = model_actions(model, my_key, env_state)
                 opp_action = model_actions(baseline_model, opp_key, env_state)
-                action = jnp.where(env_state.current_player == my_player, my_action, opp_action)
+                action = jnp.where(
+                    env_state.current_player == my_player,
+                    my_action,
+                    opp_action,
+                )
                 env_state = jax.vmap(env.step)(env_state, action)
-                returns = returns + env_state.rewards[jnp.arange(eval_batch_size), my_player]
+                returns = returns + env_state.rewards[
+                    jnp.arange(eval_batch_size),
+                    my_player,
+                ]
             return returns
 
         return evaluate
@@ -189,16 +130,22 @@ def make_mcts_evaluate(env, config, baseline_model):
         key, init_key = jax.random.split(rng_key)
         init_keys = jax.random.split(init_key, eval_batch_size)
         env_state = jax.vmap(env.init)(init_keys)
-       
+
         def body_fn(val):
             key, env_state, returns = val
             key, my_key, opp_key = jax.random.split(key, 3)
 
-            my_policy = _make_model_mcts_policy(env, config, model, my_key, env_state, config.num_simulations)
-            opp_policy = _make_model_mcts_policy(env, config, baseline_model, opp_key, env_state, config.num_simulations)
-            
+            my_action = _model_eval_action(env, config, model, my_key, env_state)
+            opp_action = _model_eval_action(
+                env,
+                config,
+                baseline_model,
+                opp_key,
+                env_state,
+            )
+
             is_my_turn = env_state.current_player == my_player
-            action = jnp.where(is_my_turn, my_policy.action, opp_policy.action)
+            action = jnp.where(is_my_turn, my_action, opp_action)
 
             env_state = jax.vmap(env.step)(env_state, action)
             returns = returns + env_state.rewards[
@@ -214,4 +161,4 @@ def make_mcts_evaluate(env, config, baseline_model):
         )
         return returns
 
-    return evaluate    
+    return evaluate

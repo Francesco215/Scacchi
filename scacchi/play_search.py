@@ -197,6 +197,7 @@ def _run_dirichlet_search(
     posterior_key: jax.Array,
     action_key: jax.Array,
     config,
+    action_source: str | None = None,
 ) -> _SearchStepOutput:
     logits, alpha_v, alpha_q = model_output
     root = _make_dirichlet_root(env_state, logits, alpha_v, alpha_q)
@@ -251,7 +252,7 @@ def _run_dirichlet_search(
         posterior_policy_target,
     )
     played_action = _select_played_action(
-        config.selfplay_action_source,
+        config.selfplay_action_source if action_source is None else action_source,
         action_key,
         posterior_policy_target,
         env_state.legal_action_mask,
@@ -281,6 +282,7 @@ def _run_model_search(
     posterior_key: jax.Array,
     action_key: jax.Array,
     config,
+    action_source: str | None = None,
 ) -> _SearchStepOutput:
     if len(model_output) == 2:
         return _run_scalar_gumbel_search(
@@ -298,6 +300,40 @@ def _run_model_search(
         posterior_key=posterior_key,
         action_key=action_key,
         config=config,
+        action_source=action_source,
+    )
+
+
+def _run_model_eval_search(
+    *,
+    env_state: pgx.State,
+    model_output,
+    scalar_recurrent_fn,
+    dirichlet_recurrent_fn,
+    rng_key: jax.Array,
+    config,
+) -> _SearchStepOutput:
+    if (
+        len(model_output) == 3
+        and getattr(config, "search_policy", "gumbel") == "dirichlet_thompson"
+    ):
+        search_key, posterior_key = jax.random.split(rng_key)
+        return _run_dirichlet_search(
+            env_state=env_state,
+            model_output=model_output,
+            recurrent_fn=dirichlet_recurrent_fn,
+            search_key=search_key,
+            posterior_key=posterior_key,
+            action_key=posterior_key,
+            config=config,
+            action_source="posterior_argmax",
+        )
+    return _run_scalar_gumbel_search(
+        env_state=env_state,
+        model_output=model_output,
+        recurrent_fn=scalar_recurrent_fn,
+        rng_key=rng_key,
+        config=config,
     )
 
 
@@ -311,6 +347,7 @@ def _run_posterior_tree_search_step(
     action_key: jax.Array,
     use_wavefront_arena: bool,
     device_put_cpu: Callable[[Any], Any],
+    action_source: str | None = None,
 ) -> _SearchStepOutput:
     if use_wavefront_arena:
         search_output = run_posterior_tree_search_state_batch(
@@ -336,7 +373,7 @@ def _run_posterior_tree_search_step(
     )
     played_action = (
         _select_played_action(
-            config.selfplay_action_source,
+            config.selfplay_action_source if action_source is None else action_source,
             action_key,
             search_output.action_weights,
             env_state.legal_action_mask,
