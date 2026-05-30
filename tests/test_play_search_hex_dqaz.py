@@ -5,7 +5,56 @@ import jax.numpy as jnp
 import numpy as np
 
 from scacchi.envs import make_env
-from scacchi.play_search import _run_posterior_tree_search_step
+from scacchi.play_search import (
+    _flatten_padded_valid_actions_np,
+    _padded_valid_actions_from_mask,
+    _run_posterior_tree_search_step,
+)
+
+
+def test_padded_valid_actions_from_mask_packs_active_legal_rows():
+    legal_action_mask = jnp.asarray(
+        [
+            [False, True, False, True],
+            [True, False, True, False],
+            [True, True, False, False],
+        ],
+        dtype=jnp.bool_,
+    )
+    policy_logits = jnp.asarray(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0, 7.0],
+            [8.0, 9.0, 10.0, 11.0],
+        ],
+        dtype=jnp.float32,
+    )
+    alpha_q = jnp.arange(3 * 4 * 3, dtype=jnp.float32).reshape((3, 4, 3)) + 1.0
+    terminated = jnp.asarray([False, False, True])
+    active_mask = jnp.asarray([True, False, True])
+
+    padded_actions, padded_logits, padded_q, valid_counts = (
+        _padded_valid_actions_from_mask(
+            legal_action_mask,
+            policy_logits,
+            alpha_q,
+            terminated,
+            active_mask,
+        )
+    )
+    offsets, legal_actions, compact_logits, compact_q = (
+        _flatten_padded_valid_actions_np(
+            padded_actions,
+            padded_logits,
+            padded_q,
+            valid_counts,
+        )
+    )
+
+    np.testing.assert_array_equal(offsets, np.array([0, 2, 2, 2], dtype=np.int64))
+    np.testing.assert_array_equal(legal_actions, np.array([1, 3], dtype=np.int32))
+    np.testing.assert_allclose(compact_logits, np.array([1.0, 3.0], dtype=np.float32))
+    np.testing.assert_allclose(compact_q, np.asarray(alpha_q[0, [1, 3]]))
 
 
 def test_pgx_hex_dqaz_wdl3_smoke():

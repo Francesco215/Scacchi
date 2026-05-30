@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use numpy::PyArrayDyn;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
@@ -9,6 +10,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_distr::{Distribution, Gamma};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 type TreeId = u64;
 type NodeId = u32;
@@ -168,6 +170,122 @@ struct DecisionData {
     value_alpha: [f32; 3],
     q_alpha: Vec<[f32; 3]>,
     edges: Vec<DecisionEdge>,
+}
+
+#[derive(Default)]
+struct SubmitProfile {
+    enabled: bool,
+    active_rows: usize,
+    padded_rows: usize,
+    parsed_rows: usize,
+    rows_seen: usize,
+    terminal_rows: usize,
+    new_decision_nodes: usize,
+    existing_decision_nodes: usize,
+    skipped_rows: usize,
+    total_legal_actions: usize,
+    backup_path_steps: usize,
+    recompute_calls: usize,
+    posterior_policy_calls: usize,
+    posterior_policy_action_visits: usize,
+    total: Duration,
+    parse: Duration,
+    loop_total: Duration,
+    batch_item: Duration,
+    decision_data: Duration,
+    decision_key: Duration,
+    decision_lookup: Duration,
+    node_insert: Duration,
+    parent_update: Duration,
+    backup: Duration,
+    publish_child: Duration,
+    align: Duration,
+    edge_write: Duration,
+    recompute: Duration,
+    recompute_categorize: Duration,
+    posterior_policy: Duration,
+    propagate: Duration,
+}
+
+impl SubmitProfile {
+    fn new(active_rows: usize, padded_rows: usize) -> Self {
+        Self {
+            enabled: std::env::var_os("DQAZ_PROFILE_SUBMIT").is_some(),
+            active_rows,
+            padded_rows,
+            ..Self::default()
+        }
+    }
+
+    fn start(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
+    }
+
+    fn print(&self) {
+        if !self.enabled {
+            return;
+        }
+        let accounted = self.parse
+            + self.batch_item
+            + self.decision_data
+            + self.decision_key
+            + self.decision_lookup
+            + self.node_insert
+            + self.parent_update
+            + self.backup;
+        eprintln!(
+            concat!(
+                "DQAZ_PROFILE_SUBMIT",
+                " active_rows={} padded_rows={} parsed_rows={} rows_seen={} skipped_rows={}",
+                " terminal_rows={} new_decision_nodes={} existing_decision_nodes={}",
+                " total_legal_actions={} backup_path_steps={} recompute_calls={}",
+                " posterior_policy_calls={} posterior_policy_action_visits={}",
+                " total_ms={:.3} parse_ms={:.3} loop_ms={:.3}",
+                " batch_item_ms={:.3} decision_data_ms={:.3}",
+                " decision_key_ms={:.3} decision_lookup_ms={:.3}",
+                " node_insert_ms={:.3} parent_update_ms={:.3} backup_ms={:.3}",
+                " publish_child_ms={:.3} align_ms={:.3} edge_write_ms={:.3}",
+                " recompute_ms={:.3} recompute_categorize_ms={:.3}",
+                " posterior_policy_ms={:.3} propagate_ms={:.3}",
+                " accounted_ms={:.3}"
+            ),
+            self.active_rows,
+            self.padded_rows,
+            self.parsed_rows,
+            self.rows_seen,
+            self.skipped_rows,
+            self.terminal_rows,
+            self.new_decision_nodes,
+            self.existing_decision_nodes,
+            self.total_legal_actions,
+            self.backup_path_steps,
+            self.recompute_calls,
+            self.posterior_policy_calls,
+            self.posterior_policy_action_visits,
+            duration_ms(self.total),
+            duration_ms(self.parse),
+            duration_ms(self.loop_total),
+            duration_ms(self.batch_item),
+            duration_ms(self.decision_data),
+            duration_ms(self.decision_key),
+            duration_ms(self.decision_lookup),
+            duration_ms(self.node_insert),
+            duration_ms(self.parent_update),
+            duration_ms(self.backup),
+            duration_ms(self.publish_child),
+            duration_ms(self.align),
+            duration_ms(self.edge_write),
+            duration_ms(self.recompute),
+            duration_ms(self.recompute_categorize),
+            duration_ms(self.posterior_policy),
+            duration_ms(self.propagate),
+            duration_ms(accounted),
+        );
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }
 
 impl DecisionData {
@@ -640,12 +758,15 @@ impl SearchEngine {
         value_alpha: &PyAny,
         q_alpha: &PyAny,
     ) -> PyResult<()> {
+        let total_start = Instant::now();
         let mut inner = self.lock()?;
         let pending = inner
             .request_table
             .remove(&token)
             .ok_or_else(|| PyValueError::new_err("wrong transition batch token"))?;
+        let mut profile = SubmitProfile::new(pending.records.len(), pending.padded_size);
 
+        let parse_start = profile.start();
         let batch = ParsedNodeBatch::parse(
             py,
             &inner.config,
@@ -660,12 +781,32 @@ impl SearchEngine {
             Some(terminal_alpha),
             Some(pending.records.len()),
         )?;
+        if let Some(start) = parse_start {
+            profile.parse = start.elapsed();
+        }
+        profile.parsed_rows = batch.len;
         if batch.len != pending.padded_size {
             return Err(PyValueError::new_err("transition output shape mismatch"));
         }
 
+        let loop_start = profile.start();
         for (row, record) in pending.records.iter().enumerate() {
-            submit_one_transition(py, &mut inner, record, &batch, child_states, row)?;
+            submit_one_transition(
+                py,
+                &mut inner,
+                record,
+                &batch,
+                child_states,
+                row,
+                &mut profile,
+            )?;
+        }
+        if let Some(start) = loop_start {
+            profile.loop_total = start.elapsed();
+        }
+        if profile.enabled {
+            profile.total = total_start.elapsed();
+            profile.print();
         }
         Ok(())
     }
@@ -1323,27 +1464,41 @@ fn submit_one_transition(
     batch: &ParsedNodeBatch,
     child_states: &PyAny,
     row: usize,
+    profile: &mut SubmitProfile,
 ) -> PyResult<()> {
+    profile.rows_seen += 1;
+    profile.backup_path_steps += record.path.len();
     let config = forest.config.clone();
     let Ok(tree) = forest.tree_mut(record.tree_id) else {
+        profile.skipped_rows += 1;
         return Ok(());
     };
     if tree.generation != record.tree_generation {
+        profile.skipped_rows += 1;
         return Ok(());
     }
     let Ok(parent) = tree.node(record.node_id) else {
+        profile.skipped_rows += 1;
         return Ok(());
     };
     if parent.generation != record.node_generation {
+        profile.skipped_rows += 1;
         return Ok(());
     }
     if !tree.pending_requests.contains(&record.request_id) {
+        profile.skipped_rows += 1;
         return Ok(());
     }
 
+    let batch_item_start = profile.start();
     let child_state = batch_item(py, child_states, row)?;
+    if let Some(start) = batch_item_start {
+        profile.batch_item += start.elapsed();
+    }
     let current_player = batch.current_players[row];
     let (child_id, is_new_child) = if batch.terminated[row] {
+        profile.terminal_rows += 1;
+        let node_insert_start = profile.start();
         let child_id = tree.nodes.len() as NodeId;
         let alpha = batch.terminal_alpha[row].ok_or_else(|| {
             PyValueError::new_err("terminal row missing positive terminal_alpha")
@@ -1355,13 +1510,36 @@ fn submit_one_transition(
         });
         child.depth = tree.node(record.node_id)?.depth + 1;
         tree.nodes.push(child);
+        if let Some(start) = node_insert_start {
+            profile.node_insert += start.elapsed();
+        }
         (child_id, true)
     } else {
+        let action_start = batch.action_offsets[row];
+        let action_end = batch.action_offsets[row + 1];
+        profile.total_legal_actions += action_end - action_start;
+
+        let decision_data_start = profile.start();
         let decision = batch.decision_data_for_row(&config, row)?;
+        if let Some(start) = decision_data_start {
+            profile.decision_data += start.elapsed();
+        }
+        let decision_key_start = profile.start();
         let key = decision_key(current_player, &decision.observation);
-        if let Some(existing) = tree.decision_table.get(&key).copied() {
+        if let Some(start) = decision_key_start {
+            profile.decision_key += start.elapsed();
+        }
+        let lookup_start = profile.start();
+        let existing = tree.decision_table.get(&key).copied();
+        if let Some(start) = lookup_start {
+            profile.decision_lookup += start.elapsed();
+        }
+        if let Some(existing) = existing {
+            profile.existing_decision_nodes += 1;
             (existing, false)
         } else {
+            profile.new_decision_nodes += 1;
+            let node_insert_start = profile.start();
             let child_id = tree.nodes.len() as NodeId;
             let mut child = decision_node(child_id, child_state, current_player, decision);
             child.parent = Some(record.node_id);
@@ -1371,10 +1549,14 @@ fn submit_one_transition(
             child.depth = tree.node(record.node_id)?.depth + 1;
             tree.nodes.push(child);
             tree.decision_table.insert(key, child_id);
+            if let Some(start) = node_insert_start {
+                profile.node_insert += start.elapsed();
+            }
             (child_id, true)
         }
     };
 
+    let parent_update_start = profile.start();
     let parent = tree.node_mut(record.node_id)?;
     let data = match &mut parent.kind {
         NodeKind::Decision(data) => data,
@@ -1387,14 +1569,22 @@ fn submit_one_transition(
     edge.child = Some(child_id);
     edge.pending = false;
     tree.pending_requests.remove(&record.request_id);
+    if let Some(start) = parent_update_start {
+        profile.parent_update += start.elapsed();
+    }
 
     let _ = is_new_child;
-    match &tree.node(child_id)?.kind {
-        NodeKind::Decision(data) => backup(tree, &record.path, data.value_alpha, &config),
+    let backup_start = profile.start();
+    let result = match &tree.node(child_id)?.kind {
+        NodeKind::Decision(data) => backup(tree, &record.path, data.value_alpha, &config, profile),
         NodeKind::Terminal(data) => {
-            backup_terminal(tree, &record.path, data.alpha, data.outcome, &config)
+            backup_terminal_profile(tree, &record.path, data.alpha, data.outcome, &config, profile)
         }
+    };
+    if let Some(start) = backup_start {
+        profile.backup += start.elapsed();
     }
+    result
 }
 
 fn advance_one_root(forest: &mut Forest, tree_id: TreeId, action: Action) -> PyResult<()> {
@@ -1686,21 +1876,37 @@ fn backup(
     path: &[PathStep],
     beta_leaf: [f32; 3],
     config: &SearchConfig,
+    profile: &mut SubmitProfile,
 ) -> PyResult<()> {
     let mut beta = beta_leaf;
     for step in path.iter().rev() {
         let child_id = decision(tree, step.node_id)?.edges[step.edge_index]
             .child
             .ok_or_else(|| PyRuntimeError::new_err("backup edge has no child"))?;
-        if publish_categorical_edge_from_child(tree, step.node_id, step.edge_index, child_id, false)? {
-            recompute_node(tree, step.node_id, config)?;
+        let publish_start = profile.start();
+        let published =
+            publish_categorical_edge_from_child(tree, step.node_id, step.edge_index, child_id, false)?;
+        if let Some(start) = publish_start {
+            profile.publish_child += start.elapsed();
+        }
+        if published {
+            recompute_node_profile(tree, step.node_id, config, profile)?;
+            let propagate_start = profile.start();
             propagate_categorical(tree, step.node_id, config)?;
+            if let Some(start) = propagate_start {
+                profile.propagate += start.elapsed();
+            }
             beta = tree.node(step.node_id)?.c_v.unwrap_or(categorical_proxy(
                 tree.node(step.node_id)?.cat_outcome,
             ));
             continue;
         }
+        let align_start = profile.start();
         beta = align_child_to_parent(tree, child_id, step.node_id, beta)?;
+        if let Some(start) = align_start {
+            profile.align += start.elapsed();
+        }
+        let edge_write_start = profile.start();
         {
             let parent = tree.node_mut(step.node_id)?;
             let NodeKind::Decision(data) = &mut parent.kind else {
@@ -1713,8 +1919,15 @@ fn backup(
             edge.cat_outcome = NO_OUTCOME;
             edge.cat_distance = NO_DISTANCE;
         }
-        recompute_node(tree, step.node_id, config)?;
+        if let Some(start) = edge_write_start {
+            profile.edge_write += start.elapsed();
+        }
+        recompute_node_profile(tree, step.node_id, config, profile)?;
+        let propagate_start = profile.start();
         propagate_categorical(tree, step.node_id, config)?;
+        if let Some(start) = propagate_start {
+            profile.propagate += start.elapsed();
+        }
         beta = tree.node(step.node_id)?.c_v.unwrap_or(beta);
     }
     Ok(())
@@ -1727,6 +1940,18 @@ fn backup_terminal(
     terminal_outcome: i8,
     config: &SearchConfig,
 ) -> PyResult<()> {
+    let mut profile = SubmitProfile::default();
+    backup_terminal_profile(tree, path, terminal_alpha, terminal_outcome, config, &mut profile)
+}
+
+fn backup_terminal_profile(
+    tree: &mut Tree,
+    path: &[PathStep],
+    terminal_alpha: [f32; 3],
+    terminal_outcome: i8,
+    config: &SearchConfig,
+    profile: &mut SubmitProfile,
+) -> PyResult<()> {
     if path.is_empty() {
         return Ok(());
     }
@@ -1734,12 +1959,17 @@ fn backup_terminal(
     let child_id = decision(tree, final_step.node_id)?.edges[final_step.edge_index]
         .child
         .ok_or_else(|| PyRuntimeError::new_err("terminal backup edge has no child"))?;
+    let align_start = profile.start();
     let aligned_alpha = align_child_to_parent(tree, child_id, final_step.node_id, terminal_alpha)?;
+    if let Some(start) = align_start {
+        profile.align += start.elapsed();
+    }
     let aligned_outcome = align_outcome(
         terminal_outcome,
         tree.node(child_id)?.current_player,
         tree.node(final_step.node_id)?.current_player,
     );
+    let edge_write_start = profile.start();
     publish_categorical_edge(
         tree,
         final_step.node_id,
@@ -1749,22 +1979,44 @@ fn backup_terminal(
         aligned_alpha,
         true,
     )?;
-    recompute_node(tree, final_step.node_id, config)?;
+    if let Some(start) = edge_write_start {
+        profile.edge_write += start.elapsed();
+    }
+    recompute_node_profile(tree, final_step.node_id, config, profile)?;
+    let propagate_start = profile.start();
     propagate_categorical(tree, final_step.node_id, config)?;
+    if let Some(start) = propagate_start {
+        profile.propagate += start.elapsed();
+    }
     let mut beta = tree.node(final_step.node_id)?.c_v.unwrap_or(aligned_alpha);
     for step in path[..path.len() - 1].iter().rev() {
         let child_id = decision(tree, step.node_id)?.edges[step.edge_index]
             .child
             .ok_or_else(|| PyRuntimeError::new_err("backup edge has no child"))?;
-        if publish_categorical_edge_from_child(tree, step.node_id, step.edge_index, child_id, false)? {
-            recompute_node(tree, step.node_id, config)?;
+        let publish_start = profile.start();
+        let published =
+            publish_categorical_edge_from_child(tree, step.node_id, step.edge_index, child_id, false)?;
+        if let Some(start) = publish_start {
+            profile.publish_child += start.elapsed();
+        }
+        if published {
+            recompute_node_profile(tree, step.node_id, config, profile)?;
+            let propagate_start = profile.start();
             propagate_categorical(tree, step.node_id, config)?;
+            if let Some(start) = propagate_start {
+                profile.propagate += start.elapsed();
+            }
             beta = tree.node(step.node_id)?.c_v.unwrap_or(categorical_proxy(
                 tree.node(step.node_id)?.cat_outcome,
             ));
             continue;
         }
+        let align_start = profile.start();
         beta = align_child_to_parent(tree, child_id, step.node_id, beta)?;
+        if let Some(start) = align_start {
+            profile.align += start.elapsed();
+        }
+        let edge_write_start = profile.start();
         {
             let parent = tree.node_mut(step.node_id)?;
             let NodeKind::Decision(data) = &mut parent.kind else {
@@ -1777,60 +2029,99 @@ fn backup_terminal(
             edge.cat_outcome = NO_OUTCOME;
             edge.cat_distance = NO_DISTANCE;
         }
-        recompute_node(tree, step.node_id, config)?;
+        if let Some(start) = edge_write_start {
+            profile.edge_write += start.elapsed();
+        }
+        recompute_node_profile(tree, step.node_id, config, profile)?;
+        let propagate_start = profile.start();
         propagate_categorical(tree, step.node_id, config)?;
+        if let Some(start) = propagate_start {
+            profile.propagate += start.elapsed();
+        }
         beta = tree.node(step.node_id)?.c_v.unwrap_or(beta);
     }
     Ok(())
 }
 
 fn recompute_node(tree: &mut Tree, node_id: NodeId, config: &SearchConfig) -> PyResult<()> {
+    let mut profile = SubmitProfile::default();
+    recompute_node_profile(tree, node_id, config, &mut profile)
+}
+
+fn recompute_node_profile(
+    tree: &mut Tree,
+    node_id: NodeId,
+    config: &SearchConfig,
+    profile: &mut SubmitProfile,
+) -> PyResult<()> {
+    profile.recompute_calls += 1;
+    let recompute_start = profile.start();
+    let categorize_start = profile.start();
     try_categorize_node(tree, node_id)?;
-    let cache = match &tree.node(node_id)?.kind {
-        NodeKind::Terminal(data) => {
-            let alpha = data.alpha;
+    if let Some(start) = categorize_start {
+        profile.recompute_categorize += start.elapsed();
+    }
+
+    let cache = if let NodeKind::Terminal(data) = &tree.node(node_id)?.kind {
+        let alpha = data.alpha;
+        let node = tree.node_mut(node_id)?;
+        node.n_down = 1;
+        Some(alpha)
+    } else if tree.node(node_id)?.cat_outcome != NO_OUTCOME {
+        let n_down = decision(tree, node_id)?
+            .edges
+            .iter()
+            .map(|edge| edge.r_count)
+            .sum::<u32>();
+        let alpha = categorical_proxy(tree.node(node_id)?.cat_outcome);
+        let node = tree.node_mut(node_id)?;
+        node.n_down = n_down;
+        Some(alpha)
+    } else {
+        let (n_down, value_alpha, action_count) = {
+            let data = decision(tree, node_id)?;
+            (
+                data.edges.iter().map(|edge| edge.r_count).sum::<u32>(),
+                data.value_alpha,
+                data.edges.len(),
+            )
+        };
+        if n_down == 0 {
             let node = tree.node_mut(node_id)?;
-            node.n_down = 1;
-            Some(alpha)
-        }
-        NodeKind::Decision(data) => {
-            if tree.node(node_id)?.cat_outcome != NO_OUTCOME {
-                let n_down = data.edges.iter().map(|edge| edge.r_count).sum::<u32>();
-                let alpha = categorical_proxy(tree.node(node_id)?.cat_outcome);
-                let node = tree.node_mut(node_id)?;
-                node.n_down = n_down;
-                Some(alpha)
-            } else {
-            let n_down = data.edges.iter().map(|edge| edge.r_count).sum::<u32>();
-            let value_alpha = data.value_alpha;
-            if n_down == 0 {
-                let node = tree.node_mut(node_id)?;
-                node.n_down = 0;
-                Some(value_alpha)
-            } else {
-                let pi = posterior_best_policy_target_ref(tree, node_id, config)?;
-                let mut evidence = [0.0f32; 3];
-                for (edge_index, weight) in pi.iter().enumerate() {
-                    let alpha = decision_edge_posterior_ref(tree, node_id, edge_index, config)?;
-                    for k in 0..3 {
-                        evidence[k] += *weight * alpha[k];
-                    }
-                }
-                let gamma = n_down as f32 / (config.kappa_n as f32 + n_down as f32);
-                let mut c_v = [0.0f32; 3];
+            node.n_down = 0;
+            Some(value_alpha)
+        } else {
+            profile.posterior_policy_calls += 1;
+            profile.posterior_policy_action_visits +=
+                config.posterior_best_samples as usize * action_count;
+            let policy_start = profile.start();
+            let pi = posterior_best_policy_target_ref(tree, node_id, config)?;
+            if let Some(start) = policy_start {
+                profile.posterior_policy += start.elapsed();
+            }
+            let mut evidence = [0.0f32; 3];
+            for (edge_index, weight) in pi.iter().enumerate() {
+                let alpha = decision_edge_posterior_ref(tree, node_id, edge_index, config)?;
                 for k in 0..3 {
-                    c_v[k] = (1.0 - gamma) * value_alpha[k] + gamma * evidence[k];
+                    evidence[k] += *weight * alpha[k];
                 }
-                let node = tree.node_mut(node_id)?;
-                node.n_down = n_down;
-                Some(c_v)
             }
+            let gamma = n_down as f32 / (config.kappa_n as f32 + n_down as f32);
+            let mut c_v = [0.0f32; 3];
+            for k in 0..3 {
+                c_v[k] = (1.0 - gamma) * value_alpha[k] + gamma * evidence[k];
             }
+            let node = tree.node_mut(node_id)?;
+            node.n_down = n_down;
+            Some(c_v)
         }
     };
     let node = tree.node_mut(node_id)?;
     node.c_v = cache;
     node.cache_version = node.cache_version.wrapping_add(1);
+    if let Some(start) = recompute_start {
+        profile.recompute += start.elapsed();
+    }
     Ok(())
 }
 
@@ -2341,21 +2632,57 @@ fn batch_item(py: Python<'_>, batch: &PyAny, index: usize) -> PyResult<PyObject>
 
 fn array_flat_f32(py: Python<'_>, obj: &PyAny) -> PyResult<Vec<f32>> {
     let np = PyModule::import(py, "numpy")?;
-    let arr = np.call_method1("asarray", (obj,))?;
-    let flat = arr.call_method1("reshape", (-1,))?;
-    let list = flat.call_method0("tolist")?;
-    Ok(list
-        .extract::<Vec<f64>>()?
-        .into_iter()
-        .map(|value| value as f32)
-        .collect())
+    let arr = np.call_method1("ascontiguousarray", (obj,))?;
+    if let Ok(array) = arr.downcast::<PyArrayDyn<f32>>() {
+        return Ok(array.readonly().as_slice()?.to_vec());
+    }
+    let arr = np.call_method1("ascontiguousarray", (obj, "float32"))?;
+    Ok(arr
+        .downcast::<PyArrayDyn<f32>>()?
+        .readonly()
+        .as_slice()?
+        .to_vec())
 }
 
 fn array_flat_i64(py: Python<'_>, obj: &PyAny) -> PyResult<Vec<i64>> {
     let np = PyModule::import(py, "numpy")?;
-    let arr = np.call_method1("asarray", (obj,))?;
-    let flat = arr.call_method1("reshape", (-1,))?;
-    flat.call_method0("tolist")?.extract()
+    let arr = np.call_method1("ascontiguousarray", (obj,))?;
+    if let Ok(array) = arr.downcast::<PyArrayDyn<i64>>() {
+        return Ok(array.readonly().as_slice()?.to_vec());
+    }
+    if let Ok(array) = arr.downcast::<PyArrayDyn<i32>>() {
+        return Ok(array
+            .readonly()
+            .as_slice()?
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect());
+    }
+    if let Ok(array) = arr.downcast::<PyArrayDyn<u32>>() {
+        return Ok(array
+            .readonly()
+            .as_slice()?
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect());
+    }
+    if let Ok(array) = arr.downcast::<PyArrayDyn<u64>>() {
+        return array
+            .readonly()
+            .as_slice()?
+            .iter()
+            .map(|value| {
+                i64::try_from(*value)
+                    .map_err(|_| PyValueError::new_err("integer value does not fit in i64"))
+            })
+            .collect();
+    }
+    let arr = np.call_method1("ascontiguousarray", (obj, "int64"))?;
+    Ok(arr
+        .downcast::<PyArrayDyn<i64>>()?
+        .readonly()
+        .as_slice()?
+        .to_vec())
 }
 
 fn array_flat_u64(py: Python<'_>, obj: &PyAny) -> PyResult<Vec<u64>> {
@@ -2374,9 +2701,12 @@ fn array_flat_u64(py: Python<'_>, obj: &PyAny) -> PyResult<Vec<u64>> {
 
 fn array_flat_bool(py: Python<'_>, obj: &PyAny) -> PyResult<Vec<bool>> {
     let np = PyModule::import(py, "numpy")?;
-    let arr = np.call_method1("asarray", (obj,))?;
-    let flat = arr.call_method1("reshape", (-1,))?;
-    flat.call_method0("tolist")?.extract()
+    let arr = np.call_method1("ascontiguousarray", (obj, "bool_"))?;
+    Ok(arr
+        .downcast::<PyArrayDyn<bool>>()?
+        .readonly()
+        .as_slice()?
+        .to_vec())
 }
 
 fn np_array<T: ToPyObject>(py: Python<'_>, data: T, dtype: &str) -> PyResult<PyObject> {

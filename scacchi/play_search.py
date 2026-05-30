@@ -577,22 +577,54 @@ def _run_dqaz_posterior_tree_search(
         child_state_batch, logits, alpha_v, alpha_q = _unpack_transition_output(
             transition_output
         )
-        logits, alpha_v, alpha_q = jax.device_get((logits, alpha_v, alpha_q))
-        terminated = np.asarray(jax.device_get(child_state_batch.terminated), dtype=bool)
-        current_players = np.asarray(
-            jax.device_get(child_state_batch.current_player),
-            dtype=np.int32,
-        )
-        offsets, legal_actions, policy_logits, q_alpha = _compact_valid_actions_from_mask_np(
-            np.asarray(jax.device_get(child_state_batch.legal_action_mask), dtype=bool),
+        active_mask = jnp.asarray(np.asarray(batch.active_mask), dtype=jnp.bool_)
+        (
+            padded_actions,
+            padded_policy_logits,
+            padded_q_alpha,
+            valid_counts,
+        ) = _padded_valid_actions_from_mask(
+            child_state_batch.legal_action_mask,
             logits,
             alpha_q,
-            terminated=terminated,
+            child_state_batch.terminated,
+            active_mask,
+        )
+        (
+            logits,
+            alpha_v,
+            padded_actions,
+            padded_policy_logits,
+            padded_q_alpha,
+            valid_counts,
+            terminated,
+            current_players,
+            child_observations,
+        ) = jax.device_get(
+            (
+                logits,
+                alpha_v,
+                padded_actions,
+                padded_policy_logits,
+                padded_q_alpha,
+                valid_counts,
+                child_state_batch.terminated,
+                child_state_batch.current_player,
+                child_state_batch.observation,
+            )
+        )
+        terminated = np.asarray(terminated, dtype=bool)
+        current_players = np.asarray(current_players, dtype=np.int32)
+        offsets, legal_actions, policy_logits, q_alpha = _flatten_padded_valid_actions_np(
+            padded_actions,
+            padded_policy_logits,
+            padded_q_alpha,
+            valid_counts,
         )
         engine.submit_transitions(
             batch.token,
             state_store.add_transitions(parent_handles, action_array),
-            np.asarray(jax.device_get(child_state_batch.observation), dtype=np.float32),
+            np.asarray(child_observations, dtype=np.float32),
             offsets,
             legal_actions,
             current_players,
@@ -689,6 +721,57 @@ def _compact_valid_actions_from_mask_np(
         np.asarray(legal_actions, dtype=np.int32),
         np.asarray(compact_logits, dtype=np.float32),
         q_alpha,
+    )
+
+
+@jax.jit
+def _padded_valid_actions_from_mask(
+    legal_action_mask: jax.Array,
+    policy_logits: jax.Array,
+    alpha_q: jax.Array,
+    terminated: jax.Array,
+    active_mask: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    action_size = legal_action_mask.shape[-1]
+    action_ids = jnp.arange(action_size, dtype=jnp.int32)
+    valid_mask = (
+        legal_action_mask
+        & active_mask[:, None]
+        & (~terminated)[:, None]
+    )
+    rank = jnp.where(valid_mask, action_ids[None, :], action_size)
+    order = jnp.argsort(rank, axis=-1, stable=True)
+    action_table = jnp.broadcast_to(action_ids[None, :], legal_action_mask.shape)
+    return (
+        jnp.take_along_axis(action_table, order, axis=-1),
+        jnp.take_along_axis(policy_logits, order, axis=-1),
+        jnp.take_along_axis(alpha_q, order[..., None], axis=-2),
+        jnp.sum(valid_mask, axis=-1, dtype=jnp.int32),
+    )
+
+
+def _flatten_padded_valid_actions_np(
+    padded_actions: Any,
+    padded_policy_logits: Any,
+    padded_q_alpha: Any,
+    valid_counts: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    padded_actions = np.asarray(padded_actions, dtype=np.int32)
+    padded_policy_logits = np.asarray(padded_policy_logits, dtype=np.float32)
+    padded_q_alpha = np.asarray(padded_q_alpha, dtype=np.float32)
+    valid_counts = np.asarray(valid_counts, dtype=np.int64)
+
+    offsets = np.empty((valid_counts.shape[0] + 1,), dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(valid_counts, out=offsets[1:])
+
+    action_slots = np.arange(padded_actions.shape[1])[None, :]
+    valid = action_slots < valid_counts[:, None]
+    return (
+        offsets,
+        padded_actions[valid].astype(np.int32, copy=False),
+        padded_policy_logits[valid].astype(np.float32, copy=False),
+        padded_q_alpha[valid].astype(np.float32, copy=False),
     )
 
 
