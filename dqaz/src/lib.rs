@@ -1,6 +1,22 @@
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
+#![allow(dead_code)]
+
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyModule};
+use rand::distributions::WeightedIndex;
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
+use rand_distr::{Distribution, Gamma};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, MutexGuard};
+
+type TreeId = u64;
+type NodeId = u32;
+type RequestId = u64;
+type BatchToken = u64;
+type Action = u32;
+
+const DUMMY_ALPHA: [f32; 3] = [1.0, 1.0, 1.0];
 
 #[pyclass(module = "dqaz")]
 #[derive(Clone)]
@@ -44,6 +60,9 @@ impl SearchConfig {
     ) -> PyResult<Self> {
         if action_size == 0 {
             return Err(PyValueError::new_err("action_size must be positive"));
+        }
+        if action_size > Action::MAX as usize {
+            return Err(PyValueError::new_err("action_size must fit in u32"));
         }
         if observation_shape.is_empty() || observation_shape.iter().any(|dim| *dim == 0) {
             return Err(PyValueError::new_err(
@@ -93,10 +112,255 @@ impl SearchConfig {
     }
 }
 
+impl SearchConfig {
+    fn observation_len(&self) -> usize {
+        self.observation_shape.iter().product()
+    }
+}
+
+struct Node {
+    id: NodeId,
+    generation: u32,
+    parent: Option<NodeId>,
+    parent_link: Option<ParentLink>,
+    depth: u32,
+    state: PyObject,
+    current_player: i32,
+    kind: NodeKind,
+    c_v: Option<[f32; 3]>,
+    n_down: u32,
+    cache_version: u32,
+}
+
+enum NodeKind {
+    Decision(DecisionData),
+    Terminal(TerminalData),
+}
+
+#[derive(Clone, Copy)]
+enum ParentLink {
+    DecisionAction { action: Action },
+}
+
+#[derive(Debug)]
+struct DecisionData {
+    observation: Vec<f32>,
+    legal_actions: Vec<Action>,
+    policy_logits: Vec<f32>,
+    value_alpha: [f32; 3],
+    q_alpha: Vec<[f32; 3]>,
+    edges: Vec<DecisionEdge>,
+}
+
+impl DecisionData {
+    fn new(
+        action_size: usize,
+        observation: Vec<f32>,
+        legal_actions: Vec<Action>,
+        policy_logits: Vec<f32>,
+        value_alpha: [f32; 3],
+        q_alpha: Vec<[f32; 3]>,
+    ) -> PyResult<Self> {
+        let valid_count = legal_actions.len();
+        if valid_count == 0 {
+            return Err(PyValueError::new_err(
+                "decision nodes must have at least one legal action",
+            ));
+        }
+        if policy_logits.len() != valid_count {
+            return Err(PyValueError::new_err(
+                "policy_logits length must match legal_actions length",
+            ));
+        }
+        if q_alpha.len() != valid_count {
+            return Err(PyValueError::new_err(
+                "q_alpha length must match legal_actions length",
+            ));
+        }
+        if value_alpha.iter().any(|alpha| !alpha.is_finite() || *alpha <= 0.0) {
+            return Err(PyValueError::new_err("value_alpha must be strictly positive"));
+        }
+        if q_alpha
+            .iter()
+            .flatten()
+            .any(|alpha| !alpha.is_finite() || *alpha <= 0.0)
+        {
+            return Err(PyValueError::new_err("q_alpha must be strictly positive"));
+        }
+
+        let mut seen = HashSet::with_capacity(valid_count);
+        for action in &legal_actions {
+            if (*action as usize) >= action_size {
+                return Err(PyValueError::new_err("legal action outside action_size"));
+            }
+            if !seen.insert(*action) {
+                return Err(PyValueError::new_err("duplicate legal action"));
+            }
+        }
+
+        Ok(Self {
+            observation,
+            legal_actions,
+            policy_logits,
+            value_alpha,
+            q_alpha,
+            edges: (0..valid_count).map(|_| DecisionEdge::new()).collect(),
+        })
+    }
+
+    fn edge_index_for_action(&self, action: Action) -> Option<usize> {
+        self.legal_actions
+            .iter()
+            .position(|candidate| *candidate == action)
+    }
+}
+
+#[derive(Debug)]
+struct DecisionEdge {
+    child: Option<NodeId>,
+    completed: bool,
+    b: [f32; 3],
+    r_count: u32,
+    child_cache_version: Option<u32>,
+}
+
+impl DecisionEdge {
+    fn new() -> Self {
+        Self {
+            child: None,
+            completed: false,
+            b: DUMMY_ALPHA,
+            r_count: 0,
+            child_cache_version: None,
+        }
+    }
+}
+
+struct TerminalData {
+    alpha: [f32; 3],
+}
+
+#[derive(Clone)]
+struct PathStep {
+    node_id: NodeId,
+    edge_index: usize,
+    action: Action,
+}
+
+#[derive(Clone)]
+struct RequestRecord {
+    request_id: RequestId,
+    tree_id: TreeId,
+    tree_generation: u32,
+    node_id: NodeId,
+    node_generation: u32,
+    action: Action,
+    path: Vec<PathStep>,
+}
+
+struct PendingBatch {
+    records: Vec<RequestRecord>,
+    padded_size: usize,
+}
+
+struct Tree {
+    id: TreeId,
+    generation: u32,
+    nodes: Vec<Node>,
+    root: NodeId,
+    pending_request: Option<RequestId>,
+    rng: ChaCha20Rng,
+}
+
+impl Tree {
+    fn node(&self, node_id: NodeId) -> PyResult<&Node> {
+        self.nodes
+            .get(node_id as usize)
+            .ok_or_else(|| PyRuntimeError::new_err("node id out of range"))
+    }
+
+    fn node_mut(&mut self, node_id: NodeId) -> PyResult<&mut Node> {
+        self.nodes
+            .get_mut(node_id as usize)
+            .ok_or_else(|| PyRuntimeError::new_err("node id out of range"))
+    }
+
+    fn is_done(&self, config: &SearchConfig) -> bool {
+        if self.pending_request.is_some() {
+            return false;
+        }
+        let Ok(root) = self.node(self.root) else {
+            return true;
+        };
+        match root.kind {
+            NodeKind::Decision(_) => root.n_down >= config.simulations_per_root,
+            NodeKind::Terminal(_) => true,
+        }
+    }
+}
+
+struct Forest {
+    config: SearchConfig,
+    trees: Vec<Option<Tree>>,
+    free_tree_slots: Vec<usize>,
+    next_tree_id: TreeId,
+    next_request_id: RequestId,
+    next_batch_token: BatchToken,
+    request_table: HashMap<BatchToken, PendingBatch>,
+    round_robin_cursor: usize,
+}
+
+impl Forest {
+    fn new(config: SearchConfig) -> Self {
+        Self {
+            config,
+            trees: Vec::new(),
+            free_tree_slots: Vec::new(),
+            next_tree_id: 1,
+            next_request_id: 1,
+            next_batch_token: 1,
+            request_table: HashMap::new(),
+            round_robin_cursor: 0,
+        }
+    }
+
+    fn insert_tree(&mut self, tree: Tree) {
+        if let Some(slot) = self.free_tree_slots.pop() {
+            self.trees[slot] = Some(tree);
+        } else {
+            self.trees.push(Some(tree));
+        }
+    }
+
+    fn tree_index(&self, tree_id: TreeId) -> PyResult<usize> {
+        self.trees
+            .iter()
+            .position(|tree| tree.as_ref().is_some_and(|tree| tree.id == tree_id))
+            .ok_or_else(|| PyValueError::new_err(format!("unknown tree id {tree_id}")))
+    }
+
+    fn tree(&self, tree_id: TreeId) -> PyResult<&Tree> {
+        let index = self.tree_index(tree_id)?;
+        Ok(self.trees[index].as_ref().expect("tree slot must be occupied"))
+    }
+
+    fn tree_mut(&mut self, tree_id: TreeId) -> PyResult<&mut Tree> {
+        let index = self.tree_index(tree_id)?;
+        Ok(self.trees[index].as_mut().expect("tree slot must be occupied"))
+    }
+
+    fn active_tree_ids(&self) -> Vec<TreeId> {
+        self.trees
+            .iter()
+            .filter_map(|tree| tree.as_ref().map(|tree| tree.id))
+            .collect()
+    }
+}
+
 #[pyclass(module = "dqaz")]
 struct TransitionBatch {
     #[pyo3(get)]
-    token: u64,
+    token: BatchToken,
     #[pyo3(get)]
     size: usize,
     #[pyo3(get)]
@@ -107,6 +371,14 @@ struct TransitionBatch {
     actions: PyObject,
     #[pyo3(get)]
     active_mask: PyObject,
+    #[pyo3(get)]
+    tree_ids: PyObject,
+    #[pyo3(get)]
+    parent_node_ids: PyObject,
+    #[pyo3(get)]
+    request_ids: PyObject,
+    #[pyo3(get)]
+    tree_generations: PyObject,
 }
 
 #[pymethods]
@@ -120,77 +392,1264 @@ impl TransitionBatch {
 }
 
 #[pyclass(module = "dqaz")]
-struct SearchResults {}
+struct SearchResults {
+    #[pyo3(get)]
+    tree_ids: PyObject,
+    #[pyo3(get)]
+    actions: PyObject,
+    #[pyo3(get)]
+    action_offsets: PyObject,
+    #[pyo3(get)]
+    legal_actions: PyObject,
+    #[pyo3(get)]
+    pi_search: PyObject,
+    #[pyo3(get)]
+    root_alpha: PyObject,
+    #[pyo3(get)]
+    root_q_mean: PyObject,
+}
 
 #[pyclass(module = "dqaz")]
-struct SearchTargets {}
+struct SearchTargets {
+    #[pyo3(get)]
+    observations: PyObject,
+    #[pyo3(get)]
+    action_offsets: PyObject,
+    #[pyo3(get)]
+    legal_actions: PyObject,
+    #[pyo3(get)]
+    policy_target: PyObject,
+    #[pyo3(get)]
+    q_target_alpha: PyObject,
+    #[pyo3(get)]
+    q_loss_weight: PyObject,
+    #[pyo3(get)]
+    v_target_alpha: PyObject,
+    #[pyo3(get)]
+    row_mask: PyObject,
+    #[pyo3(get)]
+    tree_ids: PyObject,
+    #[pyo3(get)]
+    node_ids: PyObject,
+    #[pyo3(get)]
+    depths: PyObject,
+}
 
 #[pyclass(module = "dqaz")]
 struct SearchEngine {
-    #[allow(dead_code)]
-    config: SearchConfig,
+    inner: Mutex<Forest>,
 }
 
 #[pymethods]
 impl SearchEngine {
     #[new]
     fn new(config: SearchConfig) -> Self {
-        Self { config }
+        Self {
+            inner: Mutex::new(Forest::new(config)),
+        }
     }
 
-    #[pyo3(signature = (*_args, **_kwargs))]
-    fn add_roots(&self, _args: &PyTuple, _kwargs: Option<&PyDict>) -> PyResult<PyObject> {
-        Err(not_implemented())
+    #[pyo3(signature = (
+        root_states,
+        observations,
+        action_offsets,
+        legal_actions,
+        current_players,
+        policy_logits,
+        value_alpha,
+        q_alpha,
+        terminated=None,
+        terminal_alpha=None
+    ))]
+    fn add_roots(
+        &self,
+        py: Python<'_>,
+        root_states: &PyAny,
+        observations: &PyAny,
+        action_offsets: &PyAny,
+        legal_actions: &PyAny,
+        current_players: &PyAny,
+        policy_logits: &PyAny,
+        value_alpha: &PyAny,
+        q_alpha: &PyAny,
+        terminated: Option<&PyAny>,
+        terminal_alpha: Option<&PyAny>,
+    ) -> PyResult<PyObject> {
+        let mut inner = self.lock()?;
+        let batch = ParsedNodeBatch::parse(
+            py,
+            &inner.config,
+            observations,
+            action_offsets,
+            legal_actions,
+            current_players,
+            policy_logits,
+            value_alpha,
+        q_alpha,
+        terminated,
+        terminal_alpha,
+        None,
+    )?;
+
+        let mut tree_ids = Vec::with_capacity(batch.len);
+        for row in 0..batch.len {
+            let state = batch_item(py, root_states, row)?;
+            let current_player = batch.current_players[row];
+            let node = if batch.terminated[row] {
+                let alpha = batch.terminal_alpha[row].ok_or_else(|| {
+                    PyValueError::new_err("terminal row missing positive terminal_alpha")
+                })?;
+                terminal_node(0, state, current_player, alpha)
+            } else {
+                let decision = batch.decision_data_for_row(&inner.config, row)?;
+                decision_node(0, state, current_player, decision)
+            };
+
+            let id = inner.next_tree_id;
+            inner.next_tree_id += 1;
+            let rng = ChaCha20Rng::seed_from_u64(inner.config.seed ^ id.rotate_left(17));
+            let tree = Tree {
+                id,
+                generation: 0,
+                nodes: vec![node],
+                root: 0,
+                pending_request: None,
+                rng,
+            };
+            inner.insert_tree(tree);
+            tree_ids.push(id);
+        }
+
+        np_array(py, tree_ids, "uint64")
     }
 
     #[pyo3(signature = (max_batch_size, pad_to=None))]
     fn request_transitions(
         &self,
+        py: Python<'_>,
         max_batch_size: usize,
         pad_to: Option<usize>,
     ) -> PyResult<Py<TransitionBatch>> {
         if max_batch_size == 0 {
             return Err(PyValueError::new_err("max_batch_size must be positive"));
         }
-        if let Some(pad_to) = pad_to {
-            if pad_to == 0 {
-                return Err(PyValueError::new_err("pad_to must be positive"));
-            }
-        }
-        Err(not_implemented())
+
+        let mut inner = self.lock()?;
+        let batch = request_transitions(py, &mut inner, max_batch_size, pad_to)?;
+        Py::new(py, batch)
     }
 
-    #[pyo3(signature = (*_args, **_kwargs))]
-    fn submit_transitions(&self, _args: &PyTuple, _kwargs: Option<&PyDict>) -> PyResult<()> {
-        Err(not_implemented())
+    #[pyo3(signature = (
+        token,
+        child_states,
+        observations,
+        action_offsets,
+        legal_actions,
+        current_players,
+        terminated,
+        terminal_alpha,
+        policy_logits,
+        value_alpha,
+        q_alpha
+    ))]
+    fn submit_transitions(
+        &self,
+        py: Python<'_>,
+        token: BatchToken,
+        child_states: &PyAny,
+        observations: &PyAny,
+        action_offsets: &PyAny,
+        legal_actions: &PyAny,
+        current_players: &PyAny,
+        terminated: &PyAny,
+        terminal_alpha: &PyAny,
+        policy_logits: &PyAny,
+        value_alpha: &PyAny,
+        q_alpha: &PyAny,
+    ) -> PyResult<()> {
+        let mut inner = self.lock()?;
+        let pending = inner
+            .request_table
+            .remove(&token)
+            .ok_or_else(|| PyValueError::new_err("wrong transition batch token"))?;
+
+        let batch = ParsedNodeBatch::parse(
+            py,
+            &inner.config,
+            observations,
+            action_offsets,
+            legal_actions,
+            current_players,
+            policy_logits,
+            value_alpha,
+            q_alpha,
+            Some(terminated),
+            Some(terminal_alpha),
+            Some(pending.records.len()),
+        )?;
+        if batch.len != pending.padded_size {
+            return Err(PyValueError::new_err("transition output shape mismatch"));
+        }
+
+        for (row, record) in pending.records.iter().enumerate() {
+            submit_one_transition(py, &mut inner, record, &batch, child_states, row)?;
+        }
+        Ok(())
     }
 
     #[pyo3(signature = (tree_ids=None))]
-    fn is_done(&self, tree_ids: Option<PyObject>) -> PyResult<bool> {
-        let _ = tree_ids;
-        Err(not_implemented())
+    fn is_done(&self, tree_ids: Option<&PyAny>) -> PyResult<bool> {
+        let inner = self.lock()?;
+        let ids = selected_tree_ids(&inner, tree_ids)?;
+        Ok(ids
+            .iter()
+            .all(|tree_id| inner.tree(*tree_id).is_ok_and(|tree| tree.is_done(&inner.config))))
     }
 
-    fn stats(&self) -> PyResult<PyObject> {
-        Err(not_implemented())
+    fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let inner = self.lock()?;
+        let stats = PyDict::new(py);
+        let active = inner.trees.iter().filter(|tree| tree.is_some()).count();
+        let pending = inner.request_table.len();
+        stats.set_item("trees", active)?;
+        stats.set_item("pending_batches", pending)?;
+        stats.set_item("next_tree_id", inner.next_tree_id)?;
+        Ok(stats.into_py(py))
     }
 
     #[pyo3(signature = (tree_ids=None, commit="posterior_sample"))]
-    fn finish(&self, tree_ids: Option<PyObject>, commit: &str) -> PyResult<Py<SearchResults>> {
-        let _ = tree_ids;
+    fn finish(
+        &self,
+        py: Python<'_>,
+        tree_ids: Option<&PyAny>,
+        commit: &str,
+    ) -> PyResult<Py<SearchResults>> {
         validate_commit(commit)?;
-        Err(not_implemented())
+        let mut inner = self.lock()?;
+        let ids = selected_tree_ids(&inner, tree_ids)?;
+        let results = finish_trees(py, &mut inner, &ids, commit)?;
+        Py::new(py, results)
     }
 
     #[pyo3(signature = (tree_ids=None))]
-    fn export_targets(&self, tree_ids: Option<PyObject>) -> PyResult<Py<SearchTargets>> {
-        let _ = tree_ids;
-        Err(not_implemented())
+    fn export_targets(
+        &self,
+        py: Python<'_>,
+        tree_ids: Option<&PyAny>,
+    ) -> PyResult<Py<SearchTargets>> {
+        let inner = self.lock()?;
+        let ids = selected_tree_ids(&inner, tree_ids)?;
+        let targets = export_targets(py, &inner, &ids)?;
+        Py::new(py, targets)
     }
 
-    fn advance_roots(&self, tree_ids: PyObject, actions: PyObject) -> PyResult<()> {
-        let _ = (tree_ids, actions);
-        Err(not_implemented())
+    fn advance_roots(&self, tree_ids: &PyAny, actions: &PyAny) -> PyResult<()> {
+        let ids = array_flat_u64(tree_ids.py(), tree_ids)?;
+        let actions = array_flat_i64(actions.py(), actions)?;
+        if ids.len() != actions.len() {
+            return Err(PyValueError::new_err("tree_ids and actions length mismatch"));
+        }
+
+        let mut inner = self.lock()?;
+        for (tree_id, action) in ids.iter().zip(actions.iter()) {
+            if *action < 0 || (*action as usize) >= inner.config.action_size {
+                return Err(PyValueError::new_err("invalid legal action in advance_roots"));
+            }
+            advance_one_root(&mut inner, *tree_id, *action as Action)?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (tree_ids=None))]
+    fn clear(&self, tree_ids: Option<&PyAny>) -> PyResult<()> {
+        let mut inner = self.lock()?;
+        let ids = selected_tree_ids(&inner, tree_ids)?;
+        let id_set = ids.iter().copied().collect::<HashSet<_>>();
+        let mut canceled = Vec::new();
+        inner.request_table.retain(|_, batch| {
+            if batch.records.iter().any(|record| id_set.contains(&record.tree_id)) {
+                canceled.extend(batch.records.iter().map(|record| {
+                    (record.tree_id, record.request_id)
+                }));
+                false
+            } else {
+                true
+            }
+        });
+        for (tree_id, request_id) in canceled {
+            if let Ok(tree) = inner.tree_mut(tree_id) {
+                if tree.pending_request == Some(request_id) {
+                    tree.pending_request = None;
+                }
+            }
+        }
+        for tree_id in ids {
+            let index = inner.tree_index(tree_id)?;
+            inner.trees[index] = None;
+            inner.free_tree_slots.push(index);
+        }
+        Ok(())
+    }
+
+    fn clear_all(&self) -> PyResult<()> {
+        let mut inner = self.lock()?;
+        inner.trees.clear();
+        inner.free_tree_slots.clear();
+        inner.request_table.clear();
+        inner.round_robin_cursor = 0;
+        Ok(())
+    }
+}
+
+impl SearchEngine {
+    fn lock(&self) -> PyResult<MutexGuard<'_, Forest>> {
+        self.inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("SearchEngine mutex is poisoned"))
+    }
+}
+
+struct ParsedNodeBatch {
+    len: usize,
+    observations: Vec<f32>,
+    action_offsets: Vec<usize>,
+    legal_actions: Vec<Action>,
+    current_players: Vec<i32>,
+    policy_logits: Vec<f32>,
+    value_alpha: Vec<[f32; 3]>,
+    q_alpha: Vec<[f32; 3]>,
+    terminated: Vec<bool>,
+    terminal_alpha: Vec<Option<[f32; 3]>>,
+}
+
+impl ParsedNodeBatch {
+    #[allow(clippy::too_many_arguments)]
+    fn parse(
+        py: Python<'_>,
+        config: &SearchConfig,
+        observations: &PyAny,
+        action_offsets: &PyAny,
+        legal_actions: &PyAny,
+        current_players: &PyAny,
+        policy_logits: &PyAny,
+        value_alpha: &PyAny,
+        q_alpha: &PyAny,
+        terminated: Option<&PyAny>,
+        terminal_alpha: Option<&PyAny>,
+        active_rows: Option<usize>,
+    ) -> PyResult<Self> {
+        let current_players = array_flat_i64(py, current_players)?
+            .into_iter()
+            .map(|value| value as i32)
+            .collect::<Vec<_>>();
+        let len = current_players.len();
+        let obs_len = config.observation_len();
+        let observations = array_flat_f32(py, observations)?;
+        if observations.len() != len * obs_len {
+            return Err(PyValueError::new_err("transition output shape mismatch"));
+        }
+
+        let raw_offsets = array_flat_i64(py, action_offsets)?;
+        if raw_offsets.len() != len + 1 {
+            return Err(PyValueError::new_err(
+                "invalid action_offsets shape or monotonicity",
+            ));
+        }
+        if raw_offsets.first() != Some(&0) || raw_offsets.iter().any(|offset| *offset < 0) {
+            return Err(PyValueError::new_err(
+                "invalid action_offsets shape or monotonicity",
+            ));
+        }
+        let mut action_offsets = Vec::with_capacity(raw_offsets.len());
+        let mut last = 0usize;
+        for raw in raw_offsets {
+            let offset = raw as usize;
+            if offset < last {
+                return Err(PyValueError::new_err(
+                    "invalid action_offsets shape or monotonicity",
+                ));
+            }
+            action_offsets.push(offset);
+            last = offset;
+        }
+        let total_actions = *action_offsets.last().unwrap_or(&0);
+
+        let legal_actions = array_flat_i64(py, legal_actions)?
+            .into_iter()
+            .map(|action| {
+                if action < 0 || action as usize >= config.action_size {
+                    Err(PyValueError::new_err("legal action outside 0..action_size"))
+                } else {
+                    Ok(action as Action)
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        if legal_actions.len() != total_actions {
+            return Err(PyValueError::new_err(
+                "legal_actions length mismatch with action_offsets",
+            ));
+        }
+
+        let policy_logits = array_flat_f32(py, policy_logits)?;
+        if policy_logits.len() != total_actions {
+            return Err(PyValueError::new_err(
+                "policy_logits length mismatch with legal_actions",
+            ));
+        }
+
+        let q_flat = array_flat_f32(py, q_alpha)?;
+        if q_flat.len() != total_actions * 3 {
+            return Err(PyValueError::new_err(
+                "q_alpha length mismatch with legal_actions",
+            ));
+        }
+        let q_alpha = q_flat
+            .chunks_exact(3)
+            .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+            .collect::<Vec<_>>();
+
+        let value_flat = array_flat_f32(py, value_alpha)?;
+        if value_flat.len() != len * 3 {
+            return Err(PyValueError::new_err("value_alpha shape mismatch"));
+        }
+        let value_alpha = value_flat
+            .chunks_exact(3)
+            .map(|chunk| [chunk[0], chunk[1], chunk[2]])
+            .collect::<Vec<_>>();
+
+        let terminated = match terminated {
+            Some(value) => {
+                let values = array_flat_bool(py, value)?;
+                if values.len() != len {
+                    return Err(PyValueError::new_err("terminated shape mismatch"));
+                }
+                values
+            }
+            None => vec![false; len],
+        };
+
+        let terminal_alpha = match terminal_alpha {
+            Some(value) => {
+                let flat = array_flat_f32(py, value)?;
+                if flat.len() != len * 3 {
+                    return Err(PyValueError::new_err("terminal alpha invalid"));
+                }
+                flat.chunks_exact(3)
+                    .map(|chunk| Some([chunk[0], chunk[1], chunk[2]]))
+                    .collect::<Vec<_>>()
+            }
+            None => vec![None; len],
+        };
+
+        let active_rows = active_rows.unwrap_or(len);
+        if active_rows > len {
+            return Err(PyValueError::new_err("transition output shape mismatch"));
+        }
+        for row in 0..active_rows {
+            let start = action_offsets[row];
+            let end = action_offsets[row + 1];
+            if terminated[row] {
+                let alpha = terminal_alpha[row].ok_or_else(|| {
+                    PyValueError::new_err("terminal row missing positive terminal_alpha")
+                })?;
+                validate_alpha(alpha, "terminal alpha invalid")?;
+                continue;
+            }
+            if start == end {
+                return Err(PyValueError::new_err(
+                    "decision nodes must have at least one legal action",
+                ));
+            }
+            validate_alpha(value_alpha[row], "non-terminal row missing positive value_alpha")?;
+            let mut seen = HashSet::with_capacity(end - start);
+            for index in start..end {
+                if !seen.insert(legal_actions[index]) {
+                    return Err(PyValueError::new_err("duplicate legal action within one row"));
+                }
+                validate_alpha(q_alpha[index], "non-terminal row missing positive q_alpha")?;
+            }
+        }
+
+        Ok(Self {
+            len,
+            observations,
+            action_offsets,
+            legal_actions,
+            current_players,
+            policy_logits,
+            value_alpha,
+            q_alpha,
+            terminated,
+            terminal_alpha,
+        })
+    }
+
+    fn decision_data_for_row(&self, config: &SearchConfig, row: usize) -> PyResult<DecisionData> {
+        let obs_len = config.observation_len();
+        let obs_start = row * obs_len;
+        let action_start = self.action_offsets[row];
+        let action_end = self.action_offsets[row + 1];
+        DecisionData::new(
+            config.action_size,
+            self.observations[obs_start..obs_start + obs_len].to_vec(),
+            self.legal_actions[action_start..action_end].to_vec(),
+            self.policy_logits[action_start..action_end].to_vec(),
+            self.value_alpha[row],
+            self.q_alpha[action_start..action_end].to_vec(),
+        )
+    }
+}
+
+fn validate_alpha(alpha: [f32; 3], message: &str) -> PyResult<()> {
+    if alpha.iter().all(|value| value.is_finite() && *value > 0.0) {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(message.to_string()))
+    }
+}
+
+fn decision_node(
+    id: NodeId,
+    state: PyObject,
+    current_player: i32,
+    decision: DecisionData,
+) -> Node {
+    Node {
+        id,
+        generation: 0,
+        parent: None,
+        parent_link: None,
+        depth: 0,
+        state,
+        current_player,
+        c_v: Some(decision.value_alpha),
+        n_down: 0,
+        cache_version: 0,
+        kind: NodeKind::Decision(decision),
+    }
+}
+
+fn terminal_node(id: NodeId, state: PyObject, current_player: i32, alpha: [f32; 3]) -> Node {
+    Node {
+        id,
+        generation: 0,
+        parent: None,
+        parent_link: None,
+        depth: 0,
+        state,
+        current_player,
+        kind: NodeKind::Terminal(TerminalData { alpha }),
+        c_v: Some(alpha),
+        n_down: 1,
+        cache_version: 0,
+    }
+}
+
+fn request_transitions(
+    py: Python<'_>,
+    forest: &mut Forest,
+    max_batch_size: usize,
+    pad_to: Option<usize>,
+) -> PyResult<TransitionBatch> {
+    let mut records = Vec::new();
+    let tree_slots = forest.trees.len();
+    if tree_slots == 0 {
+        return empty_transition_batch(py);
+    }
+
+    loop {
+        let mut made_progress = false;
+        for offset in 0..tree_slots {
+            if records.len() == max_batch_size {
+                break;
+            }
+            let index = (forest.round_robin_cursor + offset) % tree_slots;
+            let Some(tree) = forest.trees[index].as_mut() else {
+                continue;
+            };
+            if tree.pending_request.is_some() || tree.is_done(&forest.config) {
+                continue;
+            }
+            match next_transition_request(tree, &forest.config, &mut forest.next_request_id)? {
+                NextRequestResult::TransitionRequest(record) => {
+                    records.push(record);
+                    made_progress = true;
+                }
+                NextRequestResult::CompletedOneSimulation => {
+                    made_progress = true;
+                }
+                NextRequestResult::BlockedByPendingRequest
+                | NextRequestResult::TreeDone
+                | NextRequestResult::NoProgress => {}
+            }
+        }
+        forest.round_robin_cursor = (forest.round_robin_cursor + 1) % tree_slots;
+        if records.len() == max_batch_size || !made_progress {
+            break;
+        }
+    }
+
+    if records.is_empty() {
+        return empty_transition_batch(py);
+    }
+
+    let size = records.len();
+    let padded_size = pad_to.unwrap_or(size);
+    if padded_size < size {
+        return Err(PyValueError::new_err(
+            "pad_to smaller than collected active rows",
+        ));
+    }
+
+    let mut parent_states = Vec::with_capacity(padded_size);
+    let mut actions = Vec::with_capacity(padded_size);
+    let mut active_mask = Vec::with_capacity(padded_size);
+    let mut tree_ids = Vec::with_capacity(padded_size);
+    let mut parent_node_ids = Vec::with_capacity(padded_size);
+    let mut request_ids = Vec::with_capacity(padded_size);
+    let mut tree_generations = Vec::with_capacity(padded_size);
+
+    for record in &records {
+        let tree = forest.tree(record.tree_id)?;
+        let node = tree.node(record.node_id)?;
+        parent_states.push(node.state.clone_ref(py));
+        actions.push(record.action as i32);
+        active_mask.push(true);
+        tree_ids.push(record.tree_id);
+        parent_node_ids.push(record.node_id);
+        request_ids.push(record.request_id);
+        tree_generations.push(record.tree_generation);
+    }
+    for _ in size..padded_size {
+        parent_states.push(parent_states[0].clone_ref(py));
+        actions.push(actions[0]);
+        active_mask.push(false);
+        tree_ids.push(tree_ids[0]);
+        parent_node_ids.push(parent_node_ids[0]);
+        request_ids.push(request_ids[0]);
+        tree_generations.push(tree_generations[0]);
+    }
+
+    let token = forest.next_batch_token;
+    forest.next_batch_token += 1;
+    forest.request_table.insert(
+        token,
+        PendingBatch {
+            records,
+            padded_size,
+        },
+    );
+
+    Ok(TransitionBatch {
+        token,
+        size,
+        padded_size,
+        parent_states: PyList::new(py, parent_states).into_py(py),
+        actions: np_array(py, actions, "int32")?,
+        active_mask: np_array(py, active_mask, "bool_")?,
+        tree_ids: np_array(py, tree_ids, "uint64")?,
+        parent_node_ids: np_array(py, parent_node_ids, "uint32")?,
+        request_ids: np_array(py, request_ids, "uint64")?,
+        tree_generations: np_array(py, tree_generations, "uint32")?,
+    })
+}
+
+fn empty_transition_batch(py: Python<'_>) -> PyResult<TransitionBatch> {
+    Ok(TransitionBatch {
+        token: 0,
+        size: 0,
+        padded_size: 0,
+        parent_states: PyList::empty(py).into_py(py),
+        actions: np_array(py, Vec::<i32>::new(), "int32")?,
+        active_mask: np_array(py, Vec::<bool>::new(), "bool_")?,
+        tree_ids: np_array(py, Vec::<TreeId>::new(), "uint64")?,
+        parent_node_ids: np_array(py, Vec::<NodeId>::new(), "uint32")?,
+        request_ids: np_array(py, Vec::<RequestId>::new(), "uint64")?,
+        tree_generations: np_array(py, Vec::<u32>::new(), "uint32")?,
+    })
+}
+
+enum NextRequestResult {
+    TransitionRequest(RequestRecord),
+    CompletedOneSimulation,
+    BlockedByPendingRequest,
+    TreeDone,
+    NoProgress,
+}
+
+fn next_transition_request(
+    tree: &mut Tree,
+    config: &SearchConfig,
+    next_request_id: &mut RequestId,
+) -> PyResult<NextRequestResult> {
+    if tree.pending_request.is_some() {
+        return Ok(NextRequestResult::BlockedByPendingRequest);
+    }
+    if tree.is_done(config) {
+        return Ok(NextRequestResult::TreeDone);
+    }
+
+    let mut node_id = tree.root;
+    let mut path = Vec::new();
+    loop {
+        match &tree.node(node_id)?.kind {
+            NodeKind::Terminal(data) => {
+                backup(tree, &path, data.alpha, config)?;
+                return Ok(NextRequestResult::CompletedOneSimulation);
+            }
+            NodeKind::Decision(_) => {
+                let edge_index = thompson_select(tree, node_id, config)?;
+                let action = decision(tree, node_id)?.legal_actions[edge_index];
+                if let Some(child_id) = decision(tree, node_id)?.edges[edge_index].child {
+                    path.push(PathStep {
+                        node_id,
+                        edge_index,
+                        action,
+                    });
+                    node_id = child_id;
+                    continue;
+                }
+
+                let request_id = *next_request_id;
+                *next_request_id += 1;
+                tree.pending_request = Some(request_id);
+                path.push(PathStep {
+                    node_id,
+                    edge_index,
+                    action,
+                });
+                let record = RequestRecord {
+                    request_id,
+                    tree_id: tree.id,
+                    tree_generation: tree.generation,
+                    node_id,
+                    node_generation: tree.node(node_id)?.generation,
+                    action,
+                    path,
+                };
+                return Ok(NextRequestResult::TransitionRequest(record));
+            }
+        }
+    }
+}
+
+fn submit_one_transition(
+    py: Python<'_>,
+    forest: &mut Forest,
+    record: &RequestRecord,
+    batch: &ParsedNodeBatch,
+    child_states: &PyAny,
+    row: usize,
+) -> PyResult<()> {
+    let config = forest.config.clone();
+    let Ok(tree) = forest.tree_mut(record.tree_id) else {
+        return Ok(());
+    };
+    if tree.generation != record.tree_generation {
+        return Ok(());
+    }
+    let Ok(parent) = tree.node(record.node_id) else {
+        return Ok(());
+    };
+    if parent.generation != record.node_generation {
+        return Ok(());
+    }
+    if tree.pending_request != Some(record.request_id) {
+        return Ok(());
+    }
+
+    let child_state = batch_item(py, child_states, row)?;
+    let current_player = batch.current_players[row];
+    let child_id = tree.nodes.len() as NodeId;
+    let mut child = if batch.terminated[row] {
+        let alpha = batch.terminal_alpha[row]
+            .ok_or_else(|| PyValueError::new_err("terminal row missing positive terminal_alpha"))?;
+        terminal_node(child_id, child_state, current_player, alpha)
+    } else {
+        let decision = batch.decision_data_for_row(&config, row)?;
+        decision_node(child_id, child_state, current_player, decision)
+    };
+    child.parent = Some(record.node_id);
+    child.parent_link = Some(ParentLink::DecisionAction {
+        action: record.action,
+    });
+    child.depth = tree.node(record.node_id)?.depth + 1;
+    tree.nodes.push(child);
+
+    let parent = tree.node_mut(record.node_id)?;
+    let data = match &mut parent.kind {
+        NodeKind::Decision(data) => data,
+        NodeKind::Terminal(_) => return Err(PyRuntimeError::new_err("request parent is terminal")),
+    };
+    if data.edges[record.path.last().unwrap().edge_index].child.is_some() {
+        return Err(PyRuntimeError::new_err("request edge already has a child"));
+    }
+    data.edges[record.path.last().unwrap().edge_index].child = Some(child_id);
+    tree.pending_request = None;
+
+    let beta = match &tree.node(child_id)?.kind {
+        NodeKind::Decision(data) => data.value_alpha,
+        NodeKind::Terminal(data) => data.alpha,
+    };
+    backup(tree, &record.path, beta, &config)
+}
+
+fn advance_one_root(forest: &mut Forest, tree_id: TreeId, action: Action) -> PyResult<()> {
+    let tree = forest.tree_mut(tree_id)?;
+    let root = tree.root;
+    let edge_index = decision(tree, root)?
+        .edge_index_for_action(action)
+        .ok_or_else(|| PyValueError::new_err("invalid legal action in advance_roots"))?;
+    let child = decision(tree, root)?.edges[edge_index]
+        .child
+        .ok_or_else(|| PyValueError::new_err("advance_roots called for an action without an existing child"))?;
+
+    tree.root = child;
+    tree.generation += 1;
+    tree.pending_request = None;
+    let root_node = tree.node_mut(child)?;
+    root_node.parent = None;
+    root_node.parent_link = None;
+    root_node.depth = 0;
+    recompute_depths_from_root(tree)?;
+    Ok(())
+}
+
+fn recompute_depths_from_root(tree: &mut Tree) -> PyResult<()> {
+    let mut stack = vec![(tree.root, 0u32)];
+    while let Some((node_id, depth)) = stack.pop() {
+        let children = {
+            let node = tree.node_mut(node_id)?;
+            node.depth = depth;
+            match &node.kind {
+                NodeKind::Decision(data) => data
+                    .edges
+                    .iter()
+                    .filter_map(|edge| edge.child)
+                    .collect::<Vec<_>>(),
+                NodeKind::Terminal(_) => Vec::new(),
+            }
+        };
+        for child in children {
+            stack.push((child, depth + 1));
+        }
+    }
+    Ok(())
+}
+
+fn finish_trees(
+    py: Python<'_>,
+    forest: &mut Forest,
+    tree_ids: &[TreeId],
+    commit: &str,
+) -> PyResult<SearchResults> {
+    let mut out_tree_ids = Vec::with_capacity(tree_ids.len());
+    let mut actions = Vec::with_capacity(tree_ids.len());
+    let mut action_offsets = Vec::with_capacity(tree_ids.len() + 1);
+    let mut legal_actions = Vec::new();
+    let mut pi_search = Vec::new();
+    let mut root_alpha = Vec::new();
+    let mut root_q_mean = Vec::new();
+    action_offsets.push(0i64);
+
+    for tree_id in tree_ids {
+        let config = forest.config.clone();
+        let tree = forest.tree_mut(*tree_id)?;
+        if tree.pending_request.is_some() {
+            return Err(PyValueError::new_err("finish called with pending request"));
+        }
+        if !matches!(tree.node(tree.root)?.kind, NodeKind::Decision(_)) {
+            return Err(PyValueError::new_err("finish called on non-decision root"));
+        }
+        if tree.node(tree.root)?.n_down < config.simulations_per_root {
+            return Err(PyValueError::new_err(
+                "finish called before simulations_per_root reached",
+            ));
+        }
+
+        let root = tree.root;
+        let legal_actions_for_root = decision(tree, root)?.legal_actions.clone();
+        let pi = posterior_best_policy_target(tree, root, &config)?;
+        let mut alpha_rows = Vec::with_capacity(legal_actions_for_root.len());
+        let mut q_rows = Vec::with_capacity(legal_actions_for_root.len());
+        for edge_index in 0..legal_actions_for_root.len() {
+            let alpha = decision_edge_posterior_ref(tree, root, edge_index, &config)?;
+            alpha_rows.push(alpha);
+            q_rows.push((alpha[2] - alpha[0]) / alpha.iter().sum::<f32>());
+        }
+        let selected_edge = match commit {
+            "posterior_argmax" => argmax(&pi),
+            "mean_utility_argmax" => argmax(&q_rows),
+            "posterior_sample" => sample_index(&pi, &mut tree.rng)?,
+            _ => unreachable!("commit mode already validated"),
+        };
+
+        out_tree_ids.push(*tree_id);
+        actions.push(legal_actions_for_root[selected_edge] as i32);
+        legal_actions.extend(legal_actions_for_root.iter().map(|action| *action as i32));
+        pi_search.extend(pi);
+        root_alpha.extend(alpha_rows);
+        root_q_mean.extend(q_rows);
+        action_offsets.push(legal_actions.len() as i64);
+    }
+
+    Ok(SearchResults {
+        tree_ids: np_array(py, out_tree_ids, "uint64")?,
+        actions: np_array(py, actions, "int32")?,
+        action_offsets: np_array(py, action_offsets, "int64")?,
+        legal_actions: np_array(py, legal_actions, "int32")?,
+        pi_search: np_array(py, pi_search, "float32")?,
+        root_alpha: np_array_reshape(
+            py,
+            alpha_rows_to_flat(&root_alpha),
+            vec![root_alpha.len(), 3],
+            "float32",
+        )?,
+        root_q_mean: np_array(py, root_q_mean, "float32")?,
+    })
+}
+
+fn export_targets(py: Python<'_>, forest: &Forest, tree_ids: &[TreeId]) -> PyResult<SearchTargets> {
+    for tree_id in tree_ids {
+        if forest.tree(*tree_id)?.pending_request.is_some() {
+            return Err(PyValueError::new_err("export called with pending request"));
+        }
+    }
+
+    let mut observations: Vec<f32> = Vec::new();
+    let mut action_offsets = vec![0i64];
+    let mut legal_actions: Vec<i32> = Vec::new();
+    let mut policy_target: Vec<f32> = Vec::new();
+    let mut q_target_alpha: Vec<[f32; 3]> = Vec::new();
+    let mut q_loss_weight: Vec<f32> = Vec::new();
+    let mut v_target_alpha: Vec<[f32; 3]> = Vec::new();
+    let mut row_mask: Vec<bool> = Vec::new();
+    let mut out_tree_ids: Vec<TreeId> = Vec::new();
+    let mut node_ids: Vec<NodeId> = Vec::new();
+    let mut depths: Vec<u32> = Vec::new();
+
+    for tree_id in tree_ids {
+        let tree = forest.tree(*tree_id)?;
+        let mut stack = vec![tree.root];
+        while let Some(node_id) = stack.pop() {
+            let node = tree.node(node_id)?;
+            let NodeKind::Decision(data) = &node.kind else {
+                continue;
+            };
+            for edge in &data.edges {
+                if let Some(child) = edge.child {
+                    stack.push(child);
+                }
+            }
+            if node.n_down == 0 || node.c_v.is_none() {
+                continue;
+            }
+            let pi = posterior_best_policy_target_ref(tree, node_id, &forest.config)?;
+            observations.extend(&data.observation);
+            legal_actions.extend(data.legal_actions.iter().map(|action| *action as i32));
+            policy_target.extend(&pi);
+            q_loss_weight.extend(&pi);
+            for edge_index in 0..data.legal_actions.len() {
+                q_target_alpha.push(decision_edge_posterior_ref(
+                    tree,
+                    node_id,
+                    edge_index,
+                    &forest.config,
+                )?);
+            }
+            v_target_alpha.push(node.c_v.unwrap());
+            row_mask.push(true);
+            out_tree_ids.push(*tree_id);
+            node_ids.push(node_id);
+            depths.push(node.depth);
+            action_offsets.push(legal_actions.len() as i64);
+        }
+    }
+
+    let rows = row_mask.len();
+    Ok(SearchTargets {
+        observations: np_array_reshape(
+            py,
+            observations,
+            std::iter::once(rows)
+                .chain(forest.config.observation_shape.iter().copied())
+                .collect(),
+            "float32",
+        )?,
+        action_offsets: np_array(py, action_offsets, "int64")?,
+        legal_actions: np_array(py, legal_actions, "int32")?,
+        policy_target: np_array(py, policy_target, "float32")?,
+        q_target_alpha: np_array_reshape(
+            py,
+            alpha_rows_to_flat(&q_target_alpha),
+            vec![q_target_alpha.len(), 3],
+            "float32",
+        )?,
+        q_loss_weight: np_array(py, q_loss_weight, "float32")?,
+        v_target_alpha: np_array_reshape(
+            py,
+            alpha_rows_to_flat(&v_target_alpha),
+            vec![v_target_alpha.len(), 3],
+            "float32",
+        )?,
+        row_mask: np_array(py, row_mask, "bool_")?,
+        tree_ids: np_array(py, out_tree_ids, "uint64")?,
+        node_ids: np_array(py, node_ids, "uint32")?,
+        depths: np_array(py, depths, "uint32")?,
+    })
+}
+
+fn backup(
+    tree: &mut Tree,
+    path: &[PathStep],
+    beta_leaf: [f32; 3],
+    config: &SearchConfig,
+) -> PyResult<()> {
+    let mut beta = beta_leaf;
+    for step in path.iter().rev() {
+        let child_id = decision(tree, step.node_id)?.edges[step.edge_index]
+            .child
+            .ok_or_else(|| PyRuntimeError::new_err("backup edge has no child"))?;
+        beta = align_child_to_parent(tree, child_id, step.node_id, beta)?;
+        {
+            let parent = tree.node_mut(step.node_id)?;
+            let NodeKind::Decision(data) = &mut parent.kind else {
+                return Err(PyRuntimeError::new_err("backup parent is not a decision node"));
+            };
+            let edge = &mut data.edges[step.edge_index];
+            edge.b = beta;
+            edge.completed = true;
+            edge.r_count += 1;
+        }
+        recompute_node(tree, step.node_id, config)?;
+        beta = tree.node(step.node_id)?.c_v.unwrap_or(beta);
+    }
+    Ok(())
+}
+
+fn recompute_node(tree: &mut Tree, node_id: NodeId, config: &SearchConfig) -> PyResult<()> {
+    let cache = match &tree.node(node_id)?.kind {
+        NodeKind::Terminal(data) => {
+            let alpha = data.alpha;
+            let node = tree.node_mut(node_id)?;
+            node.n_down = 1;
+            Some(alpha)
+        }
+        NodeKind::Decision(data) => {
+            let n_down = data.edges.iter().map(|edge| edge.r_count).sum::<u32>();
+            let value_alpha = data.value_alpha;
+            if n_down == 0 {
+                let node = tree.node_mut(node_id)?;
+                node.n_down = 0;
+                Some(value_alpha)
+            } else {
+                let pi = posterior_best_policy_target_ref(tree, node_id, config)?;
+                let mut evidence = [0.0f32; 3];
+                for (edge_index, weight) in pi.iter().enumerate() {
+                    let alpha = decision_edge_posterior_ref(tree, node_id, edge_index, config)?;
+                    for k in 0..3 {
+                        evidence[k] += *weight * alpha[k];
+                    }
+                }
+                let gamma = n_down as f32 / (config.kappa_n as f32 + n_down as f32);
+                let mut c_v = [0.0f32; 3];
+                for k in 0..3 {
+                    c_v[k] = (1.0 - gamma) * value_alpha[k] + gamma * evidence[k];
+                }
+                let node = tree.node_mut(node_id)?;
+                node.n_down = n_down;
+                Some(c_v)
+            }
+        }
+    };
+    let node = tree.node_mut(node_id)?;
+    node.c_v = cache;
+    node.cache_version = node.cache_version.wrapping_add(1);
+    Ok(())
+}
+
+fn thompson_select(
+    tree: &mut Tree,
+    node_id: NodeId,
+    config: &SearchConfig,
+) -> PyResult<usize> {
+    let action_count = decision(tree, node_id)?.legal_actions.len();
+    let mut best_index = 0usize;
+    let mut best_utility = f32::NEG_INFINITY;
+    for edge_index in 0..action_count {
+        let alpha = decision_edge_posterior(tree, node_id, edge_index, config)?;
+        let sample = sample_dirichlet(alpha, &mut tree.rng)?;
+        let utility = sample[2] - sample[0];
+        if utility > best_utility {
+            best_utility = utility;
+            best_index = edge_index;
+        }
+    }
+    Ok(best_index)
+}
+
+fn posterior_best_policy_target(
+    tree: &mut Tree,
+    node_id: NodeId,
+    config: &SearchConfig,
+) -> PyResult<Vec<f32>> {
+    let action_count = decision(tree, node_id)?.legal_actions.len();
+    let mut counts = vec![0u32; action_count];
+    for _ in 0..config.posterior_best_samples {
+        let mut best_index = 0usize;
+        let mut best_utility = f32::NEG_INFINITY;
+        for edge_index in 0..action_count {
+            let alpha = decision_edge_posterior(tree, node_id, edge_index, config)?;
+            let sample = sample_dirichlet(alpha, &mut tree.rng)?;
+            let utility = sample[2] - sample[0];
+            if utility > best_utility {
+                best_utility = utility;
+                best_index = edge_index;
+            }
+        }
+        counts[best_index] += 1;
+    }
+    let denom = config.posterior_best_samples as f32;
+    Ok(counts.into_iter().map(|count| count as f32 / denom).collect())
+}
+
+fn posterior_best_policy_target_ref(
+    tree: &Tree,
+    node_id: NodeId,
+    config: &SearchConfig,
+) -> PyResult<Vec<f32>> {
+    let action_count = decision(tree, node_id)?.legal_actions.len();
+    let node = tree.node(node_id)?;
+    let mut rng = ChaCha20Rng::seed_from_u64(
+        config.seed
+            ^ tree.id.rotate_left(11)
+            ^ (node_id as u64).rotate_left(29)
+            ^ (node.generation as u64).rotate_left(43),
+    );
+    let mut counts = vec![0u32; action_count];
+    for _ in 0..config.posterior_best_samples {
+        let mut best_index = 0usize;
+        let mut best_utility = f32::NEG_INFINITY;
+        for edge_index in 0..action_count {
+            let alpha = decision_edge_posterior_ref(tree, node_id, edge_index, config)?;
+            let sample = sample_dirichlet(alpha, &mut rng)?;
+            let utility = sample[2] - sample[0];
+            if utility > best_utility {
+                best_utility = utility;
+                best_index = edge_index;
+            }
+        }
+        counts[best_index] += 1;
+    }
+    let denom = config.posterior_best_samples as f32;
+    Ok(counts.into_iter().map(|count| count as f32 / denom).collect())
+}
+
+fn decision_edge_posterior(
+    tree: &mut Tree,
+    node_id: NodeId,
+    edge_index: usize,
+    config: &SearchConfig,
+) -> PyResult<[f32; 3]> {
+    decision_edge_posterior_ref(tree, node_id, edge_index, config)
+}
+
+fn decision_edge_posterior_ref(
+    tree: &Tree,
+    node_id: NodeId,
+    edge_index: usize,
+    _config: &SearchConfig,
+) -> PyResult<[f32; 3]> {
+    let data = decision(tree, node_id)?;
+    let edge = data
+        .edges
+        .get(edge_index)
+        .ok_or_else(|| PyRuntimeError::new_err("edge index out of range"))?;
+    if edge.completed {
+        return Ok(edge.b);
+    }
+    if let Some(child_id) = edge.child {
+        let child = tree.node(child_id)?;
+        if is_summarizable(child) {
+            return align_child_to_parent(tree, child_id, node_id, child.c_v.unwrap());
+        }
+        if let NodeKind::Decision(child_data) = &child.kind {
+            return align_child_to_parent(tree, child_id, node_id, child_data.value_alpha);
+        }
+    }
+    Ok(data.q_alpha[edge_index])
+}
+
+fn is_summarizable(node: &Node) -> bool {
+    match node.kind {
+        NodeKind::Terminal(_) => true,
+        NodeKind::Decision(_) => node.n_down > 0 && node.c_v.is_some(),
+    }
+}
+
+fn align_child_to_parent(
+    tree: &Tree,
+    child_id: NodeId,
+    parent_id: NodeId,
+    alpha: [f32; 3],
+) -> PyResult<[f32; 3]> {
+    let child = tree.node(child_id)?;
+    let parent = tree.node(parent_id)?;
+    if child.current_player == parent.current_player {
+        Ok(alpha)
+    } else {
+        Ok([alpha[2], alpha[1], alpha[0]])
+    }
+}
+
+fn decision(tree: &Tree, node_id: NodeId) -> PyResult<&DecisionData> {
+    match &tree.node(node_id)?.kind {
+        NodeKind::Decision(data) => Ok(data),
+        NodeKind::Terminal(_) => Err(PyRuntimeError::new_err("node is not a decision node")),
+    }
+}
+
+fn sample_dirichlet(alpha: [f32; 3], rng: &mut ChaCha20Rng) -> PyResult<[f32; 3]> {
+    let mut sample = [0.0f32; 3];
+    let mut sum = 0.0f32;
+    for k in 0..3 {
+        let gamma = Gamma::new(alpha[k] as f64, 1.0).map_err(|_| {
+            PyRuntimeError::new_err("failed to create gamma distribution for Dirichlet sample")
+        })?;
+        sample[k] = gamma.sample(rng) as f32;
+        sum += sample[k];
+    }
+    if sum <= 0.0 || !sum.is_finite() {
+        return Err(PyRuntimeError::new_err("invalid Dirichlet sample"));
+    }
+    for value in &mut sample {
+        *value /= sum;
+    }
+    Ok(sample)
+}
+
+fn sample_index(weights: &[f32], rng: &mut ChaCha20Rng) -> PyResult<usize> {
+    let dist = WeightedIndex::new(weights.iter().map(|w| w.max(0.0) as f64))
+        .map_err(|_| PyRuntimeError::new_err("invalid posterior_sample weights"))?;
+    Ok(dist.sample(rng))
+}
+
+fn argmax(values: &[f32]) -> usize {
+    let mut best_index = 0usize;
+    let mut best_value = f32::NEG_INFINITY;
+    for (index, value) in values.iter().enumerate() {
+        if *value > best_value {
+            best_value = *value;
+            best_index = index;
+        }
+    }
+    best_index
+}
+
+fn selected_tree_ids(forest: &Forest, tree_ids: Option<&PyAny>) -> PyResult<Vec<TreeId>> {
+    match tree_ids {
+        Some(ids) => array_flat_u64(ids.py(), ids),
+        None => Ok(forest.active_tree_ids()),
     }
 }
 
@@ -203,10 +1662,72 @@ fn validate_commit(commit: &str) -> PyResult<()> {
     }
 }
 
-fn not_implemented() -> PyErr {
-    PyNotImplementedError::new_err(
-        "dqaz Rust search has not been reimplemented for the fused Python env.step + NN boundary",
-    )
+fn batch_item(py: Python<'_>, batch: &PyAny, index: usize) -> PyResult<PyObject> {
+    Ok(batch.get_item(index)?.into_py(py))
+}
+
+fn array_flat_f32(py: Python<'_>, obj: &PyAny) -> PyResult<Vec<f32>> {
+    let np = PyModule::import(py, "numpy")?;
+    let arr = np.call_method1("asarray", (obj,))?;
+    let flat = arr.call_method1("reshape", (-1,))?;
+    let list = flat.call_method0("tolist")?;
+    Ok(list
+        .extract::<Vec<f64>>()?
+        .into_iter()
+        .map(|value| value as f32)
+        .collect())
+}
+
+fn array_flat_i64(py: Python<'_>, obj: &PyAny) -> PyResult<Vec<i64>> {
+    let np = PyModule::import(py, "numpy")?;
+    let arr = np.call_method1("asarray", (obj,))?;
+    let flat = arr.call_method1("reshape", (-1,))?;
+    flat.call_method0("tolist")?.extract()
+}
+
+fn array_flat_u64(py: Python<'_>, obj: &PyAny) -> PyResult<Vec<u64>> {
+    let values = array_flat_i64(py, obj)?;
+    values
+        .into_iter()
+        .map(|value| {
+            if value < 0 {
+                Err(PyValueError::new_err("tree id must be nonnegative"))
+            } else {
+                Ok(value as u64)
+            }
+        })
+        .collect()
+}
+
+fn array_flat_bool(py: Python<'_>, obj: &PyAny) -> PyResult<Vec<bool>> {
+    let np = PyModule::import(py, "numpy")?;
+    let arr = np.call_method1("asarray", (obj,))?;
+    let flat = arr.call_method1("reshape", (-1,))?;
+    flat.call_method0("tolist")?.extract()
+}
+
+fn np_array<T: ToPyObject>(py: Python<'_>, data: T, dtype: &str) -> PyResult<PyObject> {
+    let np = PyModule::import(py, "numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", dtype)?;
+    Ok(np
+        .call_method("array", (data.to_object(py),), Some(kwargs))?
+        .into_py(py))
+}
+
+fn np_array_reshape<T: ToPyObject>(
+    py: Python<'_>,
+    data: T,
+    shape: Vec<usize>,
+    dtype: &str,
+) -> PyResult<PyObject> {
+    let array = np_array(py, data, dtype)?;
+    let reshaped = array.as_ref(py).call_method1("reshape", (shape,))?;
+    Ok(reshaped.into_py(py))
+}
+
+fn alpha_rows_to_flat(rows: &[[f32; 3]]) -> Vec<f32> {
+    rows.iter().flat_map(|row| row.iter().copied()).collect()
 }
 
 #[pymodule]
@@ -217,4 +1738,57 @@ fn _dqaz(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<SearchResults>()?;
     m.add_class::<SearchTargets>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decision_data(legal_actions: Vec<Action>, q_alpha: Vec<[f32; 3]>) -> PyResult<DecisionData> {
+        pyo3::prepare_freethreaded_python();
+        let policy_logits = vec![0.0; legal_actions.len()];
+        DecisionData::new(
+            128,
+            vec![0.0, 1.0, 2.0],
+            legal_actions,
+            policy_logits,
+            [1.0, 1.0, 1.0],
+            q_alpha,
+        )
+    }
+
+    #[test]
+    fn decision_data_stores_q_and_edges_for_valid_actions_only() {
+        let data = decision_data(vec![3, 42], vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            .expect("valid sparse decision data");
+
+        assert_eq!(data.legal_actions, vec![3, 42]);
+        assert_eq!(data.q_alpha.len(), data.legal_actions.len());
+        assert_eq!(data.edges.len(), data.legal_actions.len());
+        assert_eq!(data.edge_index_for_action(42), Some(1));
+        assert_eq!(data.edge_index_for_action(7), None);
+    }
+
+    #[test]
+    fn decision_data_rejects_dense_q_length() {
+        let err = decision_data(
+            vec![3, 42],
+            vec![
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+            ],
+        )
+        .expect_err("q_alpha must be compact");
+
+        assert!(err.to_string().contains("q_alpha length"));
+    }
+
+    #[test]
+    fn decision_data_rejects_duplicate_legal_actions() {
+        let err = decision_data(vec![3, 3], vec![[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
+            .expect_err("legal actions must be unique");
+
+        assert!(err.to_string().contains("duplicate legal action"));
+    }
 }

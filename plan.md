@@ -111,13 +111,18 @@ Utility:   U(phi) = phi[W] - phi[L]
 Flip:      flip([L, D, W]) = [W, D, L]
 ```
 
-The network predicts, for decision nodes only:
+The network output submitted to Rust is compacted to valid actions for decision
+nodes:
 
 ```text
-policy_logits: [A]
+legal_actions: [K]
+policy_logits: [K]
 value_alpha:   [3]
-q_alpha:       [A, 3]
+q_alpha:       [K, 3]
 ```
+
+where `K` is the number of valid actions at that node and each
+`legal_actions[i]` is a global action id in `0..action_size`.
 
 The training policy target is not a visit-count target. It is:
 
@@ -160,7 +165,12 @@ fused batch:
 
 ```text
 child_states = env.step(parent_states, actions)
-policy_logits, value_alpha, q_alpha = model(child_states.observation)
+dense_policy_logits, value_alpha, dense_q_alpha = model(child_states.observation)
+legal_actions, action_offsets, policy_logits, q_alpha = compact_valid_actions(
+    child_states.legal_action_mask,
+    dense_policy_logits,
+    dense_q_alpha,
+)
 ```
 
 and submits both the child-state metadata and neural outputs back to Rust.
@@ -169,14 +179,20 @@ The Python loop should look like:
 
 ```python
 root_eval = model_apply(root_states.observation)
+root_actions = compact_valid_actions(
+    root_states.legal_action_mask,
+    root_eval.policy_logits,
+    root_eval.q_alpha,
+)
 tree_ids = engine.add_roots(
     root_states=root_states,
     observations=root_states.observation,
-    legal_masks=root_states.legal_action_mask,
+    action_offsets=root_actions.action_offsets,
+    legal_actions=root_actions.legal_actions,
     current_players=root_states.current_player,
-    policy_logits=root_eval.policy_logits,
+    policy_logits=root_actions.policy_logits,
     value_alpha=root_eval.value_alpha,
-    q_alpha=root_eval.q_alpha,
+    q_alpha=root_actions.q_alpha,
 )
 
 while not engine.is_done(tree_ids):
@@ -187,18 +203,24 @@ while not engine.is_done(tree_ids):
 
     child_states = env_step(batch.parent_states, batch.actions)
     child_eval = model_apply(child_states.observation)
+    child_actions = compact_valid_actions(
+        child_states.legal_action_mask,
+        child_eval.policy_logits,
+        child_eval.q_alpha,
+    )
 
     engine.submit_transitions(
         batch.token,
         child_states=child_states,
         observations=child_states.observation,
-        legal_masks=child_states.legal_action_mask,
+        action_offsets=child_actions.action_offsets,
+        legal_actions=child_actions.legal_actions,
         current_players=child_states.current_player,
         terminated=child_states.terminated,
         terminal_alpha=terminal_alpha_from_rewards(child_states),
-        policy_logits=child_eval.policy_logits,
+        policy_logits=child_actions.policy_logits,
         value_alpha=child_eval.value_alpha,
-        q_alpha=child_eval.q_alpha,
+        q_alpha=child_actions.q_alpha,
     )
 
 results = engine.finish(tree_ids, commit="posterior_sample")
@@ -231,7 +253,8 @@ Fields:
 
 ```text
 action_size:
-  Number of discrete decision actions.
+  Maximum global action id exclusive. Individual tree nodes store only their
+  valid actions, so per-node policy/Q/edge arrays have length K, not action_size.
 
 observation_shape:
   Shape of one decision-node observation supplied by Python for root, leaf, and
@@ -286,7 +309,7 @@ Python owns:
 PGX state objects
 env.step / auto-reset policy outside the search tree
 observation tensors
-legal action masks
+legal-action metadata and optional dense masks used for compaction
 current-player metadata
 terminal detection and terminal WDL alpha construction
 neural network evaluation
@@ -329,7 +352,8 @@ Expose:
 tree_ids = engine.add_roots(
     root_states,
     observations,
-    legal_masks,
+    action_offsets,
+    legal_actions,
     current_players,
     policy_logits,
     value_alpha,
@@ -351,12 +375,27 @@ For non-terminal rows:
 
 ```text
 observations:     [B, *observation_shape], float32
-legal_masks:      [B, action_size], bool
+action_offsets:   [B + 1], int64
+legal_actions:    [M], int32
 current_players:  [B], int32
-policy_logits:    [B, action_size], float32
+policy_logits:    [M], float32
 value_alpha:      [B, 3], float32, strictly positive
-q_alpha:          [B, action_size, 3], float32, strictly positive
+q_alpha:          [M, 3], float32, strictly positive
 ```
+
+For row `r`, the valid actions live in:
+
+```text
+start = action_offsets[r]
+end = action_offsets[r + 1]
+legal_actions[start:end]
+policy_logits[start:end]
+q_alpha[start:end]
+```
+
+Each non-terminal row must have at least one valid action. Action ids must be
+unique within a row and satisfy `0 <= action < action_size`. The submitted order
+is the edge order stored by Rust.
 
 If `terminated` is provided and true for a row, `terminal_alpha[row]` must be
 strictly positive. Terminal roots are tracked as complete but cannot be finished
@@ -435,13 +474,14 @@ engine.submit_transitions(
     token: int,
     child_states,                 # opaque Python state batch, [padded_size]
     observations: np.ndarray,     # [padded_size, *obs_shape], float32
-    legal_masks: np.ndarray,      # [padded_size, A], bool
+    action_offsets: np.ndarray,   # [padded_size + 1], int64
+    legal_actions: np.ndarray,    # [M], int32
     current_players: np.ndarray,  # [padded_size], int32
     terminated: np.ndarray,       # [padded_size], bool
     terminal_alpha: np.ndarray,   # [padded_size, 3], float32, positive for terminals
-    policy_logits: np.ndarray,    # [padded_size, A], float32
+    policy_logits: np.ndarray,    # [M], float32
     value_alpha: np.ndarray,      # [padded_size, 3], float32, positive for nonterminals
-    q_alpha: np.ndarray,          # [padded_size, A, 3], float32, positive for nonterminals
+    q_alpha: np.ndarray,          # [M, 3], float32, positive for nonterminals
 )
 ```
 
@@ -462,7 +502,7 @@ On submit, Rust must:
    - back up terminal_alpha along the stored path;
    - count one completed simulation under the current root.
 7. For non-terminal child rows:
-   - create/store the child state, observation, legal mask, and current player;
+   - create/store the child state, observation, compact valid actions, and current player;
    - store policy logits, value alpha, and Q alpha;
    - create a decision child with submitted model outputs;
    - initialize C^V to value_alpha;
@@ -539,10 +579,11 @@ Returned object:
 class SearchResults:
     tree_ids: np.ndarray          # [G], uint64
     actions: np.ndarray           # [G], int32
-    pi_search: np.ndarray         # [G, A], float32
-    root_alpha: np.ndarray        # [G, A, 3], float32
-    root_q_mean: np.ndarray       # [G, A], float32
-    legal_masks: np.ndarray       # [G, A], bool
+    action_offsets: np.ndarray    # [G + 1], int64
+    legal_actions: np.ndarray     # [M], int32
+    pi_search: np.ndarray         # [M], float32
+    root_alpha: np.ndarray        # [M, 3], float32
+    root_q_mean: np.ndarray       # [M], float32
 ```
 
 Before finishing each tree, Rust must:
@@ -552,7 +593,7 @@ Before finishing each tree, Rust must:
 2. Require current root kind == Decision.
 3. Require root_completed_count >= simulations_per_root,
    unless a future partial_finish mode is added.
-4. Compute EdgePosterior(root, a) for every legal action.
+4. Compute EdgePosterior(root, i) for every compact edge index.
 5. Estimate pi_search using posterior_best_samples.
 6. Select committed action according to commit mode.
 ```
@@ -575,12 +616,13 @@ Returned object:
 @dataclass
 class SearchTargets:
     observations: np.ndarray       # [N, *observation_shape], float32
-    legal_masks: np.ndarray        # [N, A], bool
+    action_offsets: np.ndarray     # [N + 1], int64
+    legal_actions: np.ndarray      # [M], int32
 
-    policy_target: np.ndarray      # [N, A], float32
+    policy_target: np.ndarray      # [M], float32
 
-    q_target_alpha: np.ndarray     # [N, A, 3], float32
-    q_loss_weight: np.ndarray      # [N, A], float32
+    q_target_alpha: np.ndarray     # [M, 3], float32
+    q_loss_weight: np.ndarray      # [M], float32
 
     v_target_alpha: np.ndarray     # [N, 3], float32
 
@@ -612,29 +654,21 @@ nodes outside the current retained subtree
 padding rows
 ```
 
-For each exported decision node:
+For each exported decision node, append one compact segment containing only its
+valid actions:
 
 ```text
-policy_target[a] =
-  posterior-best policy target over EdgePosterior(v, a)
+policy_target[i] =
+  posterior-best policy target over EdgePosterior(v, edge_ix=i)
 
-q_target_alpha[a] =
-  EdgePosterior(v, a)
+q_target_alpha[i] =
+  EdgePosterior(v, edge_ix=i)
 
-q_loss_weight[a] =
-  policy_target[a]
+q_loss_weight[i] =
+  policy_target[i]
 
 v_target_alpha =
   C^V_v
-```
-
-Illegal action rows:
-
-```text
-legal_mask[a] = False
-policy_target[a] = 0
-q_loss_weight[a] = 0
-q_target_alpha[a] = [1, 1, 1] or any other positive dummy alpha
 ```
 
 Terminal nodes do not produce policy or Q rows.
@@ -783,8 +817,6 @@ struct Node {
     depth: u32,
 
     state: PyObject,              // opaque Python/PGX state handle
-    observation: Vec<f32>,         // [*observation_shape]
-    legal_mask: Vec<bool>,         // [A]
     current_player: i32,
     kind: NodeKind,
 
@@ -813,17 +845,23 @@ enum ParentLink {
 
 ```rust
 struct DecisionData {
-    policy_logits: Vec<f32>,       // [A]
+    observation: Vec<f32>,         // [*observation_shape]
+    legal_actions: Vec<Action>,    // [K], global action ids
+    policy_logits: Vec<f32>,       // [K]
     value_alpha: [f32; 3],
-    q_alpha: Vec<[f32; 3]>,        // [A, 3]
+    q_alpha: Vec<[f32; 3]>,        // [K, 3]
 
-    edges: Vec<DecisionEdge>,      // [A]
+    edges: Vec<DecisionEdge>,      // [K]
 }
 ```
 
 A decision node always has submitted model outputs. Transition requests are
-pending on parent actions, not on unevaluated child nodes. The legal mask lives
-on `Node` because it is supplied by Python for both roots and child states.
+pending on parent actions, not on unevaluated child nodes.
+
+`K = legal_actions.len() = policy_logits.len() = q_alpha.len() = edges.len()`.
+The compact edge index `i` is distinct from the global action id
+`legal_actions[i]`. Use a linear scan for `action -> edge_index` in the MVP, or
+add a per-node lookup table if profiles show it matters.
 
 ---
 
@@ -914,16 +952,16 @@ table still exists because Python submits padded batched results by token.
 
 ### 8.1 Decision EdgeBase
 
-For a decision node `v` and action `a`:
+For a decision node `v` and compact edge index `i`:
 
 ```text
-DecisionEdgeBase(v, a):
-  if edge(v,a) has child u and u is summarizable:
+DecisionEdgeBase(v, i):
+  if edge(v,i) has child u and u is summarizable:
       return align_wdl(from_state=s_u, to_state=s_v, alpha=C^V_u)
-  else if edge(v,a) has decision child u:
+  else if edge(v,i) has decision child u:
       return align_wdl(from_state=s_u, to_state=s_v, alpha=value_alpha[u])
   else:
-      return q_alpha[v,a]
+      return q_alpha[v,i]
 ```
 
 A child is summarizable when:
@@ -943,11 +981,11 @@ A newly evaluated decision leaf with no child evidence is not summarizable. Its 
 ### 8.2 Decision EdgePosterior
 
 ```text
-DecisionEdgePosterior(v, a):
-  if edge(v,a).completed:
-      return edge(v,a).b
+DecisionEdgePosterior(v, i):
+  if edge(v,i).completed:
+      return edge(v,i).b
   else:
-      return DecisionEdgeBase(v, a)
+      return DecisionEdgeBase(v, i)
 ```
 
 ---
@@ -958,11 +996,12 @@ For a decision node:
 
 ```text
 ThompsonSelect(v):
-  for each legal action a:
-      alpha[a] = DecisionEdgePosterior(v, a)
-      phi[a] ~ Dirichlet(alpha[a])
-      utility[a] = phi[a,W] - phi[a,L]
-  return argmax utility
+  for each compact edge index i in 0..K:
+      alpha[i] = DecisionEdgePosterior(v, i)
+      phi[i] ~ Dirichlet(alpha[i])
+      utility[i] = phi[i,W] - phi[i,L]
+  i_star = argmax utility
+  return legal_actions[i_star]
 ```
 
 No virtual loss or in-flight masking is required, because a tree has at most one pending request and is not concurrently searched.
@@ -975,19 +1014,18 @@ For a decision node:
 
 ```text
 PosteriorBestPolicyTarget(v):
-  count[a] = 0 for every action
+  count[i] = 0 for every compact edge index
 
   repeat M = posterior_best_samples times:
-      for each legal action a:
-          alpha[a] = DecisionEdgePosterior(v, a)
-          phi[a] ~ Dirichlet(alpha[a])
-          utility[a] = phi[a,W] - phi[a,L]
+      for each compact edge index i in 0..K:
+          alpha[i] = DecisionEdgePosterior(v, i)
+          phi[i] ~ Dirichlet(alpha[i])
+          utility[i] = phi[i,W] - phi[i,L]
 
-      a_star = argmax legal utility[a]
-      count[a_star] += 1
+      i_star = argmax utility[i]
+      count[i_star] += 1
 
-  pi[a] = count[a] / M for legal actions
-  pi[a] = 0 for illegal actions
+  pi[i] = count[i] / M
 ```
 
 ---
@@ -1002,12 +1040,12 @@ For a decision node with child evidence:
 pi = PosteriorBestPolicyTarget(v)
 
 E_v =
-  sum over legal actions a:
-      pi[a] * DecisionEdgePosterior(v, a)
+  sum over compact edge indices i:
+      pi[i] * DecisionEdgePosterior(v, i)
 
 N_down =
-  sum over legal actions a:
-      edge(v,a).r_count
+  sum over compact edge indices i:
+      edge(v,i).r_count
 
 gamma =
   N_down / (kappa_n + N_down)
@@ -1218,11 +1256,10 @@ finish(tree):
   require root kind == Decision
   require root_completed_count >= simulations_per_root
 
-  root_alpha[a] = DecisionEdgePosterior(root, a) for legal actions
-  root_alpha[a] = [1,1,1] for illegal actions
+  root_alpha[i] = DecisionEdgePosterior(root, i) for compact edge indices
 
-  root_q_mean[a] =
-      (root_alpha[a][W] - root_alpha[a][L]) / sum(root_alpha[a])
+  root_q_mean[i] =
+      (root_alpha[i][W] - root_alpha[i][L]) / sum(root_alpha[i])
 
   pi_search = PosteriorBestPolicyTarget(root)
 
@@ -1233,7 +1270,7 @@ finish(tree):
       action = argmax pi_search
 
   if commit == mean_utility_argmax:
-      action = argmax root_q_mean over legal actions
+      action = legal_actions[argmax root_q_mean]
 ```
 
 `posterior_argmax` is greedy with respect to posterior optimal-action probability. `mean_utility_argmax` is greedy with respect to posterior mean utility.
@@ -1272,16 +1309,16 @@ For each exported decision node:
 ```text
 observation = node.observation
 
-legal_mask = node.legal_mask
+legal_actions = node.legal_actions
 
 policy_target =
   PosteriorBestPolicyTarget(node)
 
-q_target_alpha[a] =
-  DecisionEdgePosterior(node, a) for legal actions
+q_target_alpha[i] =
+  DecisionEdgePosterior(node, i)
 
-q_loss_weight[a] =
-  policy_target[a]
+q_loss_weight[i] =
+  policy_target[i]
 
 v_target_alpha =
   node.C^V
@@ -1438,6 +1475,12 @@ submitting same token twice
 transition output shape mismatch
 pad_to smaller than collected active rows
 opaque state batch length mismatch
+invalid action_offsets shape or monotonicity
+legal_actions length mismatch with action_offsets
+policy_logits length mismatch with legal_actions
+q_alpha length mismatch with legal_actions
+duplicate legal action within one row
+legal action outside 0..action_size
 current_player shape mismatch
 alpha <= 0 for active rows in debug mode
 terminal row missing positive terminal_alpha
@@ -1468,7 +1511,9 @@ Test:
 ```text
 Dirichlet sampling returns legal argmax actions
 posterior-best target sums to 1 over legal actions
-illegal actions get zero policy probability
+invalid actions are absent from compact policy/Q/edge arrays
+decision nodes store only K valid-action Q rows and K edges
+action ids round-trip through compact edge indices
 DecisionEdgeBase uses Q alpha before child expansion
 DecisionEdgeBase uses aligned child value alpha after child expansion
 newly evaluated decision leaf with no child evidence does not overwrite parent edge via refresh
@@ -1487,7 +1532,8 @@ padding rows repeat an active parent/action and are marked inactive
 submit_transitions ignores inactive padded rows after shape validation
 Python can run one fixed-size env.step + model call over padded_size rows
 terminal child rows back up terminal_alpha without requiring NN outputs
-non-terminal child rows store observations/legal masks/current players/NN outputs
+non-terminal child rows store observations/compact valid actions/current players/NN outputs
+non-terminal child rows are compacted to legal_actions/action_offsets before storage
 ```
 
 ### 20.3 MVP no-duplicate tests
@@ -1552,10 +1598,11 @@ Assert arrays have correct shapes:
 
 ```text
 observations: [N, *obs_shape]
-legal_masks: [N, A]
-policy_target: [N, A]
-q_target_alpha: [N, A, 3]
-q_loss_weight: [N, A]
+action_offsets: [N + 1]
+legal_actions: [M]
+policy_target: [M]
+q_target_alpha: [M, 3]
+q_loss_weight: [M]
 v_target_alpha: [N, 3]
 ```
 
@@ -1591,12 +1638,20 @@ Run:
 engine = dqaz.SearchEngine(config)
 
 root_eval = model(root_states.observation, root_states.legal_action_mask)
+root_actions = compact_valid_actions(
+    root_states.legal_action_mask,
+    root_eval[0],
+    root_eval[2],
+)
 tree_ids = engine.add_roots(
     root_states,
     root_states.observation,
-    root_states.legal_action_mask,
+    root_actions.action_offsets,
+    root_actions.legal_actions,
     root_states.current_player,
-    *root_eval,
+    root_actions.policy_logits,
+    root_eval[1],
+    root_actions.q_alpha,
 )
 
 while not engine.is_done(tree_ids):
@@ -1605,15 +1660,23 @@ while not engine.is_done(tree_ids):
     if batch.size:
         child_states = env_step(batch.parent_states, batch.actions)
         child_eval = model(child_states.observation, child_states.legal_action_mask)
+        child_actions = compact_valid_actions(
+            child_states.legal_action_mask,
+            child_eval[0],
+            child_eval[2],
+        )
         engine.submit_transitions(
             batch.token,
             child_states,
             child_states.observation,
-            child_states.legal_action_mask,
+            child_actions.action_offsets,
+            child_actions.legal_actions,
             child_states.current_player,
             child_states.terminated,
             terminal_alpha_from_rewards(child_states),
-            *child_eval,
+            child_actions.policy_logits,
+            child_eval[1],
+            child_actions.q_alpha,
         )
 
 results = engine.finish(tree_ids)
@@ -1745,15 +1808,21 @@ root_eval = model_apply(
     root_states.observation,
     root_states.legal_action_mask,
 )
+root_actions = compact_valid_actions(
+    root_states.legal_action_mask,
+    root_eval.policy_logits,
+    root_eval.q_alpha,
+)
 
 tree_ids = engine.add_roots(
     root_states,
     root_states.observation,
-    root_states.legal_action_mask,
+    root_actions.action_offsets,
+    root_actions.legal_actions,
     root_states.current_player,
-    root_eval.policy_logits,
+    root_actions.policy_logits,
     root_eval.value_alpha,
-    root_eval.q_alpha,
+    root_actions.q_alpha,
 )
 
 while not engine.is_done(tree_ids):
@@ -1767,18 +1836,24 @@ while not engine.is_done(tree_ids):
         child_states.observation,
         child_states.legal_action_mask,
     )
+    child_actions = compact_valid_actions(
+        child_states.legal_action_mask,
+        child_eval.policy_logits,
+        child_eval.q_alpha,
+    )
 
     engine.submit_transitions(
         batch.token,
         child_states,
         child_states.observation,
-        child_states.legal_action_mask,
+        child_actions.action_offsets,
+        child_actions.legal_actions,
         child_states.current_player,
         child_states.terminated,
         terminal_alpha_from_rewards(child_states),
-        child_eval.policy_logits,
+        child_actions.policy_logits,
         child_eval.value_alpha,
-        child_eval.q_alpha,
+        child_actions.q_alpha,
     )
 
 results = engine.finish(tree_ids, commit="posterior_sample")
