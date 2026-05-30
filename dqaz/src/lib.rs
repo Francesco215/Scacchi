@@ -28,6 +28,7 @@ const OUTCOME_WIN: i8 = 2;
 const NO_OUTCOME: i8 = -1;
 const NO_DISTANCE: i32 = -1;
 const CATEGORICAL_EPSILON: f32 = 1e-6;
+const JAX_BACKUP_BLOCK_DEPTH: usize = 32;
 
 #[pyclass(module = "dqaz")]
 #[derive(Clone)]
@@ -145,6 +146,7 @@ struct Node {
     current_player: i32,
     kind: NodeKind,
     c_v: Option<[f32; 3]>,
+    cached_pi: Option<Vec<f32>>,
     n_down: u32,
     cache_version: u32,
     cat_outcome: i8,
@@ -406,6 +408,14 @@ struct PendingBatch {
     padded_size: usize,
 }
 
+struct PreparedJaxBackup {
+    tree_id: TreeId,
+    path: Vec<PathStep>,
+    leaf_alpha: [f32; 3],
+    leaf_player: i32,
+    categorical_found: bool,
+}
+
 struct Tree {
     id: TreeId,
     generation: u32,
@@ -622,6 +632,48 @@ struct SearchTargets {
 }
 
 #[pyclass(module = "dqaz")]
+struct JaxBackupBatch {
+    #[pyo3(get)]
+    used_jax: bool,
+    #[pyo3(get)]
+    node_count: usize,
+    #[pyo3(get)]
+    path_count: usize,
+    #[pyo3(get)]
+    max_depth: usize,
+    #[pyo3(get)]
+    path_depth: usize,
+    #[pyo3(get)]
+    tree_ids: PyObject,
+    #[pyo3(get)]
+    node_ids: PyObject,
+    #[pyo3(get)]
+    edge_b: PyObject,
+    #[pyo3(get)]
+    edge_completed: PyObject,
+    #[pyo3(get)]
+    edge_r_count: PyObject,
+    #[pyo3(get)]
+    q_alpha: PyObject,
+    #[pyo3(get)]
+    value_alpha: PyObject,
+    #[pyo3(get)]
+    legal_mask: PyObject,
+    #[pyo3(get)]
+    node_players: PyObject,
+    #[pyo3(get)]
+    path_nodes: PyObject,
+    #[pyo3(get)]
+    path_edges: PyObject,
+    #[pyo3(get)]
+    path_mask: PyObject,
+    #[pyo3(get)]
+    leaf_alpha: PyObject,
+    #[pyo3(get)]
+    leaf_players: PyObject,
+}
+
+#[pyclass(module = "dqaz")]
 struct SearchEngine {
     inner: Mutex<Forest>,
 }
@@ -809,6 +861,158 @@ impl SearchEngine {
             profile.print();
         }
         Ok(())
+    }
+
+    #[pyo3(signature = (
+        token,
+        child_states,
+        observations,
+        action_offsets,
+        legal_actions,
+        current_players,
+        terminated,
+        terminal_alpha,
+        policy_logits,
+        value_alpha,
+        q_alpha
+    ))]
+    fn submit_transitions_jax_prepare(
+        &self,
+        py: Python<'_>,
+        token: BatchToken,
+        child_states: &PyAny,
+        observations: &PyAny,
+        action_offsets: &PyAny,
+        legal_actions: &PyAny,
+        current_players: &PyAny,
+        terminated: &PyAny,
+        terminal_alpha: &PyAny,
+        policy_logits: &PyAny,
+        value_alpha: &PyAny,
+        q_alpha: &PyAny,
+    ) -> PyResult<Py<JaxBackupBatch>> {
+        let mut inner = self.lock()?;
+        let pending = inner
+            .request_table
+            .remove(&token)
+            .ok_or_else(|| PyValueError::new_err("wrong transition batch token"))?;
+        let mut profile = SubmitProfile::new(pending.records.len(), pending.padded_size);
+
+        let batch = ParsedNodeBatch::parse(
+            py,
+            &inner.config,
+            observations,
+            action_offsets,
+            legal_actions,
+            current_players,
+            policy_logits,
+            value_alpha,
+            q_alpha,
+            Some(terminated),
+            Some(terminal_alpha),
+            Some(pending.records.len()),
+        )?;
+        profile.parsed_rows = batch.len;
+        if batch.len != pending.padded_size {
+            return Err(PyValueError::new_err("transition output shape mismatch"));
+        }
+
+        if batch
+            .terminated
+            .iter()
+            .take(pending.records.len())
+            .any(|terminated| *terminated)
+        {
+            for (row, record) in pending.records.iter().enumerate() {
+                submit_one_transition(
+                    py,
+                    &mut inner,
+                    record,
+                    &batch,
+                    child_states,
+                    row,
+                    &mut profile,
+                )?;
+            }
+            return empty_jax_backup_batch(py);
+        }
+
+        let mut prepared = Vec::with_capacity(pending.records.len());
+        let mut categorical_found = false;
+        for (row, record) in pending.records.iter().enumerate() {
+            if let Some(item) = submit_one_transition_prepare_jax(
+                py,
+                &mut inner,
+                record,
+                &batch,
+                child_states,
+                row,
+                &mut profile,
+            )? {
+                categorical_found |= item.categorical_found;
+                prepared.push(item);
+            }
+        }
+
+        if categorical_found {
+            let config = inner.config.clone();
+            for item in &prepared {
+                let tree = inner.tree_mut(item.tree_id)?;
+                backup(tree, &item.path, item.leaf_alpha, &config, &mut profile)?;
+            }
+            return empty_jax_backup_batch(py);
+        }
+
+        build_jax_backup_batch(py, &inner, &prepared, pending.padded_size)
+    }
+
+    #[pyo3(signature = (
+        tree_ids,
+        node_ids,
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        c_v,
+        n_down,
+        policy,
+        node_count=None
+    ))]
+    fn apply_jax_backup(
+        &self,
+        py: Python<'_>,
+        tree_ids: &PyAny,
+        node_ids: &PyAny,
+        edge_b: &PyAny,
+        edge_completed: &PyAny,
+        edge_r_count: &PyAny,
+        c_v: &PyAny,
+        n_down: &PyAny,
+        policy: &PyAny,
+        node_count: Option<usize>,
+    ) -> PyResult<()> {
+        let tree_ids = array_flat_u64(py, tree_ids)?;
+        let node_ids = array_flat_i64(py, node_ids)?;
+        let edge_b = array_flat_f32(py, edge_b)?;
+        let edge_completed = array_flat_bool(py, edge_completed)?;
+        let edge_r_count = array_flat_i64(py, edge_r_count)?;
+        let c_v = array_flat_f32(py, c_v)?;
+        let n_down = array_flat_i64(py, n_down)?;
+        let policy = array_flat_f32(py, policy)?;
+
+        let mut inner = self.lock()?;
+        let node_count = node_count.unwrap_or(tree_ids.len());
+        apply_jax_backup_result(
+            &mut inner,
+            &tree_ids,
+            &node_ids,
+            &edge_b,
+            &edge_completed,
+            &edge_r_count,
+            &c_v,
+            &n_down,
+            &policy,
+            node_count,
+        )
     }
 
     #[pyo3(signature = (tree_ids=None))]
@@ -1135,6 +1339,7 @@ fn decision_node(
         state,
         current_player,
         c_v: Some(decision.value_alpha),
+        cached_pi: None,
         n_down: 0,
         cache_version: 0,
         cat_outcome: NO_OUTCOME,
@@ -1156,6 +1361,7 @@ fn terminal_node(id: NodeId, state: PyObject, current_player: i32, alpha: [f32; 
         current_player,
         kind: NodeKind::Terminal(TerminalData { alpha, outcome }),
         c_v: Some(alpha),
+        cached_pi: None,
         n_down: 1,
         cache_version: 0,
         cat_outcome: outcome,
@@ -1558,6 +1764,7 @@ fn submit_one_transition(
 
     let parent_update_start = profile.start();
     let parent = tree.node_mut(record.node_id)?;
+    parent.cached_pi = None;
     let data = match &mut parent.kind {
         NodeKind::Decision(data) => data,
         NodeKind::Terminal(_) => return Err(PyRuntimeError::new_err("request parent is terminal")),
@@ -1585,6 +1792,135 @@ fn submit_one_transition(
         profile.backup += start.elapsed();
     }
     result
+}
+
+fn submit_one_transition_prepare_jax(
+    py: Python<'_>,
+    forest: &mut Forest,
+    record: &RequestRecord,
+    batch: &ParsedNodeBatch,
+    child_states: &PyAny,
+    row: usize,
+    profile: &mut SubmitProfile,
+) -> PyResult<Option<PreparedJaxBackup>> {
+    profile.rows_seen += 1;
+    profile.backup_path_steps += record.path.len();
+    let config = forest.config.clone();
+    let Ok(tree) = forest.tree_mut(record.tree_id) else {
+        profile.skipped_rows += 1;
+        return Ok(None);
+    };
+    if tree.generation != record.tree_generation {
+        profile.skipped_rows += 1;
+        return Ok(None);
+    }
+    let Ok(parent) = tree.node(record.node_id) else {
+        profile.skipped_rows += 1;
+        return Ok(None);
+    };
+    if parent.generation != record.node_generation {
+        profile.skipped_rows += 1;
+        return Ok(None);
+    }
+    if !tree.pending_requests.contains(&record.request_id) {
+        profile.skipped_rows += 1;
+        return Ok(None);
+    }
+    if batch.terminated[row] {
+        return Err(PyRuntimeError::new_err(
+            "jax backup preparation received a terminal row",
+        ));
+    }
+
+    let batch_item_start = profile.start();
+    let child_state = batch_item(py, child_states, row)?;
+    if let Some(start) = batch_item_start {
+        profile.batch_item += start.elapsed();
+    }
+    let current_player = batch.current_players[row];
+    let action_start = batch.action_offsets[row];
+    let action_end = batch.action_offsets[row + 1];
+    profile.total_legal_actions += action_end - action_start;
+
+    let decision_data_start = profile.start();
+    let decision_data = batch.decision_data_for_row(&config, row)?;
+    if let Some(start) = decision_data_start {
+        profile.decision_data += start.elapsed();
+    }
+    let decision_key_start = profile.start();
+    let key = decision_key(current_player, &decision_data.observation);
+    if let Some(start) = decision_key_start {
+        profile.decision_key += start.elapsed();
+    }
+    let lookup_start = profile.start();
+    let existing = tree.decision_table.get(&key).copied();
+    if let Some(start) = lookup_start {
+        profile.decision_lookup += start.elapsed();
+    }
+    let child_id = if let Some(existing) = existing {
+        profile.existing_decision_nodes += 1;
+        existing
+    } else {
+        profile.new_decision_nodes += 1;
+        let node_insert_start = profile.start();
+        let child_id = tree.nodes.len() as NodeId;
+        let mut child = decision_node(child_id, child_state, current_player, decision_data);
+        child.parent = Some(record.node_id);
+        child.parent_link = Some(ParentLink::DecisionAction {
+            action: record.action,
+        });
+        child.depth = tree.node(record.node_id)?.depth + 1;
+        tree.nodes.push(child);
+        tree.decision_table.insert(key, child_id);
+        if let Some(start) = node_insert_start {
+            profile.node_insert += start.elapsed();
+        }
+        child_id
+    };
+    let leaf_alpha = match &tree.node(child_id)?.kind {
+        NodeKind::Decision(data) => data.value_alpha,
+        NodeKind::Terminal(data) => data.alpha,
+    };
+
+    let parent_update_start = profile.start();
+    let parent = tree.node_mut(record.node_id)?;
+    parent.cached_pi = None;
+    let data = match &mut parent.kind {
+        NodeKind::Decision(data) => data,
+        NodeKind::Terminal(_) => return Err(PyRuntimeError::new_err("request parent is terminal")),
+    };
+    if data.edges[record.path.last().unwrap().edge_index].child.is_some() {
+        return Err(PyRuntimeError::new_err("request edge already has a child"));
+    }
+    let edge = &mut data.edges[record.path.last().unwrap().edge_index];
+    edge.child = Some(child_id);
+    edge.pending = false;
+    tree.pending_requests.remove(&record.request_id);
+    if let Some(start) = parent_update_start {
+        profile.parent_update += start.elapsed();
+    }
+
+    let mut categorical_found = tree.node(child_id)?.cat_outcome != NO_OUTCOME;
+    for step in &record.path {
+        let node = tree.node(step.node_id)?;
+        if node.cat_outcome != NO_OUTCOME {
+            categorical_found = true;
+            break;
+        }
+        let edge = &decision(tree, step.node_id)?.edges[step.edge_index];
+        if edge.cat_outcome != NO_OUTCOME {
+            categorical_found = true;
+            break;
+        }
+    }
+
+    Ok(Some(PreparedJaxBackup {
+        tree_id: record.tree_id,
+        path: record.path.clone(),
+        leaf_alpha,
+        leaf_player: current_player,
+        categorical_found,
+    }))
 }
 
 fn advance_one_root(forest: &mut Forest, tree_id: TreeId, action: Action) -> PyResult<()> {
@@ -1641,6 +1977,30 @@ fn clear_pending_edges(tree: &mut Tree) {
     }
 }
 
+fn cached_policy_target(tree: &Tree, node_id: NodeId) -> PyResult<Option<Vec<f32>>> {
+    let action_count = decision(tree, node_id)?.legal_actions.len();
+    let Some(pi) = tree.node(node_id)?.cached_pi.as_ref() else {
+        return Ok(None);
+    };
+    if pi.len() != action_count {
+        return Ok(None);
+    }
+    if !pi.iter().all(|value| value.is_finite() && *value >= 0.0) {
+        return Err(PyRuntimeError::new_err("cached policy contains invalid value"));
+    }
+    if pi.iter().sum::<f32>() <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(pi.clone()))
+}
+
+fn decision_has_categorical_edge(tree: &Tree, node_id: NodeId) -> PyResult<bool> {
+    Ok(decision(tree, node_id)?
+        .edges
+        .iter()
+        .any(|edge| edge.cat_outcome != NO_OUTCOME))
+}
+
 fn finish_trees(
     py: Python<'_>,
     forest: &mut Forest,
@@ -1685,9 +2045,15 @@ fn finish_trees(
         let root = tree.root;
         let legal_actions_for_root = decision(tree, root)?.legal_actions.clone();
         propagate_categorical(tree, root, &config)?;
-        refresh_categorical_edges(tree, root, &config)?;
+        let root_is_categorical = tree.node(root)?.cat_outcome != NO_OUTCOME;
+        let has_categorical_edge = !root_is_categorical && decision_has_categorical_edge(tree, root)?;
+        if root_is_categorical || has_categorical_edge || cached_policy_target(tree, root)?.is_none() {
+            refresh_categorical_edges(tree, root, &config)?;
+        }
         let pi = if tree.node(root)?.cat_outcome != NO_OUTCOME {
             solved_policy_target(tree, root)?
+        } else if let Some(pi) = cached_policy_target(tree, root)? {
+            pi
         } else {
             posterior_best_policy_target(tree, root, &config)?
         };
@@ -1869,6 +2235,332 @@ fn export_targets(py: Python<'_>, forest: &Forest, tree_ids: &[TreeId]) -> PyRes
         node_ids: np_array(py, node_ids, "uint32")?,
         depths: np_array(py, depths, "uint32")?,
     })
+}
+
+fn empty_jax_backup_batch(py: Python<'_>) -> PyResult<Py<JaxBackupBatch>> {
+    Py::new(
+        py,
+        JaxBackupBatch {
+            used_jax: false,
+            node_count: 0,
+            path_count: 0,
+            max_depth: 0,
+            path_depth: 0,
+            tree_ids: np_array(py, Vec::<TreeId>::new(), "uint64")?,
+            node_ids: np_array(py, Vec::<NodeId>::new(), "uint32")?,
+            edge_b: np_array_reshape(py, Vec::<f32>::new(), vec![0, 0, 3], "float32")?,
+            edge_completed: np_array_reshape(py, Vec::<bool>::new(), vec![0, 0], "bool_")?,
+            edge_r_count: np_array_reshape(py, Vec::<i32>::new(), vec![0, 0], "int32")?,
+            q_alpha: np_array_reshape(py, Vec::<f32>::new(), vec![0, 0, 3], "float32")?,
+            value_alpha: np_array_reshape(py, Vec::<f32>::new(), vec![0, 3], "float32")?,
+            legal_mask: np_array_reshape(py, Vec::<bool>::new(), vec![0, 0], "bool_")?,
+            node_players: np_array(py, Vec::<i32>::new(), "int32")?,
+            path_nodes: np_array_reshape(py, Vec::<i32>::new(), vec![0, 0], "int32")?,
+            path_edges: np_array_reshape(py, Vec::<i32>::new(), vec![0, 0], "int32")?,
+            path_mask: np_array_reshape(py, Vec::<bool>::new(), vec![0, 0], "bool_")?,
+            leaf_alpha: np_array_reshape(py, Vec::<f32>::new(), vec![0, 3], "float32")?,
+            leaf_players: np_array(py, Vec::<i32>::new(), "int32")?,
+        },
+    )
+}
+
+fn round_up_to(value: usize, multiple: usize) -> usize {
+    if value == 0 {
+        multiple
+    } else {
+        value.div_ceil(multiple) * multiple
+    }
+}
+
+fn jax_backup_node_capacity(forest: &Forest, node_count: usize) -> PyResult<usize> {
+    let active_trees = forest.trees.iter().filter(|tree| tree.is_some()).count();
+    let per_tree = usize::try_from(forest.config.simulations_per_root)
+        .map_err(|_| PyRuntimeError::new_err("simulations_per_root does not fit in usize"))?
+        .saturating_add(1);
+    Ok(active_trees.saturating_mul(per_tree).max(node_count).max(1))
+}
+
+fn build_jax_backup_batch(
+    py: Python<'_>,
+    forest: &Forest,
+    prepared: &[PreparedJaxBackup],
+    path_capacity: usize,
+) -> PyResult<Py<JaxBackupBatch>> {
+    if prepared.is_empty() {
+        return empty_jax_backup_batch(py);
+    }
+
+    let mut node_map: HashMap<(TreeId, NodeId), usize> = HashMap::new();
+    let mut node_refs: Vec<(TreeId, NodeId)> = Vec::new();
+    for item in prepared {
+        for step in &item.path {
+            let key = (item.tree_id, step.node_id);
+            if !node_map.contains_key(&key) {
+                node_map.insert(key, node_refs.len());
+                node_refs.push(key);
+            }
+        }
+    }
+    if node_refs.is_empty() {
+        return empty_jax_backup_batch(py);
+    }
+
+    let node_count = node_refs.len();
+    let node_capacity = jax_backup_node_capacity(forest, node_count)?;
+    let max_actions = forest.config.action_size;
+    let max_depth = prepared
+        .iter()
+        .map(|item| item.path.len())
+        .max()
+        .unwrap_or(0);
+    let configured_depth = usize::try_from(forest.config.simulations_per_root)
+        .map_err(|_| PyRuntimeError::new_err("simulations_per_root does not fit in usize"))?;
+    let path_depth = round_up_to(max_depth.max(configured_depth).max(1), JAX_BACKUP_BLOCK_DEPTH);
+    let path_capacity = path_capacity.max(prepared.len()).max(1);
+
+    let mut out_tree_ids = Vec::with_capacity(node_capacity);
+    let mut out_node_ids = Vec::with_capacity(node_capacity);
+    let mut edge_b: Vec<[f32; 3]> = Vec::with_capacity(node_capacity * max_actions);
+    let mut edge_completed: Vec<bool> = Vec::with_capacity(node_capacity * max_actions);
+    let mut edge_r_count: Vec<i32> = Vec::with_capacity(node_capacity * max_actions);
+    let mut q_alpha: Vec<[f32; 3]> = Vec::with_capacity(node_capacity * max_actions);
+    let mut value_alpha: Vec<[f32; 3]> = Vec::with_capacity(node_capacity);
+    let mut legal_mask: Vec<bool> = Vec::with_capacity(node_capacity * max_actions);
+    let mut node_players: Vec<i32> = Vec::with_capacity(node_capacity);
+
+    for (tree_id, node_id) in &node_refs {
+        let tree = forest.tree(*tree_id)?;
+        let node = tree.node(*node_id)?;
+        let NodeKind::Decision(data) = &node.kind else {
+            return Err(PyRuntimeError::new_err("jax backup node is not a decision node"));
+        };
+        if node.cat_outcome != NO_OUTCOME {
+            return Err(PyRuntimeError::new_err(
+                "jax backup export encountered a categorical node",
+            ));
+        }
+        out_tree_ids.push(*tree_id);
+        out_node_ids.push(*node_id);
+        value_alpha.push(data.value_alpha);
+        node_players.push(node.current_player);
+        for edge_index in 0..max_actions {
+            if edge_index < data.edges.len() {
+                let edge = &data.edges[edge_index];
+                if edge.cat_outcome != NO_OUTCOME {
+                    return Err(PyRuntimeError::new_err(
+                        "jax backup export encountered a categorical edge",
+                    ));
+                }
+                edge_b.push(edge.b);
+                edge_completed.push(edge.completed);
+                edge_r_count.push(i32::try_from(edge.r_count).map_err(|_| {
+                    PyRuntimeError::new_err("edge visit count does not fit in int32")
+                })?);
+                q_alpha.push(data.q_alpha[edge_index]);
+                legal_mask.push(true);
+            } else {
+                edge_b.push(DUMMY_ALPHA);
+                edge_completed.push(false);
+                edge_r_count.push(0);
+                q_alpha.push(DUMMY_ALPHA);
+                legal_mask.push(false);
+            }
+        }
+    }
+    let dummy_tree_id = out_tree_ids.first().copied().unwrap_or(0);
+    for _ in node_count..node_capacity {
+        out_tree_ids.push(dummy_tree_id);
+        out_node_ids.push(0);
+        value_alpha.push(DUMMY_ALPHA);
+        node_players.push(0);
+        for _ in 0..max_actions {
+            edge_b.push(DUMMY_ALPHA);
+            edge_completed.push(false);
+            edge_r_count.push(0);
+            q_alpha.push(DUMMY_ALPHA);
+            legal_mask.push(false);
+        }
+    }
+
+    let mut path_nodes = vec![0i32; path_capacity * path_depth];
+    let mut path_edges = vec![0i32; path_capacity * path_depth];
+    let mut path_mask = vec![false; path_capacity * path_depth];
+    let mut leaf_alpha = vec![DUMMY_ALPHA; path_capacity];
+    let mut leaf_players = vec![0i32; path_capacity];
+    for (row, item) in prepared.iter().enumerate() {
+        leaf_alpha[row] = item.leaf_alpha;
+        leaf_players[row] = item.leaf_player;
+        for (depth, step) in item.path.iter().enumerate() {
+            let node_row = *node_map
+                .get(&(item.tree_id, step.node_id))
+                .ok_or_else(|| PyRuntimeError::new_err("jax backup node mapping missing"))?;
+            let offset = row * path_depth + depth;
+            path_nodes[offset] = i32::try_from(node_row).map_err(|_| {
+                PyRuntimeError::new_err("jax backup node row does not fit in int32")
+            })?;
+            path_edges[offset] = i32::try_from(step.edge_index).map_err(|_| {
+                PyRuntimeError::new_err("jax backup edge index does not fit in int32")
+            })?;
+            path_mask[offset] = true;
+        }
+    }
+
+    Py::new(
+        py,
+        JaxBackupBatch {
+            used_jax: true,
+            node_count,
+            path_count: prepared.len(),
+            max_depth,
+            path_depth,
+            tree_ids: np_array(py, out_tree_ids, "uint64")?,
+            node_ids: np_array(py, out_node_ids, "uint32")?,
+            edge_b: np_array_reshape(
+                py,
+                alpha_rows_to_flat(&edge_b),
+                vec![node_capacity, max_actions, 3],
+                "float32",
+            )?,
+            edge_completed: np_array_reshape(
+                py,
+                edge_completed,
+                vec![node_capacity, max_actions],
+                "bool_",
+            )?,
+            edge_r_count: np_array_reshape(
+                py,
+                edge_r_count,
+                vec![node_capacity, max_actions],
+                "int32",
+            )?,
+            q_alpha: np_array_reshape(
+                py,
+                alpha_rows_to_flat(&q_alpha),
+                vec![node_capacity, max_actions, 3],
+                "float32",
+            )?,
+            value_alpha: np_array_reshape(
+                py,
+                alpha_rows_to_flat(&value_alpha),
+                vec![node_capacity, 3],
+                "float32",
+            )?,
+            legal_mask: np_array_reshape(py, legal_mask, vec![node_capacity, max_actions], "bool_")?,
+            node_players: np_array(py, node_players, "int32")?,
+            path_nodes: np_array_reshape(
+                py,
+                path_nodes,
+                vec![path_capacity, path_depth],
+                "int32",
+            )?,
+            path_edges: np_array_reshape(
+                py,
+                path_edges,
+                vec![path_capacity, path_depth],
+                "int32",
+            )?,
+            path_mask: np_array_reshape(
+                py,
+                path_mask,
+                vec![path_capacity, path_depth],
+                "bool_",
+            )?,
+            leaf_alpha: np_array_reshape(
+                py,
+                alpha_rows_to_flat(&leaf_alpha),
+                vec![path_capacity, 3],
+                "float32",
+            )?,
+            leaf_players: np_array(py, leaf_players, "int32")?,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_jax_backup_result(
+    forest: &mut Forest,
+    tree_ids: &[TreeId],
+    node_ids: &[i64],
+    edge_b: &[f32],
+    edge_completed: &[bool],
+    edge_r_count: &[i64],
+    c_v: &[f32],
+    n_down: &[i64],
+    policy: &[f32],
+    node_count: usize,
+) -> PyResult<()> {
+    let node_capacity = tree_ids.len();
+    if node_count > node_capacity {
+        return Err(PyValueError::new_err("jax backup node_count exceeds array capacity"));
+    }
+    if node_ids.len() != node_capacity
+        || n_down.len() != node_capacity
+        || c_v.len() != node_capacity * 3
+    {
+        return Err(PyValueError::new_err("jax backup node array shape mismatch"));
+    }
+    let max_actions = forest.config.action_size;
+    if edge_b.len() != node_capacity * max_actions * 3
+        || edge_completed.len() != node_capacity * max_actions
+        || edge_r_count.len() != node_capacity * max_actions
+        || policy.len() != node_capacity * max_actions
+    {
+        return Err(PyValueError::new_err("jax backup edge array shape mismatch"));
+    }
+
+    for row in 0..node_count {
+        if node_ids[row] < 0 {
+            return Err(PyValueError::new_err("jax backup node id must be nonnegative"));
+        }
+        if n_down[row] < 0 || n_down[row] > u32::MAX as i64 {
+            return Err(PyValueError::new_err("jax backup n_down out of range"));
+        }
+        let node_id = node_ids[row] as NodeId;
+        let tree = forest.tree_mut(tree_ids[row])?;
+        let node = tree.node_mut(node_id)?;
+        if node.cat_outcome != NO_OUTCOME {
+            return Err(PyRuntimeError::new_err(
+                "jax backup apply encountered a categorical node",
+            ));
+        }
+        let NodeKind::Decision(data) = &mut node.kind else {
+            return Err(PyRuntimeError::new_err("jax backup apply node is not a decision node"));
+        };
+        let mut cached_pi = Vec::with_capacity(data.edges.len());
+        for edge_index in 0..data.edges.len() {
+            let edge_offset = row * max_actions + edge_index;
+            let alpha_offset = edge_offset * 3;
+            let count = edge_r_count[edge_offset];
+            if count < 0 || count > u32::MAX as i64 {
+                return Err(PyValueError::new_err("jax backup edge count out of range"));
+            }
+            let pi = policy[edge_offset];
+            if !pi.is_finite() || pi < 0.0 {
+                return Err(PyValueError::new_err("jax backup policy contains invalid value"));
+            }
+            let edge = &mut data.edges[edge_index];
+            if edge.cat_outcome != NO_OUTCOME {
+                return Err(PyRuntimeError::new_err(
+                    "jax backup apply encountered a categorical edge",
+                ));
+            }
+            edge.b = [
+                edge_b[alpha_offset],
+                edge_b[alpha_offset + 1],
+                edge_b[alpha_offset + 2],
+            ];
+            edge.completed = edge_completed[edge_offset];
+            edge.r_count = count as u32;
+            edge.cat_outcome = NO_OUTCOME;
+            edge.cat_distance = NO_DISTANCE;
+            cached_pi.push(pi);
+        }
+        node.c_v = Some([c_v[row * 3], c_v[row * 3 + 1], c_v[row * 3 + 2]]);
+        node.cached_pi = Some(cached_pi);
+        node.n_down = n_down[row] as u32;
+        node.cache_version = node.cache_version.wrapping_add(1);
+    }
+    Ok(())
 }
 
 fn backup(
@@ -2062,11 +2754,11 @@ fn recompute_node_profile(
         profile.recompute_categorize += start.elapsed();
     }
 
-    let cache = if let NodeKind::Terminal(data) = &tree.node(node_id)?.kind {
+    let (cache, cached_pi) = if let NodeKind::Terminal(data) = &tree.node(node_id)?.kind {
         let alpha = data.alpha;
         let node = tree.node_mut(node_id)?;
         node.n_down = 1;
-        Some(alpha)
+        (Some(alpha), None)
     } else if tree.node(node_id)?.cat_outcome != NO_OUTCOME {
         let n_down = decision(tree, node_id)?
             .edges
@@ -2076,7 +2768,7 @@ fn recompute_node_profile(
         let alpha = categorical_proxy(tree.node(node_id)?.cat_outcome);
         let node = tree.node_mut(node_id)?;
         node.n_down = n_down;
-        Some(alpha)
+        (Some(alpha), None)
     } else {
         let (n_down, value_alpha, action_count) = {
             let data = decision(tree, node_id)?;
@@ -2089,7 +2781,7 @@ fn recompute_node_profile(
         if n_down == 0 {
             let node = tree.node_mut(node_id)?;
             node.n_down = 0;
-            Some(value_alpha)
+            (Some(value_alpha), None)
         } else {
             profile.posterior_policy_calls += 1;
             profile.posterior_policy_action_visits +=
@@ -2113,11 +2805,12 @@ fn recompute_node_profile(
             }
             let node = tree.node_mut(node_id)?;
             node.n_down = n_down;
-            Some(c_v)
+            (Some(c_v), Some(pi))
         }
     };
     let node = tree.node_mut(node_id)?;
     node.c_v = cache;
+    node.cached_pi = cached_pi;
     node.cache_version = node.cache_version.wrapping_add(1);
     if let Some(start) = recompute_start {
         profile.recompute += start.elapsed();
@@ -2191,6 +2884,7 @@ fn publish_categorical_edge(
     increment_count: bool,
 ) -> PyResult<bool> {
     let parent = tree.node_mut(parent_id)?;
+    parent.cached_pi = None;
     let NodeKind::Decision(data) = &mut parent.kind else {
         return Err(PyRuntimeError::new_err(
             "categorical edge parent is not a decision node",
@@ -2280,6 +2974,7 @@ fn publish_categorical_node(
     node.cat_distance = distance;
     node.cat_action = action;
     node.c_v = Some(categorical_proxy(outcome));
+    node.cached_pi = None;
     node.n_down = n_down;
     node.cache_version = node.cache_version.wrapping_add(1);
     Ok(())
@@ -2740,6 +3435,7 @@ fn _dqaz(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<TransitionBatch>()?;
     m.add_class::<SearchResults>()?;
     m.add_class::<SearchTargets>()?;
+    m.add_class::<JaxBackupBatch>()?;
     Ok(())
 }
 

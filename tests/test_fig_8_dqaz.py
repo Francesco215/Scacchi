@@ -1,7 +1,8 @@
 import jax.numpy as jnp
 import numpy as np
 
-from scripts.fig_8 import _coerce_dqaz_wdl3_output
+from scripts.fig_8 import _coerce_dqaz_wdl3_output, _with_dqaz_eval_settings
+from scacchi.train import Config
 
 
 def test_coerce_dqaz_wdl3_output_inserts_draw_channel_for_hex_lw_heads():
@@ -45,3 +46,15 @@ def test_coerce_dqaz_wdl3_output_floors_tiny_alpha_values():
 
     assert float(jnp.min(out_v)) >= 0.05
     assert float(jnp.min(out_q)) >= 0.05
+
+
+def test_fig_8_dqaz_settings_enable_jax_backup():
+    config = _with_dqaz_eval_settings(
+        Config(env_id="hex", board_size=3, network="boardlaw_dirichlet"),
+        eval_batch_size=2,
+        tree_size=4,
+        search_eval_batch_size=2,
+    )
+
+    assert config.search_backend == "dqaz"
+    assert config.search_jax_backup is True

@@ -5,9 +5,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from scacchi.dqaz_jax_backup import (
+    apply_batched_backup,
     apply_batched_backup_from_samples,
     posterior_best_policy_from_samples,
+    should_use_jax_backup,
 )
+from scacchi.dirichlet_tree.native import NO_OUTCOME, OUTCOME_DRAW, OUTCOME_WIN
 
 
 def _posterior_best_policy_from_samples_np(
@@ -79,7 +82,7 @@ def _apply_batched_backup_np(
     edge_b = edge_b.copy()
     edge_completed = edge_completed.copy()
     edge_r_count = edge_r_count.copy()
-    _, c_v, n_down = _recompute_node_cache_np(
+    policy, c_v, n_down = _recompute_node_cache_np(
         edge_b,
         edge_completed,
         edge_r_count,
@@ -107,7 +110,7 @@ def _apply_batched_backup_np(
             edge_completed[parent, edge] = True
             edge_r_count[parent, edge] += 1
 
-        _, c_v, n_down = _recompute_node_cache_np(
+        policy, c_v, n_down = _recompute_node_cache_np(
             edge_b,
             edge_completed,
             edge_r_count,
@@ -130,6 +133,7 @@ def _apply_batched_backup_np(
         "edge_r_count": edge_r_count,
         "c_v": c_v,
         "n_down": n_down,
+        "policy": policy,
     }
 
 
@@ -204,6 +208,7 @@ def _run_jax_backup(**kwargs):
         "edge_r_count": np.asarray(out.edge_r_count),
         "c_v": np.asarray(out.c_v),
         "n_down": np.asarray(out.n_down),
+        "policy": np.asarray(out.policy),
     }
 
 
@@ -213,6 +218,7 @@ def _assert_backup_matches_reference(actual: dict[str, np.ndarray], expected: di
     np.testing.assert_array_equal(actual["n_down"], expected["n_down"])
     np.testing.assert_allclose(actual["edge_b"], expected["edge_b"], rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(actual["c_v"], expected["c_v"], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(actual["policy"], expected["policy"], rtol=1e-6, atol=1e-6)
 
 
 def test_posterior_best_policy_from_samples_matches_numpy_reference():
@@ -242,6 +248,26 @@ def test_posterior_best_policy_from_samples_matches_numpy_reference():
     np.testing.assert_allclose(actual.sum(axis=-1), np.ones((2,), dtype=np.float32))
     assert actual[0, 2] == 0.0
     assert actual[1, 1] == 0.0
+
+
+def test_jax_backup_guard_rejects_any_categorical_outcome():
+    node_cat_outcome = np.full((4,), int(NO_OUTCOME), dtype=np.int8)
+    edge_cat_outcome = np.full((4, 3), int(NO_OUTCOME), dtype=np.int8)
+
+    assert should_use_jax_backup(
+        node_cat_outcome=node_cat_outcome,
+        edge_cat_outcome=edge_cat_outcome,
+    )
+
+    edge_cat_outcome[2, 1] = int(OUTCOME_WIN)
+    assert not should_use_jax_backup(
+        node_cat_outcome=node_cat_outcome,
+        edge_cat_outcome=edge_cat_outcome,
+    )
+
+    assert not should_use_jax_backup(
+        leaf_cat_outcome=jnp.asarray([int(NO_OUTCOME), int(OUTCOME_DRAW)], dtype=jnp.int8),
+    )
 
 
 def test_reverse_depth_jax_backup_matches_numpy_with_shared_parent_and_padded_paths():
@@ -417,3 +443,47 @@ def test_single_action_cache_update_matches_closed_form_value_blend():
     np.testing.assert_allclose(actual["edge_b"][0, 0], aligned)
     np.testing.assert_allclose(actual["c_v"][0], expected_c_v, rtol=1e-6, atol=1e-6)
     assert actual["n_down"][0] == 1
+
+
+def test_gamma_sampled_backup_single_action_matches_closed_form_value_blend():
+    (
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        q_alpha,
+        value_alpha,
+        legal_mask,
+        node_players,
+    ) = _base_tree_arrays()
+    legal_mask = np.zeros_like(legal_mask)
+    legal_mask[:, 0] = True
+    out = jax.jit(apply_batched_backup, static_argnames=("sample_count",))(
+        jax.random.PRNGKey(3),
+        jnp.asarray(edge_b),
+        jnp.asarray(edge_completed),
+        jnp.asarray(edge_r_count),
+        jnp.asarray(q_alpha),
+        jnp.asarray(value_alpha),
+        jnp.asarray(legal_mask),
+        jnp.asarray(node_players),
+        jnp.asarray([[0]], dtype=jnp.int32),
+        jnp.asarray([[0]], dtype=jnp.int32),
+        jnp.asarray([[True]], dtype=jnp.bool_),
+        jnp.asarray([[2.0, 1.0, 5.0]], dtype=jnp.float32),
+        jnp.asarray([1], dtype=jnp.int32),
+        4.0,
+        sample_count=8,
+    )
+
+    aligned = np.array([5.0, 1.0, 2.0], dtype=np.float32)
+    gamma = np.float32(1.0 / 5.0)
+    expected_c_v = (1.0 - gamma) * value_alpha[0] + gamma * aligned
+    np.testing.assert_allclose(np.asarray(out.edge_b)[0, 0], aligned)
+    np.testing.assert_allclose(np.asarray(out.c_v)[0], expected_c_v, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        np.asarray(out.policy)[0],
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert int(np.asarray(out.n_down)[0]) == 1

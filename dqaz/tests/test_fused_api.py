@@ -157,6 +157,159 @@ def test_nonterminal_child_can_continue_search_and_export():
     assert targets.action_offsets.tolist() == [0, 1, 2]
 
 
+def test_jax_prepare_and_apply_nonterminal_backup():
+    engine = dqaz.SearchEngine(_config(simulations_per_root=1))
+    tree_ids = engine.add_roots(
+        [10],
+        np.array([[1.0]], dtype=np.float32),
+        np.array([0, 1], dtype=np.int64),
+        np.array([2], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        np.array([0.0], dtype=np.float32),
+        np.ones((1, 3), dtype=np.float32),
+        np.ones((1, 3), dtype=np.float32),
+    )
+
+    batch = engine.request_transitions(max_batch_size=1)
+    prepared = engine.submit_transitions_jax_prepare(
+        batch.token,
+        [100],
+        np.array([[5.0]], dtype=np.float32),
+        np.array([0, 1], dtype=np.int64),
+        np.array([3], dtype=np.int32),
+        np.array([1], dtype=np.int32),
+        np.array([False], dtype=bool),
+        np.ones((1, 3), dtype=np.float32),
+        np.array([0.0], dtype=np.float32),
+        np.array([[1.0, 1.0, 3.0]], dtype=np.float32),
+        np.ones((1, 3), dtype=np.float32),
+    )
+
+    assert prepared.used_jax
+    assert prepared.node_count == 1
+    assert prepared.path_count == 1
+    assert prepared.edge_b.shape == (2, 8, 3)
+    assert prepared.path_nodes.shape == (1, 32)
+    assert prepared.path_nodes[0, 0] == 0
+    assert prepared.path_edges[0, 0] == 0
+    assert prepared.path_mask[0, 0]
+    assert not np.asarray(prepared.path_mask)[0, 1:].any()
+    edge_b = np.asarray(prepared.edge_b, dtype=np.float32)
+    edge_completed = np.asarray(prepared.edge_completed, dtype=bool)
+    edge_r_count = np.asarray(prepared.edge_r_count, dtype=np.int32)
+    c_v = np.asarray(prepared.value_alpha, dtype=np.float32)
+    n_down = np.zeros((edge_b.shape[0],), dtype=np.int32)
+    policy = np.zeros((edge_b.shape[0], 8), dtype=np.float32)
+
+    edge_b[0, 0] = np.array([3.0, 1.0, 1.0], dtype=np.float32)
+    edge_completed[0, 0] = True
+    edge_r_count[0, 0] = 1
+    policy[0, 0] = 1.0
+    gamma = np.float32(1.0 / 5.0)
+    c_v[0] = (1.0 - gamma) * np.ones((3,), dtype=np.float32) + gamma * edge_b[0, 0]
+    n_down[0] = 1
+
+    engine.apply_jax_backup(
+        prepared.tree_ids,
+        prepared.node_ids,
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        c_v,
+        n_down,
+        policy,
+        prepared.node_count,
+    )
+
+    assert engine.is_done(tree_ids)
+    results = engine.finish(tree_ids, commit="mean_utility_argmax")
+    np.testing.assert_allclose(results.root_alpha, np.array([[3.0, 1.0, 1.0]], dtype=np.float32))
+    np.testing.assert_allclose(results.beta_v, c_v[:1])
+    np.testing.assert_allclose(results.pi_search, np.array([1.0], dtype=np.float32))
+
+
+def test_jax_applied_policy_is_reused_by_finish():
+    engine = dqaz.SearchEngine(_config(simulations_per_root=1))
+    tree_ids = engine.add_roots(
+        [10],
+        np.array([[1.0]], dtype=np.float32),
+        np.array([0, 2], dtype=np.int64),
+        np.array([2, 6], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+        np.array([0.0, 0.0], dtype=np.float32),
+        np.ones((1, 3), dtype=np.float32),
+        np.ones((2, 3), dtype=np.float32),
+    )
+
+    batch = engine.request_transitions(max_batch_size=1)
+    prepared = engine.submit_transitions_jax_prepare(
+        batch.token,
+        [100],
+        np.array([[5.0]], dtype=np.float32),
+        np.array([0, 1], dtype=np.int64),
+        np.array([3], dtype=np.int32),
+        np.array([1], dtype=np.int32),
+        np.array([False], dtype=bool),
+        np.ones((1, 3), dtype=np.float32),
+        np.array([0.0], dtype=np.float32),
+        np.ones((1, 3), dtype=np.float32),
+        np.ones((1, 3), dtype=np.float32),
+    )
+
+    edge_b = np.asarray(prepared.edge_b, dtype=np.float32)
+    edge_completed = np.asarray(prepared.edge_completed, dtype=bool)
+    edge_r_count = np.asarray(prepared.edge_r_count, dtype=np.int32)
+    c_v = np.asarray(prepared.value_alpha, dtype=np.float32)
+    n_down = np.zeros((edge_b.shape[0],), dtype=np.int32)
+    policy = np.zeros((edge_b.shape[0], 8), dtype=np.float32)
+    selected_edge = int(np.asarray(prepared.path_edges)[0, 0])
+
+    edge_b[0, selected_edge] = np.array([1.0, 1.0, 3.0], dtype=np.float32)
+    edge_completed[0, selected_edge] = True
+    edge_r_count[0, selected_edge] = 1
+    c_v[0] = np.array([1.0, 1.0, 3.0], dtype=np.float32)
+    n_down[0] = 1
+    policy[0, 1] = 1.0
+
+    engine.apply_jax_backup(
+        prepared.tree_ids,
+        prepared.node_ids,
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        c_v,
+        n_down,
+        policy,
+        prepared.node_count,
+    )
+
+    results = engine.finish(tree_ids, commit="posterior_argmax")
+    assert results.actions.tolist() == [6]
+    np.testing.assert_allclose(results.pi_search, np.array([0.0, 1.0], dtype=np.float32))
+
+
+def test_jax_prepare_falls_back_for_terminal_rows():
+    engine = dqaz.SearchEngine(_config())
+    tree_ids = _add_two_sparse_roots(engine)
+    batch = engine.request_transitions(max_batch_size=2)
+    prepared = engine.submit_transitions_jax_prepare(
+        batch.token,
+        [100, 101],
+        np.zeros((2, 1), dtype=np.float32),
+        np.zeros((3,), dtype=np.int64),
+        np.zeros((0,), dtype=np.int32),
+        np.ones((2,), dtype=np.int32),
+        np.ones((2,), dtype=bool),
+        np.array([[1.0, 1.0, 3.0], [1.0, 1.0, 3.0]], dtype=np.float32),
+        np.zeros((0,), dtype=np.float32),
+        np.ones((2, 3), dtype=np.float32),
+        np.zeros((0, 3), dtype=np.float32),
+    )
+
+    assert not prepared.used_jax
+    assert engine.is_done(tree_ids)
+
+
 def test_pending_request_submitted_after_prune_is_ignored():
     engine = dqaz.SearchEngine(_config(simulations_per_root=2))
     tree_ids = engine.add_roots(

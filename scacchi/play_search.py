@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Any, Callable, NamedTuple
 
 import dqaz
@@ -27,6 +28,7 @@ from .dirichlet_tree.native import (
     native_fields_from_beta,
 )
 from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
+from .dqaz_jax_backup import BackupArrays, apply_batched_backup_block
 from .network import policy_value_from_output
 from .posterior_tree import (
     PosteriorTree,
@@ -508,6 +510,144 @@ def _run_fused_posterior_tree_search(
     )
 
 
+_DQAZ_JAX_BACKUP_BLOCK_DEPTH = 32
+
+
+@partial(jax.jit, static_argnames=("sample_count",))
+def _apply_dqaz_jax_backup_block(
+    rng_key: jax.Array,
+    edge_b: jax.Array,
+    edge_completed: jax.Array,
+    edge_r_count: jax.Array,
+    q_alpha: jax.Array,
+    value_alpha: jax.Array,
+    legal_mask: jax.Array,
+    node_players: jax.Array,
+    path_nodes: jax.Array,
+    path_edges: jax.Array,
+    path_mask: jax.Array,
+    c_v: jax.Array,
+    n_down: jax.Array,
+    policy: jax.Array,
+    beta: jax.Array,
+    beta_players: jax.Array,
+    block_start: jax.Array,
+    kappa_n: float,
+    *,
+    sample_count: int,
+):
+    return apply_batched_backup_block(
+        rng_key,
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        q_alpha,
+        value_alpha,
+        legal_mask,
+        node_players,
+        path_nodes,
+        path_edges,
+        path_mask,
+        c_v,
+        n_down,
+        policy,
+        beta,
+        beta_players,
+        block_start,
+        kappa_n,
+        sample_count,
+    )
+
+
+def _apply_dqaz_jax_backup(
+    rng_key: jax.Array,
+    edge_b: jax.Array,
+    edge_completed: jax.Array,
+    edge_r_count: jax.Array,
+    q_alpha: jax.Array,
+    value_alpha: jax.Array,
+    legal_mask: jax.Array,
+    node_players: jax.Array,
+    path_nodes: jax.Array,
+    path_edges: jax.Array,
+    path_mask: jax.Array,
+    leaf_alpha: jax.Array,
+    leaf_players: jax.Array,
+    kappa_n: float,
+    *,
+    sample_count: int,
+    max_depth: int | None = None,
+) -> BackupArrays:
+    path_depth = int(path_nodes.shape[1])
+    if path_depth % _DQAZ_JAX_BACKUP_BLOCK_DEPTH != 0:
+        raise ValueError(
+            f"dqaz jax backup path depth {path_depth} is not divisible by "
+            f"{_DQAZ_JAX_BACKUP_BLOCK_DEPTH}"
+        )
+
+    c_v = value_alpha
+    n_down = jnp.sum(
+        jnp.where(legal_mask, edge_r_count, 0),
+        axis=1,
+        dtype=jnp.int32,
+    )
+    policy = jnp.zeros_like(legal_mask, dtype=value_alpha.dtype)
+    beta = leaf_alpha
+    beta_players = leaf_players
+
+    active_depth = path_depth if max_depth is None else int(max_depth)
+    active_depth = max(1, min(active_depth, path_depth))
+    active_depth = (
+        (active_depth + _DQAZ_JAX_BACKUP_BLOCK_DEPTH - 1)
+        // _DQAZ_JAX_BACKUP_BLOCK_DEPTH
+        * _DQAZ_JAX_BACKUP_BLOCK_DEPTH
+    )
+
+    for block_start in range(
+        active_depth - _DQAZ_JAX_BACKUP_BLOCK_DEPTH,
+        -1,
+        -_DQAZ_JAX_BACKUP_BLOCK_DEPTH,
+    ):
+        block = _apply_dqaz_jax_backup_block(
+            rng_key,
+            edge_b,
+            edge_completed,
+            edge_r_count,
+            q_alpha,
+            value_alpha,
+            legal_mask,
+            node_players,
+            path_nodes[:, block_start : block_start + _DQAZ_JAX_BACKUP_BLOCK_DEPTH],
+            path_edges[:, block_start : block_start + _DQAZ_JAX_BACKUP_BLOCK_DEPTH],
+            path_mask[:, block_start : block_start + _DQAZ_JAX_BACKUP_BLOCK_DEPTH],
+            c_v,
+            n_down,
+            policy,
+            beta,
+            beta_players,
+            jnp.asarray(block_start, dtype=jnp.int32),
+            kappa_n,
+            sample_count=sample_count,
+        )
+        edge_b = block.edge_b
+        edge_completed = block.edge_completed
+        edge_r_count = block.edge_r_count
+        c_v = block.c_v
+        n_down = block.n_down
+        policy = block.policy
+        beta = block.beta
+        beta_players = block.beta_players
+
+    return BackupArrays(
+        edge_b=edge_b,
+        edge_completed=edge_completed,
+        edge_r_count=edge_r_count,
+        c_v=c_v,
+        n_down=n_down,
+        policy=policy,
+    )
+
+
 def _run_dqaz_posterior_tree_search(
     *,
     env: Any,
@@ -565,6 +705,8 @@ def _run_dqaz_posterior_tree_search(
 
     eval_batch_size = _eval_batch_size(config, len(root_states))
     pad_to = eval_batch_size if bool(getattr(config, "search_pad_to_eval_batch", False)) else None
+    use_jax_backup = bool(getattr(config, "search_jax_backup", False))
+    jax_backup_step = 0
     while not engine.is_done(tree_ids):
         batch = engine.request_transitions(max_batch_size=eval_batch_size, pad_to=pad_to)
         if batch.size == 0:
@@ -621,23 +763,91 @@ def _run_dqaz_posterior_tree_search(
             padded_q_alpha,
             valid_counts,
         )
-        engine.submit_transitions(
-            batch.token,
-            state_store.add_transitions(parent_handles, action_array),
-            np.asarray(child_observations, dtype=np.float32),
-            offsets,
-            legal_actions,
-            current_players,
-            terminated,
-            _terminal_alpha_from_state_batch(
-                child_state_batch,
-                epsilon=float(getattr(config, "epsilon_terminal", 1e-6)),
-                kappa=float(getattr(config, "kappa_terminal", 8.0)),
-            ),
-            policy_logits,
-            np.asarray(alpha_v, dtype=np.float32),
-            q_alpha,
+        child_handles = state_store.add_transitions(parent_handles, action_array)
+        child_observations_np = np.asarray(child_observations, dtype=np.float32)
+        terminal_alpha = _terminal_alpha_from_state_batch(
+            child_state_batch,
+            epsilon=float(getattr(config, "epsilon_terminal", 1e-6)),
+            kappa=float(getattr(config, "kappa_terminal", 8.0)),
         )
+        value_alpha_np = np.asarray(alpha_v, dtype=np.float32)
+        if use_jax_backup:
+            backup_batch = engine.submit_transitions_jax_prepare(
+                batch.token,
+                child_handles,
+                child_observations_np,
+                offsets,
+                legal_actions,
+                current_players,
+                terminated,
+                terminal_alpha,
+                policy_logits,
+                value_alpha_np,
+                q_alpha,
+            )
+            if bool(backup_batch.used_jax):
+                backup_key = jax.random.fold_in(search_key, jax_backup_step)
+                jax_backup_step += 1
+                backup = _apply_dqaz_jax_backup(
+                    backup_key,
+                    jnp.asarray(np.asarray(backup_batch.edge_b), dtype=jnp.float32),
+                    jnp.asarray(np.asarray(backup_batch.edge_completed), dtype=jnp.bool_),
+                    jnp.asarray(np.asarray(backup_batch.edge_r_count), dtype=jnp.int32),
+                    jnp.asarray(np.asarray(backup_batch.q_alpha), dtype=jnp.float32),
+                    jnp.asarray(np.asarray(backup_batch.value_alpha), dtype=jnp.float32),
+                    jnp.asarray(np.asarray(backup_batch.legal_mask), dtype=jnp.bool_),
+                    jnp.asarray(np.asarray(backup_batch.node_players), dtype=jnp.int32),
+                    jnp.asarray(np.asarray(backup_batch.path_nodes), dtype=jnp.int32),
+                    jnp.asarray(np.asarray(backup_batch.path_edges), dtype=jnp.int32),
+                    jnp.asarray(np.asarray(backup_batch.path_mask), dtype=jnp.bool_),
+                    jnp.asarray(np.asarray(backup_batch.leaf_alpha), dtype=jnp.float32),
+                    jnp.asarray(np.asarray(backup_batch.leaf_players), dtype=jnp.int32),
+                    float(getattr(config, "state_posterior_kappa_n", 9.0)),
+                    sample_count=int(getattr(config, "policy_mc_samples")),
+                    max_depth=int(backup_batch.max_depth),
+                )
+                (
+                    edge_b_out,
+                    edge_completed_out,
+                    edge_r_count_out,
+                    c_v_out,
+                    n_down_out,
+                    policy_out,
+                ) = jax.device_get(
+                    (
+                        backup.edge_b,
+                        backup.edge_completed,
+                        backup.edge_r_count,
+                        backup.c_v,
+                        backup.n_down,
+                        backup.policy,
+                    )
+                )
+                engine.apply_jax_backup(
+                    backup_batch.tree_ids,
+                    backup_batch.node_ids,
+                    np.asarray(edge_b_out, dtype=np.float32),
+                    np.asarray(edge_completed_out, dtype=bool),
+                    np.asarray(edge_r_count_out, dtype=np.int32),
+                    np.asarray(c_v_out, dtype=np.float32),
+                    np.asarray(n_down_out, dtype=np.int32),
+                    np.asarray(policy_out, dtype=np.float32),
+                    int(backup_batch.node_count),
+                )
+        else:
+            engine.submit_transitions(
+                batch.token,
+                child_handles,
+                child_observations_np,
+                offsets,
+                legal_actions,
+                current_players,
+                terminated,
+                terminal_alpha,
+                policy_logits,
+                value_alpha_np,
+                q_alpha,
+            )
 
     commit = getattr(config, "selfplay_action_source")
     if commit in ("posterior_best", "search_action"):

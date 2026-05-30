@@ -179,6 +179,7 @@ def _with_dqaz_eval_settings(
             "search_backend": "dqaz",
             "search_eval_batch_size": search_eval_batch_size,
             "search_pad_to_eval_batch": True,
+            "search_jax_backup": True,
             "solve_categorical": True,
             "selfplay_action_source": "posterior_argmax",
         }
@@ -455,6 +456,7 @@ def _load_existing_results(
     target_num_search_blocks: int,
     candidate_search_backend: str,
     search_eval_batch_size: int | None,
+    candidate_search_jax_backup: bool,
 ) -> dict[tuple[int, int, int, int, int], dict[str, Any]]:
     if not path.exists():
         return {}
@@ -476,9 +478,11 @@ def _load_existing_results(
             row_eval_batch = row.get("search_eval_batch_size")
             if row_eval_batch is not None:
                 row_eval_batch = int(row_eval_batch)
+            row_jax_backup = bool(row.get("candidate_search_jax_backup", False))
             if (
                 row_backend != candidate_search_backend
                 or row_eval_batch != search_eval_batch_size
+                or row_jax_backup != candidate_search_jax_backup
             ):
                 backend_incompatible += 1
                 continue
@@ -648,6 +652,7 @@ def _summarize_returns(
     seed: int,
     candidate_search_backend: str,
     search_eval_batch_size: int | None,
+    candidate_search_jax_backup: bool,
     elapsed_seconds: float,
     num_plies: int | None,
     candidate_search_seconds: float | None,
@@ -670,6 +675,7 @@ def _summarize_returns(
         "seed": int(seed),
         "candidate_search_backend": candidate_search_backend,
         "search_eval_batch_size": search_eval_batch_size,
+        "candidate_search_jax_backup": candidate_search_jax_backup,
         "elapsed_seconds": float(elapsed_seconds),
         "num_plies": num_plies,
         "candidate_search_seconds": candidate_search_seconds,
@@ -689,17 +695,21 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     target_dir = args.target_dir
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    candidate_search_eval_batch_size = (
-        args.search_eval_batch_size
-        if args.search_backend != "dqaz" or args.search_eval_batch_size is not None
-        else args.eval_games
-    )
 
     all_steps = _checkpoint_steps(checkpoint_dir)
     steps = args.checkpoint_steps or all_steps
     missing = sorted(set(steps) - set(all_steps))
     if missing:
         raise FileNotFoundError(f"checkpoint steps not found: {missing}")
+
+    base_config = _load_config_at_step(checkpoint_dir, steps[0])
+    env = make_env(base_config.env_id, base_config.board_size)
+    candidate_search_eval_batch_size = (
+        args.search_eval_batch_size
+        if args.search_backend != "dqaz" or args.search_eval_batch_size is not None
+        else args.eval_games * env.num_actions
+    )
+    candidate_search_jax_backup = args.search_backend == "dqaz"
 
     results_path = out_dir / "fig_8_results.jsonl"
     csv_path = out_dir / "fig_8_results.csv"
@@ -711,10 +721,9 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         target_num_search_blocks=args.target_num_search_blocks,
         candidate_search_backend=args.search_backend,
         search_eval_batch_size=candidate_search_eval_batch_size,
+        candidate_search_jax_backup=candidate_search_jax_backup,
     )
 
-    base_config = _load_config_at_step(checkpoint_dir, steps[0])
-    env = make_env(base_config.env_id, base_config.board_size)
     target_model = from_pretrained(str(target_dir), env, rngs=nnx.Rngs(args.seed))
 
     pending_steps = [
@@ -805,6 +814,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 seed=eval_seed,
                 candidate_search_backend=args.search_backend,
                 search_eval_batch_size=candidate_search_eval_batch_size,
+                candidate_search_jax_backup=candidate_search_jax_backup,
                 elapsed_seconds=elapsed_seconds,
                 num_plies=timing.get("num_plies"),
                 candidate_search_seconds=timing.get("candidate_search_seconds"),
@@ -828,6 +838,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "target_num_search_blocks": args.target_num_search_blocks,
                 "candidate_search_backend": args.search_backend,
                 "search_eval_batch_size": candidate_search_eval_batch_size,
+                "candidate_search_jax_backup": candidate_search_jax_backup,
                 "tree_sizes": list(args.tree_sizes),
                 "num_search_blocks": args.num_search_blocks,
                 "eval_games": args.eval_games,
@@ -877,7 +888,10 @@ def parse_args() -> argparse.Namespace:
         "--search-eval-batch-size",
         type=int,
         default=None,
-        help="Leaf-evaluation batch size for dqaz candidate search; defaults to eval-games.",
+        help=(
+            "Leaf-evaluation batch size for dqaz candidate search; defaults to "
+            "eval-games times action count."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")

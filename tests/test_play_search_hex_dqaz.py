@@ -85,6 +85,7 @@ def test_pgx_hex_dqaz_wdl3_smoke():
         state_posterior_kappa_n=16.0,
         search_eval_batch_size=2,
         search_pad_to_eval_batch=True,
+        search_jax_backup=True,
         kappa_terminal=8.0,
         epsilon_terminal=0.05,
     )
