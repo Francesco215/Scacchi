@@ -518,7 +518,6 @@ def _run_dqaz_posterior_tree_search(
     config,
     device_put_cpu: Callable[[Any], Any],
 ) -> PosteriorTreeBatchOutput:
-    del env
     if not root_states:
         raise ValueError("root_states must not be empty")
 
@@ -550,8 +549,9 @@ def _run_dqaz_posterior_tree_search(
         root_logits,
         root_alpha_q,
     )
-    state_store = _StateStore()
-    root_handles = state_store.add_batch(_stack_states(root_states))
+    root_state_batch = _stack_states(root_states)
+    state_store = _PathStateStore(env, root_state_batch)
+    root_handles = state_store.add_roots(len(root_states))
     tree_ids = engine.add_roots(
         root_handles,
         np.asarray(root_observations, dtype=np.float32),
@@ -569,8 +569,10 @@ def _run_dqaz_posterior_tree_search(
         batch = engine.request_transitions(max_batch_size=eval_batch_size, pad_to=pad_to)
         if batch.size == 0:
             raise RuntimeError("dqaz posterior tree search stalled")
-        parent_states = state_store.batch(list(batch.parent_states))
-        actions = jnp.asarray(np.asarray(batch.actions), dtype=jnp.int32)
+        parent_handles = list(batch.parent_states)
+        action_array = np.asarray(batch.actions, dtype=np.int32)
+        parent_states = state_store.batch(parent_handles)
+        actions = jnp.asarray(action_array, dtype=jnp.int32)
         transition_output = transition_evaluator(parent_states, actions)
         child_state_batch, logits, alpha_v, alpha_q = _unpack_transition_output(
             transition_output
@@ -589,7 +591,7 @@ def _run_dqaz_posterior_tree_search(
         )
         engine.submit_transitions(
             batch.token,
-            state_store.add_batch(child_state_batch),
+            state_store.add_transitions(parent_handles, action_array),
             np.asarray(jax.device_get(child_state_batch.observation), dtype=np.float32),
             offsets,
             legal_actions,
@@ -693,8 +695,7 @@ def _compact_valid_actions_from_mask_np(
 class _StateStore:
     def __init__(self):
         self._treedef = None
-        self._chunks: list[list[jax.Array]] = []
-        self._arrays: list[jax.Array] | None = None
+        self._states: list[Any] = []
         self._size = 0
 
     def add_batch(self, state_batch: Any) -> list[int]:
@@ -702,27 +703,72 @@ class _StateStore:
         batch_size = int(leaves[0].shape[0])
         if self._treedef is None:
             self._treedef = treedef
-            self._chunks = [[] for _ in leaves]
         elif treedef != self._treedef:
             raise ValueError("state batch tree structure changed")
-        for chunks, leaf in zip(self._chunks, leaves, strict=True):
-            chunks.append(leaf)
-        self._arrays = None
         start = self._size
+        self._states.extend(split_batched_state(state_batch))
         self._size += batch_size
         return list(range(start, start + batch_size))
 
     def batch(self, handles: list[int]) -> Any:
         if not handles:
             raise ValueError("state handle batch must not be empty")
-        if self._arrays is None:
-            self._arrays = [
-                chunks[0] if len(chunks) == 1 else jnp.concatenate(chunks, axis=0)
-                for chunks in self._chunks
-            ]
-        handle_index = jnp.asarray(handles, dtype=jnp.int32)
-        leaves = [array[handle_index] for array in self._arrays]
-        return jax.tree_util.tree_unflatten(self._treedef, leaves)
+        return _stack_states([self._states[handle] for handle in handles])
+
+
+class _PathStateStore:
+    def __init__(self, env: Any, root_state_batch: Any):
+        self._root_state_batch = root_state_batch
+        self._root_indices: list[int] = []
+        self._paths: list[tuple[int, ...]] = []
+
+        @jax.jit
+        def replay(root_states: Any, root_indices: jax.Array, paths: jax.Array, lengths: jax.Array):
+            states = jax.tree_util.tree_map(lambda x: x[root_indices], root_states)
+
+            def body(depth: int, current_states: Any) -> Any:
+                stepped = jax.vmap(env.step)(current_states, paths[:, depth])
+                active = depth < lengths
+                return _select_active_states(stepped, current_states, active)
+
+            return jax.lax.fori_loop(0, paths.shape[1], body, states)
+
+        self._replay = replay
+
+    def add_roots(self, count: int) -> list[int]:
+        start = len(self._paths)
+        self._root_indices.extend(range(count))
+        self._paths.extend(() for _ in range(count))
+        return list(range(start, start + count))
+
+    def add_transitions(self, parent_handles: list[int], actions: np.ndarray) -> list[int]:
+        start = len(self._paths)
+        for parent_handle, action in zip(parent_handles, actions, strict=True):
+            self._root_indices.append(self._root_indices[int(parent_handle)])
+            self._paths.append((*self._paths[int(parent_handle)], int(action)))
+        return list(range(start, len(self._paths)))
+
+    def batch(self, handles: list[int]) -> Any:
+        if not handles:
+            raise ValueError("state handle batch must not be empty")
+        paths = [self._paths[int(handle)] for handle in handles]
+        max_depth = max((len(path) for path in paths), default=0)
+        dense_paths = np.zeros((len(paths), max_depth), dtype=np.int32)
+        lengths = np.empty((len(paths),), dtype=np.int32)
+        root_indices = np.empty((len(paths),), dtype=np.int32)
+        for row, (handle, path) in enumerate(zip(handles, paths, strict=True)):
+            root_indices[row] = self._root_indices[int(handle)]
+            lengths[row] = len(path)
+            dense_paths[row, : len(path)] = path
+        if max_depth == 0:
+            index = jnp.asarray(root_indices, dtype=jnp.int32)
+            return jax.tree_util.tree_map(lambda x: x[index], self._root_state_batch)
+        return self._replay(
+            self._root_state_batch,
+            jnp.asarray(root_indices, dtype=jnp.int32),
+            jnp.asarray(dense_paths, dtype=jnp.int32),
+            jnp.asarray(lengths, dtype=jnp.int32),
+        )
 
 
 def _terminal_alpha_from_state_batch(
@@ -918,6 +964,21 @@ def _unpack_transition_output(output: Any) -> tuple[Any, jax.Array, jax.Array, j
 
 def _stack_states(states: list[Any]) -> Any:
     return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *states)
+
+
+def _select_active_states(
+    stepped_state: Any,
+    original_state: Any,
+    active_mask: jax.Array,
+) -> Any:
+    def select_leaf(stepped_leaf: jax.Array, original_leaf: jax.Array) -> jax.Array:
+        mask = jnp.reshape(
+            active_mask,
+            active_mask.shape + (1,) * (stepped_leaf.ndim - 1),
+        )
+        return jnp.where(mask, stepped_leaf, original_leaf)
+
+    return jax.tree_util.tree_map(select_leaf, stepped_state, original_state)
 
 
 def _eval_batch_size(config: Any, num_trees: int) -> int:
