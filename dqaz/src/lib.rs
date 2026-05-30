@@ -17,6 +17,15 @@ type BatchToken = u64;
 type Action = u32;
 
 const DUMMY_ALPHA: [f32; 3] = [1.0, 1.0, 1.0];
+const TARGET_PAD: i8 = 0;
+const TARGET_DIRICHLET: i8 = 1;
+const TARGET_CATEGORICAL: i8 = 2;
+const OUTCOME_LOSS: i8 = 0;
+const OUTCOME_DRAW: i8 = 1;
+const OUTCOME_WIN: i8 = 2;
+const NO_OUTCOME: i8 = -1;
+const NO_DISTANCE: i32 = -1;
+const CATEGORICAL_EPSILON: f32 = 1e-6;
 
 #[pyclass(module = "dqaz")]
 #[derive(Clone)]
@@ -35,6 +44,8 @@ struct SearchConfig {
     seed: u64,
     #[pyo3(get)]
     debug: bool,
+    #[pyo3(get)]
+    solve_categorical: bool,
 }
 
 #[pymethods]
@@ -47,7 +58,8 @@ impl SearchConfig {
         posterior_best_samples = 128,
         kappa_n = 32.0,
         seed = 0,
-        debug = false
+        debug = false,
+        solve_categorical = false
     ))]
     fn new(
         action_size: usize,
@@ -57,6 +69,7 @@ impl SearchConfig {
         kappa_n: f64,
         seed: u64,
         debug: bool,
+        solve_categorical: bool,
     ) -> PyResult<Self> {
         if action_size == 0 {
             return Err(PyValueError::new_err("action_size must be positive"));
@@ -93,6 +106,7 @@ impl SearchConfig {
             kappa_n,
             seed,
             debug,
+            solve_categorical,
         })
     }
 
@@ -100,7 +114,7 @@ impl SearchConfig {
         format!(
             "SearchConfig(action_size={}, observation_shape={:?}, \
              simulations_per_root={}, posterior_best_samples={}, \
-             kappa_n={}, seed={}, debug={})",
+             kappa_n={}, seed={}, debug={}, solve_categorical={})",
             self.action_size,
             self.observation_shape,
             self.simulations_per_root,
@@ -108,6 +122,7 @@ impl SearchConfig {
             self.kappa_n,
             self.seed,
             self.debug,
+            self.solve_categorical,
         )
     }
 }
@@ -130,6 +145,9 @@ struct Node {
     c_v: Option<[f32; 3]>,
     n_down: u32,
     cache_version: u32,
+    cat_outcome: i8,
+    cat_distance: i32,
+    cat_action: Option<Action>,
 }
 
 enum NodeKind {
@@ -219,9 +237,12 @@ impl DecisionData {
 struct DecisionEdge {
     child: Option<NodeId>,
     completed: bool,
+    pending: bool,
     b: [f32; 3],
     r_count: u32,
     child_cache_version: Option<u32>,
+    cat_outcome: i8,
+    cat_distance: i32,
 }
 
 impl DecisionEdge {
@@ -229,15 +250,19 @@ impl DecisionEdge {
         Self {
             child: None,
             completed: false,
+            pending: false,
             b: DUMMY_ALPHA,
             r_count: 0,
             child_cache_version: None,
+            cat_outcome: NO_OUTCOME,
+            cat_distance: NO_DISTANCE,
         }
     }
 }
 
 struct TerminalData {
     alpha: [f32; 3],
+    outcome: i8,
 }
 
 #[derive(Clone)]
@@ -268,8 +293,15 @@ struct Tree {
     generation: u32,
     nodes: Vec<Node>,
     root: NodeId,
-    pending_request: Option<RequestId>,
+    pending_requests: HashSet<RequestId>,
     rng: ChaCha20Rng,
+    decision_table: HashMap<DecisionKey, NodeId>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct DecisionKey {
+    current_player: i32,
+    observation_bits: Vec<u32>,
 }
 
 impl Tree {
@@ -286,14 +318,16 @@ impl Tree {
     }
 
     fn is_done(&self, config: &SearchConfig) -> bool {
-        if self.pending_request.is_some() {
+        if !self.pending_requests.is_empty() {
             return false;
         }
         let Ok(root) = self.node(self.root) else {
             return true;
         };
         match root.kind {
-            NodeKind::Decision(_) => root.n_down >= config.simulations_per_root,
+            NodeKind::Decision(_) => {
+                root.cat_outcome != NO_OUTCOME || root.n_down >= config.simulations_per_root
+            }
             NodeKind::Terminal(_) => true,
         }
     }
@@ -407,6 +441,24 @@ struct SearchResults {
     root_alpha: PyObject,
     #[pyo3(get)]
     root_q_mean: PyObject,
+    #[pyo3(get)]
+    beta_v: PyObject,
+    #[pyo3(get)]
+    q_target_kind: PyObject,
+    #[pyo3(get)]
+    q_target_weight: PyObject,
+    #[pyo3(get)]
+    q_target_outcome: PyObject,
+    #[pyo3(get)]
+    q_target_distance: PyObject,
+    #[pyo3(get)]
+    v_target_kind: PyObject,
+    #[pyo3(get)]
+    v_target_weight: PyObject,
+    #[pyo3(get)]
+    v_target_outcome: PyObject,
+    #[pyo3(get)]
+    v_target_distance: PyObject,
 }
 
 #[pyclass(module = "dqaz")]
@@ -425,6 +477,22 @@ struct SearchTargets {
     q_loss_weight: PyObject,
     #[pyo3(get)]
     v_target_alpha: PyObject,
+    #[pyo3(get)]
+    q_target_kind: PyObject,
+    #[pyo3(get)]
+    q_target_weight: PyObject,
+    #[pyo3(get)]
+    q_target_outcome: PyObject,
+    #[pyo3(get)]
+    q_target_distance: PyObject,
+    #[pyo3(get)]
+    v_target_kind: PyObject,
+    #[pyo3(get)]
+    v_target_weight: PyObject,
+    #[pyo3(get)]
+    v_target_outcome: PyObject,
+    #[pyo3(get)]
+    v_target_distance: PyObject,
     #[pyo3(get)]
     row_mask: PyObject,
     #[pyo3(get)]
@@ -508,13 +576,18 @@ impl SearchEngine {
             let id = inner.next_tree_id;
             inner.next_tree_id += 1;
             let rng = ChaCha20Rng::seed_from_u64(inner.config.seed ^ id.rotate_left(17));
+            let mut decision_table = HashMap::new();
+            if let NodeKind::Decision(data) = &node.kind {
+                decision_table.insert(decision_key(current_player, &data.observation), 0);
+            }
             let tree = Tree {
                 id,
                 generation: 0,
                 nodes: vec![node],
                 root: 0,
-                pending_request: None,
+                pending_requests: HashSet::new(),
                 rng,
+                decision_table,
             };
             inner.insert_tree(tree);
             tree_ids.push(id);
@@ -678,9 +751,7 @@ impl SearchEngine {
         });
         for (tree_id, request_id) in canceled {
             if let Ok(tree) = inner.tree_mut(tree_id) {
-                if tree.pending_request == Some(request_id) {
-                    tree.pending_request = None;
-                }
+                tree.pending_requests.remove(&request_id);
             }
         }
         for tree_id in ids {
@@ -925,11 +996,15 @@ fn decision_node(
         c_v: Some(decision.value_alpha),
         n_down: 0,
         cache_version: 0,
+        cat_outcome: NO_OUTCOME,
+        cat_distance: NO_DISTANCE,
+        cat_action: None,
         kind: NodeKind::Decision(decision),
     }
 }
 
 fn terminal_node(id: NodeId, state: PyObject, current_player: i32, alpha: [f32; 3]) -> Node {
+    let outcome = outcome_from_alpha(alpha);
     Node {
         id,
         generation: 0,
@@ -938,10 +1013,13 @@ fn terminal_node(id: NodeId, state: PyObject, current_player: i32, alpha: [f32; 
         depth: 0,
         state,
         current_player,
-        kind: NodeKind::Terminal(TerminalData { alpha }),
+        kind: NodeKind::Terminal(TerminalData { alpha, outcome }),
         c_v: Some(alpha),
         n_down: 1,
         cache_version: 0,
+        cat_outcome: outcome,
+        cat_distance: 0,
+        cat_action: None,
     }
 }
 
@@ -967,7 +1045,9 @@ fn request_transitions(
             let Some(tree) = forest.trees[index].as_mut() else {
                 continue;
             };
-            if tree.pending_request.is_some() || tree.is_done(&forest.config) {
+            if (!forest.config.solve_categorical && !tree.pending_requests.is_empty())
+                || tree.is_done(&forest.config)
+            {
                 continue;
             }
             match next_transition_request(tree, &forest.config, &mut forest.next_request_id)? {
@@ -1082,7 +1162,10 @@ fn next_transition_request(
     config: &SearchConfig,
     next_request_id: &mut RequestId,
 ) -> PyResult<NextRequestResult> {
-    if tree.pending_request.is_some() {
+    if config.solve_categorical {
+        return next_solve_transition_request(tree, config, next_request_id);
+    }
+    if !config.solve_categorical && !tree.pending_requests.is_empty() {
         return Ok(NextRequestResult::BlockedByPendingRequest);
     }
     if tree.is_done(config) {
@@ -1092,13 +1175,23 @@ fn next_transition_request(
     let mut node_id = tree.root;
     let mut path = Vec::new();
     loop {
+        propagate_categorical(tree, node_id, config)?;
+        if tree.node(node_id)?.cat_outcome != NO_OUTCOME {
+            return Ok(NextRequestResult::CompletedOneSimulation);
+        }
         match &tree.node(node_id)?.kind {
             NodeKind::Terminal(data) => {
-                backup(tree, &path, data.alpha, config)?;
+                backup_terminal(tree, &path, data.alpha, data.outcome, config)?;
                 return Ok(NextRequestResult::CompletedOneSimulation);
             }
             NodeKind::Decision(_) => {
-                let edge_index = thompson_select(tree, node_id, config)?;
+                let edge_index = match thompson_select(tree, node_id, config) {
+                    Ok(edge_index) => edge_index,
+                    Err(_) if config.solve_categorical => {
+                        return Ok(NextRequestResult::NoProgress);
+                    }
+                    Err(err) => return Err(err),
+                };
                 let action = decision(tree, node_id)?.legal_actions[edge_index];
                 if let Some(child_id) = decision(tree, node_id)?.edges[edge_index].child {
                     path.push(PathStep {
@@ -1112,7 +1205,14 @@ fn next_transition_request(
 
                 let request_id = *next_request_id;
                 *next_request_id += 1;
-                tree.pending_request = Some(request_id);
+                tree.pending_requests.insert(request_id);
+                {
+                    let parent = tree.node_mut(node_id)?;
+                    let NodeKind::Decision(data) = &mut parent.kind else {
+                        return Err(PyRuntimeError::new_err("request parent is terminal"));
+                    };
+                    data.edges[edge_index].pending = true;
+                }
                 path.push(PathStep {
                     node_id,
                     edge_index,
@@ -1131,6 +1231,89 @@ fn next_transition_request(
             }
         }
     }
+}
+
+fn next_solve_transition_request(
+    tree: &mut Tree,
+    config: &SearchConfig,
+    next_request_id: &mut RequestId,
+) -> PyResult<NextRequestResult> {
+    if tree.is_done(config) {
+        return Ok(NextRequestResult::TreeDone);
+    }
+    let mut path = Vec::new();
+    find_solve_transition_request(tree, tree.root, config, next_request_id, &mut path)
+}
+
+fn find_solve_transition_request(
+    tree: &mut Tree,
+    node_id: NodeId,
+    config: &SearchConfig,
+    next_request_id: &mut RequestId,
+    path: &mut Vec<PathStep>,
+) -> PyResult<NextRequestResult> {
+    propagate_categorical(tree, node_id, config)?;
+    if tree.node(node_id)?.cat_outcome != NO_OUTCOME {
+        return Ok(NextRequestResult::CompletedOneSimulation);
+    }
+    if let NodeKind::Terminal(data) = &tree.node(node_id)?.kind {
+        backup_terminal(tree, path, data.alpha, data.outcome, config)?;
+        return Ok(NextRequestResult::CompletedOneSimulation);
+    }
+
+    let action_count = decision(tree, node_id)?.legal_actions.len();
+    for edge_index in 0..action_count {
+        let action = decision(tree, node_id)?.legal_actions[edge_index];
+        let edge_snapshot = {
+            let edge = &decision(tree, node_id)?.edges[edge_index];
+            (edge.child, edge.pending, edge.cat_outcome)
+        };
+        if edge_snapshot.2 != NO_OUTCOME || edge_snapshot.1 {
+            continue;
+        }
+        if let Some(child_id) = edge_snapshot.0 {
+            path.push(PathStep {
+                node_id,
+                edge_index,
+                action,
+            });
+            match find_solve_transition_request(tree, child_id, config, next_request_id, path)? {
+                NextRequestResult::NoProgress => {
+                    path.pop();
+                    continue;
+                }
+                other => return Ok(other),
+            }
+        }
+
+        let request_id = *next_request_id;
+        *next_request_id += 1;
+        tree.pending_requests.insert(request_id);
+        {
+            let parent = tree.node_mut(node_id)?;
+            let NodeKind::Decision(data) = &mut parent.kind else {
+                return Err(PyRuntimeError::new_err("request parent is terminal"));
+            };
+            data.edges[edge_index].pending = true;
+        }
+        path.push(PathStep {
+            node_id,
+            edge_index,
+            action,
+        });
+        let record = RequestRecord {
+            request_id,
+            tree_id: tree.id,
+            tree_generation: tree.generation,
+            node_id,
+            node_generation: tree.node(node_id)?.generation,
+            action,
+            path: path.clone(),
+        };
+        path.pop();
+        return Ok(NextRequestResult::TransitionRequest(record));
+    }
+    Ok(NextRequestResult::NoProgress)
 }
 
 fn submit_one_transition(
@@ -1154,27 +1337,43 @@ fn submit_one_transition(
     if parent.generation != record.node_generation {
         return Ok(());
     }
-    if tree.pending_request != Some(record.request_id) {
+    if !tree.pending_requests.contains(&record.request_id) {
         return Ok(());
     }
 
     let child_state = batch_item(py, child_states, row)?;
     let current_player = batch.current_players[row];
-    let child_id = tree.nodes.len() as NodeId;
-    let mut child = if batch.terminated[row] {
-        let alpha = batch.terminal_alpha[row]
-            .ok_or_else(|| PyValueError::new_err("terminal row missing positive terminal_alpha"))?;
-        terminal_node(child_id, child_state, current_player, alpha)
+    let (child_id, is_new_child) = if batch.terminated[row] {
+        let child_id = tree.nodes.len() as NodeId;
+        let alpha = batch.terminal_alpha[row].ok_or_else(|| {
+            PyValueError::new_err("terminal row missing positive terminal_alpha")
+        })?;
+        let mut child = terminal_node(child_id, child_state, current_player, alpha);
+        child.parent = Some(record.node_id);
+        child.parent_link = Some(ParentLink::DecisionAction {
+            action: record.action,
+        });
+        child.depth = tree.node(record.node_id)?.depth + 1;
+        tree.nodes.push(child);
+        (child_id, true)
     } else {
         let decision = batch.decision_data_for_row(&config, row)?;
-        decision_node(child_id, child_state, current_player, decision)
+        let key = decision_key(current_player, &decision.observation);
+        if let Some(existing) = tree.decision_table.get(&key).copied() {
+            (existing, false)
+        } else {
+            let child_id = tree.nodes.len() as NodeId;
+            let mut child = decision_node(child_id, child_state, current_player, decision);
+            child.parent = Some(record.node_id);
+            child.parent_link = Some(ParentLink::DecisionAction {
+                action: record.action,
+            });
+            child.depth = tree.node(record.node_id)?.depth + 1;
+            tree.nodes.push(child);
+            tree.decision_table.insert(key, child_id);
+            (child_id, true)
+        }
     };
-    child.parent = Some(record.node_id);
-    child.parent_link = Some(ParentLink::DecisionAction {
-        action: record.action,
-    });
-    child.depth = tree.node(record.node_id)?.depth + 1;
-    tree.nodes.push(child);
 
     let parent = tree.node_mut(record.node_id)?;
     let data = match &mut parent.kind {
@@ -1184,14 +1383,18 @@ fn submit_one_transition(
     if data.edges[record.path.last().unwrap().edge_index].child.is_some() {
         return Err(PyRuntimeError::new_err("request edge already has a child"));
     }
-    data.edges[record.path.last().unwrap().edge_index].child = Some(child_id);
-    tree.pending_request = None;
+    let edge = &mut data.edges[record.path.last().unwrap().edge_index];
+    edge.child = Some(child_id);
+    edge.pending = false;
+    tree.pending_requests.remove(&record.request_id);
 
-    let beta = match &tree.node(child_id)?.kind {
-        NodeKind::Decision(data) => data.value_alpha,
-        NodeKind::Terminal(data) => data.alpha,
-    };
-    backup(tree, &record.path, beta, &config)
+    let _ = is_new_child;
+    match &tree.node(child_id)?.kind {
+        NodeKind::Decision(data) => backup(tree, &record.path, data.value_alpha, &config),
+        NodeKind::Terminal(data) => {
+            backup_terminal(tree, &record.path, data.alpha, data.outcome, &config)
+        }
+    }
 }
 
 fn advance_one_root(forest: &mut Forest, tree_id: TreeId, action: Action) -> PyResult<()> {
@@ -1206,7 +1409,8 @@ fn advance_one_root(forest: &mut Forest, tree_id: TreeId, action: Action) -> PyR
 
     tree.root = child;
     tree.generation += 1;
-    tree.pending_request = None;
+    tree.pending_requests.clear();
+    clear_pending_edges(tree);
     let root_node = tree.node_mut(child)?;
     root_node.parent = None;
     root_node.parent_link = None;
@@ -1237,6 +1441,16 @@ fn recompute_depths_from_root(tree: &mut Tree) -> PyResult<()> {
     Ok(())
 }
 
+fn clear_pending_edges(tree: &mut Tree) {
+    for node in &mut tree.nodes {
+        if let NodeKind::Decision(data) = &mut node.kind {
+            for edge in &mut data.edges {
+                edge.pending = false;
+            }
+        }
+    }
+}
+
 fn finish_trees(
     py: Python<'_>,
     forest: &mut Forest,
@@ -1250,18 +1464,29 @@ fn finish_trees(
     let mut pi_search = Vec::new();
     let mut root_alpha = Vec::new();
     let mut root_q_mean = Vec::new();
+    let mut beta_v = Vec::new();
+    let mut q_target_kind = Vec::new();
+    let mut q_target_weight = Vec::new();
+    let mut q_target_outcome = Vec::new();
+    let mut q_target_distance = Vec::new();
+    let mut v_target_kind = Vec::new();
+    let mut v_target_weight = Vec::new();
+    let mut v_target_outcome = Vec::new();
+    let mut v_target_distance = Vec::new();
     action_offsets.push(0i64);
 
     for tree_id in tree_ids {
         let config = forest.config.clone();
         let tree = forest.tree_mut(*tree_id)?;
-        if tree.pending_request.is_some() {
+        if !tree.pending_requests.is_empty() {
             return Err(PyValueError::new_err("finish called with pending request"));
         }
         if !matches!(tree.node(tree.root)?.kind, NodeKind::Decision(_)) {
             return Err(PyValueError::new_err("finish called on non-decision root"));
         }
-        if tree.node(tree.root)?.n_down < config.simulations_per_root {
+        if tree.node(tree.root)?.cat_outcome == NO_OUTCOME
+            && tree.node(tree.root)?.n_down < config.simulations_per_root
+        {
             return Err(PyValueError::new_err(
                 "finish called before simulations_per_root reached",
             ));
@@ -1269,20 +1494,41 @@ fn finish_trees(
 
         let root = tree.root;
         let legal_actions_for_root = decision(tree, root)?.legal_actions.clone();
-        let pi = posterior_best_policy_target(tree, root, &config)?;
+        propagate_categorical(tree, root, &config)?;
+        refresh_categorical_edges(tree, root, &config)?;
+        let pi = if tree.node(root)?.cat_outcome != NO_OUTCOME {
+            solved_policy_target(tree, root)?
+        } else {
+            posterior_best_policy_target(tree, root, &config)?
+        };
         let mut alpha_rows = Vec::with_capacity(legal_actions_for_root.len());
         let mut q_rows = Vec::with_capacity(legal_actions_for_root.len());
         for edge_index in 0..legal_actions_for_root.len() {
             let alpha = decision_edge_posterior_ref(tree, root, edge_index, &config)?;
             alpha_rows.push(alpha);
             q_rows.push((alpha[2] - alpha[0]) / alpha.iter().sum::<f32>());
+            let (kind, weight, outcome, distance) = q_native_field(tree, root, edge_index)?;
+            q_target_kind.push(kind);
+            q_target_weight.push(weight);
+            q_target_outcome.push(outcome);
+            q_target_distance.push(distance);
         }
-        let selected_edge = match commit {
-            "posterior_argmax" => argmax(&pi),
-            "mean_utility_argmax" => argmax(&q_rows),
-            "posterior_sample" => sample_index(&pi, &mut tree.rng)?,
-            _ => unreachable!("commit mode already validated"),
+        let selected_edge = if tree.node(root)?.cat_outcome != NO_OUTCOME {
+            solved_edge_index(tree, root)?
+        } else {
+            match commit {
+                "posterior_argmax" => argmax(&pi),
+                "mean_utility_argmax" => argmax(&q_rows),
+                "posterior_sample" => sample_index(&pi, &mut tree.rng)?,
+                _ => unreachable!("commit mode already validated"),
+            }
         };
+        let (v_kind, v_weight, v_outcome, v_distance) = v_native_field(tree, root)?;
+        beta_v.push(tree.node(root)?.c_v.unwrap_or(DUMMY_ALPHA));
+        v_target_kind.push(v_kind);
+        v_target_weight.push(v_weight);
+        v_target_outcome.push(v_outcome);
+        v_target_distance.push(v_distance);
 
         out_tree_ids.push(*tree_id);
         actions.push(legal_actions_for_root[selected_edge] as i32);
@@ -1306,12 +1552,21 @@ fn finish_trees(
             "float32",
         )?,
         root_q_mean: np_array(py, root_q_mean, "float32")?,
+        beta_v: np_array_reshape(py, alpha_rows_to_flat(&beta_v), vec![beta_v.len(), 3], "float32")?,
+        q_target_kind: np_array(py, q_target_kind, "int8")?,
+        q_target_weight: np_array(py, q_target_weight, "float32")?,
+        q_target_outcome: np_array(py, q_target_outcome, "int8")?,
+        q_target_distance: np_array(py, q_target_distance, "int32")?,
+        v_target_kind: np_array(py, v_target_kind, "int8")?,
+        v_target_weight: np_array(py, v_target_weight, "float32")?,
+        v_target_outcome: np_array(py, v_target_outcome, "int8")?,
+        v_target_distance: np_array(py, v_target_distance, "int32")?,
     })
 }
 
 fn export_targets(py: Python<'_>, forest: &Forest, tree_ids: &[TreeId]) -> PyResult<SearchTargets> {
     for tree_id in tree_ids {
-        if forest.tree(*tree_id)?.pending_request.is_some() {
+        if !forest.tree(*tree_id)?.pending_requests.is_empty() {
             return Err(PyValueError::new_err("export called with pending request"));
         }
     }
@@ -1323,6 +1578,14 @@ fn export_targets(py: Python<'_>, forest: &Forest, tree_ids: &[TreeId]) -> PyRes
     let mut q_target_alpha: Vec<[f32; 3]> = Vec::new();
     let mut q_loss_weight: Vec<f32> = Vec::new();
     let mut v_target_alpha: Vec<[f32; 3]> = Vec::new();
+    let mut q_target_kind: Vec<i8> = Vec::new();
+    let mut q_target_weight: Vec<f32> = Vec::new();
+    let mut q_target_outcome: Vec<i8> = Vec::new();
+    let mut q_target_distance: Vec<i32> = Vec::new();
+    let mut v_target_kind: Vec<i8> = Vec::new();
+    let mut v_target_weight: Vec<f32> = Vec::new();
+    let mut v_target_outcome: Vec<i8> = Vec::new();
+    let mut v_target_distance: Vec<i32> = Vec::new();
     let mut row_mask: Vec<bool> = Vec::new();
     let mut out_tree_ids: Vec<TreeId> = Vec::new();
     let mut node_ids: Vec<NodeId> = Vec::new();
@@ -1356,8 +1619,19 @@ fn export_targets(py: Python<'_>, forest: &Forest, tree_ids: &[TreeId]) -> PyRes
                     edge_index,
                     &forest.config,
                 )?);
+                let (kind, weight, outcome, distance) =
+                    q_native_field(tree, node_id, edge_index)?;
+                q_target_kind.push(kind);
+                q_target_weight.push(weight);
+                q_target_outcome.push(outcome);
+                q_target_distance.push(distance);
             }
             v_target_alpha.push(node.c_v.unwrap());
+            let (kind, weight, outcome, distance) = v_native_field(tree, node_id)?;
+            v_target_kind.push(kind);
+            v_target_weight.push(weight);
+            v_target_outcome.push(outcome);
+            v_target_distance.push(distance);
             row_mask.push(true);
             out_tree_ids.push(*tree_id);
             node_ids.push(node_id);
@@ -1392,6 +1666,14 @@ fn export_targets(py: Python<'_>, forest: &Forest, tree_ids: &[TreeId]) -> PyRes
             vec![v_target_alpha.len(), 3],
             "float32",
         )?,
+        q_target_kind: np_array(py, q_target_kind, "int8")?,
+        q_target_weight: np_array(py, q_target_weight, "float32")?,
+        q_target_outcome: np_array(py, q_target_outcome, "int8")?,
+        q_target_distance: np_array(py, q_target_distance, "int32")?,
+        v_target_kind: np_array(py, v_target_kind, "int8")?,
+        v_target_weight: np_array(py, v_target_weight, "float32")?,
+        v_target_outcome: np_array(py, v_target_outcome, "int8")?,
+        v_target_distance: np_array(py, v_target_distance, "int32")?,
         row_mask: np_array(py, row_mask, "bool_")?,
         tree_ids: np_array(py, out_tree_ids, "uint64")?,
         node_ids: np_array(py, node_ids, "uint32")?,
@@ -1410,6 +1692,14 @@ fn backup(
         let child_id = decision(tree, step.node_id)?.edges[step.edge_index]
             .child
             .ok_or_else(|| PyRuntimeError::new_err("backup edge has no child"))?;
+        if publish_categorical_edge_from_child(tree, step.node_id, step.edge_index, child_id, false)? {
+            recompute_node(tree, step.node_id, config)?;
+            propagate_categorical(tree, step.node_id, config)?;
+            beta = tree.node(step.node_id)?.c_v.unwrap_or(categorical_proxy(
+                tree.node(step.node_id)?.cat_outcome,
+            ));
+            continue;
+        }
         beta = align_child_to_parent(tree, child_id, step.node_id, beta)?;
         {
             let parent = tree.node_mut(step.node_id)?;
@@ -1420,14 +1710,82 @@ fn backup(
             edge.b = beta;
             edge.completed = true;
             edge.r_count += 1;
+            edge.cat_outcome = NO_OUTCOME;
+            edge.cat_distance = NO_DISTANCE;
         }
         recompute_node(tree, step.node_id, config)?;
+        propagate_categorical(tree, step.node_id, config)?;
+        beta = tree.node(step.node_id)?.c_v.unwrap_or(beta);
+    }
+    Ok(())
+}
+
+fn backup_terminal(
+    tree: &mut Tree,
+    path: &[PathStep],
+    terminal_alpha: [f32; 3],
+    terminal_outcome: i8,
+    config: &SearchConfig,
+) -> PyResult<()> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    let final_step = path.last().expect("path is nonempty");
+    let child_id = decision(tree, final_step.node_id)?.edges[final_step.edge_index]
+        .child
+        .ok_or_else(|| PyRuntimeError::new_err("terminal backup edge has no child"))?;
+    let aligned_alpha = align_child_to_parent(tree, child_id, final_step.node_id, terminal_alpha)?;
+    let aligned_outcome = align_outcome(
+        terminal_outcome,
+        tree.node(child_id)?.current_player,
+        tree.node(final_step.node_id)?.current_player,
+    );
+    publish_categorical_edge(
+        tree,
+        final_step.node_id,
+        final_step.edge_index,
+        aligned_outcome,
+        1,
+        aligned_alpha,
+        true,
+    )?;
+    recompute_node(tree, final_step.node_id, config)?;
+    propagate_categorical(tree, final_step.node_id, config)?;
+    let mut beta = tree.node(final_step.node_id)?.c_v.unwrap_or(aligned_alpha);
+    for step in path[..path.len() - 1].iter().rev() {
+        let child_id = decision(tree, step.node_id)?.edges[step.edge_index]
+            .child
+            .ok_or_else(|| PyRuntimeError::new_err("backup edge has no child"))?;
+        if publish_categorical_edge_from_child(tree, step.node_id, step.edge_index, child_id, false)? {
+            recompute_node(tree, step.node_id, config)?;
+            propagate_categorical(tree, step.node_id, config)?;
+            beta = tree.node(step.node_id)?.c_v.unwrap_or(categorical_proxy(
+                tree.node(step.node_id)?.cat_outcome,
+            ));
+            continue;
+        }
+        beta = align_child_to_parent(tree, child_id, step.node_id, beta)?;
+        {
+            let parent = tree.node_mut(step.node_id)?;
+            let NodeKind::Decision(data) = &mut parent.kind else {
+                return Err(PyRuntimeError::new_err("backup parent is not a decision node"));
+            };
+            let edge = &mut data.edges[step.edge_index];
+            edge.b = beta;
+            edge.completed = true;
+            edge.r_count += 1;
+            edge.cat_outcome = NO_OUTCOME;
+            edge.cat_distance = NO_DISTANCE;
+        }
+        recompute_node(tree, step.node_id, config)?;
+        propagate_categorical(tree, step.node_id, config)?;
         beta = tree.node(step.node_id)?.c_v.unwrap_or(beta);
     }
     Ok(())
 }
 
 fn recompute_node(tree: &mut Tree, node_id: NodeId, config: &SearchConfig) -> PyResult<()> {
+    try_categorize_node(tree, node_id)?;
     let cache = match &tree.node(node_id)?.kind {
         NodeKind::Terminal(data) => {
             let alpha = data.alpha;
@@ -1436,6 +1794,13 @@ fn recompute_node(tree: &mut Tree, node_id: NodeId, config: &SearchConfig) -> Py
             Some(alpha)
         }
         NodeKind::Decision(data) => {
+            if tree.node(node_id)?.cat_outcome != NO_OUTCOME {
+                let n_down = data.edges.iter().map(|edge| edge.r_count).sum::<u32>();
+                let alpha = categorical_proxy(tree.node(node_id)?.cat_outcome);
+                let node = tree.node_mut(node_id)?;
+                node.n_down = n_down;
+                Some(alpha)
+            } else {
             let n_down = data.edges.iter().map(|edge| edge.r_count).sum::<u32>();
             let value_alpha = data.value_alpha;
             if n_down == 0 {
@@ -1460,6 +1825,7 @@ fn recompute_node(tree: &mut Tree, node_id: NodeId, config: &SearchConfig) -> Py
                 node.n_down = n_down;
                 Some(c_v)
             }
+            }
         }
     };
     let node = tree.node_mut(node_id)?;
@@ -1468,24 +1834,277 @@ fn recompute_node(tree: &mut Tree, node_id: NodeId, config: &SearchConfig) -> Py
     Ok(())
 }
 
+fn publish_categorical_edge_from_child(
+    tree: &mut Tree,
+    parent_id: NodeId,
+    edge_index: usize,
+    child_id: NodeId,
+    increment_count: bool,
+) -> PyResult<bool> {
+    try_categorize_node(tree, child_id)?;
+    let child = tree.node(child_id)?;
+    if child.cat_outcome == NO_OUTCOME {
+        return Ok(false);
+    }
+    let outcome = align_outcome(
+        child.cat_outcome,
+        child.current_player,
+        tree.node(parent_id)?.current_player,
+    );
+    let distance = child.cat_distance + 1;
+    let alpha = align_child_to_parent(
+        tree,
+        child_id,
+        parent_id,
+        child.c_v.unwrap_or(categorical_proxy(child.cat_outcome)),
+    )?;
+    publish_categorical_edge(
+        tree,
+        parent_id,
+        edge_index,
+        outcome,
+        distance,
+        alpha,
+        increment_count,
+    )
+}
+
+fn refresh_categorical_edges(
+    tree: &mut Tree,
+    node_id: NodeId,
+    config: &SearchConfig,
+) -> PyResult<()> {
+    let child_edges = match &tree.node(node_id)?.kind {
+        NodeKind::Decision(data) => data
+            .edges
+            .iter()
+            .enumerate()
+            .filter_map(|(edge_index, edge)| edge.child.map(|child| (edge_index, child)))
+            .collect::<Vec<_>>(),
+        NodeKind::Terminal(_) => Vec::new(),
+    };
+    for (edge_index, child_id) in child_edges {
+        publish_categorical_edge_from_child(tree, node_id, edge_index, child_id, false)?;
+    }
+    recompute_node(tree, node_id, config)?;
+    Ok(())
+}
+
+fn publish_categorical_edge(
+    tree: &mut Tree,
+    parent_id: NodeId,
+    edge_index: usize,
+    outcome: i8,
+    distance: i32,
+    alpha: [f32; 3],
+    increment_count: bool,
+) -> PyResult<bool> {
+    let parent = tree.node_mut(parent_id)?;
+    let NodeKind::Decision(data) = &mut parent.kind else {
+        return Err(PyRuntimeError::new_err(
+            "categorical edge parent is not a decision node",
+        ));
+    };
+    let edge = data
+        .edges
+        .get_mut(edge_index)
+        .ok_or_else(|| PyRuntimeError::new_err("edge index out of range"))?;
+    let was_same = edge.cat_outcome == outcome && edge.cat_distance == distance;
+    edge.b = alpha;
+    edge.completed = true;
+    edge.cat_outcome = outcome;
+    edge.cat_distance = distance;
+    if increment_count || !was_same {
+        edge.r_count = edge.r_count.saturating_add(1);
+    }
+    Ok(!was_same)
+}
+
+fn try_categorize_node(tree: &mut Tree, node_id: NodeId) -> PyResult<bool> {
+    if tree.node(node_id)?.cat_outcome != NO_OUTCOME {
+        return Ok(true);
+    }
+    if let NodeKind::Terminal(data) = &tree.node(node_id)?.kind {
+        publish_categorical_node(tree, node_id, data.outcome, 0, None)?;
+        return Ok(true);
+    }
+    let action_count = decision(tree, node_id)?.legal_actions.len();
+    for edge_index in 0..action_count {
+        let child_id = decision(tree, node_id)?.edges[edge_index].child;
+        if let Some(child_id) = child_id {
+            publish_categorical_edge_from_child(tree, node_id, edge_index, child_id, false)?;
+        }
+    }
+
+    let data = decision(tree, node_id)?;
+    if data.edges.is_empty() {
+        return Ok(false);
+    }
+    let mut known = true;
+    let mut wins: Vec<(usize, i32)> = Vec::new();
+    let mut draws: Vec<(usize, i32)> = Vec::new();
+    let mut losses: Vec<(usize, i32)> = Vec::new();
+    for (edge_index, edge) in data.edges.iter().enumerate() {
+        match edge.cat_outcome {
+            OUTCOME_WIN => wins.push((edge_index, edge.cat_distance)),
+            OUTCOME_DRAW => draws.push((edge_index, edge.cat_distance)),
+            OUTCOME_LOSS => losses.push((edge_index, edge.cat_distance)),
+            _ => known = false,
+        }
+    }
+    if let Some((edge_index, distance)) = choose_distance_edge(&wins, true) {
+        let action = data.legal_actions[edge_index];
+        publish_categorical_node(tree, node_id, OUTCOME_WIN, distance, Some(action))?;
+        return Ok(true);
+    }
+    if !known {
+        return Ok(false);
+    }
+    if let Some((edge_index, distance)) = choose_distance_edge(&draws, true) {
+        let action = data.legal_actions[edge_index];
+        publish_categorical_node(tree, node_id, OUTCOME_DRAW, distance, Some(action))?;
+        return Ok(true);
+    }
+    if let Some((edge_index, distance)) = choose_distance_edge(&losses, false) {
+        let action = data.legal_actions[edge_index];
+        publish_categorical_node(tree, node_id, OUTCOME_LOSS, distance, Some(action))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn publish_categorical_node(
+    tree: &mut Tree,
+    node_id: NodeId,
+    outcome: i8,
+    distance: i32,
+    action: Option<Action>,
+) -> PyResult<()> {
+    let n_down = match &tree.node(node_id)?.kind {
+        NodeKind::Decision(data) => data.edges.iter().map(|edge| edge.r_count).sum::<u32>(),
+        NodeKind::Terminal(_) => 1,
+    };
+    let node = tree.node_mut(node_id)?;
+    node.cat_outcome = outcome;
+    node.cat_distance = distance;
+    node.cat_action = action;
+    node.c_v = Some(categorical_proxy(outcome));
+    node.n_down = n_down;
+    node.cache_version = node.cache_version.wrapping_add(1);
+    Ok(())
+}
+
+fn propagate_categorical(tree: &mut Tree, start_node_id: NodeId, config: &SearchConfig) -> PyResult<()> {
+    let mut node_id = start_node_id;
+    let mut seen = HashSet::new();
+    while seen.insert(node_id) {
+        try_categorize_node(tree, node_id)?;
+        if tree.node(node_id)?.cat_outcome == NO_OUTCOME {
+            return Ok(());
+        }
+        let Some(parent_id) = tree.node(node_id)?.parent else {
+            return Ok(());
+        };
+        let edge_index = match tree.node(node_id)?.parent_link {
+            Some(ParentLink::DecisionAction { action }) => decision(tree, parent_id)?
+                .edge_index_for_action(action)
+                .ok_or_else(|| PyRuntimeError::new_err("parent edge missing for child"))?,
+            None => return Ok(()),
+        };
+        publish_categorical_edge_from_child(tree, parent_id, edge_index, node_id, false)?;
+        recompute_node(tree, parent_id, config)?;
+        node_id = parent_id;
+    }
+    Ok(())
+}
+
+fn choose_distance_edge(edges: &[(usize, i32)], prefer_short: bool) -> Option<(usize, i32)> {
+    edges.iter().copied().min_by_key(|(edge_index, distance)| {
+        let distance_key = if prefer_short { *distance } else { -*distance };
+        (distance_key, *edge_index as i32)
+    })
+}
+
+fn solved_edge_index(tree: &Tree, node_id: NodeId) -> PyResult<usize> {
+    let node = tree.node(node_id)?;
+    let action = node.cat_action;
+    let data = decision(tree, node_id)?;
+    if let Some(action) = action {
+        if let Some(edge_index) = data.edge_index_for_action(action) {
+            return Ok(edge_index);
+        }
+    }
+    Ok(0)
+}
+
+fn solved_policy_target(tree: &Tree, node_id: NodeId) -> PyResult<Vec<f32>> {
+    let action_count = decision(tree, node_id)?.legal_actions.len();
+    let mut pi = vec![0.0f32; action_count];
+    let edge_index = solved_edge_index(tree, node_id)?;
+    if edge_index < pi.len() {
+        pi[edge_index] = 1.0;
+    }
+    Ok(pi)
+}
+
+fn q_native_field(
+    tree: &Tree,
+    node_id: NodeId,
+    edge_index: usize,
+) -> PyResult<(i8, f32, i8, i32)> {
+    let edge = decision(tree, node_id)?
+        .edges
+        .get(edge_index)
+        .ok_or_else(|| PyRuntimeError::new_err("edge index out of range"))?;
+    if edge.cat_outcome != NO_OUTCOME {
+        Ok((TARGET_CATEGORICAL, 1.0, edge.cat_outcome, edge.cat_distance))
+    } else {
+        Ok((TARGET_DIRICHLET, 1.0, NO_OUTCOME, NO_DISTANCE))
+    }
+}
+
+fn v_native_field(tree: &Tree, node_id: NodeId) -> PyResult<(i8, f32, i8, i32)> {
+    let node = tree.node(node_id)?;
+    if node.cat_outcome != NO_OUTCOME {
+        Ok((TARGET_CATEGORICAL, 1.0, node.cat_outcome, node.cat_distance))
+    } else {
+        Ok((TARGET_DIRICHLET, 1.0, NO_OUTCOME, NO_DISTANCE))
+    }
+}
+
 fn thompson_select(
     tree: &mut Tree,
     node_id: NodeId,
     config: &SearchConfig,
 ) -> PyResult<usize> {
     let action_count = decision(tree, node_id)?.legal_actions.len();
-    let mut best_index = 0usize;
+    if config.solve_categorical {
+        for edge_index in 0..action_count {
+            let edge = &decision(tree, node_id)?.edges[edge_index];
+            if edge.cat_outcome == NO_OUTCOME && !edge.pending {
+                return Ok(edge_index);
+            }
+        }
+        return Err(PyRuntimeError::new_err("cannot select from solved node"));
+    }
+    let mut best_index = None;
     let mut best_utility = f32::NEG_INFINITY;
     for edge_index in 0..action_count {
+        if decision(tree, node_id)?.edges[edge_index].cat_outcome != NO_OUTCOME {
+            continue;
+        }
+        if decision(tree, node_id)?.edges[edge_index].pending {
+            continue;
+        }
         let alpha = decision_edge_posterior(tree, node_id, edge_index, config)?;
         let sample = sample_dirichlet(alpha, &mut tree.rng)?;
         let utility = sample[2] - sample[0];
         if utility > best_utility {
             best_utility = utility;
-            best_index = edge_index;
+            best_index = Some(edge_index);
         }
     }
-    Ok(best_index)
+    best_index.ok_or_else(|| PyRuntimeError::new_err("cannot select from solved node"))
 }
 
 fn posterior_best_policy_target(
@@ -1499,9 +2118,13 @@ fn posterior_best_policy_target(
         let mut best_index = 0usize;
         let mut best_utility = f32::NEG_INFINITY;
         for edge_index in 0..action_count {
-            let alpha = decision_edge_posterior(tree, node_id, edge_index, config)?;
-            let sample = sample_dirichlet(alpha, &mut tree.rng)?;
-            let utility = sample[2] - sample[0];
+            let utility = if decision(tree, node_id)?.edges[edge_index].cat_outcome != NO_OUTCOME {
+                outcome_utility(decision(tree, node_id)?.edges[edge_index].cat_outcome)
+            } else {
+                let alpha = decision_edge_posterior(tree, node_id, edge_index, config)?;
+                let sample = sample_dirichlet(alpha, &mut tree.rng)?;
+                sample[2] - sample[0]
+            };
             if utility > best_utility {
                 best_utility = utility;
                 best_index = edge_index;
@@ -1531,9 +2154,13 @@ fn posterior_best_policy_target_ref(
         let mut best_index = 0usize;
         let mut best_utility = f32::NEG_INFINITY;
         for edge_index in 0..action_count {
-            let alpha = decision_edge_posterior_ref(tree, node_id, edge_index, config)?;
-            let sample = sample_dirichlet(alpha, &mut rng)?;
-            let utility = sample[2] - sample[0];
+            let utility = if decision(tree, node_id)?.edges[edge_index].cat_outcome != NO_OUTCOME {
+                outcome_utility(decision(tree, node_id)?.edges[edge_index].cat_outcome)
+            } else {
+                let alpha = decision_edge_posterior_ref(tree, node_id, edge_index, config)?;
+                let sample = sample_dirichlet(alpha, &mut rng)?;
+                sample[2] - sample[0]
+            };
             if utility > best_utility {
                 best_utility = utility;
                 best_index = edge_index;
@@ -1599,6 +2226,52 @@ fn align_child_to_parent(
         Ok(alpha)
     } else {
         Ok([alpha[2], alpha[1], alpha[0]])
+    }
+}
+
+fn align_outcome(outcome: i8, source_player: i32, target_player: i32) -> i8 {
+    if outcome < 0 || source_player == target_player {
+        return outcome;
+    }
+    match outcome {
+        OUTCOME_LOSS => OUTCOME_WIN,
+        OUTCOME_WIN => OUTCOME_LOSS,
+        _ => OUTCOME_DRAW,
+    }
+}
+
+fn outcome_utility(outcome: i8) -> f32 {
+    match outcome {
+        OUTCOME_WIN => 1.0,
+        OUTCOME_LOSS => -1.0,
+        _ => 0.0,
+    }
+}
+
+fn outcome_from_alpha(alpha: [f32; 3]) -> i8 {
+    let mut best = 0usize;
+    let mut best_value = f32::NEG_INFINITY;
+    for (index, value) in alpha.iter().enumerate() {
+        if *value > best_value {
+            best_value = *value;
+            best = index;
+        }
+    }
+    best as i8
+}
+
+fn categorical_proxy(outcome: i8) -> [f32; 3] {
+    let mut alpha = [CATEGORICAL_EPSILON; 3];
+    if (0..3).contains(&(outcome as i32)) {
+        alpha[outcome as usize] = 1.0 - 2.0 * CATEGORICAL_EPSILON;
+    }
+    alpha
+}
+
+fn decision_key(current_player: i32, observation: &[f32]) -> DecisionKey {
+    DecisionKey {
+        current_player,
+        observation_bits: observation.iter().map(|value| value.to_bits()).collect(),
     }
 }
 

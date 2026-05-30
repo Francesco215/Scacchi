@@ -1,5 +1,6 @@
 from typing import Any, Callable, NamedTuple
 
+import dqaz
 import jax
 import jax.numpy as jnp
 import mctx
@@ -19,7 +20,12 @@ from .dirichlet_q_search import (
     q_evidence_sum_from_tree,
     root_action_value_priors_from_tree,
 )
-from .dirichlet_tree.native import native_fields_from_beta
+from .dirichlet_tree.native import (
+    NO_DISTANCE,
+    NO_OUTCOME,
+    TARGET_PAD,
+    native_fields_from_beta,
+)
 from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
 from .network import policy_value_from_output
 from .posterior_tree import (
@@ -354,15 +360,28 @@ def _run_posterior_tree_search_step(
             child_states = jax.vmap(env.step)(states, actions)
             return child_states, leaf_evaluator(child_states.observation)
 
-    search_output = _run_fused_posterior_tree_search(
-        env=env,
-        root_states=split_batched_state(env_state),
-        leaf_evaluator=leaf_evaluator,
-        transition_evaluator=transition_evaluator,
-        search_key=search_key,
-        config=config,
-        device_put_cpu=device_put_cpu,
-    )
+    search_backend = getattr(config, "search_backend", None)
+    root_states = split_batched_state(env_state)
+    if search_backend == "dqaz":
+        search_output = _run_dqaz_posterior_tree_search(
+            env=env,
+            root_states=root_states,
+            leaf_evaluator=leaf_evaluator,
+            transition_evaluator=transition_evaluator,
+            search_key=search_key,
+            config=config,
+            device_put_cpu=device_put_cpu,
+        )
+    else:
+        search_output = _run_fused_posterior_tree_search(
+            env=env,
+            root_states=root_states,
+            leaf_evaluator=leaf_evaluator,
+            transition_evaluator=transition_evaluator,
+            search_key=search_key,
+            config=config,
+            device_put_cpu=device_put_cpu,
+        )
     search_action = device_put_cpu(search_output.action)
     played_action = search_action
     root_search_mask = search_output.search_loss_mask
@@ -485,6 +504,305 @@ def _run_fused_posterior_tree_search(
         v_target_outcome=device_put_cpu(jnp.asarray(np.stack(v_outcome, axis=0), dtype=jnp.int8)),
         v_target_distance=device_put_cpu(
             jnp.asarray(np.stack(v_distance, axis=0), dtype=jnp.int32)
+        ),
+    )
+
+
+def _run_dqaz_posterior_tree_search(
+    *,
+    env: Any,
+    root_states: list[Any],
+    leaf_evaluator: Callable[[jax.Array], Any],
+    transition_evaluator: Callable[[Any, jax.Array], Any],
+    search_key: jax.Array,
+    config,
+    device_put_cpu: Callable[[Any], Any],
+) -> PosteriorTreeBatchOutput:
+    del env
+    if not root_states:
+        raise ValueError("root_states must not be empty")
+
+    root_observations = jnp.stack([state.observation for state in root_states], axis=0)
+    root_logits, root_alpha_v, root_alpha_q = leaf_evaluator(root_observations)
+    root_logits, root_alpha_v, root_alpha_q = jax.device_get(
+        (root_logits, root_alpha_v, root_alpha_q)
+    )
+    action_size = int(root_alpha_q.shape[-2])
+    seed = int(
+        jax.device_get(
+            jax.random.randint(search_key, (), minval=0, maxval=np.iinfo(np.int32).max)
+        )
+    )
+    engine = dqaz.SearchEngine(
+        dqaz.SearchConfig(
+            action_size=action_size,
+            observation_shape=tuple(root_observations.shape[1:]),
+            simulations_per_root=int(getattr(config, "num_simulations")),
+            posterior_best_samples=int(getattr(config, "policy_mc_samples")),
+            kappa_n=float(getattr(config, "state_posterior_kappa_n", 9.0)),
+            seed=seed,
+            debug=bool(getattr(config, "debug", False)),
+            solve_categorical=bool(getattr(config, "solve_categorical", False)),
+        )
+    )
+    root_offsets, root_actions, root_policy, root_q = _compact_valid_actions_np(
+        root_states,
+        root_logits,
+        root_alpha_q,
+    )
+    state_store = _StateStore()
+    root_handles = state_store.add_batch(_stack_states(root_states))
+    tree_ids = engine.add_roots(
+        root_handles,
+        np.asarray(root_observations, dtype=np.float32),
+        root_offsets,
+        root_actions,
+        np.asarray([int(state.current_player) for state in root_states], dtype=np.int32),
+        root_policy,
+        np.asarray(root_alpha_v, dtype=np.float32),
+        root_q,
+    )
+
+    eval_batch_size = _eval_batch_size(config, len(root_states))
+    pad_to = eval_batch_size if bool(getattr(config, "search_pad_to_eval_batch", False)) else None
+    while not engine.is_done(tree_ids):
+        batch = engine.request_transitions(max_batch_size=eval_batch_size, pad_to=pad_to)
+        if batch.size == 0:
+            raise RuntimeError("dqaz posterior tree search stalled")
+        parent_states = state_store.batch(list(batch.parent_states))
+        actions = jnp.asarray(np.asarray(batch.actions), dtype=jnp.int32)
+        transition_output = transition_evaluator(parent_states, actions)
+        child_state_batch, logits, alpha_v, alpha_q = _unpack_transition_output(
+            transition_output
+        )
+        logits, alpha_v, alpha_q = jax.device_get((logits, alpha_v, alpha_q))
+        terminated = np.asarray(jax.device_get(child_state_batch.terminated), dtype=bool)
+        current_players = np.asarray(
+            jax.device_get(child_state_batch.current_player),
+            dtype=np.int32,
+        )
+        offsets, legal_actions, policy_logits, q_alpha = _compact_valid_actions_from_mask_np(
+            np.asarray(jax.device_get(child_state_batch.legal_action_mask), dtype=bool),
+            logits,
+            alpha_q,
+            terminated=terminated,
+        )
+        engine.submit_transitions(
+            batch.token,
+            state_store.add_batch(child_state_batch),
+            np.asarray(jax.device_get(child_state_batch.observation), dtype=np.float32),
+            offsets,
+            legal_actions,
+            current_players,
+            terminated,
+            _terminal_alpha_from_state_batch(
+                child_state_batch,
+                epsilon=float(getattr(config, "epsilon_terminal", 1e-6)),
+                kappa=float(getattr(config, "kappa_terminal", 8.0)),
+            ),
+            policy_logits,
+            np.asarray(alpha_v, dtype=np.float32),
+            q_alpha,
+        )
+
+    commit = getattr(config, "selfplay_action_source")
+    if commit in ("posterior_best", "search_action"):
+        commit = "posterior_argmax"
+    results = engine.finish(tree_ids, commit=commit)
+    return _dqaz_output_to_posterior_batch(
+        results,
+        batch_size=len(root_states),
+        action_size=action_size,
+        device_put_cpu=device_put_cpu,
+    )
+
+
+def _compact_valid_actions_np(
+    states: list[Any],
+    policy_logits: Any,
+    alpha_q: Any,
+    *,
+    terminated: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    policy_logits = np.asarray(policy_logits, dtype=np.float32)
+    alpha_q = np.asarray(alpha_q, dtype=np.float32)
+    if terminated is None:
+        terminated = np.zeros((len(states),), dtype=bool)
+    offsets = [0]
+    legal_actions: list[int] = []
+    compact_logits: list[float] = []
+    compact_q: list[np.ndarray] = []
+    for row, state in enumerate(states):
+        if bool(terminated[row]):
+            offsets.append(len(legal_actions))
+            continue
+        legal = np.flatnonzero(np.asarray(jax.device_get(state.legal_action_mask), dtype=bool))
+        legal_actions.extend(int(action) for action in legal)
+        compact_logits.extend(float(value) for value in policy_logits[row, legal])
+        compact_q.extend(np.asarray(alpha_q[row, legal], dtype=np.float32))
+        offsets.append(len(legal_actions))
+    if compact_q:
+        q_alpha = np.stack(compact_q, axis=0).astype(np.float32)
+    else:
+        q_alpha = np.zeros((0, alpha_q.shape[-1]), dtype=np.float32)
+    return (
+        np.asarray(offsets, dtype=np.int64),
+        np.asarray(legal_actions, dtype=np.int32),
+        np.asarray(compact_logits, dtype=np.float32),
+        q_alpha,
+    )
+
+
+def _compact_valid_actions_from_mask_np(
+    legal_action_mask: np.ndarray,
+    policy_logits: Any,
+    alpha_q: Any,
+    *,
+    terminated: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    policy_logits = np.asarray(policy_logits, dtype=np.float32)
+    alpha_q = np.asarray(alpha_q, dtype=np.float32)
+    legal_action_mask = np.asarray(legal_action_mask, dtype=bool)
+    if terminated is None:
+        terminated = np.zeros((legal_action_mask.shape[0],), dtype=bool)
+    offsets = [0]
+    legal_actions: list[int] = []
+    compact_logits: list[float] = []
+    compact_q: list[np.ndarray] = []
+    for row in range(legal_action_mask.shape[0]):
+        if bool(terminated[row]):
+            offsets.append(len(legal_actions))
+            continue
+        legal = np.flatnonzero(legal_action_mask[row])
+        legal_actions.extend(int(action) for action in legal)
+        compact_logits.extend(float(value) for value in policy_logits[row, legal])
+        compact_q.extend(np.asarray(alpha_q[row, legal], dtype=np.float32))
+        offsets.append(len(legal_actions))
+    if compact_q:
+        q_alpha = np.stack(compact_q, axis=0).astype(np.float32)
+    else:
+        q_alpha = np.zeros((0, alpha_q.shape[-1]), dtype=np.float32)
+    return (
+        np.asarray(offsets, dtype=np.int64),
+        np.asarray(legal_actions, dtype=np.int32),
+        np.asarray(compact_logits, dtype=np.float32),
+        q_alpha,
+    )
+
+
+class _StateStore:
+    def __init__(self):
+        self._treedef = None
+        self._chunks: list[list[jax.Array]] = []
+        self._arrays: list[jax.Array] | None = None
+        self._size = 0
+
+    def add_batch(self, state_batch: Any) -> list[int]:
+        leaves, treedef = jax.tree_util.tree_flatten(state_batch)
+        batch_size = int(leaves[0].shape[0])
+        if self._treedef is None:
+            self._treedef = treedef
+            self._chunks = [[] for _ in leaves]
+        elif treedef != self._treedef:
+            raise ValueError("state batch tree structure changed")
+        for chunks, leaf in zip(self._chunks, leaves, strict=True):
+            chunks.append(leaf)
+        self._arrays = None
+        start = self._size
+        self._size += batch_size
+        return list(range(start, start + batch_size))
+
+    def batch(self, handles: list[int]) -> Any:
+        if not handles:
+            raise ValueError("state handle batch must not be empty")
+        if self._arrays is None:
+            self._arrays = [
+                chunks[0] if len(chunks) == 1 else jnp.concatenate(chunks, axis=0)
+                for chunks in self._chunks
+            ]
+        handle_index = jnp.asarray(handles, dtype=jnp.int32)
+        leaves = [array[handle_index] for array in self._arrays]
+        return jax.tree_util.tree_unflatten(self._treedef, leaves)
+
+
+def _terminal_alpha_from_state_batch(
+    states: Any,
+    *,
+    epsilon: float,
+    kappa: float,
+) -> np.ndarray:
+    rewards = np.asarray(jax.device_get(states.rewards), dtype=np.float32)
+    current_players = np.asarray(jax.device_get(states.current_player), dtype=np.int32)
+    reward = rewards[np.arange(rewards.shape[0]), current_players]
+    outcome = np.where(reward > 0.0, 2, np.where(reward < 0.0, 0, 1))
+    alpha = np.full((rewards.shape[0], 3), float(epsilon), dtype=np.float32)
+    alpha[np.arange(rewards.shape[0]), outcome] += np.float32(kappa)
+    return alpha
+
+
+def _dqaz_output_to_posterior_batch(
+    results: Any,
+    *,
+    batch_size: int,
+    action_size: int,
+    device_put_cpu: Callable[[Any], Any],
+) -> PosteriorTreeBatchOutput:
+    action_offsets = np.asarray(results.action_offsets, dtype=np.int64)
+    legal_actions = np.asarray(results.legal_actions, dtype=np.int32)
+    action_weights = np.zeros((batch_size, action_size), dtype=np.float32)
+    beta_q = np.zeros((batch_size, action_size, 3), dtype=np.float32)
+    q_loss_weight = np.zeros((batch_size, action_size), dtype=np.float32)
+    q_kind = np.full((batch_size, action_size), int(TARGET_PAD), dtype=np.int8)
+    q_weight = np.zeros((batch_size, action_size), dtype=np.float32)
+    q_outcome = np.full((batch_size, action_size), int(NO_OUTCOME), dtype=np.int8)
+    q_distance = np.full((batch_size, action_size), int(NO_DISTANCE), dtype=np.int32)
+
+    sparse_policy = np.asarray(results.pi_search, dtype=np.float32)
+    sparse_q = np.asarray(results.root_alpha, dtype=np.float32)
+    sparse_q_kind = np.asarray(results.q_target_kind, dtype=np.int8)
+    sparse_q_weight = np.asarray(results.q_target_weight, dtype=np.float32)
+    sparse_q_outcome = np.asarray(results.q_target_outcome, dtype=np.int8)
+    sparse_q_distance = np.asarray(results.q_target_distance, dtype=np.int32)
+    for row in range(batch_size):
+        start = int(action_offsets[row])
+        end = int(action_offsets[row + 1])
+        actions = legal_actions[start:end]
+        action_weights[row, actions] = sparse_policy[start:end]
+        beta_q[row, actions] = sparse_q[start:end]
+        q_loss_weight[row, actions] = sparse_policy[start:end]
+        q_kind[row, actions] = sparse_q_kind[start:end]
+        q_weight[row, actions] = sparse_q_weight[start:end]
+        q_outcome[row, actions] = sparse_q_outcome[start:end]
+        q_distance[row, actions] = sparse_q_distance[start:end]
+
+    policy_array = np.asarray(action_weights, dtype=np.float32)
+    return PosteriorTreeBatchOutput(
+        action=device_put_cpu(jnp.asarray(np.asarray(results.actions), dtype=jnp.int32)),
+        action_weights=device_put_cpu(jnp.asarray(policy_array)),
+        beta_Q_target=device_put_cpu(jnp.asarray(beta_q)),
+        beta_V_target=device_put_cpu(
+            jnp.asarray(np.asarray(results.beta_v, dtype=np.float32))
+        ),
+        q_loss_weight=device_put_cpu(jnp.asarray(q_loss_weight)),
+        alpha_root=device_put_cpu(jnp.asarray(beta_q)),
+        trees=(),
+        tree_data=None,
+        search_loss_mask=device_put_cpu(jnp.asarray(np.sum(policy_array, axis=-1) > 0.0)),
+        q_target_kind=device_put_cpu(jnp.asarray(q_kind, dtype=jnp.int8)),
+        q_target_weight=device_put_cpu(jnp.asarray(q_weight, dtype=jnp.float32)),
+        q_target_outcome=device_put_cpu(jnp.asarray(q_outcome, dtype=jnp.int8)),
+        q_target_distance=device_put_cpu(jnp.asarray(q_distance, dtype=jnp.int32)),
+        v_target_kind=device_put_cpu(
+            jnp.asarray(np.asarray(results.v_target_kind), dtype=jnp.int8)
+        ),
+        v_target_weight=device_put_cpu(
+            jnp.asarray(np.asarray(results.v_target_weight), dtype=jnp.float32)
+        ),
+        v_target_outcome=device_put_cpu(
+            jnp.asarray(np.asarray(results.v_target_outcome), dtype=jnp.int8)
+        ),
+        v_target_distance=device_put_cpu(
+            jnp.asarray(np.asarray(results.v_target_distance), dtype=jnp.int32)
         ),
     )
 
