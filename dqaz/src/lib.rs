@@ -416,6 +416,12 @@ struct PreparedJaxBackup {
     categorical_found: bool,
 }
 
+#[derive(Clone)]
+struct CategoricalTouch {
+    tree_id: TreeId,
+    path: Vec<PathStep>,
+}
+
 struct Tree {
     id: TreeId,
     generation: u32,
@@ -469,6 +475,7 @@ struct Forest {
     next_request_id: RequestId,
     next_batch_token: BatchToken,
     request_table: HashMap<BatchToken, PendingBatch>,
+    pending_categorical_touches: Vec<CategoricalTouch>,
     round_robin_cursor: usize,
 }
 
@@ -482,6 +489,7 @@ impl Forest {
             next_request_id: 1,
             next_batch_token: 1,
             request_table: HashMap::new(),
+            pending_categorical_touches: Vec::new(),
             round_robin_cursor: 0,
         }
     }
@@ -917,28 +925,8 @@ impl SearchEngine {
             return Err(PyValueError::new_err("transition output shape mismatch"));
         }
 
-        if batch
-            .terminated
-            .iter()
-            .take(pending.records.len())
-            .any(|terminated| *terminated)
-        {
-            for (row, record) in pending.records.iter().enumerate() {
-                submit_one_transition(
-                    py,
-                    &mut inner,
-                    record,
-                    &batch,
-                    child_states,
-                    row,
-                    &mut profile,
-                )?;
-            }
-            return empty_jax_backup_batch(py);
-        }
-
         let mut prepared = Vec::with_capacity(pending.records.len());
-        let mut categorical_found = false;
+        let mut categorical_touches = Vec::new();
         for (row, record) in pending.records.iter().enumerate() {
             if let Some(item) = submit_one_transition_prepare_jax(
                 py,
@@ -949,21 +937,21 @@ impl SearchEngine {
                 row,
                 &mut profile,
             )? {
-                categorical_found |= item.categorical_found;
+                if item.categorical_found {
+                    categorical_touches.push(CategoricalTouch {
+                        tree_id: item.tree_id,
+                        path: item.path.clone(),
+                    });
+                }
                 prepared.push(item);
             }
         }
 
-        if categorical_found {
-            let config = inner.config.clone();
-            for item in &prepared {
-                let tree = inner.tree_mut(item.tree_id)?;
-                backup(tree, &item.path, item.leaf_alpha, &config, &mut profile)?;
-            }
-            return empty_jax_backup_batch(py);
-        }
-
-        build_jax_backup_batch(py, &inner, &prepared, pending.padded_size)
+        let batch = build_jax_backup_batch(py, &inner, &prepared, pending.padded_size)?;
+        inner
+            .pending_categorical_touches
+            .extend(categorical_touches);
+        Ok(batch)
     }
 
     #[pyo3(signature = (
@@ -1012,7 +1000,8 @@ impl SearchEngine {
             &n_down,
             &policy,
             node_count,
-        )
+        )?;
+        apply_pending_categorical_touches(&mut inner)
     }
 
     #[pyo3(signature = (tree_ids=None))]
@@ -1099,6 +1088,9 @@ impl SearchEngine {
                 tree.pending_requests.remove(&request_id);
             }
         }
+        inner
+            .pending_categorical_touches
+            .retain(|touch| !id_set.contains(&touch.tree_id));
         for tree_id in ids {
             let index = inner.tree_index(tree_id)?;
             inner.trees[index] = None;
@@ -1112,6 +1104,7 @@ impl SearchEngine {
         inner.trees.clear();
         inner.free_tree_slots.clear();
         inner.request_table.clear();
+        inner.pending_categorical_touches.clear();
         inner.round_robin_cursor = 0;
         Ok(())
     }
@@ -1826,60 +1819,80 @@ fn submit_one_transition_prepare_jax(
         profile.skipped_rows += 1;
         return Ok(None);
     }
-    if batch.terminated[row] {
-        return Err(PyRuntimeError::new_err(
-            "jax backup preparation received a terminal row",
-        ));
-    }
-
     let batch_item_start = profile.start();
     let child_state = batch_item(py, child_states, row)?;
     if let Some(start) = batch_item_start {
         profile.batch_item += start.elapsed();
     }
     let current_player = batch.current_players[row];
-    let action_start = batch.action_offsets[row];
-    let action_end = batch.action_offsets[row + 1];
-    profile.total_legal_actions += action_end - action_start;
 
-    let decision_data_start = profile.start();
-    let decision_data = batch.decision_data_for_row(&config, row)?;
-    if let Some(start) = decision_data_start {
-        profile.decision_data += start.elapsed();
-    }
-    let decision_key_start = profile.start();
-    let key = decision_key(current_player, &decision_data.observation);
-    if let Some(start) = decision_key_start {
-        profile.decision_key += start.elapsed();
-    }
-    let lookup_start = profile.start();
-    let existing = tree.decision_table.get(&key).copied();
-    if let Some(start) = lookup_start {
-        profile.decision_lookup += start.elapsed();
-    }
-    let child_id = if let Some(existing) = existing {
-        profile.existing_decision_nodes += 1;
-        existing
-    } else {
-        profile.new_decision_nodes += 1;
+    let child_id = if batch.terminated[row] {
+        profile.terminal_rows += 1;
         let node_insert_start = profile.start();
         let child_id = tree.nodes.len() as NodeId;
-        let mut child = decision_node(child_id, child_state, current_player, decision_data);
+        let alpha = batch.terminal_alpha[row].ok_or_else(|| {
+            PyValueError::new_err("terminal row missing positive terminal_alpha")
+        })?;
+        let mut child = terminal_node(child_id, child_state, current_player, alpha);
         child.parent = Some(record.node_id);
         child.parent_link = Some(ParentLink::DecisionAction {
             action: record.action,
         });
         child.depth = tree.node(record.node_id)?.depth + 1;
         tree.nodes.push(child);
-        tree.decision_table.insert(key, child_id);
         if let Some(start) = node_insert_start {
             profile.node_insert += start.elapsed();
         }
         child_id
+    } else {
+        let action_start = batch.action_offsets[row];
+        let action_end = batch.action_offsets[row + 1];
+        profile.total_legal_actions += action_end - action_start;
+
+        let decision_data_start = profile.start();
+        let decision_data = batch.decision_data_for_row(&config, row)?;
+        if let Some(start) = decision_data_start {
+            profile.decision_data += start.elapsed();
+        }
+        let decision_key_start = profile.start();
+        let key = decision_key(current_player, &decision_data.observation);
+        if let Some(start) = decision_key_start {
+            profile.decision_key += start.elapsed();
+        }
+        let lookup_start = profile.start();
+        let existing = tree.decision_table.get(&key).copied();
+        if let Some(start) = lookup_start {
+            profile.decision_lookup += start.elapsed();
+        }
+        if let Some(existing) = existing {
+            profile.existing_decision_nodes += 1;
+            existing
+        } else {
+            profile.new_decision_nodes += 1;
+            let node_insert_start = profile.start();
+            let child_id = tree.nodes.len() as NodeId;
+            let mut child = decision_node(child_id, child_state, current_player, decision_data);
+            child.parent = Some(record.node_id);
+            child.parent_link = Some(ParentLink::DecisionAction {
+                action: record.action,
+            });
+            child.depth = tree.node(record.node_id)?.depth + 1;
+            tree.nodes.push(child);
+            tree.decision_table.insert(key, child_id);
+            if let Some(start) = node_insert_start {
+                profile.node_insert += start.elapsed();
+            }
+            child_id
+        }
     };
-    let leaf_alpha = match &tree.node(child_id)?.kind {
-        NodeKind::Decision(data) => data.value_alpha,
-        NodeKind::Terminal(data) => data.alpha,
+    let child = tree.node(child_id)?;
+    let leaf_alpha = if child.cat_outcome != NO_OUTCOME {
+        child.c_v.unwrap_or(categorical_proxy(child.cat_outcome))
+    } else {
+        match &child.kind {
+            NodeKind::Decision(data) => data.value_alpha,
+            NodeKind::Terminal(data) => data.alpha,
+        }
     };
 
     let parent_update_start = profile.start();
@@ -1900,19 +1913,7 @@ fn submit_one_transition_prepare_jax(
         profile.parent_update += start.elapsed();
     }
 
-    let mut categorical_found = tree.node(child_id)?.cat_outcome != NO_OUTCOME;
-    for step in &record.path {
-        let node = tree.node(step.node_id)?;
-        if node.cat_outcome != NO_OUTCOME {
-            categorical_found = true;
-            break;
-        }
-        let edge = &decision(tree, step.node_id)?.edges[step.edge_index];
-        if edge.cat_outcome != NO_OUTCOME {
-            categorical_found = true;
-            break;
-        }
-    }
+    let categorical_found = tree.node(child_id)?.cat_outcome != NO_OUTCOME;
 
     Ok(Some(PreparedJaxBackup {
         tree_id: record.tree_id,
@@ -2563,6 +2564,41 @@ fn apply_jax_backup_result(
     Ok(())
 }
 
+fn apply_pending_categorical_touches(forest: &mut Forest) -> PyResult<()> {
+    let touches = std::mem::take(&mut forest.pending_categorical_touches);
+    for touch in touches {
+        let tree = forest.tree_mut(touch.tree_id)?;
+        apply_categorical_touch(tree, &touch.path)?;
+    }
+    Ok(())
+}
+
+fn apply_categorical_touch(tree: &mut Tree, path: &[PathStep]) -> PyResult<()> {
+    let Some(final_step) = path.last() else {
+        return Ok(());
+    };
+    let mut child_id = decision(tree, final_step.node_id)?.edges[final_step.edge_index]
+        .child
+        .ok_or_else(|| PyRuntimeError::new_err("categorical touch edge has no child"))?;
+    for step in path.iter().rev() {
+        let changed = publish_categorical_edge_from_child_metadata(
+            tree,
+            step.node_id,
+            step.edge_index,
+            child_id,
+        )?;
+        if !changed && tree.node(step.node_id)?.cat_outcome == NO_OUTCOME {
+            break;
+        }
+        try_categorize_node_from_known_edges(tree, step.node_id)?;
+        if tree.node(step.node_id)?.cat_outcome == NO_OUTCOME {
+            break;
+        }
+        child_id = step.node_id;
+    }
+    Ok(())
+}
+
 fn backup(
     tree: &mut Tree,
     path: &[PathStep],
@@ -2853,6 +2889,32 @@ fn publish_categorical_edge_from_child(
     )
 }
 
+fn publish_categorical_edge_from_child_metadata(
+    tree: &mut Tree,
+    parent_id: NodeId,
+    edge_index: usize,
+    child_id: NodeId,
+) -> PyResult<bool> {
+    try_categorize_node_from_known_edges(tree, child_id)?;
+    let child = tree.node(child_id)?;
+    if child.cat_outcome == NO_OUTCOME {
+        return Ok(false);
+    }
+    let outcome = align_outcome(
+        child.cat_outcome,
+        child.current_player,
+        tree.node(parent_id)?.current_player,
+    );
+    let distance = child.cat_distance + 1;
+    let alpha = align_child_to_parent(
+        tree,
+        child_id,
+        parent_id,
+        child.c_v.unwrap_or(categorical_proxy(child.cat_outcome)),
+    )?;
+    publish_categorical_edge_metadata(tree, parent_id, edge_index, outcome, distance, alpha)
+}
+
 fn refresh_categorical_edges(
     tree: &mut Tree,
     node_id: NodeId,
@@ -2905,6 +2967,33 @@ fn publish_categorical_edge(
     Ok(!was_same)
 }
 
+fn publish_categorical_edge_metadata(
+    tree: &mut Tree,
+    parent_id: NodeId,
+    edge_index: usize,
+    outcome: i8,
+    distance: i32,
+    alpha: [f32; 3],
+) -> PyResult<bool> {
+    let parent = tree.node_mut(parent_id)?;
+    parent.cached_pi = None;
+    let NodeKind::Decision(data) = &mut parent.kind else {
+        return Err(PyRuntimeError::new_err(
+            "categorical edge parent is not a decision node",
+        ));
+    };
+    let edge = data
+        .edges
+        .get_mut(edge_index)
+        .ok_or_else(|| PyRuntimeError::new_err("edge index out of range"))?;
+    let was_same = edge.cat_outcome == outcome && edge.cat_distance == distance;
+    edge.b = alpha;
+    edge.completed = true;
+    edge.cat_outcome = outcome;
+    edge.cat_distance = distance;
+    Ok(!was_same)
+}
+
 fn try_categorize_node(tree: &mut Tree, node_id: NodeId) -> PyResult<bool> {
     if tree.node(node_id)?.cat_outcome != NO_OUTCOME {
         return Ok(true);
@@ -2919,6 +3008,52 @@ fn try_categorize_node(tree: &mut Tree, node_id: NodeId) -> PyResult<bool> {
         if let Some(child_id) = child_id {
             publish_categorical_edge_from_child(tree, node_id, edge_index, child_id, false)?;
         }
+    }
+
+    let data = decision(tree, node_id)?;
+    if data.edges.is_empty() {
+        return Ok(false);
+    }
+    let mut known = true;
+    let mut wins: Vec<(usize, i32)> = Vec::new();
+    let mut draws: Vec<(usize, i32)> = Vec::new();
+    let mut losses: Vec<(usize, i32)> = Vec::new();
+    for (edge_index, edge) in data.edges.iter().enumerate() {
+        match edge.cat_outcome {
+            OUTCOME_WIN => wins.push((edge_index, edge.cat_distance)),
+            OUTCOME_DRAW => draws.push((edge_index, edge.cat_distance)),
+            OUTCOME_LOSS => losses.push((edge_index, edge.cat_distance)),
+            _ => known = false,
+        }
+    }
+    if let Some((edge_index, distance)) = choose_distance_edge(&wins, true) {
+        let action = data.legal_actions[edge_index];
+        publish_categorical_node(tree, node_id, OUTCOME_WIN, distance, Some(action))?;
+        return Ok(true);
+    }
+    if !known {
+        return Ok(false);
+    }
+    if let Some((edge_index, distance)) = choose_distance_edge(&draws, true) {
+        let action = data.legal_actions[edge_index];
+        publish_categorical_node(tree, node_id, OUTCOME_DRAW, distance, Some(action))?;
+        return Ok(true);
+    }
+    if let Some((edge_index, distance)) = choose_distance_edge(&losses, false) {
+        let action = data.legal_actions[edge_index];
+        publish_categorical_node(tree, node_id, OUTCOME_LOSS, distance, Some(action))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn try_categorize_node_from_known_edges(tree: &mut Tree, node_id: NodeId) -> PyResult<bool> {
+    if tree.node(node_id)?.cat_outcome != NO_OUTCOME {
+        return Ok(true);
+    }
+    if let NodeKind::Terminal(data) = &tree.node(node_id)?.kind {
+        publish_categorical_node(tree, node_id, data.outcome, 0, None)?;
+        return Ok(true);
     }
 
     let data = decision(tree, node_id)?;

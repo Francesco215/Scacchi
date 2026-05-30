@@ -288,7 +288,7 @@ def test_jax_applied_policy_is_reused_by_finish():
     np.testing.assert_allclose(results.pi_search, np.array([0.0, 1.0], dtype=np.float32))
 
 
-def test_jax_prepare_falls_back_for_terminal_rows():
+def test_jax_prepare_uses_jax_for_terminal_rows_then_marks_categorical():
     engine = dqaz.SearchEngine(_config())
     tree_ids = _add_two_sparse_roots(engine)
     batch = engine.request_transitions(max_batch_size=2)
@@ -306,8 +306,45 @@ def test_jax_prepare_falls_back_for_terminal_rows():
         np.zeros((0, 3), dtype=np.float32),
     )
 
-    assert not prepared.used_jax
+    assert prepared.used_jax
+    assert prepared.node_count == 2
+    edge_b = np.asarray(prepared.edge_b, dtype=np.float32)
+    edge_completed = np.asarray(prepared.edge_completed, dtype=bool)
+    edge_r_count = np.asarray(prepared.edge_r_count, dtype=np.int32)
+    c_v = np.asarray(prepared.value_alpha, dtype=np.float32)
+    n_down = np.zeros((edge_b.shape[0],), dtype=np.int32)
+    policy = np.zeros((edge_b.shape[0], 8), dtype=np.float32)
+    aligned_terminal = np.array([3.0, 1.0, 1.0], dtype=np.float32)
+    gamma = np.float32(1.0 / 5.0)
+    for row in range(prepared.path_count):
+        node_row = int(np.asarray(prepared.path_nodes)[row, 0])
+        edge_index = int(np.asarray(prepared.path_edges)[row, 0])
+        edge_b[node_row, edge_index] = aligned_terminal
+        edge_completed[node_row, edge_index] = True
+        edge_r_count[node_row, edge_index] = 1
+        c_v[node_row] = (1.0 - gamma) * np.ones((3,), dtype=np.float32) + gamma * aligned_terminal
+        n_down[node_row] = 1
+        policy[node_row, edge_index] = 1.0
+
+    engine.apply_jax_backup(
+        prepared.tree_ids,
+        prepared.node_ids,
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        c_v,
+        n_down,
+        policy,
+        prepared.node_count,
+    )
+
     assert engine.is_done(tree_ids)
+    results = engine.finish(tree_ids, commit="posterior_argmax")
+    assert results.actions.tolist() == [2, 6]
+    np.testing.assert_allclose(
+        results.root_alpha,
+        np.array([[3.0, 1.0, 1.0], [3.0, 1.0, 1.0]], dtype=np.float32),
+    )
 
 
 def test_pending_request_submitted_after_prune_is_ignored():
