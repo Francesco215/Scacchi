@@ -180,7 +180,7 @@ def _with_dqaz_eval_settings(
             "search_eval_batch_size": search_eval_batch_size,
             "search_pad_to_eval_batch": True,
             "search_jax_backup": True,
-            "solve_categorical": True,
+            "inflight_limit": max(1, tree_size),
             "selfplay_action_source": "posterior_argmax",
         }
     )

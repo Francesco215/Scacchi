@@ -4,9 +4,6 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-
-from scacchi.dirichlet_tree.native import NO_OUTCOME
 
 
 class BackupArrays(NamedTuple):
@@ -29,31 +26,90 @@ class BackupBlockArrays(NamedTuple):
     beta_players: jax.Array
 
 
-def has_categorical_outcome(*outcome_arrays: object | None) -> bool:
-    """Return true when the batch must stay on Rust's categorical solver path."""
+def _flatten_path_batch(
+    path_slots: jax.Array,
+    path_edges: jax.Array,
+    path_mask: jax.Array,
+    leaf_alpha: jax.Array,
+    leaf_players: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Accept either flat [P, D] or depth-major [B, D, T] trajectory batches."""
 
-    for outcome_array in outcome_arrays:
-        if outcome_array is None:
-            continue
-        outcomes = np.asarray(jax.device_get(outcome_array))
-        if outcomes.size and bool(np.any(outcomes != int(NO_OUTCOME))):
-            return True
-    return False
-
-
-def should_use_jax_backup(
-    *,
-    node_cat_outcome: object | None = None,
-    edge_cat_outcome: object | None = None,
-    leaf_cat_outcome: object | None = None,
-) -> bool:
-    """Host-side guard for the non-categorical GPU backup prototype."""
-
-    return not has_categorical_outcome(
-        node_cat_outcome,
-        edge_cat_outcome,
-        leaf_cat_outcome,
+    if path_slots.ndim == 2:
+        return path_slots, path_edges, path_mask, leaf_alpha, leaf_players
+    if path_slots.ndim != 3:
+        raise ValueError(f"path tensors must be rank 2 or 3, got rank {path_slots.ndim}")
+    path_count = path_slots.shape[0] * path_slots.shape[2]
+    return (
+        jnp.swapaxes(path_slots, 1, 2).reshape((path_count, path_slots.shape[1])),
+        jnp.swapaxes(path_edges, 1, 2).reshape((path_count, path_edges.shape[1])),
+        jnp.swapaxes(path_mask, 1, 2).reshape((path_count, path_mask.shape[1])),
+        leaf_alpha.reshape((path_count, leaf_alpha.shape[-1])),
+        leaf_players.reshape((path_count,)),
     )
+
+
+def _coalesced_edge_update(
+    edge_b: jax.Array,
+    edge_completed: jax.Array,
+    edge_r_count: jax.Array,
+    parent_nodes: jax.Array,
+    edge_indices: jax.Array,
+    active: jax.Array,
+    aligned_beta: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Coalesce duplicate active `(node, edge)` hits before writing edge tables."""
+
+    hit_count = jnp.zeros_like(edge_r_count).at[parent_nodes, edge_indices].add(
+        active.astype(edge_r_count.dtype)
+    )
+    beta_sum = jnp.zeros_like(edge_b).at[parent_nodes, edge_indices].add(
+        jnp.where(active[:, None], aligned_beta, 0.0)
+    )
+    hit_mask = hit_count > 0
+    hit_count_f = hit_count.astype(edge_b.dtype)
+    beta_out = beta_sum / jnp.maximum(hit_count_f[..., None], 1.0)
+    edge_b = jnp.where(hit_mask[..., None], beta_out, edge_b)
+    edge_completed = edge_completed | hit_mask
+    edge_r_count = edge_r_count + hit_count
+    return edge_b, edge_completed, edge_r_count
+
+
+def _coalesced_depth_edge_update(
+    edge_b: jax.Array,
+    edge_completed: jax.Array,
+    edge_r_count: jax.Array,
+    depth: jax.Array,
+    slots: jax.Array,
+    edge_indices: jax.Array,
+    active: jax.Array,
+    aligned_beta: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Coalesce active `(root, depth, slot, edge)` hits for depth-bucketed tables."""
+
+    root_count = edge_r_count.shape[0]
+    root_ix = jnp.broadcast_to(jnp.arange(root_count)[:, None], slots.shape)
+    depth_edge_count = edge_r_count[:, depth]
+    depth_edge_b = edge_b[:, depth]
+    depth_completed = edge_completed[:, depth]
+
+    hit_count = jnp.zeros_like(depth_edge_count).at[root_ix, slots, edge_indices].add(
+        active.astype(edge_r_count.dtype)
+    )
+    beta_sum = jnp.zeros_like(depth_edge_b).at[root_ix, slots, edge_indices].add(
+        jnp.where(active[..., None], aligned_beta, 0.0)
+    )
+    hit_mask = hit_count > 0
+    hit_count_f = hit_count.astype(edge_b.dtype)
+    beta_out = beta_sum / jnp.maximum(hit_count_f[..., None], 1.0)
+
+    depth_edge_b = jnp.where(hit_mask[..., None], beta_out, depth_edge_b)
+    depth_completed = depth_completed | hit_mask
+    depth_edge_count = depth_edge_count + hit_count
+    edge_b = edge_b.at[:, depth].set(depth_edge_b)
+    edge_completed = edge_completed.at[:, depth].set(depth_completed)
+    edge_r_count = edge_r_count.at[:, depth].set(depth_edge_count)
+    return edge_b, edge_completed, edge_r_count
 
 
 def flip_wdl(alpha: jax.Array) -> jax.Array:
@@ -80,9 +136,9 @@ def posterior_best_policy_from_samples(
     """
 
     sample_count = wdl_samples.shape[0]
-    max_actions = wdl_samples.shape[2]
+    max_actions = wdl_samples.shape[-2]
     utility = wdl_samples[..., 2] - wdl_samples[..., 0]
-    utility = jnp.where(legal_mask[None, :, :], utility, -jnp.inf)
+    utility = jnp.where(legal_mask[None, ...], utility, -jnp.inf)
     best = jnp.argmax(utility, axis=-1)
     counts = jnp.sum(
         jax.nn.one_hot(best, max_actions, dtype=wdl_samples.dtype),
@@ -120,15 +176,15 @@ def recompute_node_cache_from_policy(
 ) -> tuple[jax.Array, jax.Array]:
     edge_posterior = jnp.where(edge_completed[..., None], edge_b, q_alpha)
     policy = jnp.where(legal_mask, policy, 0.0)
-    evidence = jnp.sum(policy[..., None] * edge_posterior, axis=1)
+    evidence = jnp.sum(policy[..., None] * edge_posterior, axis=-2)
     n_down = jnp.sum(
         jnp.where(legal_mask, edge_r_count, 0),
-        axis=1,
+        axis=-1,
         dtype=jnp.int32,
     )
     n_down_f = n_down.astype(value_alpha.dtype)
     gamma = jnp.where(n_down > 0, n_down_f / (jnp.asarray(kappa_n) + n_down_f), 0.0)
-    c_v = (1.0 - gamma[:, None]) * value_alpha + gamma[:, None] * evidence
+    c_v = (1.0 - gamma[..., None]) * value_alpha + gamma[..., None] * evidence
     return c_v, n_down
 
 
@@ -206,6 +262,14 @@ def apply_batched_backup(
 ) -> BackupArrays:
     """Apply the non-categorical backup and sample posterior-best policy on GPU."""
 
+    path_nodes, path_edges, path_mask, leaf_alpha, leaf_players = _flatten_path_batch(
+        path_nodes,
+        path_edges,
+        path_mask,
+        leaf_alpha,
+        leaf_players,
+    )
+
     num_nodes = edge_b.shape[0]
     dummy_edge_b = jnp.zeros_like(edge_b[:1])
     dummy_completed = jnp.zeros_like(edge_completed[:1])
@@ -243,16 +307,14 @@ def apply_batched_backup(
         parent_players = node_players[parent_nodes]
         aligned_beta = align_wdl(beta, beta_players, parent_players)
 
-        old_b = edge_b[parent_nodes, edge_indices]
-        old_completed = edge_completed[parent_nodes, edge_indices]
-        edge_b = edge_b.at[parent_nodes, edge_indices].set(
-            jnp.where(active[:, None], aligned_beta, old_b)
-        )
-        edge_completed = edge_completed.at[parent_nodes, edge_indices].set(
-            jnp.where(active, True, old_completed)
-        )
-        edge_r_count = edge_r_count.at[parent_nodes, edge_indices].add(
-            active.astype(edge_r_count.dtype)
+        edge_b, edge_completed, edge_r_count = _coalesced_edge_update(
+            edge_b,
+            edge_completed,
+            edge_r_count,
+            parent_nodes,
+            edge_indices,
+            active,
+            aligned_beta,
         )
 
         policy, c_v, n_down = recompute_node_cache_from_key(
@@ -334,6 +396,29 @@ def apply_batched_backup_block(
     the variable-depth part of the tree.
     """
 
+    if edge_b.ndim == 5:
+        return _apply_depth_bucketed_backup_block(
+            rng_key,
+            edge_b,
+            edge_completed,
+            edge_r_count,
+            q_alpha,
+            value_alpha,
+            legal_mask,
+            node_players,
+            path_nodes,
+            path_edges,
+            path_mask,
+            c_v,
+            n_down,
+            policy,
+            beta,
+            beta_players,
+            block_start,
+            kappa_n,
+            sample_count,
+        )
+
     num_nodes = edge_b.shape[0]
     dummy_edge_b = jnp.zeros_like(edge_b[:1])
     dummy_completed = jnp.zeros_like(edge_completed[:1])
@@ -370,16 +455,14 @@ def apply_batched_backup_block(
             parent_players = node_players[parent_nodes]
             aligned_beta = align_wdl(beta, beta_players, parent_players)
 
-            old_b = edge_b[parent_nodes, edge_indices]
-            old_completed = edge_completed[parent_nodes, edge_indices]
-            edge_b = edge_b.at[parent_nodes, edge_indices].set(
-                jnp.where(active[:, None], aligned_beta, old_b)
-            )
-            edge_completed = edge_completed.at[parent_nodes, edge_indices].set(
-                jnp.where(active, True, old_completed)
-            )
-            edge_r_count = edge_r_count.at[parent_nodes, edge_indices].add(
-                active.astype(edge_r_count.dtype)
+            edge_b, edge_completed, edge_r_count = _coalesced_edge_update(
+                edge_b,
+                edge_completed,
+                edge_r_count,
+                parent_nodes,
+                edge_indices,
+                active,
+                aligned_beta,
             )
 
             depth_key = jax.random.fold_in(rng_key, block_start + local_depth)
@@ -438,6 +521,206 @@ def apply_batched_backup_block(
     )
 
 
+def _apply_depth_bucketed_backup_block(
+    rng_key: jax.Array,
+    edge_b: jax.Array,
+    edge_completed: jax.Array,
+    edge_r_count: jax.Array,
+    q_alpha: jax.Array,
+    value_alpha: jax.Array,
+    legal_mask: jax.Array,
+    node_players: jax.Array,
+    path_slots: jax.Array,
+    path_edges: jax.Array,
+    path_mask: jax.Array,
+    c_v: jax.Array,
+    n_down: jax.Array,
+    policy: jax.Array,
+    beta: jax.Array,
+    beta_players: jax.Array,
+    block_start: jax.Array,
+    kappa_n: float | jax.Array,
+    sample_count: int,
+) -> BackupBlockArrays:
+    block_depth = path_slots.shape[1]
+
+    def body(depth_offset: jax.Array, carry: tuple[jax.Array, ...]) -> tuple[jax.Array, ...]:
+        local_depth = block_depth - 1 - depth_offset
+        depth = block_start + local_depth
+        active = path_mask[:, local_depth, :]
+
+        def active_body(carry: tuple[jax.Array, ...]) -> tuple[jax.Array, ...]:
+            edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players = carry
+            slots = jnp.where(active, path_slots[:, local_depth, :], 0)
+            edge_indices = jnp.where(active, path_edges[:, local_depth, :], 0)
+            depth_players = node_players[:, depth]
+            parent_players = jnp.take_along_axis(depth_players, slots, axis=1)
+            aligned_beta = align_wdl(beta, beta_players, parent_players)
+
+            edge_b, edge_completed, edge_r_count = _coalesced_depth_edge_update(
+                edge_b,
+                edge_completed,
+                edge_r_count,
+                depth,
+                slots,
+                edge_indices,
+                active,
+                aligned_beta,
+            )
+
+            depth_key = jax.random.fold_in(rng_key, depth)
+            depth_policy, depth_c_v, depth_n_down = recompute_node_cache_from_key(
+                depth_key,
+                edge_b[:, depth],
+                edge_completed[:, depth],
+                edge_r_count[:, depth],
+                q_alpha[:, depth],
+                value_alpha[:, depth],
+                legal_mask[:, depth],
+                kappa_n,
+                sample_count,
+            )
+            policy = policy.at[:, depth].set(depth_policy)
+            c_v = c_v.at[:, depth].set(depth_c_v)
+            n_down = n_down.at[:, depth].set(depth_n_down)
+            parent_c_v = jnp.take_along_axis(depth_c_v, slots[..., None], axis=1)
+            beta = jnp.where(active[..., None], parent_c_v, beta)
+            beta_players = jnp.where(active, parent_players, beta_players)
+            return edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players
+
+        return jax.lax.cond(jnp.any(active), active_body, lambda x: x, carry)
+
+    (
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        c_v,
+        n_down,
+        policy,
+        beta,
+        beta_players,
+    ) = jax.lax.fori_loop(
+        0,
+        block_depth,
+        body,
+        (
+            edge_b,
+            edge_completed,
+            edge_r_count,
+            c_v,
+            n_down,
+            policy,
+            beta,
+            beta_players,
+        ),
+    )
+
+    return BackupBlockArrays(
+        edge_b=edge_b,
+        edge_completed=edge_completed,
+        edge_r_count=edge_r_count,
+        c_v=c_v,
+        n_down=n_down,
+        policy=policy,
+        beta=beta,
+        beta_players=beta_players,
+    )
+
+
+def _apply_depth_bucketed_backup_from_samples(
+    edge_b: jax.Array,
+    edge_completed: jax.Array,
+    edge_r_count: jax.Array,
+    q_alpha: jax.Array,
+    value_alpha: jax.Array,
+    legal_mask: jax.Array,
+    node_players: jax.Array,
+    path_slots: jax.Array,
+    path_edges: jax.Array,
+    path_mask: jax.Array,
+    leaf_alpha: jax.Array,
+    leaf_players: jax.Array,
+    policy_samples_by_depth: jax.Array,
+    kappa_n: float | jax.Array,
+) -> BackupArrays:
+    max_depth = path_slots.shape[1]
+    c_v = value_alpha
+    n_down = jnp.sum(
+        jnp.where(legal_mask, edge_r_count, 0),
+        axis=-1,
+        dtype=jnp.int32,
+    )
+    policy = jnp.zeros_like(legal_mask, dtype=value_alpha.dtype)
+
+    def body(depth_offset: jax.Array, carry: tuple[jax.Array, ...]) -> tuple[jax.Array, ...]:
+        edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players = carry
+        depth = max_depth - 1 - depth_offset
+        active = path_mask[:, depth, :]
+
+        def active_body(carry: tuple[jax.Array, ...]) -> tuple[jax.Array, ...]:
+            edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players = carry
+            slots = jnp.where(active, path_slots[:, depth, :], 0)
+            edge_indices = jnp.where(active, path_edges[:, depth, :], 0)
+            depth_players = node_players[:, depth]
+            parent_players = jnp.take_along_axis(depth_players, slots, axis=1)
+            aligned_beta = align_wdl(beta, beta_players, parent_players)
+
+            edge_b, edge_completed, edge_r_count = _coalesced_depth_edge_update(
+                edge_b,
+                edge_completed,
+                edge_r_count,
+                depth,
+                slots,
+                edge_indices,
+                active,
+                aligned_beta,
+            )
+
+            depth_policy, depth_c_v, depth_n_down = recompute_node_cache_from_samples(
+                edge_b[:, depth],
+                edge_completed[:, depth],
+                edge_r_count[:, depth],
+                q_alpha[:, depth],
+                value_alpha[:, depth],
+                legal_mask[:, depth],
+                policy_samples_by_depth[depth],
+                kappa_n,
+            )
+            policy = policy.at[:, depth].set(depth_policy)
+            c_v = c_v.at[:, depth].set(depth_c_v)
+            n_down = n_down.at[:, depth].set(depth_n_down)
+            parent_c_v = jnp.take_along_axis(depth_c_v, slots[..., None], axis=1)
+            beta = jnp.where(active[..., None], parent_c_v, beta)
+            beta_players = jnp.where(active, parent_players, beta_players)
+            return edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players
+
+        return jax.lax.cond(jnp.any(active), active_body, lambda x: x, carry)
+
+    edge_b, edge_completed, edge_r_count, c_v, n_down, policy, _, _ = jax.lax.fori_loop(
+        0,
+        max_depth,
+        body,
+        (
+            edge_b,
+            edge_completed,
+            edge_r_count,
+            c_v,
+            n_down,
+            policy,
+            leaf_alpha,
+            leaf_players,
+        ),
+    )
+    return BackupArrays(
+        edge_b=edge_b,
+        edge_completed=edge_completed,
+        edge_r_count=edge_r_count,
+        c_v=c_v,
+        n_down=n_down,
+        policy=policy,
+    )
+
+
 def apply_batched_backup_from_samples(
     edge_b: jax.Array,
     edge_completed: jax.Array,
@@ -456,15 +739,36 @@ def apply_batched_backup_from_samples(
 ) -> BackupArrays:
     """Apply reverse path backups with JAX scatter/scan semantics.
 
-    This is only the non-categorical fast path. Callers should use
-    `should_use_jax_backup` and leave any tree with categorical outcomes on the
-    existing Rust path.
-
-    This prototype assumes no duplicate active `(node, edge)` updates at the
-    same reverse depth. Duplicate edge updates require explicit conflict
-    resolution before production use because `scatter.set` is not a stable
-    last-write primitive.
+    Duplicate active `(node, edge)` updates at the same reverse depth are
+    coalesced before edge tables are written, so counts and backed-up beta
+    snapshots are deterministic.
     """
+
+    if edge_b.ndim == 5:
+        return _apply_depth_bucketed_backup_from_samples(
+            edge_b,
+            edge_completed,
+            edge_r_count,
+            q_alpha,
+            value_alpha,
+            legal_mask,
+            node_players,
+            path_nodes,
+            path_edges,
+            path_mask,
+            leaf_alpha,
+            leaf_players,
+            policy_samples_by_depth,
+            kappa_n,
+        )
+
+    path_nodes, path_edges, path_mask, leaf_alpha, leaf_players = _flatten_path_batch(
+        path_nodes,
+        path_edges,
+        path_mask,
+        leaf_alpha,
+        leaf_players,
+    )
 
     num_nodes = edge_b.shape[0]
     dummy_edge_b = jnp.zeros_like(edge_b[:1])
@@ -510,16 +814,14 @@ def apply_batched_backup_from_samples(
         parent_players = node_players[parent_nodes]
         aligned_beta = align_wdl(beta, beta_players, parent_players)
 
-        old_b = edge_b[parent_nodes, edge_indices]
-        old_completed = edge_completed[parent_nodes, edge_indices]
-        edge_b = edge_b.at[parent_nodes, edge_indices].set(
-            jnp.where(active[:, None], aligned_beta, old_b)
-        )
-        edge_completed = edge_completed.at[parent_nodes, edge_indices].set(
-            jnp.where(active, True, old_completed)
-        )
-        edge_r_count = edge_r_count.at[parent_nodes, edge_indices].add(
-            active.astype(edge_r_count.dtype)
+        edge_b, edge_completed, edge_r_count = _coalesced_edge_update(
+            edge_b,
+            edge_completed,
+            edge_r_count,
+            parent_nodes,
+            edge_indices,
+            active,
+            aligned_beta,
         )
 
         policy, c_v, n_down = recompute_node_cache_from_samples(

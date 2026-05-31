@@ -8,25 +8,25 @@ from scacchi.dqaz_jax_backup import (
     apply_batched_backup,
     apply_batched_backup_from_samples,
     posterior_best_policy_from_samples,
-    should_use_jax_backup,
 )
-from scacchi.dirichlet_tree.native import NO_OUTCOME, OUTCOME_DRAW, OUTCOME_WIN
 
 
 def _posterior_best_policy_from_samples_np(
     wdl_samples: np.ndarray,
     legal_mask: np.ndarray,
 ) -> np.ndarray:
-    sample_count, num_nodes, max_actions, _ = wdl_samples.shape
-    counts = np.zeros((num_nodes, max_actions), dtype=np.float32)
+    sample_count = wdl_samples.shape[0]
+    max_actions = wdl_samples.shape[-2]
+    leading_shape = wdl_samples.shape[1:-2]
+    counts = np.zeros(leading_shape + (max_actions,), dtype=np.float32)
     utility = wdl_samples[..., 2] - wdl_samples[..., 0]
     for sample in range(sample_count):
-        for node in range(num_nodes):
-            legal = np.flatnonzero(legal_mask[node])
+        for index in np.ndindex(leading_shape):
+            legal = np.flatnonzero(legal_mask[index])
             if legal.size == 0:
                 continue
-            best = legal[int(np.argmax(utility[sample, node, legal]))]
-            counts[node, best] += 1.0
+            best = legal[int(np.argmax(utility[(sample, *index)][legal]))]
+            counts[index + (best,)] += 1.0
     return counts / float(sample_count)
 
 
@@ -55,10 +55,10 @@ def _recompute_node_cache_np(
     policy = _posterior_best_policy_from_samples_np(wdl_samples, legal_mask)
     edge_posterior = np.where(edge_completed[..., None], edge_b, q_alpha)
     policy = np.where(legal_mask, policy, 0.0)
-    evidence = np.sum(policy[..., None] * edge_posterior, axis=1)
-    n_down = np.sum(np.where(legal_mask, edge_r_count, 0), axis=1).astype(np.int32)
+    evidence = np.sum(policy[..., None] * edge_posterior, axis=-2)
+    n_down = np.sum(np.where(legal_mask, edge_r_count, 0), axis=-1).astype(np.int32)
     gamma = np.where(n_down > 0, n_down / (kappa_n + n_down), 0.0).astype(np.float32)
-    c_v = (1.0 - gamma[:, None]) * value_alpha + gamma[:, None] * evidence
+    c_v = (1.0 - gamma[..., None]) * value_alpha + gamma[..., None] * evidence
     return policy, c_v.astype(np.float32), n_down
 
 
@@ -96,6 +96,7 @@ def _apply_batched_backup_np(
     beta_players = leaf_players.copy()
 
     for depth in range(path_nodes.shape[1] - 1, -1, -1):
+        hits: dict[tuple[int, int], list[np.ndarray]] = {}
         for row in range(path_nodes.shape[0]):
             if not path_mask[row, depth]:
                 continue
@@ -106,9 +107,11 @@ def _apply_batched_backup_np(
                 np.asarray(beta_players[row]),
                 np.asarray(node_players[parent]),
             )
-            edge_b[parent, edge] = aligned
+            hits.setdefault((parent, edge), []).append(aligned)
+        for (parent, edge), aligned_rows in hits.items():
+            edge_b[parent, edge] = np.mean(np.stack(aligned_rows, axis=0), axis=0)
             edge_completed[parent, edge] = True
-            edge_r_count[parent, edge] += 1
+            edge_r_count[parent, edge] += len(aligned_rows)
 
         policy, c_v, n_down = _recompute_node_cache_np(
             edge_b,
@@ -126,6 +129,82 @@ def _apply_batched_backup_np(
             parent = int(path_nodes[row, depth])
             beta[row] = c_v[parent]
             beta_players[row] = node_players[parent]
+
+    return {
+        "edge_b": edge_b,
+        "edge_completed": edge_completed,
+        "edge_r_count": edge_r_count,
+        "c_v": c_v,
+        "n_down": n_down,
+        "policy": policy,
+    }
+
+
+def _apply_depth_bucketed_backup_np(
+    *,
+    edge_b: np.ndarray,
+    edge_completed: np.ndarray,
+    edge_r_count: np.ndarray,
+    q_alpha: np.ndarray,
+    value_alpha: np.ndarray,
+    legal_mask: np.ndarray,
+    node_players: np.ndarray,
+    path_nodes: np.ndarray,
+    path_edges: np.ndarray,
+    path_mask: np.ndarray,
+    leaf_alpha: np.ndarray,
+    leaf_players: np.ndarray,
+    policy_samples_by_depth: np.ndarray,
+    kappa_n: float,
+) -> dict[str, np.ndarray]:
+    edge_b = edge_b.copy()
+    edge_completed = edge_completed.copy()
+    edge_r_count = edge_r_count.copy()
+    c_v = value_alpha.copy()
+    n_down = np.sum(np.where(legal_mask, edge_r_count, 0), axis=-1).astype(np.int32)
+    policy = np.zeros_like(legal_mask, dtype=np.float32)
+    beta = leaf_alpha.copy()
+    beta_players = leaf_players.copy()
+
+    for depth in range(path_nodes.shape[1] - 1, -1, -1):
+        hits: dict[tuple[int, int, int], list[np.ndarray]] = {}
+        for root in range(path_nodes.shape[0]):
+            for trajectory in range(path_nodes.shape[2]):
+                if not path_mask[root, depth, trajectory]:
+                    continue
+                slot = int(path_nodes[root, depth, trajectory])
+                edge = int(path_edges[root, depth, trajectory])
+                aligned = _align_wdl_np(
+                    beta[root, trajectory],
+                    np.asarray(beta_players[root, trajectory]),
+                    np.asarray(node_players[root, depth, slot]),
+                )
+                hits.setdefault((root, slot, edge), []).append(aligned)
+        for (root, slot, edge), aligned_rows in hits.items():
+            edge_b[root, depth, slot, edge] = np.mean(np.stack(aligned_rows, axis=0), axis=0)
+            edge_completed[root, depth, slot, edge] = True
+            edge_r_count[root, depth, slot, edge] += len(aligned_rows)
+
+        depth_policy, depth_c_v, depth_n_down = _recompute_node_cache_np(
+            edge_b[:, depth],
+            edge_completed[:, depth],
+            edge_r_count[:, depth],
+            q_alpha[:, depth],
+            value_alpha[:, depth],
+            legal_mask[:, depth],
+            policy_samples_by_depth[depth],
+            kappa_n,
+        )
+        policy[:, depth] = depth_policy
+        c_v[:, depth] = depth_c_v
+        n_down[:, depth] = depth_n_down
+        for root in range(path_nodes.shape[0]):
+            for trajectory in range(path_nodes.shape[2]):
+                if not path_mask[root, depth, trajectory]:
+                    continue
+                slot = int(path_nodes[root, depth, trajectory])
+                beta[root, trajectory] = c_v[root, depth, slot]
+                beta_players[root, trajectory] = node_players[root, depth, slot]
 
     return {
         "edge_b": edge_b,
@@ -250,26 +329,6 @@ def test_posterior_best_policy_from_samples_matches_numpy_reference():
     assert actual[1, 1] == 0.0
 
 
-def test_jax_backup_guard_rejects_any_categorical_outcome():
-    node_cat_outcome = np.full((4,), int(NO_OUTCOME), dtype=np.int8)
-    edge_cat_outcome = np.full((4, 3), int(NO_OUTCOME), dtype=np.int8)
-
-    assert should_use_jax_backup(
-        node_cat_outcome=node_cat_outcome,
-        edge_cat_outcome=edge_cat_outcome,
-    )
-
-    edge_cat_outcome[2, 1] = int(OUTCOME_WIN)
-    assert not should_use_jax_backup(
-        node_cat_outcome=node_cat_outcome,
-        edge_cat_outcome=edge_cat_outcome,
-    )
-
-    assert not should_use_jax_backup(
-        leaf_cat_outcome=jnp.asarray([int(NO_OUTCOME), int(OUTCOME_DRAW)], dtype=jnp.int8),
-    )
-
-
 def test_reverse_depth_jax_backup_matches_numpy_with_shared_parent_and_padded_paths():
     rng = np.random.default_rng(7)
     (
@@ -342,6 +401,258 @@ def test_reverse_depth_jax_backup_matches_numpy_with_shared_parent_and_padded_pa
     np.testing.assert_array_equal(actual["edge_completed"][0, :2], np.array([True, True]))
     assert actual["edge_r_count"][0, 0] == 1
     assert actual["edge_r_count"][0, 1] == 1
+
+
+def test_split_trajectories_recompute_shared_node_before_parent_backup():
+    (
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        q_alpha,
+        value_alpha,
+        legal_mask,
+        node_players,
+    ) = _base_tree_arrays()
+    legal_mask = np.zeros_like(legal_mask)
+    legal_mask[0, 0] = True
+    legal_mask[1, :2] = True
+    path_nodes = np.asarray(
+        [
+            [0, 1],
+            [0, 1],
+        ],
+        dtype=np.int32,
+    )
+    path_edges = np.asarray(
+        [
+            [0, 0],
+            [0, 1],
+        ],
+        dtype=np.int32,
+    )
+    path_mask = np.ones_like(path_nodes, dtype=bool)
+    leaf_alpha = np.asarray(
+        [
+            [1.0, 1.0, 5.0],
+            [5.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    leaf_players = np.asarray([1, 1], dtype=np.int32)
+    samples = np.ones((2, 2, edge_b.shape[0], edge_b.shape[1], 3), dtype=np.float32) / 3.0
+    samples[1, :, 1, 0] = np.asarray([0.1, 0.1, 0.8], dtype=np.float32)
+    samples[1, :, 1, 1] = np.asarray([0.8, 0.1, 0.1], dtype=np.float32)
+
+    actual = _run_jax_backup(
+        edge_b=edge_b,
+        edge_completed=edge_completed,
+        edge_r_count=edge_r_count,
+        q_alpha=q_alpha,
+        value_alpha=value_alpha,
+        legal_mask=legal_mask,
+        node_players=node_players,
+        path_nodes=path_nodes,
+        path_edges=path_edges,
+        path_mask=path_mask,
+        leaf_alpha=leaf_alpha,
+        leaf_players=leaf_players,
+        policy_samples_by_depth=samples,
+        kappa_n=2.0,
+    )
+
+    expected_child_summary = (1.0 - np.float32(0.5)) * value_alpha[1] + np.float32(0.5) * np.asarray(
+        [1.0, 1.0, 5.0],
+        dtype=np.float32,
+    )
+    expected_root_edge = _flip_wdl_np(expected_child_summary)
+    np.testing.assert_allclose(actual["c_v"][1], expected_child_summary, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(actual["edge_b"][0, 0], expected_root_edge, rtol=1e-6, atol=1e-6)
+    assert actual["edge_r_count"][1, 0] == 1
+    assert actual["edge_r_count"][1, 1] == 1
+    assert actual["edge_r_count"][0, 0] == 2
+
+
+def test_duplicate_same_edge_updates_are_coalesced_deterministically():
+    (
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        q_alpha,
+        value_alpha,
+        legal_mask,
+        node_players,
+    ) = _base_tree_arrays()
+    legal_mask = np.zeros_like(legal_mask)
+    legal_mask[:, 0] = True
+    path_nodes = np.asarray([[0], [0]], dtype=np.int32)
+    path_edges = np.asarray([[0], [0]], dtype=np.int32)
+    path_mask = np.asarray([[True], [True]], dtype=bool)
+    leaf_alpha = np.asarray(
+        [
+            [1.0, 1.0, 5.0],
+            [5.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    leaf_players = np.asarray([0, 0], dtype=np.int32)
+    samples = np.ones((1, 2, edge_b.shape[0], edge_b.shape[1], 3), dtype=np.float32) / 3.0
+
+    actual = _run_jax_backup(
+        edge_b=edge_b,
+        edge_completed=edge_completed,
+        edge_r_count=edge_r_count,
+        q_alpha=q_alpha,
+        value_alpha=value_alpha,
+        legal_mask=legal_mask,
+        node_players=node_players,
+        path_nodes=path_nodes,
+        path_edges=path_edges,
+        path_mask=path_mask,
+        leaf_alpha=leaf_alpha,
+        leaf_players=leaf_players,
+        policy_samples_by_depth=samples,
+        kappa_n=2.0,
+    )
+
+    expected_edge = np.asarray([3.0, 1.0, 3.0], dtype=np.float32)
+    expected_c_v = (1.0 - np.float32(0.5)) * value_alpha[0] + np.float32(0.5) * expected_edge
+    np.testing.assert_allclose(actual["edge_b"][0, 0], expected_edge, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(actual["c_v"][0], expected_c_v, rtol=1e-6, atol=1e-6)
+    assert actual["edge_completed"][0, 0]
+    assert actual["edge_r_count"][0, 0] == 2
+
+
+def test_depth_bucketed_split_backup_matches_numpy_reference():
+    edge_b = np.zeros((1, 2, 2, 3, 3), dtype=np.float32)
+    edge_completed = np.zeros((1, 2, 2, 3), dtype=bool)
+    edge_r_count = np.zeros((1, 2, 2, 3), dtype=np.int32)
+    q_alpha = np.ones_like(edge_b)
+    value_alpha = np.ones((1, 2, 2, 3), dtype=np.float32)
+    value_alpha[0, 1, 0] = np.asarray([2.0, 1.0, 1.0], dtype=np.float32)
+    legal_mask = np.zeros((1, 2, 2, 3), dtype=bool)
+    legal_mask[0, 0, 0, 0] = True
+    legal_mask[0, 1, 0, :2] = True
+    node_players = np.asarray([[[0, 0], [1, 0]]], dtype=np.int32)
+    path_nodes = np.asarray([[[0, 0], [0, 0]]], dtype=np.int32)
+    path_edges = np.asarray([[[0, 0], [0, 1]]], dtype=np.int32)
+    path_mask = np.ones((1, 2, 2), dtype=bool)
+    leaf_alpha = np.asarray([[[1.0, 1.0, 5.0], [5.0, 1.0, 1.0]]], dtype=np.float32)
+    leaf_players = np.asarray([[1, 1]], dtype=np.int32)
+    samples = np.ones((2, 2, 1, 2, 3, 3), dtype=np.float32) / 3.0
+    samples[1, :, 0, 0, 0] = np.asarray([0.1, 0.1, 0.8], dtype=np.float32)
+    samples[1, :, 0, 0, 1] = np.asarray([0.8, 0.1, 0.1], dtype=np.float32)
+
+    kwargs = dict(
+        edge_b=edge_b,
+        edge_completed=edge_completed,
+        edge_r_count=edge_r_count,
+        q_alpha=q_alpha,
+        value_alpha=value_alpha,
+        legal_mask=legal_mask,
+        node_players=node_players,
+        path_nodes=path_nodes,
+        path_edges=path_edges,
+        path_mask=path_mask,
+        leaf_alpha=leaf_alpha,
+        leaf_players=leaf_players,
+        policy_samples_by_depth=samples,
+        kappa_n=2.0,
+    )
+
+    actual = _run_jax_backup(**kwargs)
+    expected = _apply_depth_bucketed_backup_np(**kwargs)
+
+    _assert_backup_matches_reference(actual, expected)
+    np.testing.assert_array_equal(actual["edge_r_count"][0, 1, 0, :2], np.array([1, 1]))
+    assert actual["edge_r_count"][0, 0, 0, 0] == 2
+    np.testing.assert_allclose(actual["edge_b"][0, 0, 0, 0], _flip_wdl_np(actual["c_v"][0, 1, 0]))
+
+
+def test_depth_bucketed_duplicate_same_edge_updates_are_coalesced_deterministically():
+    edge_b = np.zeros((1, 1, 2, 3, 3), dtype=np.float32)
+    edge_completed = np.zeros((1, 1, 2, 3), dtype=bool)
+    edge_r_count = np.zeros((1, 1, 2, 3), dtype=np.int32)
+    q_alpha = np.ones_like(edge_b)
+    value_alpha = np.ones((1, 1, 2, 3), dtype=np.float32)
+    legal_mask = np.zeros((1, 1, 2, 3), dtype=bool)
+    legal_mask[0, 0, 0, 0] = True
+    node_players = np.asarray([[[0, 0]]], dtype=np.int32)
+    path_nodes = np.asarray([[[0, 0]]], dtype=np.int32)
+    path_edges = np.asarray([[[0, 0]]], dtype=np.int32)
+    path_mask = np.ones((1, 1, 2), dtype=bool)
+    leaf_alpha = np.asarray([[[1.0, 1.0, 5.0], [5.0, 1.0, 1.0]]], dtype=np.float32)
+    leaf_players = np.asarray([[0, 0]], dtype=np.int32)
+    samples = np.ones((1, 2, 1, 2, 3, 3), dtype=np.float32) / 3.0
+
+    kwargs = dict(
+        edge_b=edge_b,
+        edge_completed=edge_completed,
+        edge_r_count=edge_r_count,
+        q_alpha=q_alpha,
+        value_alpha=value_alpha,
+        legal_mask=legal_mask,
+        node_players=node_players,
+        path_nodes=path_nodes,
+        path_edges=path_edges,
+        path_mask=path_mask,
+        leaf_alpha=leaf_alpha,
+        leaf_players=leaf_players,
+        policy_samples_by_depth=samples,
+        kappa_n=2.0,
+    )
+
+    actual = _run_jax_backup(**kwargs)
+    expected = _apply_depth_bucketed_backup_np(**kwargs)
+
+    _assert_backup_matches_reference(actual, expected)
+    expected_edge = np.asarray([3.0, 1.0, 3.0], dtype=np.float32)
+    np.testing.assert_allclose(actual["edge_b"][0, 0, 0, 0], expected_edge)
+    assert actual["edge_r_count"][0, 0, 0, 0] == 2
+
+
+def test_root_major_path_tensors_match_flat_batch():
+    rng = np.random.default_rng(13)
+    (
+        edge_b,
+        edge_completed,
+        edge_r_count,
+        q_alpha,
+        value_alpha,
+        legal_mask,
+        node_players,
+    ) = _base_tree_arrays()
+    flat_kwargs = dict(
+        edge_b=edge_b,
+        edge_completed=edge_completed,
+        edge_r_count=edge_r_count,
+        q_alpha=q_alpha,
+        value_alpha=value_alpha,
+        legal_mask=legal_mask,
+        node_players=node_players,
+        path_nodes=np.asarray([[0, 1], [2, 4]], dtype=np.int32),
+        path_edges=np.asarray([[0, 1], [0, 2]], dtype=np.int32),
+        path_mask=np.asarray([[True, True], [True, True]], dtype=bool),
+        leaf_alpha=np.asarray([[1.0, 1.0, 4.0], [2.0, 3.0, 1.0]], dtype=np.float32),
+        leaf_players=np.asarray([0, 1], dtype=np.int32),
+        policy_samples_by_depth=_random_wdl_samples(
+            rng,
+            (2, 4, edge_b.shape[0], edge_b.shape[1], 3),
+        ),
+        kappa_n=4.0,
+    )
+    root_major_kwargs = dict(
+        flat_kwargs,
+        path_nodes=np.swapaxes(flat_kwargs["path_nodes"].reshape((1, 2, 2)), 1, 2),
+        path_edges=np.swapaxes(flat_kwargs["path_edges"].reshape((1, 2, 2)), 1, 2),
+        path_mask=np.swapaxes(flat_kwargs["path_mask"].reshape((1, 2, 2)), 1, 2),
+        leaf_alpha=flat_kwargs["leaf_alpha"].reshape((1, 2, 3)),
+        leaf_players=flat_kwargs["leaf_players"].reshape((1, 2)),
+    )
+
+    flat = _run_jax_backup(**flat_kwargs)
+    root_major = _run_jax_backup(**root_major_kwargs)
+
+    _assert_backup_matches_reference(root_major, flat)
 
 
 def test_snapshot_replacement_across_two_submits_does_not_accumulate_edge_alpha():

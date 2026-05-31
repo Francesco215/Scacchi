@@ -588,7 +588,7 @@ def _apply_dqaz_jax_backup(
     c_v = value_alpha
     n_down = jnp.sum(
         jnp.where(legal_mask, edge_r_count, 0),
-        axis=1,
+        axis=-1,
         dtype=jnp.int32,
     )
     policy = jnp.zeros_like(legal_mask, dtype=value_alpha.dtype)
@@ -608,6 +608,11 @@ def _apply_dqaz_jax_backup(
         -1,
         -_DQAZ_JAX_BACKUP_BLOCK_DEPTH,
     ):
+        path_slice = (
+            (slice(None), slice(block_start, block_start + _DQAZ_JAX_BACKUP_BLOCK_DEPTH), slice(None))
+            if path_nodes.ndim == 3
+            else (slice(None), slice(block_start, block_start + _DQAZ_JAX_BACKUP_BLOCK_DEPTH))
+        )
         block = _apply_dqaz_jax_backup_block(
             rng_key,
             edge_b,
@@ -617,9 +622,9 @@ def _apply_dqaz_jax_backup(
             value_alpha,
             legal_mask,
             node_players,
-            path_nodes[:, block_start : block_start + _DQAZ_JAX_BACKUP_BLOCK_DEPTH],
-            path_edges[:, block_start : block_start + _DQAZ_JAX_BACKUP_BLOCK_DEPTH],
-            path_mask[:, block_start : block_start + _DQAZ_JAX_BACKUP_BLOCK_DEPTH],
+            path_nodes[path_slice],
+            path_edges[path_slice],
+            path_mask[path_slice],
             c_v,
             n_down,
             policy,
@@ -681,7 +686,7 @@ def _run_dqaz_posterior_tree_search(
             kappa_n=float(getattr(config, "state_posterior_kappa_n", 9.0)),
             seed=seed,
             debug=bool(getattr(config, "debug", False)),
-            solve_categorical=bool(getattr(config, "solve_categorical", False)),
+            max_pending_requests_per_root=int(getattr(config, "inflight_limit", 1)),
         )
     )
     root_offsets, root_actions, root_policy, root_q = _compact_valid_actions_np(
@@ -705,7 +710,7 @@ def _run_dqaz_posterior_tree_search(
 
     eval_batch_size = _eval_batch_size(config, len(root_states))
     pad_to = eval_batch_size if bool(getattr(config, "search_pad_to_eval_batch", False)) else None
-    use_jax_backup = bool(getattr(config, "search_jax_backup", False))
+    use_jax_backup = bool(getattr(config, "search_jax_backup", True))
     jax_backup_step = 0
     while not engine.is_done(tree_ids):
         batch = engine.request_transitions(max_batch_size=eval_batch_size, pad_to=pad_to)
@@ -797,7 +802,7 @@ def _run_dqaz_posterior_tree_search(
                     jnp.asarray(np.asarray(backup_batch.value_alpha), dtype=jnp.float32),
                     jnp.asarray(np.asarray(backup_batch.legal_mask), dtype=jnp.bool_),
                     jnp.asarray(np.asarray(backup_batch.node_players), dtype=jnp.int32),
-                    jnp.asarray(np.asarray(backup_batch.path_nodes), dtype=jnp.int32),
+                    jnp.asarray(np.asarray(backup_batch.path_slots), dtype=jnp.int32),
                     jnp.asarray(np.asarray(backup_batch.path_edges), dtype=jnp.int32),
                     jnp.asarray(np.asarray(backup_batch.path_mask), dtype=jnp.bool_),
                     jnp.asarray(np.asarray(backup_batch.leaf_alpha), dtype=jnp.float32),

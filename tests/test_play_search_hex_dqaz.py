@@ -78,11 +78,11 @@ def test_pgx_hex_dqaz_wdl3_smoke():
 
     config = SimpleNamespace(
         search_backend="dqaz",
-        solve_categorical=True,
         selfplay_action_source="posterior_argmax",
         num_simulations=2,
         policy_mc_samples=4,
         state_posterior_kappa_n=16.0,
+        inflight_limit=2,
         search_eval_batch_size=2,
         search_pad_to_eval_batch=True,
         search_jax_backup=True,

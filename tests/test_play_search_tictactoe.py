@@ -18,18 +18,22 @@ def _dumb_tic_tac_toe_model(obs):
     )
 
 
-def test_pgx_tic_tac_toe_empty_root_solves_to_draw_with_dumb_model():
+def test_pgx_tic_tac_toe_forced_draw_root_uses_solved_policy():
     env = pgx.make("tic_tac_toe")
-    root = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 1))
+    state = env.init(jax.random.PRNGKey(0))
+    for action in [0, 1, 2, 4, 3, 6, 7, 5]:
+        state = env.step(state, jnp.asarray(action, dtype=jnp.int32))
+    root = jax.tree_util.tree_map(lambda value: value[None, ...], state)
     config = SimpleNamespace(
         search_backend="dqaz",
-        solve_categorical=True,
         selfplay_action_source="posterior_argmax",
-        num_simulations=100_000,
+        num_simulations=1,
         policy_mc_samples=8,
         state_posterior_kappa_n=4.0,
-        search_eval_batch_size=1024,
+        inflight_limit=1,
+        search_eval_batch_size=1,
         search_pad_to_eval_batch=True,
+        search_jax_backup=True,
         kappa_terminal=80.0,
         epsilon_terminal=0.01,
     )
@@ -57,7 +61,7 @@ def test_pgx_tic_tac_toe_empty_root_solves_to_draw_with_dumb_model():
 
     assert np.asarray(output.v_target_kind).tolist() == [int(TARGET_CATEGORICAL)]
     assert np.asarray(output.v_target_outcome).tolist() == [int(OUTCOME_DRAW)]
-    assert int(np.asarray(output.v_target_distance)[0]) > 0
+    assert int(np.asarray(output.v_target_distance)[0]) == 1
 
     q_kind = np.asarray(output.q_target_kind)[0]
     q_outcome = np.asarray(output.q_target_outcome)[0]

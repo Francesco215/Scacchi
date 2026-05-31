@@ -58,3 +58,4 @@ def test_fig_8_dqaz_settings_enable_jax_backup():
 
     assert config.search_backend == "dqaz"
     assert config.search_jax_backup is True
+    assert config.inflight_limit == 4
