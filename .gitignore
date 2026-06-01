@@ -227,3 +227,4 @@ __marimo__/
 .streamlit/secrets.toml
 wandb
 artifacts/
+*.tar.gz

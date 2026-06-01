@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import NamedTuple
 
 import jax
@@ -154,14 +155,25 @@ def posterior_best_policy_from_alpha(
     legal_mask: jax.Array,
     sample_count: int,
 ) -> jax.Array:
-    samples = jax.random.gamma(
-        rng_key,
-        edge_alpha[None, :, :, :],
-        shape=(sample_count, *edge_alpha.shape),
-        dtype=edge_alpha.dtype,
+    if os.environ.get("DQAZ_BACKUP_POLICY", "mean_argmax") == "sampled":
+        samples = jax.random.gamma(
+            rng_key,
+            edge_alpha[None, :, :, :],
+            shape=(sample_count, *edge_alpha.shape),
+            dtype=edge_alpha.dtype,
+        )
+        samples = samples / jnp.sum(samples, axis=-1, keepdims=True)
+        return posterior_best_policy_from_samples(samples, legal_mask)
+
+    expected = edge_alpha / jnp.sum(edge_alpha, axis=-1, keepdims=True)
+    utility = expected[..., 2] - expected[..., 0]
+    utility = jnp.where(legal_mask, utility, -jnp.inf)
+    best = jnp.argmax(utility, axis=-1)
+    return jnp.where(
+        legal_mask,
+        jax.nn.one_hot(best, edge_alpha.shape[-2], dtype=edge_alpha.dtype),
+        0.0,
     )
-    samples = samples / jnp.sum(samples, axis=-1, keepdims=True)
-    return posterior_best_policy_from_samples(samples, legal_mask)
 
 
 def recompute_node_cache_from_policy(
@@ -260,7 +272,7 @@ def apply_batched_backup(
     kappa_n: float | jax.Array,
     sample_count: int,
 ) -> BackupArrays:
-    """Apply the non-categorical backup and sample posterior-best policy on GPU."""
+    """Apply the non-categorical backup and recompute posterior-best policy on GPU."""
 
     path_nodes, path_edges, path_mask, leaf_alpha, leaf_players = _flatten_path_batch(
         path_nodes,
@@ -569,24 +581,55 @@ def _apply_depth_bucketed_backup_block(
             )
 
             depth_key = jax.random.fold_in(rng_key, depth)
-            depth_policy, depth_c_v, depth_n_down = recompute_node_cache_from_key(
-                depth_key,
-                edge_b[:, depth],
-                edge_completed[:, depth],
-                edge_r_count[:, depth],
-                q_alpha[:, depth],
-                value_alpha[:, depth],
-                legal_mask[:, depth],
-                kappa_n,
-                sample_count,
+
+            def recompute_root_slot(carry: tuple[jax.Array, ...]) -> tuple[jax.Array, ...]:
+                edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players = carry
+                depth_policy, depth_c_v, depth_n_down = recompute_node_cache_from_key(
+                    depth_key,
+                    edge_b[:, depth, :1],
+                    edge_completed[:, depth, :1],
+                    edge_r_count[:, depth, :1],
+                    q_alpha[:, depth, :1],
+                    value_alpha[:, depth, :1],
+                    legal_mask[:, depth, :1],
+                    kappa_n,
+                    sample_count,
+                )
+                policy = policy.at[:, depth, :1].set(depth_policy)
+                c_v = c_v.at[:, depth, :1].set(depth_c_v)
+                n_down = n_down.at[:, depth, :1].set(depth_n_down)
+                parent_c_v = jnp.broadcast_to(depth_c_v, beta.shape)
+                beta = jnp.where(active[..., None], parent_c_v, beta)
+                beta_players = jnp.where(active, parent_players, beta_players)
+                return edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players
+
+            def recompute_full_depth(carry: tuple[jax.Array, ...]) -> tuple[jax.Array, ...]:
+                edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players = carry
+                depth_policy, depth_c_v, depth_n_down = recompute_node_cache_from_key(
+                    depth_key,
+                    edge_b[:, depth],
+                    edge_completed[:, depth],
+                    edge_r_count[:, depth],
+                    q_alpha[:, depth],
+                    value_alpha[:, depth],
+                    legal_mask[:, depth],
+                    kappa_n,
+                    sample_count,
+                )
+                policy = policy.at[:, depth].set(depth_policy)
+                c_v = c_v.at[:, depth].set(depth_c_v)
+                n_down = n_down.at[:, depth].set(depth_n_down)
+                parent_c_v = jnp.take_along_axis(depth_c_v, slots[..., None], axis=1)
+                beta = jnp.where(active[..., None], parent_c_v, beta)
+                beta_players = jnp.where(active, parent_players, beta_players)
+                return edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players
+
+            return jax.lax.cond(
+                depth == 0,
+                recompute_root_slot,
+                recompute_full_depth,
+                (edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players),
             )
-            policy = policy.at[:, depth].set(depth_policy)
-            c_v = c_v.at[:, depth].set(depth_c_v)
-            n_down = n_down.at[:, depth].set(depth_n_down)
-            parent_c_v = jnp.take_along_axis(depth_c_v, slots[..., None], axis=1)
-            beta = jnp.where(active[..., None], parent_c_v, beta)
-            beta_players = jnp.where(active, parent_players, beta_players)
-            return edge_b, edge_completed, edge_r_count, c_v, n_down, policy, beta, beta_players
 
         return jax.lax.cond(jnp.any(active), active_body, lambda x: x, carry)
 

@@ -7,6 +7,7 @@ import numpy as np
 from scacchi.dqaz_jax_backup import (
     apply_batched_backup,
     apply_batched_backup_from_samples,
+    posterior_best_policy_from_alpha,
     posterior_best_policy_from_samples,
 )
 
@@ -327,6 +328,101 @@ def test_posterior_best_policy_from_samples_matches_numpy_reference():
     np.testing.assert_allclose(actual.sum(axis=-1), np.ones((2,), dtype=np.float32))
     assert actual[0, 2] == 0.0
     assert actual[1, 1] == 0.0
+
+
+def test_posterior_best_policy_from_alpha_defaults_to_mean_argmax(monkeypatch):
+    monkeypatch.delenv("DQAZ_BACKUP_POLICY", raising=False)
+    edge_alpha = jnp.asarray(
+        [
+            [
+                [9.0, 1.0, 1.0],
+                [1.0, 1.0, 5.0],
+                [1.0, 1.0, 4.0],
+            ],
+            [
+                [1.0, 1.0, 3.0],
+                [1.0, 1.0, 9.0],
+                [7.0, 1.0, 1.0],
+            ],
+            [
+                [1.0, 1.0, 1.0],
+                [2.0, 1.0, 5.0],
+                [1.0, 1.0, 6.0],
+            ],
+        ],
+        dtype=jnp.float32,
+    )
+    legal = jnp.asarray(
+        [
+            [True, True, True],
+            [True, False, False],
+            [False, False, False],
+        ],
+        dtype=jnp.bool_,
+    )
+
+    actual = np.asarray(
+        posterior_best_policy_from_alpha(
+            jax.random.PRNGKey(0),
+            edge_alpha,
+            legal,
+            sample_count=8,
+        )
+    )
+
+    np.testing.assert_array_equal(
+        actual,
+        np.asarray(
+            [
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_posterior_best_policy_from_alpha_sampled_mode_uses_gamma_path(monkeypatch):
+    monkeypatch.setenv("DQAZ_BACKUP_POLICY", "sampled")
+    key = jax.random.PRNGKey(4)
+    sample_count = 6
+    edge_alpha = jnp.asarray(
+        [
+            [
+                [1.0, 2.0, 5.0],
+                [3.0, 2.0, 1.0],
+                [2.0, 2.0, 2.0],
+            ],
+            [
+                [1.0, 1.0, 4.0],
+                [5.0, 1.0, 1.0],
+                [2.0, 3.0, 1.0],
+            ],
+        ],
+        dtype=jnp.float32,
+    )
+    legal = jnp.asarray(
+        [
+            [True, True, True],
+            [True, False, True],
+        ],
+        dtype=jnp.bool_,
+    )
+
+    samples = jax.random.gamma(
+        key,
+        edge_alpha[None, :, :, :],
+        shape=(sample_count, *edge_alpha.shape),
+        dtype=edge_alpha.dtype,
+    )
+    samples = samples / jnp.sum(samples, axis=-1, keepdims=True)
+
+    actual = np.asarray(
+        posterior_best_policy_from_alpha(key, edge_alpha, legal, sample_count=sample_count)
+    )
+    expected = np.asarray(posterior_best_policy_from_samples(samples, legal))
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_reverse_depth_jax_backup_matches_numpy_with_shared_parent_and_padded_paths():
