@@ -338,6 +338,35 @@ def test_single_search_block_matches_one_block_policy():
     assert jnp.allclose(policy.alpha_search, block.alpha_search)
 
 
+def test_zero_simulation_policy_uses_q_prior_without_search_tree():
+    rng_key = jax.random.PRNGKey(17)
+    root = _toy_root(num_actions=3)
+    action_value_prior = jnp.array(
+        [[[1.0, 4.0], [4.0, 1.0], [2.0, 2.0]]],
+        dtype=jnp.float32,
+    )
+    invalid_actions = jnp.array([[False, False, True]])
+
+    policy = dirichlet_q_policy(
+        params=(),
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=_toy_recurrent_fn,
+        action_value_prior=action_value_prior,
+        num_simulations=0,
+        invalid_actions=invalid_actions,
+    )
+
+    assert policy.search_tree is None
+    assert jnp.allclose(policy.q_evidence_sum, jnp.zeros_like(action_value_prior))
+    assert jnp.allclose(policy.alpha_search, action_value_prior)
+    assert not bool(policy.explored_action_mask.any())
+    assert policy.action.shape == (1,)
+    assert policy.action_weights.shape == (1, 3)
+    assert float(policy.action_weights[0, 2]) == 0.0
+    assert float(policy.action_weights.sum()) == 1.0
+
+
 def test_q_evidence_routes_by_root_action_and_aligns_parity():
     embedding = NodeEmbedding(
         state=None,

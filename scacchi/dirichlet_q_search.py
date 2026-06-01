@@ -291,6 +291,28 @@ def dirichlet_q_policy(
         action_value_prior = action_alpha_prior
     elif action_alpha_prior is not None:
         raise ValueError("pass only one of action_value_prior or action_alpha_prior")
+    if num_simulations < 0:
+        raise ValueError(f"num_simulations must be >= 0, got {num_simulations}")
+    if num_simulations == 0:
+        del params, root, recurrent_fn, max_depth, loop_fn
+        q_evidence_total = jnp.zeros_like(action_value_prior)
+        alpha_search = action_value_prior
+        sampled_outcome = jax.random.dirichlet(rng_key, alpha_search)
+        score = outcome_utility(sampled_outcome)
+        action = action_selection.masked_argmax(score, invalid_actions)
+        action_weights = jax.nn.one_hot(
+            action,
+            action_value_prior.shape[-2],
+            dtype=action_value_prior.dtype,
+        )
+        return DirichletQSearchOutput(
+            action=action,
+            action_weights=action_weights,
+            search_tree=None,
+            q_evidence_sum=q_evidence_total,
+            alpha_search=alpha_search,
+            explored_action_mask=jnp.zeros(action_value_prior.shape[:-1], dtype=bool),
+        )
 
     block_keys = (
         rng_key[None, ...]

@@ -1,7 +1,14 @@
+import argparse
+
 import jax.numpy as jnp
 import numpy as np
 
-from scripts.fig_8 import _coerce_dqaz_wdl3_output, _with_dqaz_eval_settings
+from scripts.fig_8 import (
+    _coerce_dqaz_wdl3_output,
+    _nonnegative_int_csv,
+    _tree_size_plot_position,
+    _with_dqaz_eval_settings,
+)
 from scacchi.train import Config
 
 
@@ -59,3 +66,20 @@ def test_fig_8_dqaz_settings_enable_jax_backup():
     assert config.search_backend == "dqaz"
     assert config.search_jax_backup is True
     assert config.inflight_limit == 4
+
+
+def test_tree_size_parser_accepts_zero_candidate_search():
+    assert _nonnegative_int_csv("0,2,8") == (0, 2, 8)
+
+    try:
+        _nonnegative_int_csv("-1")
+    except argparse.ArgumentTypeError:
+        pass
+    else:
+        raise AssertionError("negative tree size should be rejected")
+
+
+def test_zero_tree_size_has_custom_plot_position():
+    assert _tree_size_plot_position(0) == -0.5
+    assert _tree_size_plot_position(1) == 0.0
+    assert _tree_size_plot_position(4) == 2.0

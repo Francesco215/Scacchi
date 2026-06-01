@@ -65,6 +65,15 @@ def _positive_int_csv(value: str) -> tuple[int, ...]:
     return values
 
 
+def _nonnegative_int_csv(value: str) -> tuple[int, ...]:
+    values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    if any(v < 0 for v in values):
+        raise argparse.ArgumentTypeError("values must be nonnegative integers")
+    return values
+
+
 def _int_csv(value: str) -> tuple[int, ...]:
     values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
     if not values:
@@ -520,10 +529,19 @@ def _write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _tree_size_plot_position(tree_size: int) -> float:
+    if tree_size == 0:
+        return -0.5
+    if tree_size < 0:
+        raise ValueError(f"tree_size must be nonnegative, got {tree_size}")
+    return math.log2(tree_size)
+
+
 def _plot_curves(rows: list[dict[str, Any]], out_path: Path) -> None:
     if not rows:
         raise ValueError("no rows to plot")
     steps = sorted({int(row["checkpoint_step"]) for row in rows})
+    tree_sizes = sorted({int(row["tree_size"]) for row in rows})
     cmap = plt.get_cmap("viridis")
     colors = {
         step: cmap(i / max(1, len(steps) - 1))
@@ -537,7 +555,10 @@ def _plot_curves(rows: list[dict[str, Any]], out_path: Path) -> None:
             (row for row in rows if int(row["checkpoint_step"]) == step),
             key=lambda row: int(row["tree_size"]),
         )
-        xs = np.array([row["tree_size"] for row in step_rows], dtype=np.float64)
+        xs = np.array(
+            [_tree_size_plot_position(int(row["tree_size"])) for row in step_rows],
+            dtype=np.float64,
+        )
         ys = np.array([row["elo_vs_target"] for row in step_rows], dtype=np.float64)
         ax.plot(
             xs,
@@ -552,9 +573,8 @@ def _plot_curves(rows: list[dict[str, Any]], out_path: Path) -> None:
             endpoints.append((step, float(xs[-1]), float(ys[-1]), colors[step]))
 
     ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.55)
-    ax.set_xscale("log", base=2)
-    ax.set_xticks(sorted({int(row["tree_size"]) for row in rows}))
-    ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+    ax.set_xticks([_tree_size_plot_position(tree_size) for tree_size in tree_sizes])
+    ax.set_xticklabels([str(tree_size) for tree_size in tree_sizes])
     ax.set_xlabel("Test-time tree size (search simulations)")
     target_tree_sizes = sorted({int(row["target_tree_size"]) for row in rows})
     target_label = (
@@ -588,7 +608,7 @@ def _plot_curves(rows: list[dict[str, Any]], out_path: Path) -> None:
         ax.annotate(
             str(step),
             xy=(x, y),
-            xytext=(x * 1.035, label_y),
+            xytext=(x + 0.08, label_y),
             textcoords="data",
             color=color,
             fontsize=8.5,
@@ -858,7 +878,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-dir", type=Path, default=DEFAULT_TARGET_DIR)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--checkpoint-steps", type=_int_csv, default=None)
-    parser.add_argument("--tree-sizes", type=_positive_int_csv, default=DEFAULT_TREE_SIZES)
+    parser.add_argument("--tree-sizes", type=_nonnegative_int_csv, default=DEFAULT_TREE_SIZES)
     parser.add_argument("--eval-games", type=int, default=256)
     parser.add_argument(
         "--num-search-blocks",
@@ -906,6 +926,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--target-num-search-blocks must be positive")
     if args.search_eval_batch_size is not None and args.search_eval_batch_size <= 0:
         parser.error("--search-eval-batch-size must be positive")
+    if args.search_backend == "dqaz" and any(tree_size == 0 for tree_size in args.tree_sizes):
+        parser.error("--tree-sizes 0 is only supported with --search-backend checkpoint")
     return args
 
 
