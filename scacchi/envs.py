@@ -1,14 +1,37 @@
 from __future__ import annotations
 
+import re
+
 import jax
 import jax.numpy as jnp
 import pgx
+import pgx.go
 import pgx.hex
 
 
+def _parse_go_size(env_id: str) -> int | None:
+    match = re.fullmatch(r"go_(\d+)x(\d+)", env_id)
+    if match is None:
+        return None
+    lhs, rhs = match.groups()
+    if lhs != rhs:
+        return None
+    return int(lhs)
+
+
 def make_env(env_id: str, board_size: int | None = None):
-    if env_id != "hex" or board_size is None:
+    if env_id == "go":
+        assert board_size is not None
+        return pgx.go.Go(size=board_size, komi=7.5)
+
+    go_size = _parse_go_size(env_id)
+    if go_size is not None:
+        return pgx.go.Go(size=go_size, komi=7.5)
+
+    if env_id != "hex":
         return pgx.make(env_id)
+
+    assert board_size is not None
 
     env = pgx.hex.Hex(size=board_size)
 

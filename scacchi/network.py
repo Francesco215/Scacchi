@@ -160,6 +160,148 @@ class AZNet(nnx.Module):
         return logits, value
 
 
+class AZDirichletNet(nnx.Module):
+    """AlphaZero convolutional trunk with policy, value-Dirichlet, and Q heads."""
+
+    def __init__(
+        self,
+        num_actions: int,
+        observation_shape: Sequence[int],
+        *,
+        num_outcomes: int = 3,
+        num_channels: int = 64,
+        num_blocks: int = 5,
+        resnet_v2: bool = True,
+        dirichlet_concentration_clip: float | None = 8.0,
+        rngs: nnx.Rngs,
+    ):
+        height, width, input_channels = observation_shape
+        self.num_actions = num_actions
+        self.num_outcomes = num_outcomes
+        self.num_channels = num_channels
+        self.num_blocks = num_blocks
+        self.resnet_v2 = resnet_v2
+        self.dirichlet_concentration_clip = dirichlet_concentration_clip
+
+        self.conv = nnx.Conv(input_channels, num_channels, kernel_size=3, padding="SAME", rngs=rngs)
+        if not resnet_v2:
+            self.bn = nnx.BatchNorm(num_channels, momentum=0.9, rngs=rngs)
+
+        block_cls = BlockV2 if resnet_v2 else BlockV1
+        self.blocks = nnx.List([block_cls(num_channels, rngs=rngs) for _ in range(num_blocks)])
+
+        if resnet_v2:
+            self.bn = nnx.BatchNorm(num_channels, momentum=0.9, rngs=rngs)
+
+        self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=1, padding="SAME", rngs=rngs)
+        self.policy_bn = nnx.BatchNorm(2, momentum=0.9, rngs=rngs)
+        self.policy_linear = nnx.Linear(
+            height * width * 2,
+            num_actions,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+            rngs=rngs,
+        )
+
+        self.value_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", rngs=rngs)
+        self.value_bn = nnx.BatchNorm(1, momentum=0.9, rngs=rngs)
+        self.value_linear = nnx.Linear(height * width, num_channels, rngs=rngs)
+        self.value_dir_out = nnx.Linear(
+            num_channels,
+            num_outcomes,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+            rngs=rngs,
+        )
+        concentration_bias_init = jax.nn.initializers.constant(
+            _unit_dirichlet_concentration_logit(num_outcomes)
+        )
+        self.value_conc_out = nnx.Linear(
+            num_channels,
+            1,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=concentration_bias_init,
+            rngs=rngs,
+        )
+
+        self.q_dir_conv = nnx.Conv(num_channels, num_outcomes, kernel_size=1, padding="SAME", rngs=rngs)
+        self.q_dir_bn = nnx.BatchNorm(num_outcomes, momentum=0.9, rngs=rngs)
+        self.q_dir_linear = nnx.Linear(
+            height * width * num_outcomes,
+            num_actions * num_outcomes,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+            rngs=rngs,
+        )
+        self.q_conc_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", rngs=rngs)
+        self.q_conc_bn = nnx.BatchNorm(1, momentum=0.9, rngs=rngs)
+        self.q_conc_linear = nnx.Linear(
+            height * width,
+            num_actions,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=concentration_bias_init,
+            rngs=rngs,
+        )
+
+    def _trunk(self, x: jax.Array, *, train: bool) -> jax.Array:
+        x = x.astype(jnp.float32)
+        x = self.conv(x)
+
+        if not self.resnet_v2:
+            x = self.bn(x, use_running_average=not train)
+            x = jax.nn.relu(x)
+
+        for block in self.blocks:
+            x = block(x, train=train)
+
+        if self.resnet_v2:
+            x = self.bn(x, use_running_average=not train)
+            x = jax.nn.relu(x)
+
+        return x
+
+    def __call__(self, x: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array, jax.Array]:
+        x = self._trunk(x, train=train)
+
+        logits = self.policy_conv(x)
+        logits = self.policy_bn(logits, use_running_average=not train)
+        logits = jax.nn.relu(logits)
+        logits = logits.reshape((logits.shape[0], -1))
+        logits = self.policy_linear(logits)
+
+        value_features = self.value_conv(x)
+        value_features = self.value_bn(value_features, use_running_average=not train)
+        value_features = jax.nn.relu(value_features)
+        value_features = value_features.reshape((value_features.shape[0], -1))
+        value_features = self.value_linear(value_features)
+        value_features = jax.nn.relu(value_features)
+        alpha_v = dirichlet_from_logits(
+            self.value_dir_out(value_features),
+            self.value_conc_out(value_features).reshape((value_features.shape[0],)),
+            concentration_clip=self.dirichlet_concentration_clip,
+        )
+
+        q_mean_logits = self.q_dir_conv(x)
+        q_mean_logits = self.q_dir_bn(q_mean_logits, use_running_average=not train)
+        q_mean_logits = jax.nn.relu(q_mean_logits)
+        q_mean_logits = q_mean_logits.reshape((q_mean_logits.shape[0], -1))
+        q_mean_logits = self.q_dir_linear(q_mean_logits).reshape(
+            (x.shape[0], self.num_actions, self.num_outcomes)
+        )
+
+        q_concentration_logit = self.q_conc_conv(x)
+        q_concentration_logit = self.q_conc_bn(q_concentration_logit, use_running_average=not train)
+        q_concentration_logit = jax.nn.relu(q_concentration_logit)
+        q_concentration_logit = q_concentration_logit.reshape((q_concentration_logit.shape[0], -1))
+        q_concentration_logit = self.q_conc_linear(q_concentration_logit)
+        alpha_q = dirichlet_from_logits(
+            q_mean_logits,
+            q_concentration_logit,
+            concentration_clip=self.dirichlet_concentration_clip,
+        )
+        return logits, alpha_v, alpha_q
+
+
 class ReZeroResidual(nnx.Module):
     """ReZero residual block: x + α · Linear(ReLU(x)) with α initialized to 0."""
 
@@ -352,6 +494,17 @@ def build_model(
     observation_shape: Sequence[int],
     rngs: nnx.Rngs,
 ) -> nnx.Module:
+    def dirichlet_num_outcomes() -> int:
+        num_outcomes = config.num_outcomes
+        if num_outcomes is None:
+            posterior_tree_search = getattr(config, "search_policy", "gumbel") in (
+                "posterior_tree",
+            )
+            if posterior_tree_search:
+                return 3
+            return 2 if config.env_id == "hex" else 3
+        return num_outcomes
+
     if config.network == "aznet":
         return AZNet(
             num_actions=num_actions,
@@ -359,6 +512,17 @@ def build_model(
             num_channels=config.num_channels,
             num_blocks=config.num_layers,
             resnet_v2=config.resnet_v2,
+            rngs=rngs,
+        )
+    if config.network == "aznet_dirichlet":
+        return AZDirichletNet(
+            num_actions=num_actions,
+            observation_shape=observation_shape,
+            num_outcomes=dirichlet_num_outcomes(),
+            num_channels=config.num_channels,
+            num_blocks=config.num_layers,
+            resnet_v2=config.resnet_v2,
+            dirichlet_concentration_clip=config.dirichlet_concentration_clip,
             rngs=rngs,
         )
     if config.network == "boardlaw":
@@ -371,19 +535,10 @@ def build_model(
             rngs=rngs,
         )
     if config.network == "boardlaw_dirichlet":
-        num_outcomes = config.num_outcomes
-        if num_outcomes is None:
-            posterior_tree_search = getattr(config, "search_policy", "gumbel") in (
-                "posterior_tree",
-            )
-            if posterior_tree_search:
-                num_outcomes = 3
-            else:
-                num_outcomes = 2 if config.env_id == "hex" else 3
         return BoardlawDirichletNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
-            num_outcomes=num_outcomes,
+            num_outcomes=dirichlet_num_outcomes(),
             width=config.num_channels,
             depth=config.num_layers,
             dirichlet_concentration_clip=config.dirichlet_concentration_clip,

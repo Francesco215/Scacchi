@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 
 from scacchi.network import (
+    AZDirichletNet,
     AZNet,
     BoardlawDirichletNet,
     BoardlawNet,
@@ -74,6 +75,49 @@ def test_boardlaw_dirichlet_heads_initialize_to_uniform_policy_and_unit_alphas()
     assert jnp.allclose(jax.nn.softmax(logits, axis=-1), jnp.full_like(logits, 0.1))
     assert jnp.allclose(alpha_v, jnp.ones_like(alpha_v))
     assert jnp.allclose(alpha_q, jnp.ones_like(alpha_q))
+
+
+def test_az_dirichlet_net_shapes_and_unit_alphas():
+    model = AZDirichletNet(
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        num_outcomes=3,
+        num_channels=8,
+        num_blocks=1,
+        rngs=nnx.Rngs(0),
+    )
+    obs = jnp.ones((2, 3, 3, 4))
+
+    logits, alpha_v, alpha_q = model(obs, train=False)
+
+    assert logits.shape == (2, 10)
+    assert alpha_v.shape == (2, 3)
+    assert alpha_q.shape == (2, 10, 3)
+    assert jnp.allclose(logits, jnp.zeros_like(logits))
+    assert jnp.allclose(alpha_v, jnp.ones_like(alpha_v))
+    assert jnp.allclose(alpha_q, jnp.ones_like(alpha_q))
+
+
+def test_build_model_supports_az_dirichlet_for_go_wdl3():
+    config = Config(
+        env_id="go",
+        board_size=8,
+        network="aznet_dirichlet",
+        search_policy="dirichlet_thompson",
+        num_outcomes=None,
+        num_channels=8,
+        num_layers=1,
+    )
+
+    model = build_model(
+        config,
+        num_actions=65,
+        observation_shape=(8, 8, 17),
+        rngs=nnx.Rngs(0),
+    )
+
+    assert isinstance(model, AZDirichletNet)
+    assert model.num_outcomes == 3
 
 
 def test_dirichlet_thompson_null_hex_outcomes_builds_legacy_two_outcome_head():

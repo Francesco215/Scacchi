@@ -134,12 +134,35 @@ def _select_played_action(
     search_action: jax.Array,
 ) -> jax.Array:
     if action_source in ("posterior_best", "posterior_argmax"):
-        return posterior_best_action(action_weights, legal_action_mask)
-    if action_source == "posterior_sample":
-        return posterior_sample_action(rng_key, action_weights, legal_action_mask)
-    if action_source == "search_action":
-        return search_action
-    raise ValueError(f"unknown selfplay_action_source: {action_source!r}")
+        selected = posterior_best_action(action_weights, legal_action_mask)
+    elif action_source == "posterior_sample":
+        selected = posterior_sample_action(rng_key, action_weights, legal_action_mask)
+    elif action_source == "search_action":
+        selected = search_action
+    else:
+        raise ValueError(f"unknown selfplay_action_source: {action_source!r}")
+    return _legalize_played_action(selected, legal_action_mask)
+
+
+def _legalize_played_action(
+    action: jax.Array,
+    legal_action_mask: jax.Array,
+) -> jax.Array:
+    """Return `action` when legal, otherwise the first legal action in each row."""
+
+    num_actions = legal_action_mask.shape[-1]
+    first_legal = jnp.argmax(legal_action_mask, axis=-1).astype(jnp.int32)
+    has_legal_action = jnp.any(legal_action_mask, axis=-1)
+    action = jnp.asarray(action, dtype=jnp.int32)
+    in_bounds = (0 <= action) & (action < num_actions)
+    safe_action = jnp.clip(action, 0, num_actions - 1)
+    selected_is_legal = jnp.take_along_axis(
+        legal_action_mask,
+        safe_action[..., None],
+        axis=-1,
+    )[..., 0]
+    selected = jnp.where(in_bounds & selected_is_legal, action, first_legal)
+    return jnp.where(has_legal_action, selected, jnp.zeros_like(selected))
 
 
 def _make_dirichlet_root(
@@ -209,7 +232,10 @@ def _run_scalar_gumbel_search(
     )
     return _SearchStepOutput(
         action_weights=policy_target,
-        played_action=policy_output.action,
+        played_action=_legalize_played_action(
+            policy_output.action,
+            env_state.legal_action_mask,
+        ),
         beta_Q_target=beta_Q_target,
         beta_V_target=beta_V_target,
         q_loss_weight=q_loss_weight,

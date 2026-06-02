@@ -23,10 +23,10 @@ model:
 selfplay:
   batch_size: 4096  # Number of games advanced in parallel.
   max_num_steps: 25  # 5x5 Hex has at most 25 placements.
-  action_source: posterior_argmax  # Self-play action source: posterior_argmax/posterior_best, posterior_sample, or search_action.
+  action_source: posterior_sample  # Self-play action source: posterior_argmax/posterior_best, posterior_sample, or search_action.
 
 search:
-  policy: posterior_tree  # Reference Python posterior-tree path; Rust dqaz will replace it.
+  policy: dirichlet_thompson  # Reference Python posterior-tree path; Rust dqaz will replace it.
   num_simulations: 32  # Posterior-tree leaf-request budget per root.
   num_blocks: 8  # Compatibility knob for dirichlet_thompson; kept so older overrides still parse.
   eval_batch_size: 1024  # Maximum neural leaf evaluations per batch.

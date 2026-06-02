@@ -27,6 +27,7 @@ from flax import nnx
 import hydra
 from hydra.utils import get_original_cwd
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pgx
@@ -104,6 +105,9 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     ),
     (("eval", "interval"), "eval_interval"),
     (("eval", "batch_size"), "eval_batch_size"),
+    (("eval", "baseline"), "eval_baseline"),
+    (("eval", "baseline_id"), "eval_baseline_id"),
+    (("eval", "checkpoint_path"), "eval_checkpoint_path"),
     (("logging", "interval"), "log_interval"),
     (("logging", "wandb", "enabled"), "wandb_enabled"),
     (("logging", "wandb", "project"), "wandb_project"),
@@ -205,12 +209,12 @@ def normalize_config_dict(config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class Config(BaseModel):
-    env_id: pgx.EnvId = "go_9x9"
+    env_id: str = "go_9x9"
     board_size: int | None = None
     seed: int = 0
     max_num_iters: int = 400
     # network params
-    network: str = "aznet"  # "aznet" | "boardlaw" | "boardlaw_dirichlet"
+    network: str = "aznet"  # "aznet" | "aznet_dirichlet" | "boardlaw" | "boardlaw_dirichlet"
     num_outcomes: int | None = None
     num_channels: int = 128
     num_layers: int = 6
@@ -259,6 +263,9 @@ class Config(BaseModel):
     # eval params
     eval_interval: int = 5
     eval_batch_size: int = 16
+    eval_baseline: str = "checkpoint"
+    eval_baseline_id: str | None = None
+    eval_checkpoint_path: str | None = None
     # logging params
     wandb_enabled: bool = True
     wandb_project: str = "scacchi-az"
@@ -295,12 +302,14 @@ class Config(BaseModel):
             for name in dirichlet_loss_weights
             if getattr(self, name) != 0.0
         ]
-        if self.network != "boardlaw_dirichlet" and active_weights:
+        dirichlet_networks = {"aznet_dirichlet", "boardlaw_dirichlet"}
+        if self.network not in dirichlet_networks and active_weights:
             weights = ", ".join(active_weights)
             raise ValueError(
-                "Dirichlet loss weights require network='boardlaw_dirichlet'; "
+                "Dirichlet loss weights require a Dirichlet network; "
                 f"got network={self.network!r} with {weights}. Set these "
-                "weights to 0.0 or use network='boardlaw_dirichlet'."
+                "weights to 0.0 or use network='aznet_dirichlet' or "
+                "network='boardlaw_dirichlet'."
             )
         valid_action_sources = {
             "posterior_best",
@@ -359,14 +368,16 @@ class Config(BaseModel):
             )
         if self.policy_target_mode not in {"search", "winner_action"}:
             raise ValueError("policy_target_mode must be 'search' or 'winner_action'.")
+        if self.eval_baseline not in {"checkpoint", "pgx", "none"}:
+            raise ValueError("eval_baseline must be 'checkpoint', 'pgx', or 'none'.")
         if self.search_policy in {
             "dirichlet_thompson",
             "posterior_tree",
         }:
-            if self.network != "boardlaw_dirichlet":
+            if self.network not in dirichlet_networks:
                 raise ValueError(
                     "posterior-tree Dirichlet search requires "
-                    "network='boardlaw_dirichlet'."
+                    "network='aznet_dirichlet' or network='boardlaw_dirichlet'."
                 )
         if self.search_policy == "posterior_tree":
             if self.num_outcomes not in (None, 3):
@@ -377,15 +388,64 @@ class Config(BaseModel):
         return self
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="hex")
+def _load_eval_baseline(config: Config, env: pgx.Env):
+    if config.eval_interval <= 0:
+        return None
+    if config.eval_baseline == "none":
+        raise ValueError("eval.baseline=none requires eval.interval=0.")
+    if config.eval_baseline == "checkpoint":
+        checkpoint_path = (
+            config.eval_checkpoint_path
+            if config.eval_checkpoint_path is not None
+            else f"checkpoints/{config.board_size}_solved"
+        )
+        return from_pretrained(checkpoint_path, env, rngs=nnx.Rngs(0))
+    if config.eval_baseline == "pgx":
+        baseline_id = config.eval_baseline_id or f"{env.id}_v0"
+        try:
+            baseline_model = pgx.make_baseline_model(cast(Any, baseline_id))
+        except AssertionError as exc:
+            raise ValueError(
+                f"PGX does not provide baseline model {baseline_id!r}. "
+                "Use eval.baseline=none with eval.interval=0, or provide a "
+                "checkpoint baseline."
+            ) from exc
+        _validate_pgx_eval_baseline(baseline_model, baseline_id, env)
+        return baseline_model
+    raise ValueError(f"unknown eval_baseline: {config.eval_baseline!r}")
+
+
+def _validate_pgx_eval_baseline(
+    baseline_model: Any,
+    baseline_id: str,
+    env: pgx.Env,
+) -> None:
+    observation = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
+    try:
+        output = baseline_model(observation)
+    except Exception as exc:
+        raise ValueError(
+            f"PGX baseline model {baseline_id!r} is incompatible with "
+            f"env {env.id!r} observation_shape={env.observation_shape}."
+        ) from exc
+
+    logits = output[0] if isinstance(output, tuple) else output
+    if tuple(logits.shape) != (1, env.num_actions):
+        raise ValueError(
+            f"PGX baseline model {baseline_id!r} returned logits shape "
+            f"{tuple(logits.shape)} for env {env.id!r}; expected "
+            f"{(1, env.num_actions)}."
+        )
+
+
+@hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
     config = Config(**normalize_config_dict(container))
     report_jax_backend()
 
     env = make_env(config.env_id, config.board_size)
-    checkpoint_path = f"checkpoints/{config.board_size}_solved"
-    baseline_model = from_pretrained(checkpoint_path, env, rngs=nnx.Rngs(0))
+    baseline_model = _load_eval_baseline(config, env)
 
     model = build_model(
         config,
@@ -419,7 +479,11 @@ def main(cfg: DictConfig) -> None:
     training_iteration = make_training_iteration(env, config)
     
     
-    evaluate = make_mcts_evaluate(env, config, baseline_model)
+    evaluate = (
+        None
+        if baseline_model is None
+        else make_mcts_evaluate(env, config, baseline_model)
+    )
 
     hours: float = 0.0
     frames: int = 0
@@ -447,7 +511,7 @@ def main(cfg: DictConfig) -> None:
                 legacy_rng_split = config.rng_split_mode == "legacy_eval_train"
                 if not legacy_rng_split:
                     rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
-                if config.eval_interval > 0 and (
+                if evaluate is not None and config.eval_interval > 0 and (
                     iteration == config.max_num_iters - 1
                     or iteration % config.eval_interval == 0
                 ):

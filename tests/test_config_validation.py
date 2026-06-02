@@ -5,7 +5,8 @@ from omegaconf import OmegaConf
 from pydantic import ValidationError
 
 from scacchi.posterior_tree import is_posterior_tree_policy
-from scacchi.train import Config, normalize_config_dict
+from scacchi.envs import make_env
+from scacchi.train import Config, _load_eval_baseline, normalize_config_dict
 
 
 def test_nested_hex_config_loads_into_runtime_config():
@@ -22,8 +23,8 @@ def test_nested_hex_config_loads_into_runtime_config():
     assert config.num_channels == 512
     assert config.selfplay_batch_size == 4096
     assert config.max_num_steps == 25
-    assert config.selfplay_action_source == "posterior_argmax"
-    assert config.search_policy == "posterior_tree"
+    assert config.selfplay_action_source == "posterior_sample"
+    assert config.search_policy == "dirichlet_thompson"
     assert config.num_simulations == 32
     assert config.search_eval_batch_size == 1024
     assert config.leaf_value_mode == "alpha"
@@ -44,6 +45,57 @@ def test_nested_hex_config_loads_into_runtime_config():
     assert config.eval_batch_size == 512
     assert config.wandb_enabled is False
     assert config.ckpt_max_to_keep == 0
+
+
+def test_gardner_chess_az_config_uses_matching_pgx_baseline():
+    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "go9_az.yaml"
+    container = OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True)
+
+    assert isinstance(container, dict)
+    config = Config(**normalize_config_dict(container))
+
+    assert config.env_id == "gardner_chess"
+    assert config.board_size == 5
+    assert config.network == "aznet_dirichlet"
+    assert config.max_num_iters == 2000
+    assert config.num_channels == 128
+    assert config.selfplay_batch_size == 256
+    assert config.search_policy == "dirichlet_thompson"
+    assert config.num_simulations == 4
+    assert config.max_num_steps == 162
+    assert config.selfplay_action_source == "posterior_sample"
+    assert config.training_batch_size == 1024
+    assert config.minibatch_sampling == "permutation"
+    assert config.terminal_edge_targets is True
+    assert config.terminal_parent_targets is True
+    assert config.value_dir_kl_weight == 1.0
+    assert config.q_dir_kl_weight == 1.0
+    assert config.eval_interval == 1
+    assert config.eval_baseline == "pgx"
+    assert config.eval_baseline_id == "gardner_chess_v0"
+
+
+def test_make_env_supports_custom_go8():
+    env = make_env("go", 8)
+
+    assert env.id == "go_8x8"
+    assert env.num_actions == 65
+    assert env.observation_shape == (8, 8, 17)
+
+
+def test_incompatible_pgx_eval_baseline_raises():
+    env = make_env("gardner_chess")
+    config = Config(
+        env_id="gardner_chess",
+        network="aznet_dirichlet",
+        search_policy="dirichlet_thompson",
+        eval_interval=1,
+        eval_baseline="pgx",
+        eval_baseline_id="go_9x9_v0",
+    )
+
+    with pytest.raises(ValueError, match="incompatible"):
+        _load_eval_baseline(config, env)
 
 
 def test_hex8_terminal_targets_use_total_concentration_clip():
