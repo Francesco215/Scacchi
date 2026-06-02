@@ -18,6 +18,7 @@ from .dirichlet_q_search import (
     terminal_outcome_from_reward,
 )
 from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
+from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, constrain_batch_axis
 from .network import policy_value_from_output
 from .play_search import (
     _SearchStepOutput,
@@ -296,14 +297,24 @@ def _select_posterior_tree_played_action(
     )
 
 
-def make_posterior_tree_selfplay(env, config):
+def make_posterior_tree_selfplay(
+    env,
+    config,
+    parallel: BatchParallel | None = None,
+):
+    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
+
     @nnx.jit
     def evaluate_leaves(model: nnx.Module, obs: jax.Array):
+        obs = constrain_batch_axis(obs, parallel, batch_axis=0)
         return model(obs, train=False)
 
     @nnx.jit
     def evaluate_transitions(model: nnx.Module, states, actions: jax.Array):
+        states = constrain_batch_axis(states, parallel, batch_axis=0)
+        actions = constrain_batch_axis(actions, parallel, batch_axis=0)
         child_states = jax.vmap(env.step)(states, actions)
+        child_states = constrain_batch_axis(child_states, parallel, batch_axis=0)
         return child_states, model(child_states.observation, train=False)
 
     def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
@@ -368,14 +379,19 @@ def make_posterior_tree_selfplay(env, config):
                 )
             )
 
-        return _stack_selfplay_frames(frames)
+        return constrain_batch_axis(
+            _stack_selfplay_frames(frames),
+            parallel,
+            batch_axis=1,
+        )
 
     return selfplay
 
 
-def make_selfplay(env, config):
+def make_selfplay(env, config, parallel: BatchParallel | None = None):
+    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     if is_posterior_tree_policy(config.search_policy):
-        return make_posterior_tree_selfplay(env, config)
+        return make_posterior_tree_selfplay(env, config, parallel=parallel)
 
     @nnx.jit
     def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
@@ -410,23 +426,39 @@ def make_selfplay(env, config):
                 search_output.played_action,
                 reset_keys,
             )
+            env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
             reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
             discount = -jnp.ones_like(reward)
             discount = jnp.where(env_state.terminated, 0.0, discount)
-            return env_state, _selfplay_frame(
-                observation=observation,
-                legal_action_mask=legal_action_mask,
-                reward=reward,
-                terminated=env_state.terminated,
-                discount=discount,
-                search_output=search_output,
+            frame = _selfplay_frame(
+                observation=constrain_batch_axis(observation, parallel, batch_axis=0),
+                legal_action_mask=constrain_batch_axis(
+                    legal_action_mask,
+                    parallel,
+                    batch_axis=0,
+                ),
+                reward=constrain_batch_axis(reward, parallel, batch_axis=0),
+                terminated=constrain_batch_axis(
+                    env_state.terminated,
+                    parallel,
+                    batch_axis=0,
+                ),
+                discount=constrain_batch_axis(discount, parallel, batch_axis=0),
+                search_output=constrain_batch_axis(
+                    search_output,
+                    parallel,
+                    batch_axis=0,
+                ),
             )
+            return env_state, frame
 
         rng_key, init_key = jax.random.split(rng_key)
         init_keys = jax.random.split(init_key, config.selfplay_batch_size)
+        init_keys = constrain_batch_axis(init_keys, parallel, batch_axis=0)
         env_state = jax.vmap(env.init)(init_keys)
+        env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
         step_keys = jax.random.split(rng_key, config.max_num_steps)
         _, data = step_fn(env_state, step_keys)
-        return data
+        return constrain_batch_axis(data, parallel, batch_axis=1)
 
     return selfplay

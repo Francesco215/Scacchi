@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -33,8 +34,54 @@ def _suppress_orbax_logs() -> None:
 class NoOpCheckpointManager(ocp.CheckpointManager):
     """Drops all saves — returned when max_to_keep == 0."""
 
+    def __init__(self, directory: Path, *args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        self._directory = directory
+
+    @property
+    def directory(self) -> Path:
+        return self._directory
+
+    def __enter__(self) -> NoOpCheckpointManager:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+
+    def latest_step(self) -> int | None:
+        return None
+
     def should_save(self, step: int) -> bool:
+        del step
         return False
+
+    def save(self, *args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
+        return False
+
+
+def _checkpoint_manager_options(
+    *,
+    max_to_keep: int | None = None,
+    save_interval_steps: int = 1,
+    save_on_steps: tuple[int, ...] | None = None,
+    read_only: bool = False,
+) -> ocp.CheckpointManagerOptions:
+    is_multihost = jax.process_count() > 1
+    return ocp.CheckpointManagerOptions(
+        max_to_keep=max_to_keep,
+        save_interval_steps=save_interval_steps,
+        save_on_steps=save_on_steps,
+        single_host_load_and_broadcast=is_multihost,
+        enable_async_checkpointing=True,
+        multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
+        read_only=read_only,
+    )
 
 
 def build_checkpoint_manager(
@@ -42,15 +89,14 @@ def build_checkpoint_manager(
     ckpt_dir: Path,
 ) -> ocp.CheckpointManager:
     _suppress_orbax_logs()
-    options = ocp.CheckpointManagerOptions(
+    options = _checkpoint_manager_options(
         max_to_keep=config.ckpt_max_to_keep,
         save_interval_steps=config.ckpt_save_interval_steps,
-        save_on_steps=[config.max_num_iters - 1],
-        enable_async_checkpointing=True,
+        save_on_steps=(config.max_num_iters - 1,),
     )
     item_names = ("model", "optimizer", "rngs", "meta")
     if config.ckpt_max_to_keep == 0:
-        return NoOpCheckpointManager(ckpt_dir, options=options, item_names=item_names)
+        return NoOpCheckpointManager(ckpt_dir)
     return ocp.CheckpointManager(ckpt_dir, options=options, item_names=item_names)
 
 
@@ -123,7 +169,8 @@ def from_pretrained(
 
     from .train import Config, normalize_config_dict  # local import avoids circular
 
-    with ocp.CheckpointManager(checkpoint_path) as manager:
+    options = _checkpoint_manager_options(read_only=True)
+    with ocp.CheckpointManager(checkpoint_path, options=options) as manager:
         step = manager.latest_step()
         if step is None:
             raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")

@@ -6,6 +6,7 @@ from .loss import Sample, TrainMetrics, make_compute_loss_input, train
 from .play import make_selfplay
 from .play import SelfplayOutput
 from .posterior_tree import is_posterior_tree_policy
+from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, constrain_batch_axis
 
 
 def make_minibatches(
@@ -173,10 +174,15 @@ def train_minibatches(
     optimizer: nnx.Optimizer,
     minibatches: Sample,
     config,
+    parallel: BatchParallel | None = None,
 ) -> TrainMetrics:
+    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
+    minibatches = constrain_batch_axis(minibatches, parallel, batch_axis=1)
+
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def scan_step(state, minibatch):
         model, optimizer = state
+        minibatch = constrain_batch_axis(minibatch, parallel, batch_axis=0)
         metrics = train(model, optimizer, minibatch, config)
         return (model, optimizer), metrics
 
@@ -184,8 +190,9 @@ def train_minibatches(
     return metrics
 
 
-def make_training_iteration(env, config):
-    selfplay = make_selfplay(env, config)
+def make_training_iteration(env, config, parallel: BatchParallel | None = None):
+    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
+    selfplay = make_selfplay(env, config, parallel=parallel)
     compute_loss_input = make_compute_loss_input(config)
     replay_buffer_size = int(getattr(config, "replay_buffer_size", 1))
 
@@ -198,13 +205,14 @@ def make_training_iteration(env, config):
             perm_key: jax.Array,
         ) -> TrainMetrics:
             samples = compute_loss_input(data)
+            samples = constrain_batch_axis(samples, parallel, batch_axis=1)
             minibatches = make_minibatches(
                 samples,
                 perm_key,
                 config.training_batch_size,
                 getattr(config, "minibatch_sampling", "active_with_replacement"),
             )
-            return train_minibatches(model, optimizer, minibatches, config)
+            return train_minibatches(model, optimizer, minibatches, config, parallel)
 
         replay_buffer: list[SelfplayOutput] = []
 
@@ -234,12 +242,13 @@ def make_training_iteration(env, config):
         selfplay_key, perm_key = jax.random.split(rng_key)
         data = selfplay(model, selfplay_key)
         samples = compute_loss_input(data)
+        samples = constrain_batch_axis(samples, parallel, batch_axis=1)
         minibatches = make_minibatches(
             samples,
             perm_key,
             config.training_batch_size,
             getattr(config, "minibatch_sampling", "active_with_replacement"),
         )
-        return train_minibatches(model, optimizer, minibatches, config)
+        return train_minibatches(model, optimizer, minibatches, config, parallel)
 
     return training_iteration

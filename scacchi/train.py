@@ -13,27 +13,37 @@
 # limitations under the License.
 
 import os
+import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
-# Training expects a GPU by default, but posterior_tree search keeps PGX env
-# stepping on CPU, so both platforms need to be visible.
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "scacchi"
+
+if any(Path("/dev").glob("accel*")):
+    os.environ.setdefault("JAX_PLATFORMS", "tpu,cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-from flax import nnx
 import hydra
 from hydra.utils import get_original_cwd
 import jax
+
+from .distributed import initialize_distributed, make_batch_parallel
+
+initialize_distributed()
+
 import jax.numpy as jnp
 import numpy as np
-import optax
-import pgx
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 from tqdm import tqdm
+
+from flax import nnx
+import optax
+import pgx
 
 from .checkpoint import build_checkpoint_manager, from_pretrained, maybe_save, restore
 from .envs import make_env
@@ -46,12 +56,17 @@ from .pipeline import make_training_iteration
 def report_jax_backend() -> None:
     backend = jax.default_backend()
     devices = jax.devices()
-    print(f"JAX backend: {backend}")
-    print(f"JAX devices: {devices}")
-    if os.environ.get("SCACCHI_ALLOW_CPU") != "1" and backend != "gpu":
+    process_index = jax.process_index()
+    process_count = jax.process_count()
+    if process_index == 0:
+        print(f"JAX backend: {backend}")
+        print(f"JAX process count: {process_count}")
+        print(f"JAX global devices: {devices}")
+    print(f"JAX process {process_index} local devices: {jax.local_devices()}")
+    if os.environ.get("SCACCHI_ALLOW_CPU") != "1" and backend not in {"gpu", "tpu"}:
         raise RuntimeError(
-            "JAX is not using a GPU backend. Set SCACCHI_ALLOW_CPU=1 only for "
-            "intentional CPU runs."
+            "JAX is not using a GPU or TPU backend. Set SCACCHI_ALLOW_CPU=1 "
+            "only for intentional CPU runs."
         )
 
 _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
@@ -442,156 +457,167 @@ def _validate_pgx_eval_baseline(
 def main(cfg: DictConfig) -> None:
     container = cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True))
     config = Config(**normalize_config_dict(container))
+    initialize_distributed()
     report_jax_backend()
+    parallel = make_batch_parallel(config)
+    if jax.process_index() != 0:
+        config.wandb_enabled = False
 
-    env = make_env(config.env_id, config.board_size)
-    baseline_model = _load_eval_baseline(config, env)
+    with parallel.mesh_context():
+        env = make_env(config.env_id, config.board_size)
+        baseline_model = _load_eval_baseline(config, env)
 
-    model = build_model(
-        config,
-        num_actions=env.num_actions,
-        observation_shape=env.observation_shape,
-        rngs=nnx.Rngs(config.seed),
-    )
-    optimizer_transforms: list[optax.GradientTransformation] = []
-    if config.grad_clip_norm is not None:
-        optimizer_transforms.append(optax.clip_by_global_norm(config.grad_clip_norm))
-    learning_rate: float | optax.Schedule = config.learning_rate
-    if config.lr_decay_after_iters is not None and config.lr_decay_factor != 1.0:
-        rows_per_iter = max(
-            1,
-            config.selfplay_batch_size * config.max_num_steps,
+        model = build_model(
+            config,
+            num_actions=env.num_actions,
+            observation_shape=env.observation_shape,
+            rngs=nnx.Rngs(config.seed),
         )
-        updates_per_iter = max(1, rows_per_iter // config.training_batch_size)
-        learning_rate = optax.piecewise_constant_schedule(
-            init_value=config.learning_rate,
-            boundaries_and_scales={
-                config.lr_decay_after_iters * updates_per_iter: config.lr_decay_factor,
-            },
-        )
-    optimizer_transforms.append(optax.adam(learning_rate=learning_rate))
-    optimizer = nnx.Optimizer(
-        model,
-        optax.chain(*optimizer_transforms),
-        wrt=nnx.Param,
-    )
-
-    training_iteration = make_training_iteration(env, config)
-    
-    
-    evaluate = (
-        None
-        if baseline_model is None
-        else make_mcts_evaluate(env, config, baseline_model)
-    )
-
-    hours: float = 0.0
-    frames: int = 0
-
-    rng_key = jax.random.PRNGKey(config.seed)
-    with build_logger(config) as logger:
-        eval_avg_return_history: list[float] = []
-        previous_eval_avg_return: float | None = None
-        board_size = "none" if config.board_size is None else str(config.board_size)
-        ckpt_dir = (
-            Path(get_original_cwd())
-            / "checkpoints"
-            / (
-                f"{config.env_id}_bs{board_size}_{config.network}"
-                f"_c{config.num_channels}_l{config.num_layers}_seed{config.seed}"
+        optimizer_transforms: list[optax.GradientTransformation] = []
+        if config.grad_clip_norm is not None:
+            optimizer_transforms.append(optax.clip_by_global_norm(config.grad_clip_norm))
+        learning_rate: float | optax.Schedule = config.learning_rate
+        if config.lr_decay_after_iters is not None and config.lr_decay_factor != 1.0:
+            rows_per_iter = max(
+                1,
+                config.selfplay_batch_size * config.max_num_steps,
             )
-        ).resolve()
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        with build_checkpoint_manager(config, ckpt_dir) as ckpt_mgr:
-            start_iter, rng_key, hours, frames = restore(ckpt_mgr, model, optimizer, rng_key)
-            pbar = tqdm(range(start_iter, config.max_num_iters), desc="training", dynamic_ncols=True, total=config.max_num_iters, initial=start_iter)
-            pbar.refresh()
-            for iteration in pbar:
-                dict_to_log = {}
-                legacy_rng_split = config.rng_split_mode == "legacy_eval_train"
-                if not legacy_rng_split:
-                    rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
-                if evaluate is not None and config.eval_interval > 0 and (
-                    iteration == config.max_num_iters - 1
-                    or iteration % config.eval_interval == 0
-                ):
+            updates_per_iter = max(1, rows_per_iter // config.training_batch_size)
+            learning_rate = optax.piecewise_constant_schedule(
+                init_value=config.learning_rate,
+                boundaries_and_scales={
+                    config.lr_decay_after_iters * updates_per_iter: config.lr_decay_factor,
+                },
+            )
+        optimizer_transforms.append(optax.adam(learning_rate=learning_rate))
+        optimizer = nnx.Optimizer(
+            model,
+            optax.chain(*optimizer_transforms),
+            wrt=nnx.Param,
+        )
+
+        training_iteration = make_training_iteration(env, config, parallel=parallel)
+
+        evaluate = (
+            None
+            if baseline_model is None
+            else make_mcts_evaluate(env, config, baseline_model)
+        )
+
+        hours: float = 0.0
+        frames: int = 0
+
+        rng_key = jax.random.PRNGKey(config.seed)
+        with build_logger(config) as logger:
+            eval_avg_return_history: list[float] = []
+            previous_eval_avg_return: float | None = None
+            board_size = "none" if config.board_size is None else str(config.board_size)
+            ckpt_dir = (
+                Path(get_original_cwd())
+                / "checkpoints"
+                / (
+                    f"{config.env_id}_bs{board_size}_{config.network}"
+                    f"_c{config.num_channels}_l{config.num_layers}_seed{config.seed}"
+                )
+            ).resolve()
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            with build_checkpoint_manager(config, ckpt_dir) as ckpt_mgr:
+                start_iter, rng_key, hours, frames = restore(ckpt_mgr, model, optimizer, rng_key)
+                pbar = tqdm(
+                    range(start_iter, config.max_num_iters),
+                    desc="training",
+                    dynamic_ncols=True,
+                    total=config.max_num_iters,
+                    initial=start_iter,
+                    disable=jax.process_index() != 0,
+                )
+                pbar.refresh()
+                for iteration in pbar:
+                    dict_to_log = {}
+                    legacy_rng_split = config.rng_split_mode == "legacy_eval_train"
+                    if not legacy_rng_split:
+                        rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
+                    if evaluate is not None and config.eval_interval > 0 and (
+                        iteration == config.max_num_iters - 1
+                        or iteration % config.eval_interval == 0
+                    ):
+                        if legacy_rng_split:
+                            rng_key, eval_key = jax.random.split(rng_key)
+                        returns = evaluate(eval_key, model)
+                        dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
+                        eval_avg_return = float(jax.device_get(returns.mean()))
+                        eval_avg_return_history.append(eval_avg_return)
+                        eval_window = eval_avg_return_history[-10:]
+                        eval_mean_10 = float(np.mean(eval_window))
+                        eval_std_10 = float(np.std(eval_window))
+                        eval_delta = (
+                            0.0
+                            if previous_eval_avg_return is None
+                            else abs(eval_avg_return - previous_eval_avg_return)
+                        )
+                        previous_eval_avg_return = eval_avg_return
+                        dict_to_log.update(
+                            {
+                                "eval/vs_baseline/avg_R_rolling_mean_10": eval_mean_10,
+                                "eval/vs_baseline/avg_R_rolling_std_10": eval_std_10,
+                                "eval/vs_baseline/avg_R_step_delta_abs": eval_delta,
+                            }
+                        )
+
+                    st = time.time()
                     if legacy_rng_split:
-                        rng_key, eval_key = jax.random.split(rng_key)
-                    returns = evaluate(eval_key, model)
-                    dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
-                    eval_avg_return = float(jax.device_get(returns.mean()))
-                    eval_avg_return_history.append(eval_avg_return)
-                    eval_window = eval_avg_return_history[-10:]
-                    eval_mean_10 = float(np.mean(eval_window))
-                    eval_std_10 = float(np.std(eval_window))
-                    eval_delta = (
-                        0.0
-                        if previous_eval_avg_return is None
-                        else abs(eval_avg_return - previous_eval_avg_return)
-                    )
-                    previous_eval_avg_return = eval_avg_return
+                        rng_key, train_key = jax.random.split(rng_key)
+                    train_metrics = training_iteration(model, optimizer, train_key)
+                    frames += config.selfplay_batch_size * config.max_num_steps
+
+                    et = time.time()
+                    hours += (et - st) / 3600
                     dict_to_log.update(
                         {
-                            "eval/vs_baseline/avg_R_rolling_mean_10": eval_mean_10,
-                            "eval/vs_baseline/avg_R_rolling_std_10": eval_std_10,
-                            "eval/vs_baseline/avg_R_step_delta_abs": eval_delta,
+                            "train/policy_loss": train_metrics.policy_loss.mean().item(),
+                            "train/value_loss": train_metrics.value_loss.mean().item(),
+                            "train/policy_nll_loss": train_metrics.policy_nll_loss.mean().item(),
+                            "train/policy_kl_hat": train_metrics.policy_kl_hat.mean().item(),
+                            "train/policy_target_entropy": train_metrics.policy_target_entropy.mean().item(),
+                            "train/value_dir_kl_loss": train_metrics.value_dir_kl_loss.mean().item(),
+                            "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
+                            "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
+                            "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
+                            "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
+                            "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
+                            "train/q_evidence_mass_mean": train_metrics.q_evidence_mass_mean.mean().item(),
+                            "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
+                            "search/path_depth_mean": train_metrics.search_path_depth_mean.mean().item(),
+                            "search/path_depth_p50": train_metrics.search_path_depth_p50.mean().item(),
+                            "search/path_depth_p90": train_metrics.search_path_depth_p90.mean().item(),
+                            "search/path_depth_max": train_metrics.search_path_depth_max.mean().item(),
+                            "search/expanded_nodes": train_metrics.search_expanded_nodes.mean().item(),
+                            "search/terminal_fraction": train_metrics.search_terminal_fraction.mean().item(),
+                            "search/root_policy_entropy": train_metrics.search_root_policy_entropy.mean().item(),
+                            "search/root_gamma": train_metrics.search_root_gamma.mean().item(),
+                            "search/root_downstream_eval_count": train_metrics.search_root_downstream_eval_count.mean().item(),
+                            "search/root_q_concentration": train_metrics.search_root_q_concentration.mean().item(),
+                            "train/hours": hours,
+                            "train/frames": frames,
                         }
                     )
-
-                st = time.time()
-                if legacy_rng_split:
-                    rng_key, train_key = jax.random.split(rng_key)
-                train_metrics = training_iteration(model, optimizer, train_key)
-                frames += config.selfplay_batch_size * config.max_num_steps
-
-                et = time.time()
-                hours += (et - st) / 3600
-                dict_to_log.update(
-                    {
-                        "train/policy_loss": train_metrics.policy_loss.mean().item(),
-                        "train/value_loss": train_metrics.value_loss.mean().item(),
-                        "train/policy_nll_loss": train_metrics.policy_nll_loss.mean().item(),
-                        "train/policy_kl_hat": train_metrics.policy_kl_hat.mean().item(),
-                        "train/policy_target_entropy": train_metrics.policy_target_entropy.mean().item(),
-                        "train/value_dir_kl_loss": train_metrics.value_dir_kl_loss.mean().item(),
-                        "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
-                        "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
-                        "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
-                        "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
-                        "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
-                        "train/q_evidence_mass_mean": train_metrics.q_evidence_mass_mean.mean().item(),
-                        "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
-                        "search/path_depth_mean": train_metrics.search_path_depth_mean.mean().item(),
-                        "search/path_depth_p50": train_metrics.search_path_depth_p50.mean().item(),
-                        "search/path_depth_p90": train_metrics.search_path_depth_p90.mean().item(),
-                        "search/path_depth_max": train_metrics.search_path_depth_max.mean().item(),
-                        "search/expanded_nodes": train_metrics.search_expanded_nodes.mean().item(),
-                        "search/terminal_fraction": train_metrics.search_terminal_fraction.mean().item(),
-                        "search/root_policy_entropy": train_metrics.search_root_policy_entropy.mean().item(),
-                        "search/root_gamma": train_metrics.search_root_gamma.mean().item(),
-                        "search/root_downstream_eval_count": train_metrics.search_root_downstream_eval_count.mean().item(),
-                        "search/root_q_concentration": train_metrics.search_root_q_concentration.mean().item(),
-                        "train/hours": hours,
-                        "train/frames": frames,
-                    }
-                )
-                logger.log(
-                    iteration,
-                    dict_to_log,
-                    pbar=pbar,
-                    prefix="",
-                    pbar_filter=r"loss|avg_R",
-                )
-                maybe_save(
-                    ckpt_mgr,
-                    iteration,
-                    model,
-                    optimizer,
-                    rng_key,
-                    config,
-                    hours,
-                    frames,
-                )
+                    logger.log(
+                        iteration,
+                        dict_to_log,
+                        pbar=pbar,
+                        prefix="",
+                        pbar_filter=r"loss|avg_R",
+                    )
+                    maybe_save(
+                        ckpt_mgr,
+                        iteration,
+                        model,
+                        optimizer,
+                        rng_key,
+                        config,
+                        hours,
+                        frames,
+                    )
 
 
 if __name__ == "__main__":
