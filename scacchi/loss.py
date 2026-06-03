@@ -98,13 +98,13 @@ def make_compute_loss_input(config):
             else policy_target_mask
         )
 
-        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
         def body_fn(carry: jax.Array, i: jax.Array) -> tuple[jax.Array, jax.Array]:
             ix = config.max_num_steps - i - 1
             value = data.reward[ix] + data.discount[ix] * carry
             return value, value
 
-        _, value_tgt = body_fn(
+        _, value_tgt = jax.lax.scan(
+            body_fn,
             jnp.zeros(data.reward.shape[1], dtype=data.reward.dtype),
             jnp.arange(config.max_num_steps),
         )

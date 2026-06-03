@@ -314,32 +314,14 @@ def dirichlet_q_policy(
             explored_action_mask=jnp.zeros(action_value_prior.shape[:-1], dtype=bool),
         )
 
-    block_keys = (
-        rng_key[None, ...]
-        if num_search_blocks == 1
-        else jax.random.split(rng_key, num_search_blocks)
-    )
-    explored_action_mask = jnp.zeros(action_value_prior.shape[:-1], dtype=bool)
-    block_output = _dirichlet_q_search_block(
-        params=params,
-        rng_key=block_keys[0],
-        root=root,
-        recurrent_fn=recurrent_fn,
-        action_value_prior=action_value_prior,
-        explored_action_mask=explored_action_mask,
-        num_simulations=num_simulations,
-        invalid_actions=invalid_actions,
-        max_depth=max_depth,
-        loop_fn=loop_fn,
-    )
-    q_evidence_total = block_output.q_evidence_sum
-    alpha_base = block_output.alpha_search
-    explored_action_mask = block_output.explored_action_mask
+    block_keys = jax.random.split(rng_key, num_search_blocks)
+    initial_explored_action_mask = jnp.zeros(action_value_prior.shape[:-1], dtype=bool)
 
-    for block_index in range(1, num_search_blocks):
+    def block_body(carry, block_key):
+        alpha_base, explored_action_mask, q_evidence_total, _ = carry
         block_output = _dirichlet_q_search_block(
             params=params,
-            rng_key=block_keys[block_index],
+            rng_key=block_key,
             root=root,
             recurrent_fn=recurrent_fn,
             action_value_prior=alpha_base,
@@ -349,17 +331,38 @@ def dirichlet_q_policy(
             max_depth=max_depth,
             loop_fn=loop_fn,
         )
-        q_evidence_total = q_evidence_total + block_output.q_evidence_sum
-        alpha_base = block_output.alpha_search
-        explored_action_mask = block_output.explored_action_mask
+        next_carry = (
+            block_output.alpha_search,
+            block_output.explored_action_mask,
+            q_evidence_total + block_output.q_evidence_sum,
+            block_output.action_weights,
+        )
+        return next_carry, ()
 
-    alpha_search = alpha_base
+    zero_q_evidence = jnp.zeros_like(action_value_prior)
+    zero_action_weights = jnp.zeros_like(root.prior_logits)
+    (
+        alpha_search,
+        explored_action_mask,
+        q_evidence_total,
+        action_weights,
+    ), _ = jax.lax.scan(
+        block_body,
+        (
+            action_value_prior,
+            initial_explored_action_mask,
+            zero_q_evidence,
+            zero_action_weights,
+        ),
+        block_keys,
+    )
+
     score = outcome_utility(outcome_mean(alpha_search))
     action = action_selection.masked_argmax(score, invalid_actions)
     return DirichletQSearchOutput(
         action=action,
-        action_weights=block_output.action_weights,
-        search_tree=block_output.search_tree,
+        action_weights=action_weights,
+        search_tree=None,
         q_evidence_sum=q_evidence_total,
         alpha_search=alpha_search,
         explored_action_mask=explored_action_mask,

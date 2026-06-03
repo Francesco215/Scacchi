@@ -83,6 +83,7 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("model", "rezero_kernel_init"), "rezero_kernel_init"),
     (("selfplay", "batch_size"), "selfplay_batch_size"),
     (("selfplay", "max_num_steps"), "max_num_steps"),
+    (("selfplay", "chunk_size"), "selfplay_chunk_size"),
     (("selfplay", "action_source"), "selfplay_action_source"),
     (("search", "policy"), "search_policy"),
     (("search", "num_simulations"), "num_simulations"),
@@ -97,6 +98,7 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("search", "constants", "state_posterior_kappa_n"), "state_posterior_kappa_n"),
     (("search", "leaf_value_mode"), "leaf_value_mode"),
     (("training", "batch_size"), "training_batch_size"),
+    (("training", "max_updates_per_iter"), "max_updates_per_iter"),
     (("training", "replay_buffer_size"), "replay_buffer_size"),
     (("training", "minibatch_sampling"), "minibatch_sampling"),
     (("training", "learning_rate"), "learning_rate"),
@@ -241,6 +243,7 @@ class Config(BaseModel):
     num_simulations: int = 32
     num_search_blocks: int = Field(default=1, ge=1)
     max_num_steps: int = 256
+    selfplay_chunk_size: int | None = Field(default=None, ge=1)
     policy_mc_samples: int = 32
     backup_mc_samples: int = Field(default=16, ge=1)
     leaf_value_mode: str = "alpha"
@@ -256,6 +259,7 @@ class Config(BaseModel):
     search_policy: str = "gumbel"
     # training params
     training_batch_size: int = 4096
+    max_updates_per_iter: int | None = Field(default=None, ge=1)
     replay_buffer_size: int = Field(default=1, ge=1)
     minibatch_sampling: str = "active_with_replacement"
     learning_rate: float = 0.001
@@ -355,11 +359,13 @@ class Config(BaseModel):
                 "rezero_kernel_init must be 'variance_scaling' or 'orthogonal'."
             )
         if self.minibatch_sampling not in {
+            "as_is",
             "active_with_replacement",
             "permutation",
         }:
             raise ValueError(
-                "minibatch_sampling must be 'active_with_replacement' or 'permutation'."
+                "minibatch_sampling must be 'active_with_replacement', 'as_is', "
+                "or 'permutation'."
             )
         if self.q_loss_weight_mode not in {"policy", "evidence_mass"}:
             raise ValueError("q_loss_weight_mode must be 'policy' or 'evidence_mass'.")
@@ -483,6 +489,8 @@ def main(cfg: DictConfig) -> None:
                 config.selfplay_batch_size * config.max_num_steps,
             )
             updates_per_iter = max(1, rows_per_iter // config.training_batch_size)
+            if config.max_updates_per_iter is not None:
+                updates_per_iter = min(updates_per_iter, config.max_updates_per_iter)
             learning_rate = optax.piecewise_constant_schedule(
                 init_value=config.learning_rate,
                 boundaries_and_scales={

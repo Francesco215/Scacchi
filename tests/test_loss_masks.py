@@ -265,6 +265,34 @@ def test_make_minibatches_legacy_permutation_uses_each_row_once():
     )
 
 
+def test_make_minibatches_as_is_preserves_order_and_truncates():
+    sample = Sample(
+        obs=jnp.arange(6, dtype=jnp.float32).reshape(1, 6, 1),
+        policy_tgt=jnp.ones((1, 6, 2)) / 2,
+        value_tgt=jnp.zeros((1, 6)),
+        played_action=jnp.zeros((1, 6), dtype=jnp.int32),
+        policy_mask=jnp.ones((1, 6, 2), dtype=jnp.bool_),
+        value_mask=jnp.ones((1, 6), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((1, 6, 2, 2)),
+        beta_V_target=jnp.ones((1, 6, 2)),
+        q_loss_weight=jnp.zeros((1, 6, 2)),
+    )
+
+    minibatches = make_minibatches(
+        sample,
+        jax.random.PRNGKey(0),
+        2,
+        max_updates_per_iter=2,
+        sampling="as_is",
+    )
+
+    assert minibatches.obs.shape == (2, 2, 1)
+    assert jnp.array_equal(
+        minibatches.obs[..., 0],
+        jnp.array([[0.0, 1.0], [2.0, 3.0]], dtype=jnp.float32),
+    )
+
+
 def test_fixed_replay_window_pads_early_batches_to_stable_shape():
     first = object()
     second = object()

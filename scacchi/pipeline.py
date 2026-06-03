@@ -13,6 +13,7 @@ def make_minibatches(
     samples: Sample,
     rng_key: jax.Array,
     training_batch_size: int,
+    max_updates_per_iter: int | None = None,
     sampling: str = "active_with_replacement",
 ) -> Sample:
     samples = jax.tree_util.tree_map(
@@ -21,10 +22,15 @@ def make_minibatches(
     )
     num_rows = samples.obs.shape[0]
     num_updates = num_rows // training_batch_size
+    if max_updates_per_iter is not None:
+        num_updates = min(num_updates, max_updates_per_iter)
     num_train_samples = num_updates * training_batch_size
-    if sampling == "permutation":
-        ixs = jax.random.permutation(rng_key, jnp.arange(num_rows))
-        samples = jax.tree_util.tree_map(lambda x: x[ixs[:num_train_samples]], samples)
+    if sampling in {"permutation", "as_is"}:
+        if sampling == "permutation":
+            ixs = jax.random.permutation(rng_key, jnp.arange(num_rows))
+            samples = jax.tree_util.tree_map(lambda x: x[ixs[:num_train_samples]], samples)
+        else:
+            samples = jax.tree_util.tree_map(lambda x: x[:num_train_samples], samples)
         return jax.tree_util.tree_map(
             lambda x: x.reshape((num_updates, training_batch_size) + x.shape[1:]),
             samples,
@@ -210,6 +216,7 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
                 samples,
                 perm_key,
                 config.training_batch_size,
+                getattr(config, "max_updates_per_iter", None),
                 getattr(config, "minibatch_sampling", "active_with_replacement"),
             )
             return train_minibatches(model, optimizer, minibatches, config, parallel)
@@ -234,6 +241,23 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
         return training_iteration
 
     @nnx.jit
+    def train_from_selfplay_data(
+        model: nnx.Module,
+        optimizer: nnx.Optimizer,
+        data: SelfplayOutput,
+        perm_key: jax.Array,
+    ) -> TrainMetrics:
+        samples = compute_loss_input(data)
+        samples = constrain_batch_axis(samples, parallel, batch_axis=1)
+        minibatches = make_minibatches(
+            samples,
+            perm_key,
+            config.training_batch_size,
+            getattr(config, "max_updates_per_iter", None),
+            getattr(config, "minibatch_sampling", "active_with_replacement"),
+        )
+        return train_minibatches(model, optimizer, minibatches, config, parallel)
+
     def training_iteration(
         model: nnx.Module,
         optimizer: nnx.Optimizer,
@@ -241,14 +265,6 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
     ) -> TrainMetrics:
         selfplay_key, perm_key = jax.random.split(rng_key)
         data = selfplay(model, selfplay_key)
-        samples = compute_loss_input(data)
-        samples = constrain_batch_axis(samples, parallel, batch_axis=1)
-        minibatches = make_minibatches(
-            samples,
-            perm_key,
-            config.training_batch_size,
-            getattr(config, "minibatch_sampling", "active_with_replacement"),
-        )
-        return train_minibatches(model, optimizer, minibatches, config, parallel)
+        return train_from_selfplay_data(model, optimizer, data, perm_key)
 
     return training_iteration

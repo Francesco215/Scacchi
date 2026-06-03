@@ -281,6 +281,55 @@ def _stack_selfplay_frames(frames: list[SelfplayOutput]) -> SelfplayOutput:
     )
 
 
+def _concat_selfplay_time(outputs: list[SelfplayOutput]) -> SelfplayOutput:
+    if len(outputs) == 1:
+        return outputs[0]
+
+    def concat_optional(name: str):
+        first = getattr(outputs[0], name)
+        if first is None:
+            return None
+        return jnp.concatenate([getattr(output, name) for output in outputs], axis=0)
+
+    tree_data = None
+    if outputs[0].tree_data is not None:
+        tree_data = jax.tree_util.tree_map(
+            lambda *xs: jnp.concatenate(xs, axis=0),
+            *(output.tree_data for output in outputs),
+        )
+
+    search_diagnostics = None
+    if outputs[0].search_diagnostics is not None:
+        search_diagnostics = jax.tree_util.tree_map(
+            lambda *xs: jnp.concatenate(xs, axis=0),
+            *(output.search_diagnostics for output in outputs),
+        )
+
+    return SelfplayOutput(
+        obs=concat_optional("obs"),
+        reward=concat_optional("reward"),
+        terminated=concat_optional("terminated"),
+        action_weights=concat_optional("action_weights"),
+        played_action=concat_optional("played_action"),
+        legal_action_mask=concat_optional("legal_action_mask"),
+        beta_Q_target=concat_optional("beta_Q_target"),
+        beta_V_target=concat_optional("beta_V_target"),
+        q_loss_weight=concat_optional("q_loss_weight"),
+        discount=concat_optional("discount"),
+        tree_data=tree_data,
+        search_loss_mask=concat_optional("search_loss_mask"),
+        search_diagnostics=search_diagnostics,
+        q_target_kind=concat_optional("q_target_kind"),
+        q_target_weight=concat_optional("q_target_weight"),
+        q_target_outcome=concat_optional("q_target_outcome"),
+        q_target_distance=concat_optional("q_target_distance"),
+        v_target_kind=concat_optional("v_target_kind"),
+        v_target_weight=concat_optional("v_target_weight"),
+        v_target_outcome=concat_optional("v_target_outcome"),
+        v_target_distance=concat_optional("v_target_distance"),
+    )
+
+
 def _select_posterior_tree_played_action(
     action_source: str,
     rng_key: jax.Array,
@@ -391,15 +440,14 @@ def make_posterior_tree_selfplay(
 def make_selfplay(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     if is_posterior_tree_policy(config.search_policy):
+        assert parallel is DISABLED_BATCH_PARALLEL, "Posterior tree policy is not supported in selfplay with batch parallelism."
         return make_posterior_tree_selfplay(env, config, parallel=parallel)
 
-    @nnx.jit
-    def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
+    def step_fn_factory(model: nnx.Module):
         predict_fn = lambda obs: model(obs, train=False)
         recurrent_fn = make_recurrent_fn(env, predict_fn)
         dirichlet_recurrent_fn = make_dirichlet_recurrent_fn(env, predict_fn, config)
 
-        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
         def step_fn(
             env_state: pgx.State,
             key: jax.Array,
@@ -452,13 +500,46 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             )
             return env_state, frame
 
-        rng_key, init_key = jax.random.split(rng_key)
-        init_keys = jax.random.split(init_key, config.selfplay_batch_size)
+        return step_fn
+
+    @nnx.jit
+    def init_env(rng_key: jax.Array):
+        init_keys = jax.random.split(rng_key, config.selfplay_batch_size)
         init_keys = constrain_batch_axis(init_keys, parallel, batch_axis=0)
         env_state = jax.vmap(env.init)(init_keys)
-        env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
+        return constrain_batch_axis(env_state, parallel, batch_axis=0)
+
+    @nnx.jit
+    def rollout(model: nnx.Module, env_state: pgx.State, step_keys: jax.Array):
+        env_state, data = jax.lax.scan(step_fn_factory(model), env_state, step_keys)
+        return env_state, constrain_batch_axis(data, parallel, batch_axis=1)
+
+    chunk_size = getattr(config, "selfplay_chunk_size", None)
+    if chunk_size is not None and chunk_size < config.max_num_steps:
+        if config.max_num_steps % chunk_size != 0:
+            raise ValueError(
+                "selfplay.chunk_size must divide selfplay.max_num_steps when set; "
+                f"got chunk_size={chunk_size} and max_num_steps={config.max_num_steps}."
+            )
+
+        def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
+            rng_key, init_key = jax.random.split(rng_key)
+            env_state = init_env(init_key)
+            step_keys = jax.random.split(rng_key, config.max_num_steps)
+            chunks = []
+            for chunk_keys in jnp.split(step_keys, config.max_num_steps // chunk_size):
+                env_state, data = rollout(model, env_state, chunk_keys)
+                chunks.append(data)
+            return _concat_selfplay_time(chunks)
+
+        return selfplay
+
+    @nnx.jit
+    def selfplay(model: nnx.Module, rng_key: jax.Array) -> SelfplayOutput:
+        rng_key, init_key = jax.random.split(rng_key)
+        env_state = init_env(init_key)
         step_keys = jax.random.split(rng_key, config.max_num_steps)
-        _, data = step_fn(env_state, step_keys)
-        return constrain_batch_axis(data, parallel, batch_axis=1)
+        _, data = rollout(model, env_state, step_keys)
+        return data
 
     return selfplay
