@@ -90,7 +90,29 @@ if [[ "${SYNC}" == "1" ]]; then
   fi
 fi
 
-REMOTE_CMD="cd ${REPO_DIR} && PYTHONPATH=${REPO_DIR} JAX_PLATFORMS=tpu,cpu ${PYTHON} -u -m scacchi.train $*"
+quote_remote() {
+  printf "%q" "$1"
+}
+
+REMOTE_ENV=("PYTHONPATH=${REPO_DIR}" "JAX_PLATFORMS=tpu,cpu")
+for name in \
+  SCACCHI_PROFILE_DIR \
+  SCACCHI_PROFILE_START_ITER \
+  SCACCHI_PROFILE_NUM_ITERS \
+  SCACCHI_PROFILE_PROCESS \
+  SCACCHI_PROFILE_PERFETTO
+do
+  if [[ -n "${!name:-}" ]]; then
+    REMOTE_ENV+=("${name}=${!name}")
+  fi
+done
+
+REMOTE_ENV_STR=""
+for assignment in "${REMOTE_ENV[@]}"; do
+  REMOTE_ENV_STR+=" $(quote_remote "${assignment}")"
+done
+
+REMOTE_CMD="cd $(quote_remote "${REPO_DIR}") &&${REMOTE_ENV_STR} $(quote_remote "${PYTHON}") -u -m scacchi.train $*"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "Would run:"
@@ -99,3 +121,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 fi
 
 "${EOPOD}" run --worker all "${REMOTE_CMD}"
+
+if [[ -n "${SCACCHI_PROFILE_DIR:-}" ]]; then
+  echo "Profile traces were written under ${SCACCHI_PROFILE_DIR} on the selected TPU workers."
+fi

@@ -69,6 +69,46 @@ def report_jax_backend() -> None:
             "only for intentional CPU runs."
         )
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        parsed = default
+    else:
+        parsed = int(value)
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{name} must be >= {minimum}; got {parsed}.")
+    return parsed
+
+
+def _profile_enabled_for_process() -> bool:
+    value = os.environ.get("SCACCHI_PROFILE_PROCESS", "0").strip().lower()
+    if value in {"all", "*"}:
+        return True
+    selected = {int(part.strip()) for part in value.split(",") if part.strip()}
+    return jax.process_index() in selected
+
+
+def _profile_log_dir() -> Path | None:
+    profile_dir = os.environ.get("SCACCHI_PROFILE_DIR")
+    if not profile_dir or not _profile_enabled_for_process():
+        return None
+    return Path(profile_dir).expanduser() / f"process_{jax.process_index():03d}"
+
+
+def _block_until_ready(value: Any) -> Any:
+    return jax.tree_util.tree_map(
+        lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
+        value,
+    )
+
 _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("run", "seed"), "seed"),
     (("run", "max_num_iters"), "max_num_iters"),
@@ -100,7 +140,6 @@ _NESTED_CONFIG_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("training", "batch_size"), "training_batch_size"),
     (("training", "max_updates_per_iter"), "max_updates_per_iter"),
     (("training", "replay_buffer_size"), "replay_buffer_size"),
-    (("training", "minibatch_sampling"), "minibatch_sampling"),
     (("training", "learning_rate"), "learning_rate"),
     (("training", "lr_decay_after_iters"), "lr_decay_after_iters"),
     (("training", "lr_decay_factor"), "lr_decay_factor"),
@@ -261,7 +300,6 @@ class Config(BaseModel):
     training_batch_size: int = 4096
     max_updates_per_iter: int | None = Field(default=None, ge=1)
     replay_buffer_size: int = Field(default=1, ge=1)
-    minibatch_sampling: str = "active_with_replacement"
     learning_rate: float = 0.001
     lr_decay_after_iters: int | None = Field(default=None, ge=1)
     lr_decay_factor: float = Field(default=1.0, gt=0.0)
@@ -357,15 +395,6 @@ class Config(BaseModel):
         if self.rezero_kernel_init not in {"variance_scaling", "orthogonal"}:
             raise ValueError(
                 "rezero_kernel_init must be 'variance_scaling' or 'orthogonal'."
-            )
-        if self.minibatch_sampling not in {
-            "as_is",
-            "active_with_replacement",
-            "permutation",
-        }:
-            raise ValueError(
-                "minibatch_sampling must be 'active_with_replacement', 'as_is', "
-                "or 'permutation'."
             )
         if self.q_loss_weight_mode not in {"policy", "evidence_mass"}:
             raise ValueError("q_loss_weight_mode must be 'policy' or 'evidence_mass'.")
@@ -531,6 +560,20 @@ def main(cfg: DictConfig) -> None:
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             with build_checkpoint_manager(config, ckpt_dir) as ckpt_mgr:
                 start_iter, rng_key, hours, frames = restore(ckpt_mgr, model, optimizer, rng_key)
+                profile_log_dir = _profile_log_dir()
+                profile_start_iter = _env_int(
+                    "SCACCHI_PROFILE_START_ITER",
+                    start_iter + 2,
+                    minimum=0,
+                )
+                profile_num_iters = _env_int(
+                    "SCACCHI_PROFILE_NUM_ITERS",
+                    3,
+                    minimum=1,
+                )
+                profile_stop_iter = profile_start_iter + profile_num_iters
+                profile_create_perfetto = _env_flag("SCACCHI_PROFILE_PERFETTO")
+                profile_trace_active = False
                 pbar = tqdm(
                     range(start_iter, config.max_num_iters),
                     desc="training",
@@ -540,92 +583,142 @@ def main(cfg: DictConfig) -> None:
                     disable=jax.process_index() != 0,
                 )
                 pbar.refresh()
-                for iteration in pbar:
-                    dict_to_log = {}
-                    legacy_rng_split = config.rng_split_mode == "legacy_eval_train"
-                    if not legacy_rng_split:
-                        rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
-                    if evaluate is not None and config.eval_interval > 0 and (
-                        iteration == config.max_num_iters - 1
-                        or iteration % config.eval_interval == 0
-                    ):
-                        if legacy_rng_split:
-                            rng_key, eval_key = jax.random.split(rng_key)
-                        returns = evaluate(eval_key, model)
-                        dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
-                        eval_avg_return = float(jax.device_get(returns.mean()))
-                        eval_avg_return_history.append(eval_avg_return)
-                        eval_window = eval_avg_return_history[-10:]
-                        eval_mean_10 = float(np.mean(eval_window))
-                        eval_std_10 = float(np.std(eval_window))
-                        eval_delta = (
-                            0.0
-                            if previous_eval_avg_return is None
-                            else abs(eval_avg_return - previous_eval_avg_return)
+                try:
+                    for iteration in pbar:
+                        dict_to_log = {}
+                        legacy_rng_split = config.rng_split_mode == "legacy_eval_train"
+                        if not legacy_rng_split:
+                            rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
+                        if evaluate is not None and config.eval_interval > 0 and (
+                            iteration == config.max_num_iters - 1
+                            or iteration % config.eval_interval == 0
+                        ):
+                            if legacy_rng_split:
+                                rng_key, eval_key = jax.random.split(rng_key)
+                            returns = evaluate(eval_key, model)
+                            dict_to_log.update(returns_metrics("eval/vs_baseline", returns))
+                            eval_avg_return = float(jax.device_get(returns.mean()))
+                            eval_avg_return_history.append(eval_avg_return)
+                            eval_window = eval_avg_return_history[-10:]
+                            eval_mean_10 = float(np.mean(eval_window))
+                            eval_std_10 = float(np.std(eval_window))
+                            eval_delta = (
+                                0.0
+                                if previous_eval_avg_return is None
+                                else abs(eval_avg_return - previous_eval_avg_return)
+                            )
+                            previous_eval_avg_return = eval_avg_return
+                            dict_to_log.update(
+                                {
+                                    "eval/vs_baseline/avg_R_rolling_mean_10": eval_mean_10,
+                                    "eval/vs_baseline/avg_R_rolling_std_10": eval_std_10,
+                                    "eval/vs_baseline/avg_R_step_delta_abs": eval_delta,
+                                }
+                            )
+
+                        profile_this_iter = (
+                            profile_log_dir is not None
+                            and profile_start_iter <= iteration < profile_stop_iter
                         )
-                        previous_eval_avg_return = eval_avg_return
+                        if profile_this_iter and not profile_trace_active:
+                            profile_log_dir.mkdir(parents=True, exist_ok=True)
+                            print(
+                                "Starting JAX profile trace at "
+                                f"iteration {iteration}: {profile_log_dir}",
+                                flush=True,
+                            )
+                            jax.profiler.start_trace(
+                                str(profile_log_dir),
+                                create_perfetto_trace=profile_create_perfetto,
+                            )
+                            profile_trace_active = True
+
+                        st = time.perf_counter()
+                        if legacy_rng_split:
+                            rng_key, train_key = jax.random.split(rng_key)
+                        if profile_this_iter:
+                            with jax.profiler.StepTraceAnnotation(
+                                "train_iteration",
+                                step_num=iteration,
+                            ):
+                                train_metrics = training_iteration(
+                                    model,
+                                    optimizer,
+                                    train_key,
+                                )
+                                train_metrics = _block_until_ready(train_metrics)
+                        else:
+                            train_metrics = training_iteration(model, optimizer, train_key)
+                            train_metrics = _block_until_ready(train_metrics)
+                        frames_this_iter = (
+                            config.selfplay_batch_size * config.max_num_steps
+                        )
+                        frames += frames_this_iter
+
+                        et = time.perf_counter()
+                        iter_seconds = et - st
+                        hours += iter_seconds / 3600
+                        if profile_trace_active and iteration + 1 >= profile_stop_iter:
+                            jax.profiler.stop_trace()
+                            print(
+                                "Stopped JAX profile trace at "
+                                f"iteration {iteration}: {profile_log_dir}",
+                                flush=True,
+                            )
+                            profile_trace_active = False
+
                         dict_to_log.update(
                             {
-                                "eval/vs_baseline/avg_R_rolling_mean_10": eval_mean_10,
-                                "eval/vs_baseline/avg_R_rolling_std_10": eval_std_10,
-                                "eval/vs_baseline/avg_R_step_delta_abs": eval_delta,
+                                "train/policy_loss": train_metrics.policy_loss.mean().item(),
+                                "train/value_loss": train_metrics.value_loss.mean().item(),
+                                "train/policy_nll_loss": train_metrics.policy_nll_loss.mean().item(),
+                                "train/policy_kl_hat": train_metrics.policy_kl_hat.mean().item(),
+                                "train/policy_target_entropy": train_metrics.policy_target_entropy.mean().item(),
+                                "train/value_dir_kl_loss": train_metrics.value_dir_kl_loss.mean().item(),
+                                "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
+                                "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
+                                "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
+                                "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
+                                "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
+                                "train/q_evidence_mass_mean": train_metrics.q_evidence_mass_mean.mean().item(),
+                                "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
+                                "search/path_depth_mean": train_metrics.search_path_depth_mean.mean().item(),
+                                "search/path_depth_p50": train_metrics.search_path_depth_p50.mean().item(),
+                                "search/path_depth_p90": train_metrics.search_path_depth_p90.mean().item(),
+                                "search/path_depth_max": train_metrics.search_path_depth_max.mean().item(),
+                                "search/expanded_nodes": train_metrics.search_expanded_nodes.mean().item(),
+                                "search/terminal_fraction": train_metrics.search_terminal_fraction.mean().item(),
+                                "search/root_policy_entropy": train_metrics.search_root_policy_entropy.mean().item(),
+                                "search/root_gamma": train_metrics.search_root_gamma.mean().item(),
+                                "search/root_downstream_eval_count": train_metrics.search_root_downstream_eval_count.mean().item(),
+                                "search/root_q_concentration": train_metrics.search_root_q_concentration.mean().item(),
+                                "train/iter_seconds": iter_seconds,
+                                "train/frames_per_second": frames_this_iter
+                                / max(iter_seconds, 1e-12),
+                                "train/hours": hours,
+                                "train/frames": frames,
                             }
                         )
-
-                    st = time.time()
-                    if legacy_rng_split:
-                        rng_key, train_key = jax.random.split(rng_key)
-                    train_metrics = training_iteration(model, optimizer, train_key)
-                    frames += config.selfplay_batch_size * config.max_num_steps
-
-                    et = time.time()
-                    hours += (et - st) / 3600
-                    dict_to_log.update(
-                        {
-                            "train/policy_loss": train_metrics.policy_loss.mean().item(),
-                            "train/value_loss": train_metrics.value_loss.mean().item(),
-                            "train/policy_nll_loss": train_metrics.policy_nll_loss.mean().item(),
-                            "train/policy_kl_hat": train_metrics.policy_kl_hat.mean().item(),
-                            "train/policy_target_entropy": train_metrics.policy_target_entropy.mean().item(),
-                            "train/value_dir_kl_loss": train_metrics.value_dir_kl_loss.mean().item(),
-                            "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
-                            "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
-                            "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
-                            "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
-                            "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
-                            "train/q_evidence_mass_mean": train_metrics.q_evidence_mass_mean.mean().item(),
-                            "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
-                            "search/path_depth_mean": train_metrics.search_path_depth_mean.mean().item(),
-                            "search/path_depth_p50": train_metrics.search_path_depth_p50.mean().item(),
-                            "search/path_depth_p90": train_metrics.search_path_depth_p90.mean().item(),
-                            "search/path_depth_max": train_metrics.search_path_depth_max.mean().item(),
-                            "search/expanded_nodes": train_metrics.search_expanded_nodes.mean().item(),
-                            "search/terminal_fraction": train_metrics.search_terminal_fraction.mean().item(),
-                            "search/root_policy_entropy": train_metrics.search_root_policy_entropy.mean().item(),
-                            "search/root_gamma": train_metrics.search_root_gamma.mean().item(),
-                            "search/root_downstream_eval_count": train_metrics.search_root_downstream_eval_count.mean().item(),
-                            "search/root_q_concentration": train_metrics.search_root_q_concentration.mean().item(),
-                            "train/hours": hours,
-                            "train/frames": frames,
-                        }
-                    )
-                    logger.log(
-                        iteration,
-                        dict_to_log,
-                        pbar=pbar,
-                        prefix="",
-                        pbar_filter=r"loss|avg_R",
-                    )
-                    maybe_save(
-                        ckpt_mgr,
-                        iteration,
-                        model,
-                        optimizer,
-                        rng_key,
-                        config,
-                        hours,
-                        frames,
-                    )
+                        logger.log(
+                            iteration,
+                            dict_to_log,
+                            pbar=pbar,
+                            prefix="",
+                            pbar_filter=r"loss|avg_R",
+                        )
+                        maybe_save(
+                            ckpt_mgr,
+                            iteration,
+                            model,
+                            optimizer,
+                            rng_key,
+                            config,
+                            hours,
+                            frames,
+                        )
+                finally:
+                    if profile_trace_active:
+                        jax.profiler.stop_trace()
 
 
 if __name__ == "__main__":

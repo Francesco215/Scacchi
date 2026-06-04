@@ -87,7 +87,7 @@ class TrainMetrics(NamedTuple):
         return self.q_loss_weight_mean
 
 
-def make_compute_loss_input(config):
+def make_compute_input_for_lossfn(config):
     def compute_loss_input(data: SelfplayOutput) -> Sample:
         value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
         legal_policy_mask = jnp.any(data.legal_action_mask, axis=-1)

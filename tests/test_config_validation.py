@@ -65,7 +65,6 @@ def test_gardner_chess_az_config_uses_matching_pgx_baseline():
     assert config.max_num_steps == 162
     assert config.selfplay_action_source == "posterior_sample"
     assert config.training_batch_size == 1024
-    assert config.minibatch_sampling == "permutation"
     assert config.terminal_edge_targets is True
     assert config.terminal_parent_targets is True
     assert config.value_dir_kl_weight == 1.0

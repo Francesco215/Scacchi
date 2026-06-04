@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import optax
+import pytest
+from jax.sharding import NamedSharding, PartitionSpec
 
+from scacchi.distributed import BatchParallel
 from scacchi.dirichlet_tree.types import TreeTrainingData
 from scacchi.dirichlet_tree.native import TARGET_CATEGORICAL, dirichlet_nll_at_categorical
 from scacchi.loss import (
@@ -13,7 +16,7 @@ from scacchi.loss import (
     _compute_losses,
     _masked_mean,
     _dirichlet_kl,
-    make_compute_loss_input,
+    make_compute_input_for_lossfn,
 )
 from scacchi.pipeline import _fixed_replay_window, make_minibatches
 from scacchi.play import SelfplayOutput
@@ -66,7 +69,7 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
     )
     config = SimpleNamespace(max_num_steps=3, selfplay_batch_size=2)
 
-    sample = make_compute_loss_input(config)(data)
+    sample = make_compute_input_for_lossfn(config)(data)
 
     assert jnp.array_equal(sample.policy_mask, data.legal_action_mask)
     assert jnp.array_equal(sample.played_action, data.played_action)
@@ -115,7 +118,7 @@ def test_compute_loss_input_appends_tree_rows_with_separate_loss_masks():
     )
     config = SimpleNamespace(max_num_steps=1, selfplay_batch_size=1)
 
-    sample = make_compute_loss_input(config)(data)
+    sample = make_compute_input_for_lossfn(config)(data)
 
     assert sample.obs.shape == (1, 3, 1)
     assert jnp.array_equal(sample.policy_loss_mask, jnp.array([[True, True, False]]))
@@ -138,7 +141,7 @@ def test_compute_loss_input_trains_root_search_targets_before_terminal_result():
     )
     config = SimpleNamespace(max_num_steps=2, selfplay_batch_size=3)
 
-    sample = make_compute_loss_input(config)(data)
+    sample = make_compute_input_for_lossfn(config)(data)
 
     assert jnp.array_equal(sample.policy_loss_mask, jnp.ones((2, 3), dtype=jnp.bool_))
     assert jnp.array_equal(sample.value_loss_mask, jnp.ones((2, 3), dtype=jnp.bool_))
@@ -164,7 +167,7 @@ def test_compute_loss_input_can_mark_played_terminal_edge_categorical():
         terminal_edge_targets=True,
     )
 
-    sample = make_compute_loss_input(config)(data)
+    sample = make_compute_input_for_lossfn(config)(data)
 
     assert sample.q_target_kind[1, 0, 2] == int(TARGET_CATEGORICAL)
     assert sample.q_target_outcome[1, 0, 2] == 2
@@ -193,7 +196,7 @@ def test_compute_loss_input_can_mark_terminal_winning_parent_categorical():
         terminal_parent_targets=True,
     )
 
-    sample = make_compute_loss_input(config)(data)
+    sample = make_compute_input_for_lossfn(config)(data)
 
     assert jnp.array_equal(sample.policy_tgt[1, 0], jnp.array([0.0, 0.0, 1.0]))
     assert bool(sample.policy_loss_mask[1, 0])
@@ -212,85 +215,103 @@ def test_masked_mean_surfaces_active_nonfinite_terms():
     )
 
 
-def test_make_minibatches_replays_active_rows_and_keeps_compute_shape():
-    active_mask = jnp.array([[False, True, False, False, False, False, True, False]])
-    sample = Sample(
-        obs=jnp.arange(8, dtype=jnp.float32).reshape(1, 8, 1),
-        policy_tgt=jnp.ones((1, 8, 2)) / 2,
-        value_tgt=jnp.zeros((1, 8)),
-        played_action=jnp.zeros((1, 8), dtype=jnp.int32),
-        policy_mask=jnp.ones((1, 8, 2), dtype=jnp.bool_),
-        value_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
-        beta_Q_target=jnp.ones((1, 8, 2, 2)),
-        beta_V_target=jnp.ones((1, 8, 2)),
-        q_loss_weight=jnp.zeros((1, 8, 2)),
-        policy_loss_mask=active_mask,
-        value_loss_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
-        outcome_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
+def _minibatch_sample(num_steps: int, batch_size: int) -> Sample:
+    obs = jnp.arange(num_steps * batch_size, dtype=jnp.float32).reshape(
+        num_steps,
+        batch_size,
+        1,
     )
+    return Sample(
+        obs=obs,
+        policy_tgt=jnp.ones((num_steps, batch_size, 2)) / 2,
+        value_tgt=jnp.zeros((num_steps, batch_size)),
+        played_action=jnp.zeros((num_steps, batch_size), dtype=jnp.int32),
+        policy_mask=jnp.ones((num_steps, batch_size, 2), dtype=jnp.bool_),
+        value_mask=jnp.ones((num_steps, batch_size), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((num_steps, batch_size, 2, 2)),
+        beta_V_target=jnp.ones((num_steps, batch_size, 2)),
+        q_loss_weight=jnp.zeros((num_steps, batch_size, 2)),
+    )
+
+
+def test_make_minibatches_shuffles_rows_without_dropping_masked_samples():
+    sample_fields = _minibatch_sample(1, 8)._asdict()
+    sample_fields.update(
+        policy_loss_mask=jnp.array(
+            [[False, True, False, False, False, False, True, False]]
+        ),
+        value_loss_mask=jnp.zeros((1, 8), dtype=jnp.bool_),
+    )
+    sample = Sample(**sample_fields)
 
     minibatches = make_minibatches(sample, jax.random.PRNGKey(0), 4)
-
-    assert minibatches.obs.shape == (2, 4, 1)
-    assert bool(
-        jnp.all((minibatches.obs[..., 0] == 1.0) | (minibatches.obs[..., 0] == 6.0))
-    )
-    assert bool(jnp.all(minibatches.policy_loss_mask))
-
-
-def test_make_minibatches_legacy_permutation_uses_each_row_once():
-    sample = Sample(
-        obs=jnp.arange(8, dtype=jnp.float32).reshape(1, 8, 1),
-        policy_tgt=jnp.ones((1, 8, 2)) / 2,
-        value_tgt=jnp.zeros((1, 8)),
-        played_action=jnp.zeros((1, 8), dtype=jnp.int32),
-        policy_mask=jnp.ones((1, 8, 2), dtype=jnp.bool_),
-        value_mask=jnp.ones((1, 8), dtype=jnp.bool_),
-        beta_Q_target=jnp.ones((1, 8, 2, 2)),
-        beta_V_target=jnp.ones((1, 8, 2)),
-        q_loss_weight=jnp.zeros((1, 8, 2)),
-    )
-
-    minibatches = make_minibatches(
-        sample,
-        jax.random.PRNGKey(0),
-        4,
-        sampling="permutation",
-    )
 
     assert minibatches.obs.shape == (2, 4, 1)
     assert jnp.array_equal(
         jnp.sort(minibatches.obs[..., 0].reshape(-1)),
         jnp.arange(8, dtype=jnp.float32),
     )
+    assert jnp.sum(minibatches.policy_loss_mask) == 2
 
 
-def test_make_minibatches_as_is_preserves_order_and_truncates():
-    sample = Sample(
-        obs=jnp.arange(6, dtype=jnp.float32).reshape(1, 6, 1),
-        policy_tgt=jnp.ones((1, 6, 2)) / 2,
-        value_tgt=jnp.zeros((1, 6)),
-        played_action=jnp.zeros((1, 6), dtype=jnp.int32),
-        policy_mask=jnp.ones((1, 6, 2), dtype=jnp.bool_),
-        value_mask=jnp.ones((1, 6), dtype=jnp.bool_),
-        beta_Q_target=jnp.ones((1, 6, 2, 2)),
-        beta_V_target=jnp.ones((1, 6, 2)),
-        q_loss_weight=jnp.zeros((1, 6, 2)),
-    )
+def test_make_minibatches_respects_max_updates_per_iter():
+    sample = _minibatch_sample(1, 6)
 
     minibatches = make_minibatches(
         sample,
         jax.random.PRNGKey(0),
         2,
         max_updates_per_iter=2,
-        sampling="as_is",
     )
 
     assert minibatches.obs.shape == (2, 2, 1)
-    assert jnp.array_equal(
-        minibatches.obs[..., 0],
-        jnp.array([[0.0, 1.0], [2.0, 3.0]], dtype=jnp.float32),
-    )
+    assert minibatches.beta_Q_target.shape == (2, 2, 2, 2)
+    assert jnp.unique(minibatches.obs[..., 0].reshape(-1)).shape[0] == 4
+
+
+def test_batch_parallel_minibatches_are_sharded_and_communication_free():
+    device_count = jax.device_count()
+    mesh = jax.make_mesh((device_count,), ("batch",))
+    parallel = BatchParallel(enabled=True, mesh=mesh)
+    local_batch_size = 4
+    num_steps = 3
+    training_batch_size = device_count * 4
+    sample = _minibatch_sample(num_steps, device_count * local_batch_size)
+
+    def build_minibatches(sample, rng_key):
+        return make_minibatches(sample, rng_key, training_batch_size, parallel=parallel)
+
+    lowered = jax.jit(build_minibatches).lower(sample, jax.random.PRNGKey(0))
+    hlo_text = lowered.compiler_ir(dialect="hlo").as_hlo_text().lower()
+    for collective in (
+        "all-gather",
+        "all_gather",
+        "all-reduce",
+        "all_reduce",
+        "all-to-all",
+        "all_to_all",
+        "collective-permute",
+        "collective_permute",
+        "collective-broadcast",
+        "collective_broadcast",
+        "reduce-scatter",
+        "reduce_scatter",
+    ):
+        assert collective not in hlo_text
+
+    minibatches = jax.jit(build_minibatches)(sample, jax.random.PRNGKey(0))
+
+    assert minibatches.obs.shape == (3, training_batch_size, 1)
+    assert isinstance(minibatches.obs.sharding, NamedSharding)
+    if device_count > 1:
+        assert minibatches.obs.sharding.spec == PartitionSpec(None, "batch")
+        assert minibatches.beta_Q_target.sharding.spec == PartitionSpec(None, "batch")
+
+    obs = minibatches.obs[..., 0].reshape(3, device_count, -1)
+    batch_indices = (obs.astype(jnp.int32) % (device_count * local_batch_size))
+    owner_devices = batch_indices // local_batch_size
+    expected_devices = jnp.arange(device_count, dtype=jnp.int32)[None, :, None]
+    assert bool(jnp.all(owner_devices == expected_devices))
 
 
 def test_fixed_replay_window_pads_early_batches_to_stable_shape():

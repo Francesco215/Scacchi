@@ -1,5 +1,5 @@
 run:
-  seed: 0
+  seed: 1
   max_num_iters: 2000
 
 env:
@@ -14,9 +14,9 @@ model:
   resnet_v2: true
 
 selfplay:
-  batch_size: 1024
+  batch_size: 128
   max_num_steps: 128
-  chunk_size: 1
+  chunk_size: 1 # remove it
   action_source: posterior_sample
 
 search:
@@ -32,9 +32,8 @@ search:
     kappa_terminal: 8.0
 
 training:
-  batch_size: 65_536
+  batch_size: 16_384
   max_updates_per_iter: 1
-  minibatch_sampling: as_is
   learning_rate: 1e-3
   grad_clip_norm: 1.0
 

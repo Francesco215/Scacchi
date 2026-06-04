@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import jax
+from jax import numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
@@ -39,6 +40,13 @@ class BatchParallel:
         axes[batch_axis] = self.axis_name
         return NamedSharding(self.mesh, PartitionSpec(*axes))
 
+    def split(self, rng_key: jax.Array, num:int) -> jax.Array:
+        ids = jnp.arange(num, dtype=jnp.uint32)
+        sharding = self.sharding_for(ndim=1)
+        if sharding is not None:
+            ids = jax.lax.with_sharding_constraint(ids, sharding)
+        keys = jax.vmap(jax.random.fold_in, in_axes=(None, 0))(rng_key, ids)
+        return keys
 
 DISABLED_BATCH_PARALLEL = BatchParallel(enabled=False)
 
@@ -84,4 +92,3 @@ def constrain_batch_axis(
         return jax.lax.with_sharding_constraint(leaf, sharding)
 
     return jax.tree_util.tree_map(constrain_leaf, value)
-

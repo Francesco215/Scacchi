@@ -43,7 +43,6 @@ search:
 
 training:
   batch_size: 1024
-  minibatch_sampling: permutation
   learning_rate: 1e-3
   grad_clip_norm: 1.0
 

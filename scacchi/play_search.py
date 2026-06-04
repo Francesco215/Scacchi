@@ -328,7 +328,6 @@ def _run_dirichlet_search(
 
 
 def _run_model_search(
-    *,
     env_state: pgx.State,
     model_output,
     scalar_recurrent_fn,
@@ -337,6 +336,7 @@ def _run_model_search(
     posterior_key: jax.Array,
     action_key: jax.Array,
     config,
+    *,
     action_source: str | None = None,
 ) -> _SearchStepOutput:
     if len(model_output) == 2:

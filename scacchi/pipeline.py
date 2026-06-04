@@ -1,8 +1,9 @@
 from flax import nnx
 import jax
 import jax.numpy as jnp
+from einops import rearrange
 
-from .loss import Sample, TrainMetrics, make_compute_loss_input, train
+from .loss import Sample, TrainMetrics, make_compute_input_for_lossfn, train
 from .play import make_selfplay
 from .play import SelfplayOutput
 from .posterior_tree import is_posterior_tree_policy
@@ -14,62 +15,37 @@ def make_minibatches(
     rng_key: jax.Array,
     training_batch_size: int,
     max_updates_per_iter: int | None = None,
-    sampling: str = "active_with_replacement",
+    parallel: BatchParallel | None = None,
 ) -> Sample:
-    samples = jax.tree_util.tree_map(
-        lambda x: x.reshape((-1, *x.shape[2:])),
-        samples,
-    )
-    num_rows = samples.obs.shape[0]
-    num_updates = num_rows // training_batch_size
+    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
+    if samples.obs.ndim < 2:
+        raise ValueError("minibatching requires samples shaped [time, batch, ...].")
+
+    samples = constrain_batch_axis(samples, parallel, batch_axis=1)
+    num_steps = samples.obs.shape[0]
+    batch_size = samples.obs.shape[1]
+    device_count = parallel.device_count if parallel.enabled else 1
+    assert batch_size % device_count == 0, f"batch_size={batch_size} must be divisible by device_count={device_count}."
+    assert training_batch_size % device_count == 0, f"training_batch_size={training_batch_size} must be divisible by device_count={device_count}."
+
+    local_batch_size = batch_size // device_count
+    local_training_batch_size = training_batch_size // device_count
+    local_rows = num_steps * local_batch_size
+    num_updates = local_rows // local_training_batch_size
     if max_updates_per_iter is not None:
         num_updates = min(num_updates, max_updates_per_iter)
-    num_train_samples = num_updates * training_batch_size
-    if sampling in {"permutation", "as_is"}:
-        if sampling == "permutation":
-            ixs = jax.random.permutation(rng_key, jnp.arange(num_rows))
-            samples = jax.tree_util.tree_map(lambda x: x[ixs[:num_train_samples]], samples)
-        else:
-            samples = jax.tree_util.tree_map(lambda x: x[:num_train_samples], samples)
-        return jax.tree_util.tree_map(
-            lambda x: x.reshape((num_updates, training_batch_size) + x.shape[1:]),
-            samples,
-        )
-    if sampling != "active_with_replacement":
-        raise ValueError(f"unknown minibatch sampling mode: {sampling!r}")
-    active_mask = _active_sample_rows(samples)
-    active_indices = jnp.nonzero(active_mask, size=num_rows, fill_value=0)[0]
-    active_count = jnp.sum(active_mask.astype(jnp.int32))
-    safe_active_count = jnp.maximum(active_count, 1)
-    draw_key, fallback_key = jax.random.split(rng_key)
-    raw_draws = jax.random.randint(
-        draw_key,
-        (num_train_samples,),
-        minval=0,
-        maxval=max(num_rows, 1),
-        dtype=jnp.int32,
-    )
-    active_ixs = active_indices[raw_draws % safe_active_count]
-    fallback_ixs = jax.random.permutation(fallback_key, jnp.arange(num_rows))[
-        :num_train_samples
-    ]
-    ixs = jnp.where(active_count > 0, active_ixs, fallback_ixs)
-    samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)
-    minibatches = jax.tree_util.tree_map(
-        lambda x: x.reshape((num_updates, training_batch_size) + x.shape[1:]),
-        samples,
-    )
+    local_train_rows = num_updates * local_training_batch_size
+
+    local_keys = parallel.split(rng_key, device_count)
+    local_row_ixs = jax.vmap(lambda key: jax.random.permutation(key, jnp.arange(local_rows))[:local_train_rows])(local_keys)
+
+    def local_shuffle(x: jax.Array) -> jax.Array:
+        x = rearrange(x, "t (d b) ... -> d (t b) ...", d=device_count, b=local_batch_size)
+        x = jax.vmap(lambda local_x, ixs: local_x[ixs])(x, local_row_ixs)
+        x = rearrange(x, "d (u b) ... -> u (d b) ...", u=num_updates, b=local_training_batch_size)
+        return x
+    minibatches = jax.tree_util.tree_map(local_shuffle, samples)
     return minibatches
-
-
-def _active_sample_rows(samples: Sample) -> jax.Array:
-    policy_mask = (
-        samples.value_mask if samples.policy_loss_mask is None else samples.policy_loss_mask
-    )
-    value_mask = (
-        samples.value_mask if samples.value_loss_mask is None else samples.value_loss_mask
-    )
-    return policy_mask | value_mask
 
 
 def _concat_selfplay_outputs(outputs: list[SelfplayOutput]) -> SelfplayOutput:
@@ -199,46 +175,7 @@ def train_minibatches(
 def make_training_iteration(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     selfplay = make_selfplay(env, config, parallel=parallel)
-    compute_loss_input = make_compute_loss_input(config)
-    replay_buffer_size = int(getattr(config, "replay_buffer_size", 1))
-
-    if is_posterior_tree_policy(config.search_policy):
-        @nnx.jit
-        def train_from_selfplay_data(
-            model: nnx.Module,
-            optimizer: nnx.Optimizer,
-            data,
-            perm_key: jax.Array,
-        ) -> TrainMetrics:
-            samples = compute_loss_input(data)
-            samples = constrain_batch_axis(samples, parallel, batch_axis=1)
-            minibatches = make_minibatches(
-                samples,
-                perm_key,
-                config.training_batch_size,
-                getattr(config, "max_updates_per_iter", None),
-                getattr(config, "minibatch_sampling", "active_with_replacement"),
-            )
-            return train_minibatches(model, optimizer, minibatches, config, parallel)
-
-        replay_buffer: list[SelfplayOutput] = []
-
-        def training_iteration(
-            model: nnx.Module,
-            optimizer: nnx.Optimizer,
-            rng_key: jax.Array,
-        ) -> TrainMetrics:
-            selfplay_key, perm_key = jax.random.split(rng_key)
-            data = selfplay(model, selfplay_key)
-            replay_buffer.append(data)
-            del replay_buffer[:-replay_buffer_size]
-            replay_data = _concat_selfplay_outputs(
-                _fixed_replay_window(replay_buffer, replay_buffer_size)
-            )
-            metrics = train_from_selfplay_data(model, optimizer, replay_data, perm_key)
-            return _with_search_diagnostics(metrics, data)
-
-        return training_iteration
+    compute_input_for_lossfn = make_compute_input_for_lossfn(config)
 
     @nnx.jit
     def train_from_selfplay_data(
@@ -247,14 +184,13 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
         data: SelfplayOutput,
         perm_key: jax.Array,
     ) -> TrainMetrics:
-        samples = compute_loss_input(data)
-        samples = constrain_batch_axis(samples, parallel, batch_axis=1)
+        samples = compute_input_for_lossfn(data) # it digests the data in such a way that it prepares the input for the loss function
         minibatches = make_minibatches(
             samples,
             perm_key,
             config.training_batch_size,
             getattr(config, "max_updates_per_iter", None),
-            getattr(config, "minibatch_sampling", "active_with_replacement"),
+            parallel,
         )
         return train_minibatches(model, optimizer, minibatches, config, parallel)
 
