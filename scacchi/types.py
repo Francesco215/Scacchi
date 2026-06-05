@@ -31,18 +31,6 @@ class SearchPolicy(StrEnum):
     dirichlet_thompson = "dirichlet_thompson"
 
 
-class LeafValueMode(StrEnum):
-    alpha = "alpha"
-    mean = "mean"
-
-
-class CategoricalDrawRule(StrEnum):
-    policy_prior = "policy_prior"
-    fastest_draw = "fastest_draw"
-    slowest_draw = "slowest_draw"
-    fixed_order = "fixed_order"
-
-
 class QLossWeightMode(StrEnum):
     policy = "policy"
     evidence_mass = "evidence_mass"
@@ -84,13 +72,7 @@ def _require_gt(name: str, value: float | int | None, minimum: float) -> None:
         raise ValueError(f"{name} must be > {minimum}; got {value}.")
 
 
-def _require_range(
-    name: str,
-    value: float,
-    *,
-    lower: float,
-    upper: float,
-) -> None:
+def _require_range(name: str, value: float, *, lower: float, upper: float) -> None:
     if not lower < value < upper:
         raise ValueError(f"{name} must be > {lower} and < {upper}; got {value}.")
 
@@ -100,9 +82,6 @@ class RunConfig:
     seed: int = 0
     max_num_iters: int = 400
 
-    def __post_init__(self) -> None:
-        _require_ge("run.max_num_iters", self.max_num_iters, 1)
-
 
 @dataclass
 class EnvConfig:
@@ -110,71 +89,40 @@ class EnvConfig:
     board_size: int | None = None
     num_outcomes: int | None = None
 
-    def __post_init__(self) -> None:
-        _require_ge("env.board_size", self.board_size, 1)
-        _require_ge("env.num_outcomes", self.num_outcomes, 1)
-
-
 @dataclass
 class ModelConfig:
     network: Network = Network.aznet
     num_channels: int = 128
     num_layers: int = 6
+    # TODO: remove the three config below and settle on some defaults in the code
     resnet_v2: bool = True
     legacy_dirichlet_head_init: bool = False
     rezero_kernel_init: RezeroKernelInit = RezeroKernelInit.variance_scaling
 
-    def __post_init__(self) -> None:
-        _require_ge("model.num_channels", self.num_channels, 1)
-        _require_ge("model.num_layers", self.num_layers, 1)
 
 
 @dataclass
 class SelfplayConfig:
     batch_size: int = 1024
     max_num_steps: int = 256
-    chunk_size: int | None = None
     action_source: SelfplayActionSource = SelfplayActionSource.posterior_best
 
-    def __post_init__(self) -> None:
-        _require_ge("selfplay.batch_size", self.batch_size, 1)
-        _require_ge("selfplay.max_num_steps", self.max_num_steps, 1)
-        _require_ge("selfplay.chunk_size", self.chunk_size, 1)
-
-
-@dataclass
-class SearchMonteCarloConfig:
-    policy_samples: int = 32
-    backup_samples: int = 16
-
-    def __post_init__(self) -> None:
-        _require_ge("search.monte_carlo.policy_samples", self.policy_samples, 1)
-        _require_ge("search.monte_carlo.backup_samples", self.backup_samples, 1)
 
 
 @dataclass
 class SearchConstantsConfig:
     kappa_leaf: float = 1.0
     kappa_terminal: float = 8.0
-    epsilon_terminal: float = 1e-6
     categorical_epsilon: float = 1e-4
-    categorical_draw_rule: CategoricalDrawRule = CategoricalDrawRule.policy_prior
-    state_posterior_kappa_n: float = 9.0
 
     def __post_init__(self) -> None:
         _require_gt("search.constants.kappa_leaf", self.kappa_leaf, 0.0)
         _require_gt("search.constants.kappa_terminal", self.kappa_terminal, 0.0)
-        _require_gt("search.constants.epsilon_terminal", self.epsilon_terminal, 0.0)
         _require_range(
             "search.constants.categorical_epsilon",
             self.categorical_epsilon,
             lower=0.0,
             upper=0.5,
-        )
-        _require_gt(
-            "search.constants.state_posterior_kappa_n",
-            self.state_posterior_kappa_n,
-            0.0,
         )
 
 
@@ -183,19 +131,11 @@ class SearchConfig:
     policy: SearchPolicy = SearchPolicy.gumbel
     num_simulations: int = 32
     num_blocks: int = 1
-    eval_batch_size: int | None = None
-    inflight_limit: int = 1
-    monte_carlo: SearchMonteCarloConfig = field(
-        default_factory=SearchMonteCarloConfig
-    )
     constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
-    leaf_value_mode: LeafValueMode = LeafValueMode.alpha
 
     def __post_init__(self) -> None:
         _require_ge("search.num_simulations", self.num_simulations, 1)
         _require_ge("search.num_blocks", self.num_blocks, 1)
-        _require_ge("search.eval_batch_size", self.eval_batch_size, 1)
-        _require_ge("search.inflight_limit", self.inflight_limit, 1)
 
 
 @dataclass

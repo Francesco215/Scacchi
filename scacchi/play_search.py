@@ -32,12 +32,11 @@ from .dirichlet_tree.native import (
 from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
 from .dqaz_jax_backup import BackupArrays, apply_batched_backup_block
 from .network import policy_value_from_output
-from .posterior_tree import (
-    PosteriorTree,
-    PosteriorTreeBatchOutput,
-    StepRequest,
-    split_batched_state,
-)
+
+
+_POSTERIOR_POLICY_TARGET_SAMPLES = 32
+_DQAZ_STATE_POSTERIOR_KAPPA_N = 9.0
+_DQAZ_EPSILON_TERMINAL = 1e-6
 
 
 class _SearchStepOutput(NamedTuple):
@@ -57,6 +56,30 @@ class _SearchStepOutput(NamedTuple):
     v_target_weight: jax.Array | None = None
     v_target_outcome: jax.Array | None = None
     v_target_distance: jax.Array | None = None
+
+
+class PosteriorTreeBatchOutput(NamedTuple):
+    action: jax.Array
+    action_weights: jax.Array
+    beta_Q_target: jax.Array
+    beta_V_target: jax.Array
+    q_loss_weight: jax.Array
+    alpha_root: jax.Array
+    trees: tuple[Any, ...] = ()
+    tree_data: TreeTrainingData | None = None
+    search_loss_mask: jax.Array | None = None
+    q_target_kind: jax.Array | None = None
+    q_target_weight: jax.Array | None = None
+    q_target_outcome: jax.Array | None = None
+    q_target_distance: jax.Array | None = None
+    v_target_kind: jax.Array | None = None
+    v_target_weight: jax.Array | None = None
+    v_target_outcome: jax.Array | None = None
+    v_target_distance: jax.Array | None = None
+
+    @property
+    def q_evidence_mass(self) -> jax.Array:
+        return self.q_loss_weight
 
 
 class _DQAZBackupInputs(NamedTuple):
@@ -107,6 +130,60 @@ def _num_outcomes_for_config(config) -> int:
     if num_outcomes is None:
         return 2 if config.env.id == "hex" else 3
     return num_outcomes
+
+
+def _config_value(config: Any, path: tuple[str, ...], default: Any) -> Any:
+    value = config
+    for name in path:
+        if isinstance(value, dict):
+            if name not in value:
+                return default
+            value = value[name]
+            continue
+        if not hasattr(value, name):
+            return default
+        value = getattr(value, name)
+    return value
+
+
+def _search_value(config: Any, name: str, default: Any) -> Any:
+    return _config_value(
+        config,
+        ("search", name),
+        _config_value(config, (name,), default),
+    )
+
+
+def _search_constant(config: Any, name: str, default: Any) -> Any:
+    return _config_value(
+        config,
+        ("search", "constants", name),
+        _config_value(config, (name,), default),
+    )
+
+
+def _policy_target_samples(config: Any) -> int:
+    return int(
+        _config_value(
+            config,
+            ("search", "monte_carlo", "policy_samples"),
+            _config_value(
+                config,
+                ("policy_mc_samples",),
+                _POSTERIOR_POLICY_TARGET_SAMPLES,
+            ),
+        )
+    )
+
+
+def _selfplay_action_source(config: Any) -> str:
+    return str(
+        _config_value(
+            config,
+            ("selfplay", "action_source"),
+            _config_value(config, ("selfplay_action_source",), "posterior_argmax"),
+        )
+    )
 
 
 def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
@@ -294,7 +371,7 @@ def _run_dirichlet_search(
         posterior_key,
         action_alpha_post,
         env_state.legal_action_mask,
-        config.search.monte_carlo.policy_samples,
+        _policy_target_samples(config),
     )
     if config.search.policy == "gumbel":
         policy_target = policy_output.action_weights
@@ -307,7 +384,7 @@ def _run_dirichlet_search(
         posterior_policy_target,
     )
     played_action = _select_played_action(
-        config.selfplay.action_source if action_source is None else action_source,
+        _selfplay_action_source(config) if action_source is None else action_source,
         action_key,
         posterior_policy_target,
         env_state.legal_action_mask,
@@ -419,15 +496,9 @@ def _run_posterior_tree_search_step(
             device_put_cpu=device_put_cpu,
         )
     else:
-        root_states = split_batched_state(env_state)
-        search_output = _run_fused_posterior_tree_search(
-            env=env,
-            root_states=root_states,
-            leaf_evaluator=leaf_evaluator,
-            transition_evaluator=transition_evaluator,
-            search_key=search_key,
-            config=config,
-            device_put_cpu=device_put_cpu,
+        raise RuntimeError(
+            "Python posterior_tree search has been removed; use "
+            "search_backend='dqaz' for native posterior forest search."
         )
     search_action = device_put_cpu(search_output.action)
     played_action = search_action
@@ -444,110 +515,6 @@ def _run_posterior_tree_search_step(
         tree_data=search_output.tree_data,
         search_diagnostics=getattr(search_output, "diagnostics", None),
         **_native_target_kwargs_from_output(search_output),
-    )
-
-
-def _run_fused_posterior_tree_search(
-    *,
-    env: Any,
-    root_states: list[Any],
-    leaf_evaluator: Callable[[jax.Array], Any],
-    transition_evaluator: Callable[[Any, jax.Array], Any],
-    search_key: jax.Array,
-    config,
-    device_put_cpu: Callable[[Any], Any],
-) -> PosteriorTreeBatchOutput:
-    if not root_states:
-        raise ValueError("root_states must not be empty")
-
-    root_observations = jnp.stack([state.observation for state in root_states], axis=0)
-    root_logits, root_alpha_v, root_alpha_q = leaf_evaluator(root_observations)
-    root_logits, root_alpha_v, root_alpha_q = jax.device_get(
-        (root_logits, root_alpha_v, root_alpha_q)
-    )
-
-    seed = int(
-        jax.device_get(
-            jax.random.randint(search_key, (), minval=0, maxval=np.iinfo(np.int32).max)
-        )
-    )
-    rng = np.random.default_rng(seed)
-    trees = tuple(
-        PosteriorTree(
-            env=env,
-            root_state=state,
-            root_logits=root_logits[ix],
-            root_alpha_v=root_alpha_v[ix],
-            root_alpha_q=root_alpha_q[ix],
-            tree_index=ix,
-            rng=rng,
-            leaf_value_mode=config.search.leaf_value_mode,
-            kappa_leaf=float(config.search.constants.kappa_leaf),
-            kappa_terminal=float(config.search.constants.kappa_terminal),
-            epsilon_terminal=float(config.search.constants.epsilon_terminal),
-            state_posterior_kappa_n=float(
-                config.search.constants.state_posterior_kappa_n
-            ),
-            policy_mc_samples=config.search.monte_carlo.policy_samples,
-            backup_mc_samples=config.search.monte_carlo.backup_samples,
-            commit=config.selfplay.action_source,
-            categorical_draw_rule=config.search.constants.categorical_draw_rule,
-        )
-        for ix, state in enumerate(root_states)
-    )
-
-    _run_fused_search_loop(
-        trees,
-        transition_evaluator=transition_evaluator,
-        num_simulations=int(config.search.num_simulations),
-        eval_batch_size=_eval_batch_size(config, len(trees)),
-        inflight_limit=int(config.search.inflight_limit),
-    )
-
-    finished = [tree.finish_native() for tree in trees]
-    (
-        actions,
-        policies,
-        beta_q,
-        beta_v,
-        q_weight,
-        alpha_root,
-        q_kind,
-        q_target_weight,
-        q_outcome,
-        q_distance,
-        v_kind,
-        v_target_weight,
-        v_outcome,
-        v_distance,
-    ) = zip(*finished, strict=True)
-    policy_array = np.stack(policies, axis=0)
-    return PosteriorTreeBatchOutput(
-        action=device_put_cpu(jnp.asarray(np.asarray(actions), dtype=jnp.int32)),
-        action_weights=device_put_cpu(jnp.asarray(policy_array)),
-        beta_Q_target=device_put_cpu(jnp.asarray(np.stack(beta_q, axis=0))),
-        beta_V_target=device_put_cpu(jnp.asarray(np.stack(beta_v, axis=0))),
-        q_loss_weight=device_put_cpu(jnp.asarray(np.stack(q_weight, axis=0))),
-        alpha_root=device_put_cpu(jnp.asarray(np.stack(alpha_root, axis=0))),
-        trees=trees,
-        tree_data=None,
-        search_loss_mask=device_put_cpu(jnp.asarray(np.sum(policy_array, axis=-1) > 0.0)),
-        q_target_kind=device_put_cpu(jnp.asarray(np.stack(q_kind, axis=0), dtype=jnp.int8)),
-        q_target_weight=device_put_cpu(
-            jnp.asarray(np.stack(q_target_weight, axis=0), dtype=jnp.float32)
-        ),
-        q_target_outcome=device_put_cpu(jnp.asarray(np.stack(q_outcome, axis=0), dtype=jnp.int8)),
-        q_target_distance=device_put_cpu(
-            jnp.asarray(np.stack(q_distance, axis=0), dtype=jnp.int32)
-        ),
-        v_target_kind=device_put_cpu(jnp.asarray(np.stack(v_kind, axis=0), dtype=jnp.int8)),
-        v_target_weight=device_put_cpu(
-            jnp.asarray(np.stack(v_target_weight, axis=0), dtype=jnp.float32)
-        ),
-        v_target_outcome=device_put_cpu(jnp.asarray(np.stack(v_outcome, axis=0), dtype=jnp.int8)),
-        v_target_distance=device_put_cpu(
-            jnp.asarray(np.stack(v_distance, axis=0), dtype=jnp.int32)
-        ),
     )
 
 
@@ -881,12 +848,18 @@ def _run_dqaz_posterior_tree_search(
         dqaz.SearchConfig(
             action_size=action_size,
             observation_shape=tuple(root_observations.shape[1:]),
-            simulations_per_root=int(config.search.num_simulations),
-            posterior_best_samples=int(config.search.monte_carlo.policy_samples),
-            kappa_n=float(config.search.constants.state_posterior_kappa_n),
+            simulations_per_root=int(_search_value(config, "num_simulations", 1)),
+            posterior_best_samples=_policy_target_samples(config),
+            kappa_n=float(
+                _search_constant(
+                    config,
+                    "state_posterior_kappa_n",
+                    _DQAZ_STATE_POSTERIOR_KAPPA_N,
+                )
+            ),
             seed=seed,
             debug=bool(getattr(config, "debug", False)),
-            max_pending_requests_per_root=int(config.search.inflight_limit),
+            max_pending_requests_per_root=int(_search_value(config, "inflight_limit", 1)),
         )
     )
     root_offsets, root_actions, root_q = _compact_valid_actions_and_q_from_mask_np(
@@ -1016,8 +989,14 @@ def _run_dqaz_posterior_tree_search(
         terminal_alpha = _terminal_alpha_from_arrays(
             np.asarray(child_rewards[:active_size], dtype=np.float32),
             current_players,
-            epsilon=float(config.search.constants.epsilon_terminal),
-            kappa=float(config.search.constants.kappa_terminal),
+            epsilon=float(
+                _search_constant(
+                    config,
+                    "epsilon_terminal",
+                    _DQAZ_EPSILON_TERMINAL,
+                )
+            ),
+            kappa=float(_search_constant(config, "kappa_terminal", 8.0)),
         )
         if profile_search:
             profile_times["terminal_alpha"] += time.perf_counter() - start
@@ -1048,7 +1027,7 @@ def _run_dqaz_posterior_tree_search(
                     backup_batch,
                     root_batch_size=batch_size,
                     eval_batch_size=eval_batch_size,
-                    num_simulations=int(config.search.num_simulations),
+                    num_simulations=int(_search_value(config, "num_simulations", 1)),
                 )
                 if profile_search:
                     profile_times["pad_backup"] += time.perf_counter() - start
@@ -1076,8 +1055,14 @@ def _run_dqaz_posterior_tree_search(
                     jnp.asarray(backup_inputs.path_mask, dtype=jnp.bool_),
                     jnp.asarray(backup_inputs.leaf_alpha, dtype=jnp.float32),
                     jnp.asarray(backup_inputs.leaf_players, dtype=jnp.int32),
-                    float(config.search.constants.state_posterior_kappa_n),
-                    sample_count=int(config.search.monte_carlo.policy_samples),
+                    float(
+                        _search_constant(
+                            config,
+                            "state_posterior_kappa_n",
+                            _DQAZ_STATE_POSTERIOR_KAPPA_N,
+                        )
+                    ),
+                    sample_count=_policy_target_samples(config),
                     max_depth=int(backup_batch.max_depth),
                 )
                 if profile_search:
@@ -1148,7 +1133,7 @@ def _run_dqaz_posterior_tree_search(
             flush=True,
         )
 
-    commit = config.selfplay.action_source
+    commit = _selfplay_action_source(config)
     if commit in ("posterior_best", "search_action"):
         commit = "posterior_argmax"
     results = engine.finish(tree_ids, commit=commit)
@@ -1362,30 +1347,6 @@ def _flatten_padded_valid_actions_and_q_np(
     )
 
 
-class _StateStore:
-    def __init__(self):
-        self._treedef = None
-        self._states: list[Any] = []
-        self._size = 0
-
-    def add_batch(self, state_batch: Any) -> list[int]:
-        leaves, treedef = jax.tree_util.tree_flatten(state_batch)
-        batch_size = int(leaves[0].shape[0])
-        if self._treedef is None:
-            self._treedef = treedef
-        elif treedef != self._treedef:
-            raise ValueError("state batch tree structure changed")
-        start = self._size
-        self._states.extend(split_batched_state(state_batch))
-        self._size += batch_size
-        return list(range(start, start + batch_size))
-
-    def batch(self, handles: list[int]) -> Any:
-        if not handles:
-            raise ValueError("state handle batch must not be empty")
-        return _stack_states([self._states[handle] for handle in handles])
-
-
 class _PathStateStore:
     def __init__(self, env: Any, root_state_batch: Any):
         self._root_state_batch = root_state_batch
@@ -1533,96 +1494,6 @@ def _dqaz_output_to_posterior_batch(
     )
 
 
-def _run_fused_search_loop(
-    trees: tuple[PosteriorTree, ...],
-    *,
-    transition_evaluator: Callable[[Any, jax.Array], Any],
-    num_simulations: int,
-    eval_batch_size: int,
-    inflight_limit: int,
-) -> None:
-    while any(tree.done < num_simulations for tree in trees):
-        step_requests, made_progress = _build_fused_step_batch(
-            trees,
-            num_simulations=num_simulations,
-            inflight_limit=inflight_limit,
-            eval_batch_size=eval_batch_size,
-        )
-        if not step_requests:
-            if made_progress:
-                continue
-            if all(tree.done >= num_simulations for tree in trees):
-                break
-            unfinished = [tree.tree_index for tree in trees if tree.done < num_simulations]
-            raise RuntimeError(f"posterior tree search stalled for roots {unfinished}")
-
-        _consume_fused_step_requests(
-            trees,
-            step_requests,
-            transition_evaluator=transition_evaluator,
-            eval_batch_size=eval_batch_size,
-        )
-
-
-def _build_fused_step_batch(
-    trees: tuple[PosteriorTree, ...],
-    *,
-    num_simulations: int,
-    inflight_limit: int,
-    eval_batch_size: int,
-) -> tuple[list[StepRequest], bool]:
-    requests: list[StepRequest] = []
-    made_progress = False
-    for tree in trees:
-        if tree.done + tree.inflight >= num_simulations or tree.inflight >= inflight_limit:
-            continue
-        before = (tree.done, tree.inflight, len(tree.nodes))
-        request = tree.next_step_request()
-        after = (tree.done, tree.inflight, len(tree.nodes))
-        if request is not None:
-            requests.append(request)
-        if request is not None or after != before:
-            made_progress = True
-        if len(requests) >= eval_batch_size:
-            break
-    return requests, made_progress
-
-
-def _consume_fused_step_requests(
-    trees: tuple[PosteriorTree, ...],
-    requests: list[StepRequest],
-    *,
-    transition_evaluator: Callable[[Any, jax.Array], Any],
-    eval_batch_size: int,
-) -> None:
-    if not requests:
-        return
-    fallback = requests[0]
-    padded = requests + [fallback] * (eval_batch_size - len(requests))
-    states = [request.state for request in padded]
-    actions = jnp.asarray([request.action for request in padded], dtype=jnp.int32)
-    transition_output = transition_evaluator(_stack_states(states), actions)
-    child_state_batch, logits, alpha_v, alpha_q = _unpack_transition_output(
-        transition_output
-    )
-    child_states = split_batched_state(child_state_batch)
-    logits, alpha_v, alpha_q = jax.device_get((logits, alpha_v, alpha_q))
-
-    for ix, request in enumerate(requests):
-        eval_request = trees[request.tree_index].consume_step_result(
-            request,
-            child_states[ix],
-        )
-        if eval_request is None:
-            continue
-        trees[eval_request.tree_index].consume_result(
-            eval_request,
-            logits=logits[ix],
-            alpha_v=alpha_v[ix],
-            alpha_q=alpha_q[ix],
-        )
-
-
 def _unpack_transition_output(output: Any) -> tuple[Any, jax.Array, jax.Array, jax.Array]:
     if len(output) == 2:
         child_states, model_output = output
@@ -1642,10 +1513,6 @@ def _unpack_transition_output(output: Any) -> tuple[Any, jax.Array, jax.Array, j
     )
 
 
-def _stack_states(states: list[Any]) -> Any:
-    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *states)
-
-
 def _select_active_states(
     stepped_state: Any,
     original_state: Any,
@@ -1662,7 +1529,9 @@ def _select_active_states(
 
 
 def _eval_batch_size(config: Any, num_trees: int) -> int:
-    configured = config.search.eval_batch_size
+    configured = _search_value(config, "eval_batch_size", None)
+    if configured is None:
+        configured = _config_value(config, ("search_eval_batch_size",), None)
     if configured is None:
         return max(1, num_trees)
     return max(1, int(configured))

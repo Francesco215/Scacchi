@@ -31,7 +31,6 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.search.policy == "dirichlet_thompson"
     assert config.search.num_simulations == 4
     assert config.search.num_blocks == 8
-    assert config.search.monte_carlo.policy_samples == 32
     assert config.search.constants.kappa_leaf == 1.0
     assert config.search.constants.kappa_terminal == 8.0
     assert config.training.batch_size == 16_384

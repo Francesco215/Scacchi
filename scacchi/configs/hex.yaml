@@ -1,7 +1,4 @@
-# Posterior-tree reference config:
-# The old Python wavefront backend has been removed from scacchi/dirichlet_tree.
-# Keep this on the slower object posterior_tree path until the Rust dqaz backend
-# described in plan.md is wired into training.
+# Dirichlet Thompson Hex training config.
 # Action-selection symbols are explicit enum values. Use posterior_argmax or
 # posterior_sample where those modes are accepted; there is no posterior_mean mode.
 
@@ -26,23 +23,13 @@ selfplay:
   action_source: posterior_sample  # Self-play action source: posterior_argmax/posterior_best, posterior_sample, or search_action.
 
 search:
-  policy: dirichlet_thompson  # Reference Python posterior-tree path; Rust dqaz will replace it.
-  num_simulations: 32  # Posterior-tree leaf-request budget per root.
-  num_blocks: 8  # Compatibility knob for dirichlet_thompson; kept so older overrides still parse.
-  eval_batch_size: 1024  # Maximum neural leaf evaluations per batch.
-  inflight_limit: 1  # Legacy object posterior_tree request limit.
-
-  monte_carlo:
-    policy_samples: 64  # Samples used to estimate posterior-best policy targets.
-    backup_samples: 4  # Samples used by posterior-tree backup/target approximations where applicable.
-
-  leaf_value_mode: alpha  # alpha preserves value-head concentration; mean uses kappa_leaf * mean(alpha).
+  policy: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
+  num_simulations: 32  # Search simulations per root.
+  num_blocks: 8  # Dirichlet Thompson search blocks.
 
   constants:
-    kappa_leaf: 1.0  # Fixed concentration for leaf_value_mode: mean; alpha mode preserves network concentration.
-    kappa_terminal: 8.0  # Legacy terminal Dirichlet mass; native categorical terminal leaves should not rely on this.
-    epsilon_terminal: 5e-2  # Legacy terminal Dirichlet smoothing; categorical targets use categorical_epsilon in the loss.
-    state_posterior_kappa_n: 16.0  # Half-trust count for blending neural value priors with downstream search evidence.
+    kappa_leaf: 1.0  # Nonterminal evidence mass used by Dirichlet-Q search.
+    kappa_terminal: 8.0  # Terminal evidence mass used by Dirichlet-Q search.
 
 training:
   batch_size: 1024  # Learner minibatch size; multiple updates per fresh self-play batch.

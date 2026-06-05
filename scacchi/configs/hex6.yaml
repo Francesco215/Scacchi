@@ -26,20 +26,10 @@ search:
   policy: dirichlet_thompson
   num_simulations: 4
   num_blocks: 8
-  eval_batch_size: 1024
-  inflight_limit: 1
-
-  monte_carlo:
-    policy_samples: 64
-    backup_samples: 4
-
-  leaf_value_mode: alpha
 
   constants:
     kappa_leaf: 1.0
     kappa_terminal: 8.0
-    epsilon_terminal: 5e-2
-    state_posterior_kappa_n: 16.0
 
 training:
   batch_size: 1024

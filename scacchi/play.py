@@ -1,5 +1,4 @@
-import weakref
-from typing import Any, Callable, NamedTuple
+from typing import Any, NamedTuple
 
 import chex
 from flax import nnx
@@ -23,17 +22,7 @@ from .network import policy_value_from_output
 from .play_search import (
     _SearchStepOutput,
     _run_model_search,
-    _run_posterior_tree_search_step,
-    _select_played_action,
 )
-from .posterior_tree import is_posterior_tree_policy
-
-
-BatchedEnvInit = Callable[[jax.Array], Any]
-BatchedEnvStep = Callable[[Any, jax.Array, jax.Array], Any]
-
-_CPU_ENV_INIT_CACHE: dict[int, tuple[weakref.ReferenceType[Any] | None, BatchedEnvInit]] = {}
-_CPU_ENV_STEP_CACHE: dict[int, tuple[weakref.ReferenceType[Any] | None, BatchedEnvStep]] = {}
 
 
 class SelfplayOutput(NamedTuple):
@@ -69,60 +58,6 @@ _STACKED_FRAME_FIELD_NAMES = tuple(
     for field in SelfplayOutput._fields
     if field not in ("tree_data", "search_diagnostics")
 )
-
-
-def _cpu_device() -> jax.Device:
-    try:
-        return jax.devices("cpu")[0]
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "posterior_tree selfplay requires the JAX CPU platform for PGX env "
-            "initialization and stepping. Use JAX_PLATFORMS=cuda,cpu when running "
-            "with a GPU."
-        ) from exc
-
-
-def _device_put_cpu(value: Any) -> Any:
-    return jax.device_put(value, _cpu_device())
-
-
-def _env_ref(env: Any) -> weakref.ReferenceType[Any] | None:
-    try:
-        return weakref.ref(env)
-    except TypeError:
-        return None
-
-
-def _cached_cpu_env_init(env: Any) -> BatchedEnvInit:
-    cache_key = id(env)
-    cached = _CPU_ENV_INIT_CACHE.get(cache_key)
-    if cached is not None:
-        env_ref, init_fn = cached
-        if env_ref is None or env_ref() is env:
-            return init_fn
-    init_fn = jax.jit(jax.vmap(env.init))
-    _CPU_ENV_INIT_CACHE[cache_key] = (_env_ref(env), init_fn)
-    return init_fn
-
-
-def _cached_cpu_env_step(env: Any) -> BatchedEnvStep:
-    cache_key = id(env)
-    cached = _CPU_ENV_STEP_CACHE.get(cache_key)
-    if cached is not None:
-        env_ref, step_fn = cached
-        if env_ref is None or env_ref() is env:
-            return step_fn
-    step_fn = jax.jit(jax.vmap(auto_reset(env.step, env.init)))
-    _CPU_ENV_STEP_CACHE[cache_key] = (_env_ref(env), step_fn)
-    return step_fn
-
-
-def _cached_default_env_init(env: Any) -> BatchedEnvInit:
-    return _cached_cpu_env_init(env)
-
-
-def _cached_default_env_step(env: Any) -> BatchedEnvStep:
-    return _cached_cpu_env_step(env)
 
 
 def make_recurrent_fn(env, predict_fn):
@@ -262,27 +197,8 @@ def _concat_selfplay_time(outputs: list[SelfplayOutput]) -> SelfplayOutput:
     )
 
 
-def _select_posterior_tree_played_action(
-    action_source: str,
-    rng_key: jax.Array,
-    action_weights: jax.Array,
-    legal_action_mask: jax.Array,
-    search_action: jax.Array,
-) -> jax.Array:
-    return _select_played_action(
-        action_source,
-        rng_key,
-        action_weights,
-        legal_action_mask,
-        search_action,
-    )
-
-
-
 def make_selfplay(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
-    if is_posterior_tree_policy(config.search.policy):
-        raise ValueError("Posterior tree policy is not supported for self-play")
 
     def step_fn_factory(model: nnx.Module):
         predict_fn = lambda obs: model(obs, train=False)

@@ -34,9 +34,6 @@ search:
   num_simulations: 4
   num_blocks: 8
 
-  monte_carlo:
-    policy_samples: 32
-
   constants:
     kappa_leaf: 1.0
     kappa_terminal: 8.0

@@ -3,11 +3,10 @@ import jax.numpy as jnp
 import pytest
 
 from scacchi.dirichlet_q_search import posterior_sample_action
-from scacchi.play import _select_posterior_tree_played_action
-from scacchi.play_search import _legalize_played_action
+from scacchi.play_search import _legalize_played_action, _select_played_action
 
 
-def test_select_posterior_tree_played_action_samples_posterior_target():
+def test_select_played_action_samples_posterior_target():
     key = jax.random.PRNGKey(0)
     action_weights = jnp.array(
         [
@@ -18,7 +17,7 @@ def test_select_posterior_tree_played_action_samples_posterior_target():
     legal_action_mask = jnp.ones_like(action_weights, dtype=jnp.bool_)
     search_action = jnp.array([0, 0], dtype=jnp.int32)
 
-    played_action = _select_posterior_tree_played_action(
+    played_action = _select_played_action(
         "posterior_sample",
         key,
         action_weights,
@@ -31,12 +30,12 @@ def test_select_posterior_tree_played_action_samples_posterior_target():
     assert not jnp.array_equal(played_action, search_action)
 
 
-def test_select_posterior_tree_played_action_can_use_search_action():
+def test_select_played_action_can_use_search_action():
     action_weights = jnp.array([[0.0, 1.0, 0.0]])
     legal_action_mask = jnp.ones_like(action_weights, dtype=jnp.bool_)
     search_action = jnp.array([2], dtype=jnp.int32)
 
-    played_action = _select_posterior_tree_played_action(
+    played_action = _select_played_action(
         "search_action",
         jax.random.PRNGKey(0),
         action_weights,
@@ -47,12 +46,12 @@ def test_select_posterior_tree_played_action_can_use_search_action():
     assert jnp.array_equal(played_action, search_action)
 
 
-def test_select_posterior_tree_played_action_legalizes_search_action():
+def test_select_played_action_legalizes_search_action():
     action_weights = jnp.array([[0.0, 1.0, 0.0]])
     legal_action_mask = jnp.array([[False, True, False]])
     search_action = jnp.array([2], dtype=jnp.int32)
 
-    played_action = _select_posterior_tree_played_action(
+    played_action = _select_played_action(
         "search_action",
         jax.random.PRNGKey(0),
         action_weights,
@@ -78,9 +77,9 @@ def test_legalize_played_action_handles_out_of_bounds_and_terminal_rows():
     assert jnp.array_equal(played_action, jnp.array([1, 2, 0], dtype=jnp.int32))
 
 
-def test_select_posterior_tree_played_action_rejects_unknown_source():
+def test_select_played_action_rejects_unknown_source():
     with pytest.raises(ValueError, match="selfplay_action_source"):
-        _select_posterior_tree_played_action(
+        _select_played_action(
             "unknown",
             jax.random.PRNGKey(0),
             jnp.array([[1.0]]),

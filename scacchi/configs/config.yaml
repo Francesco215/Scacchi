@@ -16,16 +16,12 @@ model:
 selfplay:
   batch_size: 128
   max_num_steps: 128
-  chunk_size: 1 # remove it
   action_source: posterior_sample
 
 search:
   policy: dirichlet_thompson
   num_simulations: 4
   num_blocks: 8
-
-  monte_carlo:
-    policy_samples: 32
 
   constants:
     kappa_leaf: 1.0

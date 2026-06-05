@@ -6,7 +6,6 @@ from einops import rearrange
 from .loss import Sample, TrainMetrics, make_compute_input_for_lossfn, train
 from .play import make_selfplay
 from .play import SelfplayOutput
-from .posterior_tree import is_posterior_tree_policy
 from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, constrain_batch_axis
 
 
