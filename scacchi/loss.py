@@ -59,6 +59,25 @@ class _NativeTargetFields(NamedTuple):
     v_target_distance: jax.Array
 
 
+_NATIVE_TARGET_FIELD_NAMES = _NativeTargetFields._fields
+
+_TREE_TO_SAMPLE_FIELDS = {
+    "obs": "obs",
+    "policy_tgt": "action_weights",
+    "value_tgt": "value_tgt",
+    "played_action": "played_action",
+    "policy_mask": "legal_action_mask",
+    "value_mask": "value_loss_mask",
+    "beta_Q_target": "beta_Q_target",
+    "beta_V_target": "beta_V_target",
+    "q_loss_weight": "q_loss_weight",
+    "policy_loss_mask": "policy_loss_mask",
+    "value_loss_mask": "value_loss_mask",
+    "search_loss_mask": "search_loss_mask",
+    "outcome_mask": "outcome_mask",
+}
+
+
 class TrainMetrics(NamedTuple):
     policy_loss: jax.Array
     value_loss: jax.Array
@@ -104,40 +123,13 @@ def make_compute_input_for_lossfn(
 
         def assert_native_targets(
             label: str,
-            *,
-            q_target_kind=None,
-            q_target_weight=None,
-            q_target_outcome=None,
-            q_target_distance=None,
-            v_target_kind=None,
-            v_target_weight=None,
-            v_target_outcome=None,
-            v_target_distance=None,
-        ):
-            checked = assert_batch_axis_sharded(
-                {
-                    "q_target_kind": q_target_kind,
-                    "q_target_weight": q_target_weight,
-                    "q_target_outcome": q_target_outcome,
-                    "q_target_distance": q_target_distance,
-                    "v_target_kind": v_target_kind,
-                    "v_target_weight": v_target_weight,
-                    "v_target_outcome": v_target_outcome,
-                    "v_target_distance": v_target_distance,
-                },
+            native_fields: _NativeTargetFields,
+        ) -> _NativeTargetFields:
+            return assert_batch_axis_sharded(
+                native_fields,
                 parallel,
                 batch_axis=0,
                 label=label,
-            )
-            return (
-                checked["q_target_kind"],
-                checked["q_target_weight"],
-                checked["q_target_outcome"],
-                checked["q_target_distance"],
-                checked["v_target_kind"],
-                checked["v_target_weight"],
-                checked["v_target_outcome"],
-                checked["v_target_distance"],
             )
 
         value_mask = jnp.cumsum(data.terminated[:, ::-1], axis=1)[:, ::-1] >= 1
@@ -186,14 +178,7 @@ def make_compute_input_for_lossfn(
         beta_q_target = data.beta_Q_target
         beta_v_target = data.beta_V_target
         q_loss_weight = data.q_loss_weight
-        q_target_kind = data.q_target_kind
-        q_target_weight = data.q_target_weight
-        q_target_outcome = data.q_target_outcome
-        q_target_distance = data.q_target_distance
-        v_target_kind = data.v_target_kind
-        v_target_weight = data.v_target_weight
-        v_target_outcome = data.v_target_outcome
-        v_target_distance = data.v_target_distance
+        native_target_values = _native_target_values(data)
 
         terminal_edge_targets = config.training.losses.terminal_edge_targets
         terminal_parent_targets = config.training.losses.terminal_parent_targets
@@ -205,41 +190,9 @@ def make_compute_input_for_lossfn(
                 batch_axis=0,
                 label="loss native_defaults",
             )
-            q_target_kind = (
-                native_defaults["q_target_kind"] if q_target_kind is None else q_target_kind
-            )
-            q_target_weight = (
-                native_defaults["q_target_weight"]
-                if q_target_weight is None
-                else q_target_weight
-            )
-            q_target_outcome = (
-                native_defaults["q_target_outcome"]
-                if q_target_outcome is None
-                else q_target_outcome
-            )
-            q_target_distance = (
-                native_defaults["q_target_distance"]
-                if q_target_distance is None
-                else q_target_distance
-            )
-            v_target_kind = (
-                native_defaults["v_target_kind"] if v_target_kind is None else v_target_kind
-            )
-            v_target_weight = (
-                native_defaults["v_target_weight"]
-                if v_target_weight is None
-                else v_target_weight
-            )
-            v_target_outcome = (
-                native_defaults["v_target_outcome"]
-                if v_target_outcome is None
-                else v_target_outcome
-            )
-            v_target_distance = (
-                native_defaults["v_target_distance"]
-                if v_target_distance is None
-                else v_target_distance
+            native_targets = _native_fields_from_values(
+                native_target_values,
+                native_defaults,
             )
             num_outcomes = beta_v_target.shape[-1]
             rounded_reward = jnp.round(data.reward).astype(jnp.int32)
@@ -255,72 +208,47 @@ def make_compute_input_for_lossfn(
                 dtype=bool,
             )
             terminal_action_mask = data.terminated[..., None] & played_action_mask
-            (
-                q_target_kind,
-                q_target_weight,
-                q_target_outcome,
-                q_target_distance,
-                v_target_kind,
-                v_target_weight,
-                v_target_outcome,
-                v_target_distance,
-            ) = assert_native_targets(
+            native_targets = assert_native_targets(
                 "loss native_targets after defaults",
-                q_target_kind=q_target_kind,
-                q_target_weight=q_target_weight,
-                q_target_outcome=q_target_outcome,
-                q_target_distance=q_target_distance,
-                v_target_kind=v_target_kind,
-                v_target_weight=v_target_weight,
-                v_target_outcome=v_target_outcome,
-                v_target_distance=v_target_distance,
+                native_targets,
             )
 
         if terminal_edge_targets:
-            q_target_kind = jnp.where(
-                terminal_action_mask,
-                jnp.asarray(int(TARGET_CATEGORICAL), dtype=q_target_kind.dtype),
-                q_target_kind,
-            )
-            q_target_weight = jnp.where(
-                terminal_action_mask,
-                jnp.ones((), dtype=q_target_weight.dtype),
-                q_target_weight,
-            )
-            q_target_outcome = jnp.where(
-                terminal_action_mask,
-                outcome_index[..., None].astype(q_target_outcome.dtype),
-                q_target_outcome,
-            )
-            q_target_distance = jnp.where(
-                terminal_action_mask,
-                jnp.ones((), dtype=q_target_distance.dtype),
-                q_target_distance,
+            native_targets = native_targets._replace(
+                q_target_kind=jnp.where(
+                    terminal_action_mask,
+                    jnp.asarray(
+                        int(TARGET_CATEGORICAL),
+                        dtype=native_targets.q_target_kind.dtype,
+                    ),
+                    native_targets.q_target_kind,
+                ),
+                q_target_weight=jnp.where(
+                    terminal_action_mask,
+                    jnp.ones((), dtype=native_targets.q_target_weight.dtype),
+                    native_targets.q_target_weight,
+                ),
+                q_target_outcome=jnp.where(
+                    terminal_action_mask,
+                    outcome_index[..., None].astype(
+                        native_targets.q_target_outcome.dtype,
+                    ),
+                    native_targets.q_target_outcome,
+                ),
+                q_target_distance=jnp.where(
+                    terminal_action_mask,
+                    jnp.ones((), dtype=native_targets.q_target_distance.dtype),
+                    native_targets.q_target_distance,
+                ),
             )
             q_loss_weight = jnp.where(
                 terminal_action_mask,
                 jnp.maximum(q_loss_weight, jnp.ones((), dtype=q_loss_weight.dtype)),
                 q_loss_weight,
             )
-            (
-                q_target_kind,
-                q_target_weight,
-                q_target_outcome,
-                q_target_distance,
-                v_target_kind,
-                v_target_weight,
-                v_target_outcome,
-                v_target_distance,
-            ) = assert_native_targets(
+            native_targets = assert_native_targets(
                 "loss native_targets after terminal_edge_targets",
-                q_target_kind=q_target_kind,
-                q_target_weight=q_target_weight,
-                q_target_outcome=q_target_outcome,
-                q_target_distance=q_target_distance,
-                v_target_kind=v_target_kind,
-                v_target_weight=v_target_weight,
-                v_target_outcome=v_target_outcome,
-                v_target_distance=v_target_distance,
+                native_targets,
             )
 
         if terminal_parent_targets:
@@ -332,46 +260,38 @@ def make_compute_input_for_lossfn(
             )
             policy_loss_mask = policy_loss_mask | (terminal_win_mask & legal_policy_mask)
             value_loss_mask = value_loss_mask | terminal_win_mask
-            v_target_kind = jnp.where(
-                terminal_win_mask,
-                jnp.asarray(int(TARGET_CATEGORICAL), dtype=v_target_kind.dtype),
-                v_target_kind,
+            native_targets = native_targets._replace(
+                v_target_kind=jnp.where(
+                    terminal_win_mask,
+                    jnp.asarray(
+                        int(TARGET_CATEGORICAL),
+                        dtype=native_targets.v_target_kind.dtype,
+                    ),
+                    native_targets.v_target_kind,
+                ),
+                v_target_weight=jnp.where(
+                    terminal_win_mask,
+                    jnp.ones((), dtype=native_targets.v_target_weight.dtype),
+                    native_targets.v_target_weight,
+                ),
+                v_target_outcome=jnp.where(
+                    terminal_win_mask,
+                    outcome_index.astype(native_targets.v_target_outcome.dtype),
+                    native_targets.v_target_outcome,
+                ),
+                v_target_distance=jnp.where(
+                    terminal_win_mask,
+                    jnp.ones((), dtype=native_targets.v_target_distance.dtype),
+                    native_targets.v_target_distance,
+                ),
             )
-            v_target_weight = jnp.where(
-                terminal_win_mask,
-                jnp.ones((), dtype=v_target_weight.dtype),
-                v_target_weight,
-            )
-            v_target_outcome = jnp.where(
-                terminal_win_mask,
-                outcome_index.astype(v_target_outcome.dtype),
-                v_target_outcome,
-            )
-            v_target_distance = jnp.where(
-                terminal_win_mask,
-                jnp.ones((), dtype=v_target_distance.dtype),
-                v_target_distance,
-            )
-            (
-                q_target_kind,
-                q_target_weight,
-                q_target_outcome,
-                q_target_distance,
-                v_target_kind,
-                v_target_weight,
-                v_target_outcome,
-                v_target_distance,
-            ) = assert_native_targets(
+            native_targets = assert_native_targets(
                 "loss native_targets after terminal_parent_targets",
-                q_target_kind=q_target_kind,
-                q_target_weight=q_target_weight,
-                q_target_outcome=q_target_outcome,
-                q_target_distance=q_target_distance,
-                v_target_kind=v_target_kind,
-                v_target_weight=v_target_weight,
-                v_target_outcome=v_target_outcome,
-                v_target_distance=v_target_distance,
+                native_targets,
             )
+
+        if terminal_edge_targets or terminal_parent_targets:
+            native_target_values = native_targets._asdict()
 
         sample = Sample(
             obs=data.obs,
@@ -387,14 +307,7 @@ def make_compute_input_for_lossfn(
             value_loss_mask=value_loss_mask,
             search_loss_mask=search_loss_mask,
             outcome_mask=value_mask,
-            q_target_kind=q_target_kind,
-            q_target_weight=q_target_weight,
-            q_target_outcome=q_target_outcome,
-            q_target_distance=q_target_distance,
-            v_target_kind=v_target_kind,
-            v_target_weight=v_target_weight,
-            v_target_outcome=v_target_outcome,
-            v_target_distance=v_target_distance,
+            **native_target_values,
         )
         sample = assert_batch_axis_sharded(
             sample,
@@ -420,141 +333,19 @@ def make_compute_input_for_lossfn(
             return sample
 
         tree = data.tree_data
-
-        def feature_ndim(x: jax.Array) -> int:
-            return x.ndim - 2
-
-        def flatten_rows(x: jax.Array, keep_feature_ndim: int) -> jax.Array:
-            feature_shape = x.shape[x.ndim - keep_feature_ndim :] if keep_feature_ndim else ()
-            return x.reshape((x.shape[0], -1, *feature_shape))
-
-        root_obs = flatten_rows(sample.obs, feature_ndim(sample.obs))
-        tree_obs = flatten_rows(tree.obs, feature_ndim(sample.obs))
-        root_policy_tgt = flatten_rows(sample.policy_tgt, feature_ndim(sample.policy_tgt))
-        tree_policy_tgt = flatten_rows(tree.action_weights, feature_ndim(sample.policy_tgt))
-        root_value_tgt = flatten_rows(sample.value_tgt, feature_ndim(sample.value_tgt))
-        tree_value_tgt = flatten_rows(tree.value_tgt, feature_ndim(sample.value_tgt))
-        root_played_action = flatten_rows(sample.played_action, feature_ndim(sample.played_action))
-        tree_played_action = flatten_rows(tree.played_action, feature_ndim(sample.played_action))
-        root_policy_mask = flatten_rows(sample.policy_mask, feature_ndim(sample.policy_mask))
-        tree_policy_mask = flatten_rows(tree.legal_action_mask, feature_ndim(sample.policy_mask))
-        root_beta_q = flatten_rows(sample.beta_Q_target, feature_ndim(sample.beta_Q_target))
-        tree_beta_q = flatten_rows(tree.beta_Q_target, feature_ndim(sample.beta_Q_target))
-        root_beta_v = flatten_rows(sample.beta_V_target, feature_ndim(sample.beta_V_target))
-        tree_beta_v = flatten_rows(tree.beta_V_target, feature_ndim(sample.beta_V_target))
-        root_q_weight = flatten_rows(sample.q_loss_weight, feature_ndim(sample.q_loss_weight))
-        tree_q_weight = flatten_rows(tree.q_loss_weight, feature_ndim(sample.q_loss_weight))
-        tree_q_defaults = _tree_native_defaults(tree.beta_Q_target, tree.beta_V_target)
-        tree_q_defaults = assert_batch_axis_sharded(
-            tree_q_defaults,
+        tree_native_defaults = native_fields_from_beta(
+            tree.beta_Q_target,
+            tree.beta_V_target,
+        )
+        tree_native_defaults = assert_batch_axis_sharded(
+            tree_native_defaults,
             parallel,
             batch_axis=0,
             label="loss tree native_defaults",
         )
-        root_q_kind = flatten_rows(native_fields.q_target_kind, feature_ndim(native_fields.q_target_kind))
-        tree_q_kind = flatten_rows(
-            _tree_field_or_default(tree, tree_q_defaults, "q_target_kind"),
-            feature_ndim(native_fields.q_target_kind),
-        )
-        root_q_target_weight = flatten_rows(
-            native_fields.q_target_weight,
-            feature_ndim(native_fields.q_target_weight),
-        )
-        tree_q_target_weight = flatten_rows(
-            _tree_field_or_default(tree, tree_q_defaults, "q_target_weight"),
-            feature_ndim(native_fields.q_target_weight),
-        )
-        root_q_outcome = flatten_rows(
-            native_fields.q_target_outcome,
-            feature_ndim(native_fields.q_target_outcome),
-        )
-        tree_q_outcome = flatten_rows(
-            _tree_field_or_default(tree, tree_q_defaults, "q_target_outcome"),
-            feature_ndim(native_fields.q_target_outcome),
-        )
-        root_q_distance = flatten_rows(
-            native_fields.q_target_distance,
-            feature_ndim(native_fields.q_target_distance),
-        )
-        tree_q_distance = flatten_rows(
-            _tree_field_or_default(tree, tree_q_defaults, "q_target_distance"),
-            feature_ndim(native_fields.q_target_distance),
-        )
-        root_v_kind = flatten_rows(native_fields.v_target_kind, feature_ndim(native_fields.v_target_kind))
-        tree_v_kind = flatten_rows(
-            _tree_field_or_default(tree, tree_q_defaults, "v_target_kind"),
-            feature_ndim(native_fields.v_target_kind),
-        )
-        root_v_target_weight = flatten_rows(
-            native_fields.v_target_weight,
-            feature_ndim(native_fields.v_target_weight),
-        )
-        tree_v_target_weight = flatten_rows(
-            _tree_field_or_default(tree, tree_q_defaults, "v_target_weight"),
-            feature_ndim(native_fields.v_target_weight),
-        )
-        root_v_outcome = flatten_rows(
-            native_fields.v_target_outcome,
-            feature_ndim(native_fields.v_target_outcome),
-        )
-        tree_v_outcome = flatten_rows(
-            _tree_field_or_default(tree, tree_q_defaults, "v_target_outcome"),
-            feature_ndim(native_fields.v_target_outcome),
-        )
-        root_v_distance = flatten_rows(
-            native_fields.v_target_distance,
-            feature_ndim(native_fields.v_target_distance),
-        )
-        tree_v_distance = flatten_rows(
-            _tree_field_or_default(tree, tree_q_defaults, "v_target_distance"),
-            feature_ndim(native_fields.v_target_distance),
-        )
-        root_policy_loss_mask = flatten_rows(policy_loss_mask, feature_ndim(policy_loss_mask))
-        tree_policy_loss_mask = flatten_rows(tree.policy_loss_mask, feature_ndim(policy_loss_mask))
-        root_value_loss_mask = flatten_rows(sample.value_loss_mask, feature_ndim(sample.value_loss_mask))
-        tree_value_loss_mask = flatten_rows(tree.value_loss_mask, feature_ndim(sample.value_loss_mask))
-        root_search_loss_mask = flatten_rows(search_loss_mask, feature_ndim(search_loss_mask))
-        tree_search_loss_mask = flatten_rows(tree.search_loss_mask, feature_ndim(search_loss_mask))
-        root_outcome_mask = flatten_rows(value_mask, feature_ndim(value_mask))
-        tree_outcome_mask = flatten_rows(tree.outcome_mask, feature_ndim(value_mask))
-
-        sample = Sample(
-            obs=jnp.concatenate([root_obs, tree_obs], axis=1),
-            policy_tgt=jnp.concatenate([root_policy_tgt, tree_policy_tgt], axis=1),
-            value_tgt=jnp.concatenate([root_value_tgt, tree_value_tgt], axis=1),
-            played_action=jnp.concatenate([root_played_action, tree_played_action], axis=1),
-            policy_mask=jnp.concatenate([root_policy_mask, tree_policy_mask], axis=1),
-            value_mask=jnp.concatenate([root_value_loss_mask, tree_value_loss_mask], axis=1),
-            beta_Q_target=jnp.concatenate([root_beta_q, tree_beta_q], axis=1),
-            beta_V_target=jnp.concatenate([root_beta_v, tree_beta_v], axis=1),
-            q_loss_weight=jnp.concatenate([root_q_weight, tree_q_weight], axis=1),
-            policy_loss_mask=jnp.concatenate(
-                [root_policy_loss_mask, tree_policy_loss_mask],
-                axis=1,
-            ),
-            value_loss_mask=jnp.concatenate(
-                [root_value_loss_mask, tree_value_loss_mask],
-                axis=1,
-            ),
-            search_loss_mask=jnp.concatenate(
-                [root_search_loss_mask, tree_search_loss_mask],
-                axis=1,
-            ),
-            outcome_mask=jnp.concatenate([root_outcome_mask, tree_outcome_mask], axis=1),
-            q_target_kind=jnp.concatenate([root_q_kind, tree_q_kind], axis=1),
-            q_target_weight=jnp.concatenate(
-                [root_q_target_weight, tree_q_target_weight],
-                axis=1,
-            ),
-            q_target_outcome=jnp.concatenate([root_q_outcome, tree_q_outcome], axis=1),
-            q_target_distance=jnp.concatenate([root_q_distance, tree_q_distance], axis=1),
-            v_target_kind=jnp.concatenate([root_v_kind, tree_v_kind], axis=1),
-            v_target_weight=jnp.concatenate(
-                [root_v_target_weight, tree_v_target_weight],
-                axis=1,
-            ),
-            v_target_outcome=jnp.concatenate([root_v_outcome, tree_v_outcome], axis=1),
-            v_target_distance=jnp.concatenate([root_v_distance, tree_v_distance], axis=1),
+        sample = _concat_sample_rows(
+            sample._replace(value_mask=sample.value_loss_mask),
+            _tree_as_sample(tree, tree_native_defaults),
         )
         return assert_batch_axis_sharded(
             sample,
@@ -609,46 +400,25 @@ def _mask_or(mask: jax.Array | None, fallback: jax.Array) -> jax.Array:
     return fallback if mask is None else mask
 
 
+def _native_target_values(source: Any) -> dict[str, jax.Array | None]:
+    return {field: getattr(source, field) for field in _NATIVE_TARGET_FIELD_NAMES}
+
+
+def _native_fields_from_values(
+    values: dict[str, jax.Array | None],
+    defaults: dict[str, jax.Array],
+) -> _NativeTargetFields:
+    return _NativeTargetFields(
+        **{
+            field: defaults[field] if values[field] is None else values[field]
+            for field in _NATIVE_TARGET_FIELD_NAMES
+        }
+    )
+
+
 def _native_target_fields(sample: Sample) -> _NativeTargetFields:
     defaults = native_fields_from_beta(sample.beta_Q_target, sample.beta_V_target)
-    return _NativeTargetFields(
-        q_target_kind=(
-            defaults["q_target_kind"] if sample.q_target_kind is None else sample.q_target_kind
-        ),
-        q_target_weight=(
-            defaults["q_target_weight"]
-            if sample.q_target_weight is None
-            else sample.q_target_weight
-        ),
-        q_target_outcome=(
-            defaults["q_target_outcome"]
-            if sample.q_target_outcome is None
-            else sample.q_target_outcome
-        ),
-        q_target_distance=(
-            defaults["q_target_distance"]
-            if sample.q_target_distance is None
-            else sample.q_target_distance
-        ),
-        v_target_kind=(
-            defaults["v_target_kind"] if sample.v_target_kind is None else sample.v_target_kind
-        ),
-        v_target_weight=(
-            defaults["v_target_weight"]
-            if sample.v_target_weight is None
-            else sample.v_target_weight
-        ),
-        v_target_outcome=(
-            defaults["v_target_outcome"]
-            if sample.v_target_outcome is None
-            else sample.v_target_outcome
-        ),
-        v_target_distance=(
-            defaults["v_target_distance"]
-            if sample.v_target_distance is None
-            else sample.v_target_distance
-        ),
-    )
+    return _native_fields_from_values(_native_target_values(sample), defaults)
 
 
 def _with_native_defaults(
@@ -657,25 +427,47 @@ def _with_native_defaults(
 ) -> Sample:
     if native_fields is None:
         native_fields = _native_target_fields(sample)
-    return sample._replace(
-        q_target_kind=native_fields.q_target_kind,
-        q_target_weight=native_fields.q_target_weight,
-        q_target_outcome=native_fields.q_target_outcome,
-        q_target_distance=native_fields.q_target_distance,
-        v_target_kind=native_fields.v_target_kind,
-        v_target_weight=native_fields.v_target_weight,
-        v_target_outcome=native_fields.v_target_outcome,
-        v_target_distance=native_fields.v_target_distance,
+    return sample._replace(**native_fields._asdict())
+
+
+def _tree_as_sample(tree: Any, native_defaults: dict[str, jax.Array]) -> Sample:
+    fields = {
+        sample_field: getattr(tree, tree_field)
+        for sample_field, tree_field in _TREE_TO_SAMPLE_FIELDS.items()
+    }
+    fields.update(
+        _native_fields_from_values(
+            _native_target_values(tree),
+            native_defaults,
+        )._asdict()
+    )
+    return Sample(**fields)
+
+
+def _flatten_rows_like(reference: jax.Array, value: jax.Array) -> jax.Array:
+    keep_feature_ndim = reference.ndim - 2
+    feature_shape = value.shape[-keep_feature_ndim:] if keep_feature_ndim else ()
+    return value.reshape((value.shape[0], -1, *feature_shape))
+
+
+def _concat_sample_rows(root: Sample, tree: Sample) -> Sample:
+    return jax.tree_util.tree_map(
+        lambda root_leaf, tree_leaf: jnp.concatenate(
+            [
+                _flatten_rows_like(root_leaf, root_leaf),
+                _flatten_rows_like(root_leaf, tree_leaf),
+            ],
+            axis=1,
+        ),
+        root,
+        tree,
     )
 
 
-def _tree_native_defaults(beta_q: jax.Array, beta_v: jax.Array) -> dict[str, jax.Array]:
-    return native_fields_from_beta(beta_q, beta_v)
-
-
-def _tree_field_or_default(tree, defaults: dict[str, jax.Array], field: str) -> jax.Array:
-    value = getattr(tree, field)
-    return defaults[field] if value is None else value
+def _zero_train_metrics_like(reference: jax.Array, **values: jax.Array) -> TrainMetrics:
+    fields = {field: jnp.zeros_like(reference) for field in TrainMetrics._fields}
+    fields.update(values)
+    return TrainMetrics(**fields)
 
 
 def _compute_losses(logits: jax.Array, value: jax.Array, data: Sample) -> tuple[jax.Array, jax.Array]:
@@ -862,7 +654,8 @@ def _compute_dirichlet_losses(
         + config.training.losses.value_outcome_weight * value_outcome_loss
         + config.training.losses.q_outcome_weight * q_outcome_loss
     )
-    metrics = TrainMetrics(
+    metrics = _zero_train_metrics_like(
+        policy_loss,
         policy_loss=policy_loss,
         value_loss=value_dir_kl_loss,
         policy_nll_loss=policy_loss,
@@ -875,16 +668,6 @@ def _compute_dirichlet_losses(
         alpha_V_concentration=alpha_v_concentration,
         alpha_Q_concentration=alpha_q_concentration,
         q_loss_weight_mean=q_loss_weight_mean,
-        search_path_depth_mean=jnp.zeros_like(policy_loss),
-        search_path_depth_p50=jnp.zeros_like(policy_loss),
-        search_path_depth_p90=jnp.zeros_like(policy_loss),
-        search_path_depth_max=jnp.zeros_like(policy_loss),
-        search_expanded_nodes=jnp.zeros_like(policy_loss),
-        search_terminal_fraction=jnp.zeros_like(policy_loss),
-        search_root_policy_entropy=jnp.zeros_like(policy_loss),
-        search_root_gamma=jnp.zeros_like(policy_loss),
-        search_root_downstream_eval_count=jnp.zeros_like(policy_loss),
-        search_root_q_concentration=jnp.zeros_like(policy_loss),
     )
     return total_loss, metrics
 
@@ -895,29 +678,11 @@ def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
         if len(output) == 2:
             logits, value = output
             policy_loss, value_loss = _compute_losses(logits, value, data)
-            metrics = TrainMetrics(
+            metrics = _zero_train_metrics_like(
+                policy_loss,
                 policy_loss=policy_loss,
                 value_loss=value_loss,
                 policy_nll_loss=policy_loss,
-                policy_kl_hat=jnp.zeros_like(policy_loss),
-                policy_target_entropy=jnp.zeros_like(policy_loss),
-                value_dir_kl_loss=jnp.zeros_like(value_loss),
-                q_dir_kl_loss=jnp.zeros_like(value_loss),
-                value_outcome_loss=jnp.zeros_like(value_loss),
-                q_outcome_loss=jnp.zeros_like(value_loss),
-                alpha_V_concentration=jnp.zeros_like(value_loss),
-                alpha_Q_concentration=jnp.zeros_like(value_loss),
-                q_loss_weight_mean=jnp.zeros_like(value_loss),
-                search_path_depth_mean=jnp.zeros_like(value_loss),
-                search_path_depth_p50=jnp.zeros_like(value_loss),
-                search_path_depth_p90=jnp.zeros_like(value_loss),
-                search_path_depth_max=jnp.zeros_like(value_loss),
-                search_expanded_nodes=jnp.zeros_like(value_loss),
-                search_terminal_fraction=jnp.zeros_like(value_loss),
-                search_root_policy_entropy=jnp.zeros_like(value_loss),
-                search_root_gamma=jnp.zeros_like(value_loss),
-                search_root_downstream_eval_count=jnp.zeros_like(value_loss),
-                search_root_q_concentration=jnp.zeros_like(value_loss),
             )
             return policy_loss + value_loss, metrics
 
