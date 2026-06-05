@@ -116,13 +116,16 @@ def _empty_posterior_targets(
     policy_target: jax.Array,
     num_outcomes: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    batch_size, num_actions = policy_target.shape
-    beta_q = jnp.zeros(
-        (batch_size, num_actions, num_outcomes),
-        dtype=policy_target.dtype,
+    q_loss_weight = policy_target * jnp.asarray(0.0, dtype=policy_target.dtype)
+    beta_q = jnp.broadcast_to(
+        q_loss_weight[..., None],
+        policy_target.shape + (num_outcomes,),
     )
-    beta_v = jnp.zeros((batch_size, num_outcomes), dtype=policy_target.dtype)
-    q_loss_weight = jnp.zeros((batch_size, num_actions), dtype=policy_target.dtype)
+    beta_v_seed = jnp.sum(q_loss_weight, axis=-1, keepdims=True)
+    beta_v = jnp.broadcast_to(
+        beta_v_seed,
+        policy_target.shape[:-1] + (num_outcomes,),
+    )
     return beta_q, beta_v, q_loss_weight
 
 
@@ -294,7 +297,7 @@ def _run_dirichlet_search(
     recurrent_fn,
     rng_key: jax.Array,
     config,
-    action_source: str | None = None,
+    action_source: str,
 ) -> _SearchStepOutput:
     logits, alpha_v, alpha_q = model_output
     root = _make_dirichlet_root(env_state, logits, alpha_v, alpha_q)
@@ -356,7 +359,7 @@ def _run_dirichlet_search(
         posterior_policy_target,
     )
     played_action = _select_played_action(
-        _selfplay_action_source(config) if action_source is None else action_source,
+        action_source,
         action_key,
         posterior_policy_target,
         env_state.legal_action_mask,
@@ -381,10 +384,8 @@ def _run_model_search(
     model_output,
     scalar_recurrent_fn,
     dirichlet_recurrent_fn,
-    search_key: jax.Array,
+    rng_key: jax.Array,
     config,
-    *,
-    action_source: str | None = None,
 ) -> _SearchStepOutput:
     search_kind = _search_kind(config)
     if search_kind == SearchKind.dqaz:
@@ -401,52 +402,16 @@ def _run_model_search(
             env_state=env_state,
             model_output=model_output,
             recurrent_fn=scalar_recurrent_fn,
-            rng_key=search_key,
+            rng_key=rng_key,
             config=config,
         )
     return _run_dirichlet_search(
         env_state=env_state,
         model_output=model_output,
         recurrent_fn=dirichlet_recurrent_fn,
-        rng_key=search_key,
-        config=config,
-        action_source=action_source,
-    )
-
-
-def _run_model_eval_search(
-    *,
-    env_state: pgx.State,
-    model_output,
-    scalar_recurrent_fn,
-    dirichlet_recurrent_fn,
-    rng_key: jax.Array,
-    config,
-) -> _SearchStepOutput:
-    search_kind = _search_kind(config)
-    if search_kind == SearchKind.dqaz:
-        raise RuntimeError(
-            "DQAZ search uses the native posterior-tree path, not the JAX "
-            "model-eval search path."
-        )
-    if (
-        len(model_output) == 3
-        and search_kind == SearchKind.dirichlet_thompson
-    ):
-        return _run_dirichlet_search(
-            env_state=env_state,
-            model_output=model_output,
-            recurrent_fn=dirichlet_recurrent_fn,
-            rng_key=rng_key,
-            config=config,
-            action_source="posterior_argmax",
-        )
-    return _run_scalar_gumbel_search(
-        env_state=env_state,
-        model_output=model_output,
-        recurrent_fn=scalar_recurrent_fn,
         rng_key=rng_key,
         config=config,
+        action_source=_selfplay_action_source(config), 
     )
 
 

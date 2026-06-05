@@ -9,7 +9,7 @@ from typing import Any, Iterator
 import jax
 from jax import numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 
 @dataclass(frozen=True)
@@ -20,21 +20,21 @@ class BatchParallel:
 
     @property
     def device_count(self) -> int:
-        if self.mesh is None:
+        if not self.enabled or self.mesh is None:
             return 1
         return int(np.asarray(self.mesh.devices).size)
 
     @contextmanager
     def mesh_context(self) -> Iterator[None]:
-        if self.mesh is None:
+        if not self.enabled or self.mesh is None:
             with nullcontext():
                 yield
             return
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             yield
 
     def sharding_for(self, ndim: int, batch_axis: int = 0) -> NamedSharding | None:
-        if self.mesh is None or ndim <= batch_axis:
+        if not self.enabled or self.mesh is None or ndim <= batch_axis:
             return None
         axes: list[str | None] = [None] * ndim
         axes[batch_axis] = self.axis_name
@@ -67,10 +67,24 @@ def make_batch_parallel(config: Any, axis_name: str = "batch") -> BatchParallel:
     if not devices:
         raise RuntimeError("JAX reported no devices for batch-parallel training.")
 
-    mesh = jax.make_mesh((len(devices),), (axis_name,))
+    mesh = jax.make_mesh(
+        (len(devices),),
+        (axis_name,),
+        axis_types=(AxisType.Auto,),
+    )
     parallel = BatchParallel(enabled=True, axis_name=axis_name, mesh=mesh)
-    for batch_size in [config.selfplay.batch_size, config.training.batch_size]:
-        assert batch_size % len(devices) == 0, f"batch_size ({batch_size}) must be divisible by number of devices ({len(devices)})"
+    batch_sizes = {
+        "selfplay.batch_size": config.selfplay.batch_size,
+        "training.batch_size": config.training.batch_size,
+    }
+    if config.eval.interval > 0:
+        batch_sizes["eval.batch_size"] = config.eval.batch_size
+    for name, batch_size in batch_sizes.items():
+        if batch_size % len(devices) != 0:
+            raise ValueError(
+                f"{name} ({batch_size}) must be divisible by number of "
+                f"devices ({len(devices)})."
+            )
     return parallel
 
 
@@ -92,3 +106,37 @@ def constrain_batch_axis(
         return jax.lax.with_sharding_constraint(leaf, sharding)
 
     return jax.tree_util.tree_map(constrain_leaf, value)
+
+
+def assert_batch_axis_sharded(
+    value: Any,
+    parallel: BatchParallel | None,
+    *,
+    batch_axis: int = 0,
+    label: str = "value",
+) -> Any:
+    if parallel is None or not parallel.enabled:
+        return value
+
+    def assert_leaf(path, leaf: Any) -> Any:
+        if not isinstance(leaf, jax.Array):
+            return leaf
+        expected = parallel.sharding_for(leaf.ndim, batch_axis=batch_axis)
+        if expected is None:
+            return leaf
+
+        leaf_ndim = leaf.ndim
+        leaf_label = f"{label}{jax.tree_util.keystr(path)}"
+
+        def check_sharding(actual) -> None:
+            if expected.is_equivalent_to(actual, leaf_ndim):
+                return
+            raise ValueError(
+                f"{leaf_label} has sharding {actual!r}; expected equivalent "
+                f"to {expected!r}"
+            )
+
+        jax.debug.inspect_array_sharding(leaf, callback=check_sharding)
+        return leaf
+
+    return jax.tree_util.tree_map_with_path(assert_leaf, value)

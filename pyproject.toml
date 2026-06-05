@@ -7,7 +7,7 @@ requires-python = "==3.13.*"
 dependencies = [
     "dqaz",
     "einops",
-    "jax[tpu]",
+    "jax[tpu]>=0.10.0",
     "matplotlib",
     "tqdm",
     "wandb",
@@ -17,7 +17,7 @@ dependencies = [
     "ipykernel>=7.1.0",
     "mctx ==0.0.6",
     "pgx>=2.6.0",
-    "flax",
+    "flax>=0.12.7",
     "optax",
     "dm-haiku",
     "jaxtyping>=0.3.9",

@@ -43,40 +43,26 @@ def categorical_target(outcome: int, distance: int) -> NativeTarget:
     )
 
 
-def empty_q_native(
-    beta_q: Any,
-    *,
-    kind: int = int(TARGET_DIRICHLET),
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    beta_q = jnp.asarray(beta_q)
-    target_shape = beta_q.shape[:-1]
-    target_kind = jnp.full(target_shape, int(kind), dtype=jnp.int8)
-    target_weight = jnp.ones(target_shape, dtype=beta_q.dtype)
-    target_outcome = jnp.full(target_shape, int(NO_OUTCOME), dtype=jnp.int8)
-    target_distance = jnp.full(target_shape, int(NO_DISTANCE), dtype=jnp.int32)
+def _full_like_input_sharding(source: jax.Array, value: Any, dtype: Any) -> jax.Array:
+    # Plain full_like/ones_like constants can be replicated under jit.
+    # Keep a zero-valued dependency so defaults inherit source sharding.
+    zero = jax.lax.stop_gradient(source - jax.lax.stop_gradient(source))
+    return zero.astype(dtype) + jnp.asarray(value, dtype=dtype)
+
+
+def _empty_native(beta: Any, *, kind: int = int(TARGET_DIRICHLET)) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    beta = jnp.asarray(beta)
+    target = beta[..., 0]
+    target_kind = _full_like_input_sharding(target, int(kind), jnp.int8)
+    target_weight = _full_like_input_sharding(target, 1.0, beta.dtype)
+    target_outcome = _full_like_input_sharding(target, int(NO_OUTCOME), jnp.int8)
+    target_distance = _full_like_input_sharding(target, int(NO_DISTANCE), jnp.int32)
     return target_kind, target_weight, target_outcome, target_distance
 
 
-def empty_v_native(
-    beta_v: Any,
-    *,
-    kind: int = int(TARGET_DIRICHLET),
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    beta_v = jnp.asarray(beta_v)
-    target_shape = beta_v.shape[:-1]
-    target_kind = jnp.full(target_shape, int(kind), dtype=jnp.int8)
-    target_weight = jnp.ones(target_shape, dtype=beta_v.dtype)
-    target_outcome = jnp.full(target_shape, int(NO_OUTCOME), dtype=jnp.int8)
-    target_distance = jnp.full(target_shape, int(NO_DISTANCE), dtype=jnp.int32)
-    return target_kind, target_weight, target_outcome, target_distance
-
-
-def native_fields_from_beta(
-    beta_q: Any,
-    beta_v: Any,
-) -> dict[str, jax.Array]:
-    q_kind, q_weight, q_outcome, q_distance = empty_q_native(beta_q)
-    v_kind, v_weight, v_outcome, v_distance = empty_v_native(beta_v)
+def native_fields_from_beta(beta_q: Any, beta_v: Any) -> dict[str, jax.Array]:
+    q_kind, q_weight, q_outcome, q_distance = _empty_native(beta_q)
+    v_kind, v_weight, v_outcome, v_distance = _empty_native(beta_v)
     return {
         "q_target_kind": q_kind,
         "q_target_weight": q_weight,

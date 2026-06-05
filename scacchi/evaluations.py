@@ -5,8 +5,14 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 
+from .distributed import (
+    DISABLED_BATCH_PARALLEL,
+    BatchParallel,
+    assert_batch_axis_sharded,
+    constrain_batch_axis,
+)
 from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
-from .play_search import _run_model_eval_search
+from .play_search import _run_model_search
 
 
 def _predict(model: Any, obs: jax.Array):
@@ -88,34 +94,60 @@ def _make_model_mcts_policy(
     model,
     rng_key,
     env_state,
+    parallel,
     num_simulations=None,
 ):
     search_config = _with_eval_num_simulations(config, num_simulations)
     predict = lambda obs: _predict(model, obs)
     search_state = _searchable_eval_state(env_state)
+    search_state = assert_batch_axis_sharded(
+        search_state,
+        parallel,
+        batch_axis=0,
+        label="eval search_state",
+    )
     model_output = predict(search_state.observation)
-    return _run_model_eval_search(
+    model_output = assert_batch_axis_sharded(
+        model_output,
+        parallel,
+        batch_axis=0,
+        label="eval model_output",
+    )
+    search_output = _run_model_search(
         env_state=search_state,
         model_output=model_output,
         scalar_recurrent_fn=make_recurrent_fn(env, predict),
         dirichlet_recurrent_fn=make_dirichlet_recurrent_fn(env, predict, search_config),
         rng_key=rng_key,
-        config=search_config,
+        config=search_config, #TODO: make sure that the eval path has a different search config
+    )
+    return assert_batch_axis_sharded(
+        search_output,
+        parallel,
+        batch_axis=0,
+        label="eval search_output",
     )
 
 
-def _model_eval_action(env, config, model, rng_key, env_state):
+def _model_eval_action(env, config, model, rng_key, env_state, parallel):
     action = _make_model_mcts_policy(
         env,
         config,
         model,
         rng_key,
         env_state,
+        parallel,
     ).played_action
     return action
 
 
-def make_mcts_evaluate(env, config, baseline_model):
+def make_mcts_evaluate(
+    env,
+    config,
+    baseline_model,
+    parallel: BatchParallel | None = None,
+):
+    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     eval_batch_size = int(config.eval.batch_size)
 
     @nnx.jit
@@ -124,20 +156,36 @@ def make_mcts_evaluate(env, config, baseline_model):
         my_player = 0
 
         key, init_key = jax.random.split(rng_key)
-        init_keys = jax.random.split(init_key, eval_batch_size)
+        init_keys = parallel.split(init_key, eval_batch_size)
         env_state = jax.vmap(env.init)(init_keys)
+        env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
+        env_state = assert_batch_axis_sharded(
+            env_state,
+            parallel,
+            batch_axis=0,
+            label="eval env_state",
+        )
+        returns = jnp.zeros_like(env_state.terminated, dtype=jnp.float32)
 
         def body_fn(val):
             key, env_state, returns = val
             key, my_key, opp_key = jax.random.split(key, 3)
 
-            my_action = _model_eval_action(env, config, model, my_key, env_state)
+            my_action = _model_eval_action(
+                env,
+                config,
+                model,
+                my_key,
+                env_state,
+                parallel,
+            )
             opp_action = _model_eval_action(
                 env,
                 config,
                 baseline_model,
                 opp_key,
                 env_state,
+                parallel,
             )
 
             is_my_turn = env_state.current_player == my_player
@@ -147,6 +195,12 @@ def make_mcts_evaluate(env, config, baseline_model):
                 env,
                 env_state,
                 action,
+            )
+            env_state = assert_batch_axis_sharded(
+                env_state,
+                parallel,
+                batch_axis=0,
+                label="eval stepped_env_state",
             )
             reward = env_state.rewards[
                 jnp.arange(eval_batch_size),
@@ -159,8 +213,13 @@ def make_mcts_evaluate(env, config, baseline_model):
         _, _, returns = nnx.while_loop(
             lambda x: ~(x[1].terminated.all()) & ~(jnp.isnan(x[2]).any()),
             body_fn,
-            (key, env_state, jnp.zeros(eval_batch_size)),
+            (key, env_state, returns),
         )
-        return returns
+        return assert_batch_axis_sharded(
+            returns,
+            parallel,
+            batch_axis=0,
+            label="eval returns",
+        )
 
     return evaluate

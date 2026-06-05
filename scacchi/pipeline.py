@@ -6,7 +6,7 @@ from einops import rearrange
 from .loss import Sample, TrainMetrics, make_compute_input_for_lossfn, train
 from .play import make_selfplay
 from .play import SelfplayOutput
-from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, constrain_batch_axis
+from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, assert_batch_axis_sharded
 
 
 def make_minibatches(
@@ -18,11 +18,16 @@ def make_minibatches(
 ) -> Sample:
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     if samples.obs.ndim < 2:
-        raise ValueError("minibatching requires samples shaped [time, batch, ...].")
+        raise ValueError("minibatching requires samples shaped [batch, time, ...].")
 
-    samples = constrain_batch_axis(samples, parallel, batch_axis=1)
-    num_steps = samples.obs.shape[0]
-    batch_size = samples.obs.shape[1]
+    samples = assert_batch_axis_sharded(
+        samples,
+        parallel,
+        batch_axis=0,
+        label="minibatch samples",
+    )
+    batch_size = samples.obs.shape[0]
+    num_steps = samples.obs.shape[1]
     device_count = parallel.device_count if parallel.enabled else 1
     assert batch_size % device_count == 0, f"batch_size={batch_size} must be divisible by device_count={device_count}."
     assert training_batch_size % device_count == 0, f"training_batch_size={training_batch_size} must be divisible by device_count={device_count}."
@@ -39,7 +44,7 @@ def make_minibatches(
     local_row_ixs = jax.vmap(lambda key: jax.random.permutation(key, jnp.arange(local_rows))[:local_train_rows])(local_keys)
 
     def local_shuffle(x: jax.Array) -> jax.Array:
-        x = rearrange(x, "t (d b) ... -> d (t b) ...", d=device_count, b=local_batch_size)
+        x = rearrange(x, "(d b) t ... -> d (b t) ...", d=device_count, b=local_batch_size)
         x = jax.vmap(lambda local_x, ixs: local_x[ixs])(x, local_row_ixs)
         x = rearrange(x, "d (u b) ... -> u (d b) ...", u=num_updates, b=local_training_batch_size)
         return x
@@ -52,7 +57,7 @@ def _concat_selfplay_outputs(outputs: list[SelfplayOutput]) -> SelfplayOutput:
         return outputs[0]
 
     def concat_batch(*xs):
-        return jnp.concatenate(xs, axis=1)
+        return jnp.concatenate(xs, axis=0)
 
     tree_data = None
     if outputs[0].tree_data is not None:
@@ -158,12 +163,22 @@ def train_minibatches(
     parallel: BatchParallel | None = None,
 ) -> TrainMetrics:
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
-    minibatches = constrain_batch_axis(minibatches, parallel, batch_axis=1)
+    minibatches = assert_batch_axis_sharded(
+        minibatches,
+        parallel,
+        batch_axis=1,
+        label="train minibatches",
+    )
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def scan_step(state, minibatch):
         model, optimizer = state
-        minibatch = constrain_batch_axis(minibatch, parallel, batch_axis=0)
+        minibatch = assert_batch_axis_sharded(
+            minibatch,
+            parallel,
+            batch_axis=0,
+            label="train minibatch",
+        )
         metrics = train(model, optimizer, minibatch, config)
         return (model, optimizer), metrics
 
@@ -174,7 +189,7 @@ def train_minibatches(
 def make_training_iteration(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     selfplay = make_selfplay(env, config, parallel=parallel)
-    compute_input_for_lossfn = make_compute_input_for_lossfn(config)
+    compute_input_for_lossfn = make_compute_input_for_lossfn(config, parallel=parallel)
 
     @nnx.jit
     def train_from_selfplay_data(

@@ -210,7 +210,11 @@ def main(cfg: DictConfig) -> None:
 
         training_iteration = make_training_iteration(env, config, parallel=parallel)
 
-        evaluate = None if baseline_model is None else make_mcts_evaluate(env, config, baseline_model)
+        evaluate = (
+            None
+            if baseline_model is None
+            else make_mcts_evaluate(env, config, baseline_model, parallel=parallel)
+        )
 
         hours: float = 0.0
         frames: int = 0

@@ -13,6 +13,7 @@ from .dirichlet_tree.native import (
     dirichlet_nll_at_categorical,
     native_fields_from_beta,
 )
+from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, assert_batch_axis_sharded
 from .play import SelfplayOutput
 
 
@@ -87,9 +88,59 @@ class TrainMetrics(NamedTuple):
         return self.q_loss_weight_mean
 
 
-def make_compute_input_for_lossfn(config):
+def make_compute_input_for_lossfn(
+    config,
+    parallel: BatchParallel | None = None,
+):
+    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
+
     def compute_loss_input(data: SelfplayOutput) -> Sample:
-        value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
+        data = assert_batch_axis_sharded(
+            data,
+            parallel,
+            batch_axis=0,
+            label="loss input data",
+        )
+
+        def assert_native_targets(
+            label: str,
+            *,
+            q_target_kind=None,
+            q_target_weight=None,
+            q_target_outcome=None,
+            q_target_distance=None,
+            v_target_kind=None,
+            v_target_weight=None,
+            v_target_outcome=None,
+            v_target_distance=None,
+        ):
+            checked = assert_batch_axis_sharded(
+                {
+                    "q_target_kind": q_target_kind,
+                    "q_target_weight": q_target_weight,
+                    "q_target_outcome": q_target_outcome,
+                    "q_target_distance": q_target_distance,
+                    "v_target_kind": v_target_kind,
+                    "v_target_weight": v_target_weight,
+                    "v_target_outcome": v_target_outcome,
+                    "v_target_distance": v_target_distance,
+                },
+                parallel,
+                batch_axis=0,
+                label=label,
+            )
+            return (
+                checked["q_target_kind"],
+                checked["q_target_weight"],
+                checked["q_target_outcome"],
+                checked["q_target_distance"],
+                checked["v_target_kind"],
+                checked["v_target_weight"],
+                checked["v_target_outcome"],
+                checked["v_target_distance"],
+            )
+
+        value_mask = jnp.cumsum(data.terminated[:, ::-1], axis=1)[:, ::-1] >= 1
         legal_policy_mask = jnp.any(data.legal_action_mask, axis=-1)
         policy_target_mask = jnp.sum(data.action_weights, axis=-1) > 0
         search_loss_mask = (
@@ -98,17 +149,23 @@ def make_compute_input_for_lossfn(config):
             else policy_target_mask
         )
 
-        def body_fn(carry: jax.Array, i: jax.Array) -> tuple[jax.Array, jax.Array]:
-            ix = config.selfplay.max_num_steps - i - 1
-            value = data.reward[ix] + data.discount[ix] * carry
-            return value, value
+        def trajectory_value_targets(
+            reward: jax.Array,
+            discount: jax.Array,
+        ) -> jax.Array:
+            def body_fn(carry: jax.Array, inputs) -> tuple[jax.Array, jax.Array]:
+                step_reward, step_discount = inputs
+                value = step_reward + step_discount * carry
+                return value, value
 
-        _, value_tgt = jax.lax.scan(
-            body_fn,
-            jnp.zeros(data.reward.shape[1], dtype=data.reward.dtype),
-            jnp.arange(config.selfplay.max_num_steps),
-        )
-        value_tgt = value_tgt[::-1, :]
+            _, values = jax.lax.scan(
+                body_fn,
+                jnp.zeros((), dtype=reward.dtype),
+                (reward[::-1], discount[::-1]),
+            )
+            return values[::-1]
+
+        value_tgt = jax.vmap(trajectory_value_targets)(data.reward, data.discount)
         policy_tgt = jnp.asarray(data.action_weights)
         policy_loss_mask = legal_policy_mask & search_loss_mask
         value_loss_mask = search_loss_mask
@@ -142,6 +199,12 @@ def make_compute_input_for_lossfn(config):
         terminal_parent_targets = config.training.losses.terminal_parent_targets
         if terminal_edge_targets or terminal_parent_targets:
             native_defaults = native_fields_from_beta(beta_q_target, beta_v_target)
+            native_defaults = assert_batch_axis_sharded(
+                native_defaults,
+                parallel,
+                batch_axis=0,
+                label="loss native_defaults",
+            )
             q_target_kind = (
                 native_defaults["q_target_kind"] if q_target_kind is None else q_target_kind
             )
@@ -192,6 +255,26 @@ def make_compute_input_for_lossfn(config):
                 dtype=bool,
             )
             terminal_action_mask = data.terminated[..., None] & played_action_mask
+            (
+                q_target_kind,
+                q_target_weight,
+                q_target_outcome,
+                q_target_distance,
+                v_target_kind,
+                v_target_weight,
+                v_target_outcome,
+                v_target_distance,
+            ) = assert_native_targets(
+                "loss native_targets after defaults",
+                q_target_kind=q_target_kind,
+                q_target_weight=q_target_weight,
+                q_target_outcome=q_target_outcome,
+                q_target_distance=q_target_distance,
+                v_target_kind=v_target_kind,
+                v_target_weight=v_target_weight,
+                v_target_outcome=v_target_outcome,
+                v_target_distance=v_target_distance,
+            )
 
         if terminal_edge_targets:
             q_target_kind = jnp.where(
@@ -218,6 +301,26 @@ def make_compute_input_for_lossfn(config):
                 terminal_action_mask,
                 jnp.maximum(q_loss_weight, jnp.ones((), dtype=q_loss_weight.dtype)),
                 q_loss_weight,
+            )
+            (
+                q_target_kind,
+                q_target_weight,
+                q_target_outcome,
+                q_target_distance,
+                v_target_kind,
+                v_target_weight,
+                v_target_outcome,
+                v_target_distance,
+            ) = assert_native_targets(
+                "loss native_targets after terminal_edge_targets",
+                q_target_kind=q_target_kind,
+                q_target_weight=q_target_weight,
+                q_target_outcome=q_target_outcome,
+                q_target_distance=q_target_distance,
+                v_target_kind=v_target_kind,
+                v_target_weight=v_target_weight,
+                v_target_outcome=v_target_outcome,
+                v_target_distance=v_target_distance,
             )
 
         if terminal_parent_targets:
@@ -249,6 +352,26 @@ def make_compute_input_for_lossfn(config):
                 jnp.ones((), dtype=v_target_distance.dtype),
                 v_target_distance,
             )
+            (
+                q_target_kind,
+                q_target_weight,
+                q_target_outcome,
+                q_target_distance,
+                v_target_kind,
+                v_target_weight,
+                v_target_outcome,
+                v_target_distance,
+            ) = assert_native_targets(
+                "loss native_targets after terminal_parent_targets",
+                q_target_kind=q_target_kind,
+                q_target_weight=q_target_weight,
+                q_target_outcome=q_target_outcome,
+                q_target_distance=q_target_distance,
+                v_target_kind=v_target_kind,
+                v_target_weight=v_target_weight,
+                v_target_outcome=v_target_outcome,
+                v_target_distance=v_target_distance,
+            )
 
         sample = Sample(
             obs=data.obs,
@@ -273,113 +396,171 @@ def make_compute_input_for_lossfn(config):
             v_target_outcome=v_target_outcome,
             v_target_distance=v_target_distance,
         )
+        sample = assert_batch_axis_sharded(
+            sample,
+            parallel,
+            batch_axis=0,
+            label="loss sample before native defaults",
+        )
         native_fields = _native_target_fields(sample)
+        native_fields = assert_batch_axis_sharded(
+            native_fields,
+            parallel,
+            batch_axis=0,
+            label="loss native_fields final",
+        )
         sample = _with_native_defaults(sample, native_fields)
+        sample = assert_batch_axis_sharded(
+            sample,
+            parallel,
+            batch_axis=0,
+            label="loss sample after native defaults",
+        )
         if data.tree_data is None:
             return sample
 
         tree = data.tree_data
 
-        def flatten_root(x: jax.Array) -> jax.Array:
-            return x.reshape((-1, *x.shape[2:]))
+        def feature_ndim(x: jax.Array) -> int:
+            return x.ndim - 2
 
-        def wrap_rows(x: jax.Array) -> jax.Array:
-            return x[None, ...]
+        def flatten_rows(x: jax.Array, keep_feature_ndim: int) -> jax.Array:
+            feature_shape = x.shape[x.ndim - keep_feature_ndim :] if keep_feature_ndim else ()
+            return x.reshape((x.shape[0], -1, *feature_shape))
 
-        root_obs = flatten_root(sample.obs)
-        tree_obs = flatten_root(tree.obs)
-        root_policy_tgt = flatten_root(sample.policy_tgt)
-        tree_policy_tgt = flatten_root(tree.action_weights)
-        root_value_tgt = flatten_root(sample.value_tgt)
-        tree_value_tgt = flatten_root(tree.value_tgt)
-        root_played_action = flatten_root(sample.played_action)
-        tree_played_action = flatten_root(tree.played_action)
-        root_policy_mask = flatten_root(sample.policy_mask)
-        tree_policy_mask = flatten_root(tree.legal_action_mask)
-        root_beta_q = flatten_root(sample.beta_Q_target)
-        tree_beta_q = flatten_root(tree.beta_Q_target)
-        root_beta_v = flatten_root(sample.beta_V_target)
-        tree_beta_v = flatten_root(tree.beta_V_target)
-        root_q_weight = flatten_root(sample.q_loss_weight)
-        tree_q_weight = flatten_root(tree.q_loss_weight)
+        root_obs = flatten_rows(sample.obs, feature_ndim(sample.obs))
+        tree_obs = flatten_rows(tree.obs, feature_ndim(sample.obs))
+        root_policy_tgt = flatten_rows(sample.policy_tgt, feature_ndim(sample.policy_tgt))
+        tree_policy_tgt = flatten_rows(tree.action_weights, feature_ndim(sample.policy_tgt))
+        root_value_tgt = flatten_rows(sample.value_tgt, feature_ndim(sample.value_tgt))
+        tree_value_tgt = flatten_rows(tree.value_tgt, feature_ndim(sample.value_tgt))
+        root_played_action = flatten_rows(sample.played_action, feature_ndim(sample.played_action))
+        tree_played_action = flatten_rows(tree.played_action, feature_ndim(sample.played_action))
+        root_policy_mask = flatten_rows(sample.policy_mask, feature_ndim(sample.policy_mask))
+        tree_policy_mask = flatten_rows(tree.legal_action_mask, feature_ndim(sample.policy_mask))
+        root_beta_q = flatten_rows(sample.beta_Q_target, feature_ndim(sample.beta_Q_target))
+        tree_beta_q = flatten_rows(tree.beta_Q_target, feature_ndim(sample.beta_Q_target))
+        root_beta_v = flatten_rows(sample.beta_V_target, feature_ndim(sample.beta_V_target))
+        tree_beta_v = flatten_rows(tree.beta_V_target, feature_ndim(sample.beta_V_target))
+        root_q_weight = flatten_rows(sample.q_loss_weight, feature_ndim(sample.q_loss_weight))
+        tree_q_weight = flatten_rows(tree.q_loss_weight, feature_ndim(sample.q_loss_weight))
         tree_q_defaults = _tree_native_defaults(tree.beta_Q_target, tree.beta_V_target)
-        root_q_kind = flatten_root(native_fields.q_target_kind)
-        tree_q_kind = flatten_root(_tree_field_or_default(tree, tree_q_defaults, "q_target_kind"))
-        root_q_target_weight = flatten_root(native_fields.q_target_weight)
-        tree_q_target_weight = flatten_root(
-            _tree_field_or_default(tree, tree_q_defaults, "q_target_weight")
+        tree_q_defaults = assert_batch_axis_sharded(
+            tree_q_defaults,
+            parallel,
+            batch_axis=0,
+            label="loss tree native_defaults",
         )
-        root_q_outcome = flatten_root(native_fields.q_target_outcome)
-        tree_q_outcome = flatten_root(
-            _tree_field_or_default(tree, tree_q_defaults, "q_target_outcome")
+        root_q_kind = flatten_rows(native_fields.q_target_kind, feature_ndim(native_fields.q_target_kind))
+        tree_q_kind = flatten_rows(
+            _tree_field_or_default(tree, tree_q_defaults, "q_target_kind"),
+            feature_ndim(native_fields.q_target_kind),
         )
-        root_q_distance = flatten_root(native_fields.q_target_distance)
-        tree_q_distance = flatten_root(
-            _tree_field_or_default(tree, tree_q_defaults, "q_target_distance")
+        root_q_target_weight = flatten_rows(
+            native_fields.q_target_weight,
+            feature_ndim(native_fields.q_target_weight),
         )
-        root_v_kind = flatten_root(native_fields.v_target_kind)
-        tree_v_kind = flatten_root(_tree_field_or_default(tree, tree_q_defaults, "v_target_kind"))
-        root_v_target_weight = flatten_root(native_fields.v_target_weight)
-        tree_v_target_weight = flatten_root(
-            _tree_field_or_default(tree, tree_q_defaults, "v_target_weight")
+        tree_q_target_weight = flatten_rows(
+            _tree_field_or_default(tree, tree_q_defaults, "q_target_weight"),
+            feature_ndim(native_fields.q_target_weight),
         )
-        root_v_outcome = flatten_root(native_fields.v_target_outcome)
-        tree_v_outcome = flatten_root(
-            _tree_field_or_default(tree, tree_q_defaults, "v_target_outcome")
+        root_q_outcome = flatten_rows(
+            native_fields.q_target_outcome,
+            feature_ndim(native_fields.q_target_outcome),
         )
-        root_v_distance = flatten_root(native_fields.v_target_distance)
-        tree_v_distance = flatten_root(
-            _tree_field_or_default(tree, tree_q_defaults, "v_target_distance")
+        tree_q_outcome = flatten_rows(
+            _tree_field_or_default(tree, tree_q_defaults, "q_target_outcome"),
+            feature_ndim(native_fields.q_target_outcome),
         )
-        root_policy_loss_mask = flatten_root(policy_loss_mask)
-        tree_policy_loss_mask = flatten_root(tree.policy_loss_mask)
-        root_value_loss_mask = flatten_root(sample.value_loss_mask)
-        tree_value_loss_mask = flatten_root(tree.value_loss_mask)
-        root_search_loss_mask = flatten_root(search_loss_mask)
-        tree_search_loss_mask = flatten_root(tree.search_loss_mask)
-        root_outcome_mask = flatten_root(value_mask)
-        tree_outcome_mask = flatten_root(tree.outcome_mask)
+        root_q_distance = flatten_rows(
+            native_fields.q_target_distance,
+            feature_ndim(native_fields.q_target_distance),
+        )
+        tree_q_distance = flatten_rows(
+            _tree_field_or_default(tree, tree_q_defaults, "q_target_distance"),
+            feature_ndim(native_fields.q_target_distance),
+        )
+        root_v_kind = flatten_rows(native_fields.v_target_kind, feature_ndim(native_fields.v_target_kind))
+        tree_v_kind = flatten_rows(
+            _tree_field_or_default(tree, tree_q_defaults, "v_target_kind"),
+            feature_ndim(native_fields.v_target_kind),
+        )
+        root_v_target_weight = flatten_rows(
+            native_fields.v_target_weight,
+            feature_ndim(native_fields.v_target_weight),
+        )
+        tree_v_target_weight = flatten_rows(
+            _tree_field_or_default(tree, tree_q_defaults, "v_target_weight"),
+            feature_ndim(native_fields.v_target_weight),
+        )
+        root_v_outcome = flatten_rows(
+            native_fields.v_target_outcome,
+            feature_ndim(native_fields.v_target_outcome),
+        )
+        tree_v_outcome = flatten_rows(
+            _tree_field_or_default(tree, tree_q_defaults, "v_target_outcome"),
+            feature_ndim(native_fields.v_target_outcome),
+        )
+        root_v_distance = flatten_rows(
+            native_fields.v_target_distance,
+            feature_ndim(native_fields.v_target_distance),
+        )
+        tree_v_distance = flatten_rows(
+            _tree_field_or_default(tree, tree_q_defaults, "v_target_distance"),
+            feature_ndim(native_fields.v_target_distance),
+        )
+        root_policy_loss_mask = flatten_rows(policy_loss_mask, feature_ndim(policy_loss_mask))
+        tree_policy_loss_mask = flatten_rows(tree.policy_loss_mask, feature_ndim(policy_loss_mask))
+        root_value_loss_mask = flatten_rows(sample.value_loss_mask, feature_ndim(sample.value_loss_mask))
+        tree_value_loss_mask = flatten_rows(tree.value_loss_mask, feature_ndim(sample.value_loss_mask))
+        root_search_loss_mask = flatten_rows(search_loss_mask, feature_ndim(search_loss_mask))
+        tree_search_loss_mask = flatten_rows(tree.search_loss_mask, feature_ndim(search_loss_mask))
+        root_outcome_mask = flatten_rows(value_mask, feature_ndim(value_mask))
+        tree_outcome_mask = flatten_rows(tree.outcome_mask, feature_ndim(value_mask))
 
-        return Sample(
-            obs=wrap_rows(jnp.concatenate([root_obs, tree_obs], axis=0)),
-            policy_tgt=wrap_rows(jnp.concatenate([root_policy_tgt, tree_policy_tgt], axis=0)),
-            value_tgt=wrap_rows(jnp.concatenate([root_value_tgt, tree_value_tgt], axis=0)),
-            played_action=wrap_rows(jnp.concatenate([root_played_action, tree_played_action], axis=0)),
-            policy_mask=wrap_rows(jnp.concatenate([root_policy_mask, tree_policy_mask], axis=0)),
-            value_mask=wrap_rows(jnp.concatenate([root_value_loss_mask, tree_value_loss_mask], axis=0)),
-            beta_Q_target=wrap_rows(jnp.concatenate([root_beta_q, tree_beta_q], axis=0)),
-            beta_V_target=wrap_rows(jnp.concatenate([root_beta_v, tree_beta_v], axis=0)),
-            q_loss_weight=wrap_rows(jnp.concatenate([root_q_weight, tree_q_weight], axis=0)),
-            policy_loss_mask=wrap_rows(
-                jnp.concatenate([root_policy_loss_mask, tree_policy_loss_mask], axis=0)
+        sample = Sample(
+            obs=jnp.concatenate([root_obs, tree_obs], axis=1),
+            policy_tgt=jnp.concatenate([root_policy_tgt, tree_policy_tgt], axis=1),
+            value_tgt=jnp.concatenate([root_value_tgt, tree_value_tgt], axis=1),
+            played_action=jnp.concatenate([root_played_action, tree_played_action], axis=1),
+            policy_mask=jnp.concatenate([root_policy_mask, tree_policy_mask], axis=1),
+            value_mask=jnp.concatenate([root_value_loss_mask, tree_value_loss_mask], axis=1),
+            beta_Q_target=jnp.concatenate([root_beta_q, tree_beta_q], axis=1),
+            beta_V_target=jnp.concatenate([root_beta_v, tree_beta_v], axis=1),
+            q_loss_weight=jnp.concatenate([root_q_weight, tree_q_weight], axis=1),
+            policy_loss_mask=jnp.concatenate(
+                [root_policy_loss_mask, tree_policy_loss_mask],
+                axis=1,
             ),
-            value_loss_mask=wrap_rows(
-                jnp.concatenate([root_value_loss_mask, tree_value_loss_mask], axis=0)
+            value_loss_mask=jnp.concatenate(
+                [root_value_loss_mask, tree_value_loss_mask],
+                axis=1,
             ),
-            search_loss_mask=wrap_rows(
-                jnp.concatenate([root_search_loss_mask, tree_search_loss_mask], axis=0)
+            search_loss_mask=jnp.concatenate(
+                [root_search_loss_mask, tree_search_loss_mask],
+                axis=1,
             ),
-            outcome_mask=wrap_rows(jnp.concatenate([root_outcome_mask, tree_outcome_mask], axis=0)),
-            q_target_kind=wrap_rows(jnp.concatenate([root_q_kind, tree_q_kind], axis=0)),
-            q_target_weight=wrap_rows(
-                jnp.concatenate([root_q_target_weight, tree_q_target_weight], axis=0)
+            outcome_mask=jnp.concatenate([root_outcome_mask, tree_outcome_mask], axis=1),
+            q_target_kind=jnp.concatenate([root_q_kind, tree_q_kind], axis=1),
+            q_target_weight=jnp.concatenate(
+                [root_q_target_weight, tree_q_target_weight],
+                axis=1,
             ),
-            q_target_outcome=wrap_rows(
-                jnp.concatenate([root_q_outcome, tree_q_outcome], axis=0)
+            q_target_outcome=jnp.concatenate([root_q_outcome, tree_q_outcome], axis=1),
+            q_target_distance=jnp.concatenate([root_q_distance, tree_q_distance], axis=1),
+            v_target_kind=jnp.concatenate([root_v_kind, tree_v_kind], axis=1),
+            v_target_weight=jnp.concatenate(
+                [root_v_target_weight, tree_v_target_weight],
+                axis=1,
             ),
-            q_target_distance=wrap_rows(
-                jnp.concatenate([root_q_distance, tree_q_distance], axis=0)
-            ),
-            v_target_kind=wrap_rows(jnp.concatenate([root_v_kind, tree_v_kind], axis=0)),
-            v_target_weight=wrap_rows(
-                jnp.concatenate([root_v_target_weight, tree_v_target_weight], axis=0)
-            ),
-            v_target_outcome=wrap_rows(
-                jnp.concatenate([root_v_outcome, tree_v_outcome], axis=0)
-            ),
-            v_target_distance=wrap_rows(
-                jnp.concatenate([root_v_distance, tree_v_distance], axis=0)
-            ),
+            v_target_outcome=jnp.concatenate([root_v_outcome, tree_v_outcome], axis=1),
+            v_target_distance=jnp.concatenate([root_v_distance, tree_v_distance], axis=1),
+        )
+        return assert_batch_axis_sharded(
+            sample,
+            parallel,
+            batch_axis=0,
+            label="loss sample after tree concat",
         )
 
     return compute_loss_input
