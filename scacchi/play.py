@@ -82,6 +82,10 @@ def make_recurrent_fn(env, predict_fn):
 
 
 def make_dirichlet_recurrent_fn(env, predict_fn, config):
+    search_constants = config.search.active_constants()
+    kappa_terminal = float(search_constants.kappa_terminal)
+    kappa_leaf = float(search_constants.kappa_leaf)
+
     def recurrent_fn(_, rng_key: chex.PRNGKey, action: chex.Array, embedding: NodeEmbedding):
         del rng_key
 
@@ -98,8 +102,8 @@ def make_dirichlet_recurrent_fn(env, predict_fn, config):
         outcome_dist = jnp.where(env_state.terminated[..., None], terminal_child_outcome, nonterminal_outcome)
         evidence_weight = jnp.where(
             env_state.terminated,
-            jnp.asarray(config.search.constants.kappa_terminal, dtype=outcome_dist.dtype),
-            jnp.asarray(config.search.constants.kappa_leaf, dtype=outcome_dist.dtype),
+            jnp.asarray(kappa_terminal, dtype=outcome_dist.dtype),
+            jnp.asarray(kappa_leaf, dtype=outcome_dist.dtype),
         )
         root_action = jnp.where(embedding.root_action == NO_PARENT,action,embedding.root_action)
         depth_parity = 1 - embedding.depth_parity
@@ -209,11 +213,11 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             env_state: pgx.State,
             key: jax.Array,
         ) -> tuple[pgx.State, SelfplayOutput]:
-            search_key, posterior_key, action_key, reset_key = jax.random.split(key, 4)
+            search_key, reset_key = jax.random.split(key, 2)
             observation = env_state.observation
             legal_action_mask = env_state.legal_action_mask
             model_output = predict_fn(observation)
-            search_output = _run_model_search(env_state, model_output, recurrent_fn, dirichlet_recurrent_fn, search_key, posterior_key, action_key, config)
+            search_output = _run_model_search(env_state, model_output, recurrent_fn, dirichlet_recurrent_fn, search_key, config)
 
             actor = env_state.current_player
             reset_keys = parallel.split(reset_key, config.selfplay.batch_size)

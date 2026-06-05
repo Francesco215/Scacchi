@@ -605,7 +605,7 @@ def _compute_dirichlet_losses(
     policy_target_entropy = _masked_mean(policy_target_entropy, policy_loss_mask)
     policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
 
-    categorical_epsilon = float(config.search.constants.categorical_epsilon)
+    categorical_epsilon = float(config.search.active_constants().categorical_epsilon)
     value_dir_kl = _native_dirichlet_loss(
         data.beta_V_target,
         alpha_v,

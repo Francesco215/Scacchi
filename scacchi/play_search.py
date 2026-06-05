@@ -32,6 +32,7 @@ from .dirichlet_tree.native import (
 from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
 from .dqaz_jax_backup import BackupArrays, apply_batched_backup_block
 from .network import policy_value_from_output
+from .types import SearchKind
 
 
 _POSTERIOR_POLICY_TARGET_SAMPLES = 32
@@ -132,58 +133,24 @@ def _num_outcomes_for_config(config) -> int:
     return num_outcomes
 
 
-def _config_value(config: Any, path: tuple[str, ...], default: Any) -> Any:
-    value = config
-    for name in path:
-        if isinstance(value, dict):
-            if name not in value:
-                return default
-            value = value[name]
-            continue
-        if not hasattr(value, name):
-            return default
-        value = getattr(value, name)
-    return value
-
-
 def _search_value(config: Any, name: str, default: Any) -> Any:
-    return _config_value(
-        config,
-        ("search", name),
-        _config_value(config, (name,), default),
-    )
+    return getattr(config.search.active(), name, default)
 
 
 def _search_constant(config: Any, name: str, default: Any) -> Any:
-    return _config_value(
-        config,
-        ("search", "constants", name),
-        _config_value(config, (name,), default),
-    )
+    return getattr(config.search.active_constants(), name, default)
 
 
 def _policy_target_samples(config: Any) -> int:
-    return int(
-        _config_value(
-            config,
-            ("search", "monte_carlo", "policy_samples"),
-            _config_value(
-                config,
-                ("policy_mc_samples",),
-                _POSTERIOR_POLICY_TARGET_SAMPLES,
-            ),
-        )
-    )
+    return int(_search_value(config, "policy_samples", _POSTERIOR_POLICY_TARGET_SAMPLES))
+
+
+def _search_kind(config: Any) -> SearchKind:
+    return config.search.kind
 
 
 def _selfplay_action_source(config: Any) -> str:
-    return str(
-        _config_value(
-            config,
-            ("selfplay", "action_source"),
-            _config_value(config, ("selfplay_action_source",), "posterior_argmax"),
-        )
-    )
+    return str(config.selfplay.action_source)
 
 
 def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
@@ -297,10 +264,10 @@ def _run_scalar_gumbel_search(
         rng_key=rng_key,
         root=root,
         recurrent_fn=recurrent_fn,
-        num_simulations=config.search.num_simulations,
+        num_simulations=int(_search_value(config, "num_simulations", 32)),
         invalid_actions=~env_state.legal_action_mask,
         qtransform=mctx.qtransform_completed_by_mix_value,
-        gumbel_scale=1.0,
+        gumbel_scale=float(_search_value(config, "gumbel_scale", 1.0)),
     )
     policy_target = policy_output.action_weights
     beta_Q_target, beta_V_target, q_loss_weight = _empty_posterior_targets(
@@ -325,40 +292,40 @@ def _run_dirichlet_search(
     env_state: pgx.State,
     model_output,
     recurrent_fn,
-    search_key: jax.Array,
-    posterior_key: jax.Array,
-    action_key: jax.Array,
+    rng_key: jax.Array,
     config,
     action_source: str | None = None,
 ) -> _SearchStepOutput:
     logits, alpha_v, alpha_q = model_output
     root = _make_dirichlet_root(env_state, logits, alpha_v, alpha_q)
     action_value_prior = alpha_q
+    search_kind = _search_kind(config)
 
-    if config.search.policy == "dirichlet_thompson":
+    search_key, posterior_key, action_key = jax.random.split(rng_key, 3)
+    if search_kind == SearchKind.dirichlet_thompson:
         policy_output = dirichlet_q_policy(
             params=(),
             rng_key=search_key,
             root=root,
             recurrent_fn=recurrent_fn,
             action_value_prior=action_value_prior,
-            num_simulations=config.search.num_simulations,
+            num_simulations=int(_search_value(config, "num_simulations", 32)),
             invalid_actions=~env_state.legal_action_mask,
-            num_search_blocks=config.search.num_blocks,
+            num_search_blocks=int(_search_value(config, "num_blocks", 1)),
         )
         q_evidence_sum = policy_output.q_evidence_sum
         action_alpha_post = policy_output.alpha_search
         action_value_target_prior = action_alpha_post - q_evidence_sum
-    else:
+    elif search_kind == SearchKind.gumbel:
         policy_output = mctx.gumbel_muzero_policy(
             params=(),
             rng_key=search_key,
             root=root,
             recurrent_fn=recurrent_fn,
-            num_simulations=config.search.num_simulations,
+            num_simulations=int(_search_value(config, "num_simulations", 32)),
             invalid_actions=~env_state.legal_action_mask,
             qtransform=mctx.qtransform_completed_by_mix_value,
-            gumbel_scale=1.0,
+            gumbel_scale=float(_search_value(config, "gumbel_scale", 1.0)),
         )
         q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
         action_value_target_prior = root_action_value_priors_from_tree(
@@ -366,6 +333,11 @@ def _run_dirichlet_search(
             action_value_prior,
         )
         action_alpha_post = action_value_target_prior + q_evidence_sum
+    else:
+        raise RuntimeError(
+            f"{search_kind!r} search cannot run through the JAX model-search path. "
+            "Use the posterior-tree search entry point for DQAZ."
+        )
 
     posterior_policy_target = posterior_best_policy_target(
         posterior_key,
@@ -373,7 +345,7 @@ def _run_dirichlet_search(
         env_state.legal_action_mask,
         _policy_target_samples(config),
     )
-    if config.search.policy == "gumbel":
+    if search_kind == SearchKind.gumbel:
         policy_target = policy_output.action_weights
     else:
         policy_target = posterior_policy_target
@@ -410,13 +382,21 @@ def _run_model_search(
     scalar_recurrent_fn,
     dirichlet_recurrent_fn,
     search_key: jax.Array,
-    posterior_key: jax.Array,
-    action_key: jax.Array,
     config,
     *,
     action_source: str | None = None,
 ) -> _SearchStepOutput:
+    search_kind = _search_kind(config)
+    if search_kind == SearchKind.dqaz:
+        raise RuntimeError(
+            "DQAZ search uses the native posterior-tree path, not the JAX "
+            "model-search path."
+        )
     if len(model_output) == 2:
+        if search_kind != SearchKind.gumbel:
+            raise ValueError(
+                f"{search_kind!r} search requires a Dirichlet network output."
+            )
         return _run_scalar_gumbel_search(
             env_state=env_state,
             model_output=model_output,
@@ -428,9 +408,7 @@ def _run_model_search(
         env_state=env_state,
         model_output=model_output,
         recurrent_fn=dirichlet_recurrent_fn,
-        search_key=search_key,
-        posterior_key=posterior_key,
-        action_key=action_key,
+        rng_key=search_key,
         config=config,
         action_source=action_source,
     )
@@ -445,18 +423,21 @@ def _run_model_eval_search(
     rng_key: jax.Array,
     config,
 ) -> _SearchStepOutput:
+    search_kind = _search_kind(config)
+    if search_kind == SearchKind.dqaz:
+        raise RuntimeError(
+            "DQAZ search uses the native posterior-tree path, not the JAX "
+            "model-eval search path."
+        )
     if (
         len(model_output) == 3
-        and config.search.policy == "dirichlet_thompson"
+        and search_kind == SearchKind.dirichlet_thompson
     ):
-        search_key, posterior_key = jax.random.split(rng_key)
         return _run_dirichlet_search(
             env_state=env_state,
             model_output=model_output,
             recurrent_fn=dirichlet_recurrent_fn,
-            search_key=search_key,
-            posterior_key=posterior_key,
-            action_key=posterior_key,
+            rng_key=rng_key,
             config=config,
             action_source="posterior_argmax",
         )
@@ -484,8 +465,8 @@ def _run_posterior_tree_search_step(
             child_states = jax.vmap(env.step)(states, actions)
             return child_states, leaf_evaluator(child_states.observation)
 
-    search_backend = getattr(config, "search_backend", None)
-    if search_backend == "dqaz":
+    search_kind = _search_kind(config)
+    if search_kind == SearchKind.dqaz:
         search_output = _run_dqaz_posterior_tree_search(
             env=env,
             root_state_batch=env_state,
@@ -498,7 +479,7 @@ def _run_posterior_tree_search_step(
     else:
         raise RuntimeError(
             "Python posterior_tree search has been removed; use "
-            "search_backend='dqaz' for native posterior forest search."
+            "search.kind='dqaz' for native posterior forest search."
         )
     search_action = device_put_cpu(search_output.action)
     played_action = search_action
@@ -851,14 +832,14 @@ def _run_dqaz_posterior_tree_search(
             simulations_per_root=int(_search_value(config, "num_simulations", 1)),
             posterior_best_samples=_policy_target_samples(config),
             kappa_n=float(
-                _search_constant(
+                _search_value(
                     config,
                     "state_posterior_kappa_n",
                     _DQAZ_STATE_POSTERIOR_KAPPA_N,
                 )
             ),
             seed=seed,
-            debug=bool(getattr(config, "debug", False)),
+            debug=bool(_search_value(config, "debug", getattr(config, "debug", False))),
             max_pending_requests_per_root=int(_search_value(config, "inflight_limit", 1)),
         )
     )
@@ -900,8 +881,9 @@ def _run_dqaz_posterior_tree_search(
     profile_shapes: dict[tuple[int, int, int, int], int] = {}
 
     eval_batch_size = _eval_batch_size(config, batch_size)
-    pad_to = eval_batch_size if bool(getattr(config, "search_pad_to_eval_batch", False)) else None
-    use_jax_backup = bool(getattr(config, "search_jax_backup", True))
+    pad_to_eval_batch = bool(_search_value(config, "pad_to_eval_batch", False))
+    pad_to = eval_batch_size if pad_to_eval_batch else None
+    use_jax_backup = bool(_search_value(config, "jax_backup", True))
     jax_backup_step = 0
     while not engine.is_done(tree_ids):
         start = time.perf_counter() if profile_search else 0.0
@@ -990,7 +972,7 @@ def _run_dqaz_posterior_tree_search(
             np.asarray(child_rewards[:active_size], dtype=np.float32),
             current_players,
             epsilon=float(
-                _search_constant(
+                _search_value(
                     config,
                     "epsilon_terminal",
                     _DQAZ_EPSILON_TERMINAL,
@@ -1056,7 +1038,7 @@ def _run_dqaz_posterior_tree_search(
                     jnp.asarray(backup_inputs.leaf_alpha, dtype=jnp.float32),
                     jnp.asarray(backup_inputs.leaf_players, dtype=jnp.int32),
                     float(
-                        _search_constant(
+                        _search_value(
                             config,
                             "state_posterior_kappa_n",
                             _DQAZ_STATE_POSTERIOR_KAPPA_N,
@@ -1530,8 +1512,6 @@ def _select_active_states(
 
 def _eval_batch_size(config: Any, num_trees: int) -> int:
     configured = _search_value(config, "eval_batch_size", None)
-    if configured is None:
-        configured = _config_value(config, ("search_eval_batch_size",), None)
     if configured is None:
         return max(1, num_trees)
     return max(1, int(configured))

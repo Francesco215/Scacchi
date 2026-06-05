@@ -30,13 +30,15 @@ selfplay:
   action_source: posterior_sample
 
 search:
-  policy: dirichlet_thompson
-  num_simulations: 4
-  num_blocks: 8
+  kind: dirichlet_thompson
 
-  constants:
-    kappa_leaf: 1.0
-    kappa_terminal: 8.0
+  dirichlet_thompson:
+    num_simulations: 4
+    num_blocks: 8
+
+    constants:
+      kappa_leaf: 1.0
+      kappa_terminal: 8.0
 
 training:
   batch_size: 1024

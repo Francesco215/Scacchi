@@ -106,7 +106,7 @@ def test_build_model_supports_az_dirichlet_for_go_wdl3():
             num_channels=8,
             num_layers=1,
         ),
-        search=SearchConfig(policy="dirichlet_thompson"),
+        search=SearchConfig(kind="dirichlet_thompson"),
     )
 
     model = build_model(
@@ -128,7 +128,7 @@ def test_dirichlet_thompson_null_hex_outcomes_builds_legacy_two_outcome_head():
             num_channels=16,
             num_layers=2,
         ),
-        search=SearchConfig(policy="dirichlet_thompson"),
+        search=SearchConfig(kind="dirichlet_thompson"),
     )
 
     model = build_model(
@@ -152,7 +152,7 @@ def test_legacy_dirichlet_head_init_matches_runstate_initial_concentration():
             legacy_dirichlet_head_init=True,
             rezero_kernel_init="orthogonal",
         ),
-        search=SearchConfig(policy="dirichlet_thompson"),
+        search=SearchConfig(kind="dirichlet_thompson"),
     )
     model = build_model(
         config,

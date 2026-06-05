@@ -341,20 +341,8 @@ def dirichlet_q_policy(
 
     zero_q_evidence = jnp.zeros_like(action_value_prior)
     zero_action_weights = jnp.zeros_like(root.prior_logits)
-    (
-        alpha_search,
-        explored_action_mask,
-        q_evidence_total,
-        action_weights,
-    ), _ = jax.lax.scan(
-        block_body,
-        (
-            action_value_prior,
-            initial_explored_action_mask,
-            zero_q_evidence,
-            zero_action_weights,
-        ),
-        block_keys,
+    ( alpha_search, explored_action_mask, q_evidence_total, action_weights), _ = jax.lax.scan(
+        block_body,(action_value_prior, initial_explored_action_mask, zero_q_evidence, zero_action_weights),block_keys,
     )
 
     score = outcome_utility(outcome_mean(alpha_search))

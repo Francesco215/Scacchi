@@ -23,13 +23,15 @@ selfplay:
   action_source: posterior_sample  # Self-play action source: posterior_argmax/posterior_best, posterior_sample, or search_action.
 
 search:
-  policy: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
-  num_simulations: 32  # Search simulations per root.
-  num_blocks: 8  # Dirichlet Thompson search blocks.
+  kind: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
 
-  constants:
-    kappa_leaf: 1.0  # Nonterminal evidence mass used by Dirichlet-Q search.
-    kappa_terminal: 8.0  # Terminal evidence mass used by Dirichlet-Q search.
+  dirichlet_thompson:
+    num_simulations: 32  # Search simulations per root.
+    num_blocks: 8  # Dirichlet Thompson search blocks.
+
+    constants:
+      kappa_leaf: 1.0  # Nonterminal evidence mass used by Dirichlet-Q search.
+      kappa_terminal: 8.0  # Terminal evidence mass used by Dirichlet-Q search.
 
 training:
   batch_size: 1024  # Learner minibatch size; multiple updates per fresh self-play batch.

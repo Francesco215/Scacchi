@@ -20,6 +20,7 @@ from scacchi.pipeline import _fixed_replay_window, make_minibatches
 from scacchi.play import SelfplayOutput
 from scacchi.types import (
     Config,
+    GumbelSearchConfig,
     ModelConfig,
     SearchConfig,
     SearchConstantsConfig,
@@ -45,8 +46,10 @@ def _loss_config(
         model=ModelConfig(network="boardlaw_dirichlet"),
         selfplay=SelfplayConfig(max_num_steps=max_num_steps),
         search=SearchConfig(
-            constants=SearchConstantsConfig(
-                categorical_epsilon=categorical_epsilon,
+            gumbel=GumbelSearchConfig(
+                constants=SearchConstantsConfig(
+                    categorical_epsilon=categorical_epsilon,
+                ),
             ),
         ),
         training=TrainingConfig(

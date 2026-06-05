@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -7,6 +5,14 @@ import pgx
 
 from scacchi.dirichlet_tree.native import OUTCOME_DRAW, TARGET_CATEGORICAL
 from scacchi.play_search import _run_posterior_tree_search_step
+from scacchi.types import (
+    Config,
+    DQAZSearchConfig,
+    ModelConfig,
+    SearchConfig,
+    SearchConstantsConfig,
+    SelfplayConfig,
+)
 
 
 def _dumb_tic_tac_toe_model(obs):
@@ -24,18 +30,23 @@ def test_pgx_tic_tac_toe_forced_draw_root_uses_solved_policy():
     for action in [0, 1, 2, 4, 3, 6, 7, 5]:
         state = env.step(state, jnp.asarray(action, dtype=jnp.int32))
     root = jax.tree_util.tree_map(lambda value: value[None, ...], state)
-    config = SimpleNamespace(
-        search_backend="dqaz",
-        selfplay_action_source="posterior_argmax",
-        num_simulations=1,
-        policy_mc_samples=8,
-        state_posterior_kappa_n=4.0,
-        inflight_limit=1,
-        search_eval_batch_size=1,
-        search_pad_to_eval_batch=True,
-        search_jax_backup=True,
-        kappa_terminal=80.0,
-        epsilon_terminal=0.01,
+    config = Config(
+        model=ModelConfig(network="boardlaw_dirichlet"),
+        selfplay=SelfplayConfig(action_source="posterior_argmax"),
+        search=SearchConfig(
+            kind="dqaz",
+            dqaz=DQAZSearchConfig(
+                num_simulations=1,
+                policy_samples=8,
+                state_posterior_kappa_n=4.0,
+                inflight_limit=1,
+                eval_batch_size=1,
+                pad_to_eval_batch=True,
+                jax_backup=True,
+                epsilon_terminal=0.01,
+                constants=SearchConstantsConfig(kappa_terminal=80.0),
+            ),
+        ),
     )
 
     env_step = jax.jit(jax.vmap(env.step))

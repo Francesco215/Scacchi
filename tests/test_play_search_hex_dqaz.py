@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -9,6 +7,15 @@ from scacchi.play_search import (
     _flatten_padded_valid_actions_np,
     _padded_valid_actions_from_mask,
     _run_posterior_tree_search_step,
+)
+from scacchi.types import (
+    Config,
+    DQAZSearchConfig,
+    EnvConfig,
+    ModelConfig,
+    SearchConfig,
+    SearchConstantsConfig,
+    SelfplayConfig,
 )
 
 
@@ -76,18 +83,24 @@ def test_pgx_hex_dqaz_wdl3_smoke():
         child_states = env_step(states, actions)
         return child_states, leaf_evaluator(child_states.observation)
 
-    config = SimpleNamespace(
-        search_backend="dqaz",
-        selfplay_action_source="posterior_argmax",
-        num_simulations=2,
-        policy_mc_samples=4,
-        state_posterior_kappa_n=16.0,
-        inflight_limit=2,
-        search_eval_batch_size=2,
-        search_pad_to_eval_batch=True,
-        search_jax_backup=True,
-        kappa_terminal=8.0,
-        epsilon_terminal=0.05,
+    config = Config(
+        env=EnvConfig(id="hex", board_size=3, num_outcomes=3),
+        model=ModelConfig(network="boardlaw_dirichlet"),
+        selfplay=SelfplayConfig(action_source="posterior_argmax"),
+        search=SearchConfig(
+            kind="dqaz",
+            dqaz=DQAZSearchConfig(
+                num_simulations=2,
+                policy_samples=4,
+                state_posterior_kappa_n=16.0,
+                inflight_limit=2,
+                eval_batch_size=2,
+                pad_to_eval_batch=True,
+                jax_backup=True,
+                epsilon_terminal=0.05,
+                constants=SearchConstantsConfig(kappa_terminal=8.0),
+            ),
+        ),
     )
 
     output = _run_posterior_tree_search_step(

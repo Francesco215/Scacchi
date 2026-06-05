@@ -40,8 +40,11 @@ if [[ "${SYNC}" == "1" ]]; then
 
   (
     cd "${LOCAL_REPO_DIR}"
-    git diff --name-only --diff-filter=ACMRT HEAD -- \
+    git ls-files \
       | awk '!/^(baselines|checkpoints|wandb)\//' \
+      | while IFS= read -r path; do
+          [[ -f "${path}" ]] && printf '%s\n' "${path}"
+        done \
       > "${file_list}"
     git diff --name-only --diff-filter=D HEAD -- \
       | awk '!/^(baselines|checkpoints|wandb)\//' \
@@ -52,7 +55,7 @@ if [[ "${SYNC}" == "1" ]]; then
   )
 
   if [[ -s "${file_list}" ]]; then
-    echo "Syncing changed files:"
+    echo "Syncing tracked files:"
     sed 's/^/  /' "${file_list}"
   fi
   if [[ -s "${delete_list}" ]]; then

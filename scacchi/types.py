@@ -26,9 +26,10 @@ class SelfplayActionSource(StrEnum):
     search_action = "search_action"
 
 
-class SearchPolicy(StrEnum):
+class SearchKind(StrEnum):
     gumbel = "gumbel"
     dirichlet_thompson = "dirichlet_thompson"
+    dqaz = "dqaz"
 
 
 class QLossWeightMode(StrEnum):
@@ -127,15 +128,86 @@ class SearchConstantsConfig:
 
 
 @dataclass
-class SearchConfig:
-    policy: SearchPolicy = SearchPolicy.gumbel
+class GumbelSearchConfig:
+    num_simulations: int = 32
+
+    # Used when Gumbel search runs against a Dirichlet network and produces
+    # posterior targets. Ignored by scalar policy/value models.
+    constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
+    gumbel_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        _require_ge("search.gumbel.num_simulations", self.num_simulations, 1)
+        _require_gt("search.gumbel.gumbel_scale", self.gumbel_scale, 0.0)
+
+
+@dataclass
+class DirichletThompsonSearchConfig:
     num_simulations: int = 32
     num_blocks: int = 1
+    policy_samples: int = 32
     constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
 
     def __post_init__(self) -> None:
-        _require_ge("search.num_simulations", self.num_simulations, 1)
-        _require_ge("search.num_blocks", self.num_blocks, 1)
+        _require_ge(
+            "search.dirichlet_thompson.num_simulations",
+            self.num_simulations,
+            1,
+        )
+        _require_ge("search.dirichlet_thompson.num_blocks", self.num_blocks, 1)
+        _require_ge("search.dirichlet_thompson.policy_samples", self.policy_samples, 1)
+
+
+@dataclass
+class DQAZSearchConfig:
+    num_simulations: int = 32
+    policy_samples: int = 32
+    inflight_limit: int = 1
+    state_posterior_kappa_n: float = 9.0
+    eval_batch_size: int | None = None
+    pad_to_eval_batch: bool = False
+    jax_backup: bool = True
+    debug: bool = False
+    epsilon_terminal: float = 1e-3
+    constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
+
+    def __post_init__(self) -> None:
+        _require_ge("search.dqaz.num_simulations", self.num_simulations, 1)
+        _require_ge("search.dqaz.policy_samples", self.policy_samples, 1)
+        _require_ge("search.dqaz.inflight_limit", self.inflight_limit, 1)
+        _require_gt(
+            "search.dqaz.state_posterior_kappa_n",
+            self.state_posterior_kappa_n,
+            0.0,
+        )
+        _require_ge("search.dqaz.eval_batch_size", self.eval_batch_size, 1)
+        _require_range(
+            "search.dqaz.epsilon_terminal",
+            self.epsilon_terminal,
+            lower=0.0,
+            upper=0.5,
+        )
+
+
+@dataclass
+class SearchConfig:
+    kind: SearchKind = SearchKind.gumbel
+    gumbel: GumbelSearchConfig = field(default_factory=GumbelSearchConfig)
+    dirichlet_thompson: DirichletThompsonSearchConfig = field(
+        default_factory=DirichletThompsonSearchConfig
+    )
+    dqaz: DQAZSearchConfig = field(default_factory=DQAZSearchConfig)
+
+    def active(self) -> (
+        GumbelSearchConfig | DirichletThompsonSearchConfig | DQAZSearchConfig
+    ):
+        return cast(
+            GumbelSearchConfig | DirichletThompsonSearchConfig | DQAZSearchConfig,
+            getattr(self, str(self.kind)),
+        )
+
+    def active_constants(self) -> SearchConstantsConfig:
+        return self.active().constants
 
 
 @dataclass
@@ -261,10 +333,7 @@ class TrainConfig:
     compatibility: CompatibilityConfig = field(default_factory=CompatibilityConfig)
 
     def __post_init__(self) -> None:
-        dirichlet_networks = {
-            Network.aznet_dirichlet,
-            Network.boardlaw_dirichlet,
-        }
+        dirichlet_networks = {Network.aznet_dirichlet, Network.boardlaw_dirichlet}
         active_weights = self.training.losses.active_dirichlet_weights()
         if self.model.network not in dirichlet_networks and active_weights:
             weights = ", ".join(active_weights)
@@ -274,15 +343,8 @@ class TrainConfig:
                 "weights to 0.0 or use model.network='aznet_dirichlet' or "
                 "model.network='boardlaw_dirichlet'."
             )
-        if (
-            self.search.policy == SearchPolicy.dirichlet_thompson
-            and self.model.network not in dirichlet_networks
-        ):
-            raise ValueError(
-                "Dirichlet Thompson search requires "
-                "model.network='aznet_dirichlet' or "
-                "model.network='boardlaw_dirichlet'."
-            )
+        if self.search.kind in {SearchKind.dirichlet_thompson, SearchKind.dqaz}:
+            assert self.model.network in dirichlet_networks, f"{self.search.kind!r} search requires model.network='aznet_dirichlet' or model.network='boardlaw_dirichlet'."
         if self.eval.baseline == EvalBaseline.none and self.eval.interval != 0:
             raise ValueError("eval.baseline=none requires eval.interval=0.")
 

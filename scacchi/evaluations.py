@@ -16,11 +16,18 @@ def _predict(model: Any, obs: jax.Array):
 
 
 def _with_eval_num_simulations(config, num_simulations: int | None):
-    if num_simulations is None or num_simulations == config.search.num_simulations:
+    if num_simulations is None or num_simulations == int(
+        config.search.active().num_simulations
+    ):
         return config
+    search_kind = str(config.search.kind)
+    active_search = getattr(config.search, search_kind)
     return replace(
         config,
-        search=replace(config.search, num_simulations=num_simulations),
+        search=replace(
+            config.search,
+            **{search_kind: replace(active_search, num_simulations=num_simulations)},
+        ),
     )
 
 

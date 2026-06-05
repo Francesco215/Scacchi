@@ -28,11 +28,11 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.selfplay.batch_size == 128
     assert config.selfplay.max_num_steps == 128
     assert config.selfplay.action_source == "posterior_sample"
-    assert config.search.policy == "dirichlet_thompson"
-    assert config.search.num_simulations == 4
-    assert config.search.num_blocks == 8
-    assert config.search.constants.kappa_leaf == 1.0
-    assert config.search.constants.kappa_terminal == 8.0
+    assert config.search.kind == "dirichlet_thompson"
+    assert config.search.dirichlet_thompson.num_simulations == 4
+    assert config.search.dirichlet_thompson.num_blocks == 8
+    assert config.search.dirichlet_thompson.constants.kappa_leaf == 1.0
+    assert config.search.dirichlet_thompson.constants.kappa_terminal == 8.0
     assert config.training.batch_size == 16_384
     assert config.training.max_updates_per_iter == 1
     assert config.training.learning_rate == 1e-3
@@ -67,7 +67,7 @@ def test_incompatible_pgx_eval_baseline_raises():
         {
             "env": {"id": "gardner_chess"},
             "model": {"network": "aznet_dirichlet"},
-            "search": {"policy": "dirichlet_thompson"},
+            "search": {"kind": "dirichlet_thompson"},
             "eval": {
                 "interval": 1,
                 "baseline": "pgx",
@@ -87,7 +87,7 @@ def test_flat_config_keys_are_rejected():
 
 def test_unknown_nested_config_keys_are_rejected():
     with pytest.raises(ConfigKeyError, match="unknown"):
-        _config({"search": {"constants": {"unknown": 1.0}}})
+        _config({"search": {"gumbel": {"constants": {"unknown": 1.0}}}})
 
 
 def test_scalar_network_rejects_dirichlet_loss_weights():
@@ -133,11 +133,14 @@ def test_dirichlet_network_allows_dirichlet_loss_weights():
 
 
 def test_num_search_blocks_must_be_positive():
-    with pytest.raises(ValueError, match="search.num_blocks"):
+    with pytest.raises(ValueError, match="search.dirichlet_thompson.num_blocks"):
         _config(
             {
                 "model": {"network": "boardlaw_dirichlet"},
-                "search": {"num_blocks": 0},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {"num_blocks": 0},
+                },
             }
         )
 
@@ -184,12 +187,12 @@ def test_selfplay_action_source_must_be_known():
         )
 
 
-def test_search_policy_must_be_known():
+def test_search_kind_must_be_known():
     with pytest.raises(ValidationError, match="dirichlet_thompson"):
         _config(
             {
                 "model": {"network": "boardlaw_dirichlet"},
-                "search": {"policy": "unknown"},
+                "search": {"kind": "unknown"},
             }
         )
 
@@ -199,7 +202,7 @@ def test_dirichlet_thompson_allows_legacy_two_outcome_hex_heads():
         {
             "env": {"id": "hex", "num_outcomes": 2},
             "model": {"network": "boardlaw_dirichlet"},
-            "search": {"policy": "dirichlet_thompson"},
+            "search": {"kind": "dirichlet_thompson"},
         }
     )
 
@@ -221,7 +224,7 @@ def test_posterior_tree_policy_is_not_part_of_training_config():
         _config(
             {
                 "model": {"network": "boardlaw_dirichlet"},
-                "search": {"policy": "posterior_tree"},
+                "search": {"kind": "posterior_tree"},
             }
         )
 
