@@ -201,12 +201,7 @@ def test_compute_loss_input_preserves_sample_batch_sharding():
             assert collective not in hlo_text
 
         sample = compute(data)
-    sample = assert_batch_axis_sharded(
-        sample,
-        parallel,
-        batch_axis=0,
-        label="computed sample",
-    )
+    sample = assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="computed sample")
     assert sample.q_target_weight.shape == (batch_size, 2, 3)
 
 
@@ -455,12 +450,7 @@ def test_assert_batch_axis_sharded_rejects_replicated_input_on_multi_device():
 
     @jax.jit
     def check(value):
-        return assert_batch_axis_sharded(
-            value,
-            parallel,
-            batch_axis=0,
-            label="test_value",
-        )
+        return assert_batch_axis_sharded(value, parallel, batch_axis=0, label="test_value")
 
     value = jax.device_put(
         jnp.arange(device_count * 2),
@@ -480,12 +470,7 @@ def test_assert_batch_axis_sharded_accepts_batch_sharded_input():
 
     @jax.jit
     def check(value):
-        return assert_batch_axis_sharded(
-            value,
-            parallel,
-            batch_axis=0,
-            label="test_value",
-        )
+        return assert_batch_axis_sharded(value, parallel, batch_axis=0, label="test_value")
 
     with parallel.mesh_context():
         checked = check(value)
@@ -528,12 +513,7 @@ def test_native_defaults_preserve_beta_batch_sharding():
             assert collective not in hlo_text
 
         defaults = build_defaults(beta_q, beta_v)
-    defaults = assert_batch_axis_sharded(
-        defaults,
-        parallel,
-        batch_axis=0,
-        label="native defaults",
-    )
+    defaults = assert_batch_axis_sharded(defaults, parallel, batch_axis=0, label="native defaults")
     assert defaults["q_target_weight"].shape == (batch_size, 3, 2)
     assert defaults["v_target_weight"].shape == (batch_size, 3)
 

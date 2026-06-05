@@ -214,39 +214,19 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             env_state: pgx.State,
             key: jax.Array,
         ) -> tuple[pgx.State, SelfplayOutput]:
-            env_state = assert_batch_axis_sharded(
-                env_state,
-                parallel,
-                batch_axis=0,
-                label="selfplay step input env_state",
-            )
+            env_state = assert_batch_axis_sharded(env_state, parallel, batch_axis=0, label="selfplay step input env_state")
             search_key, reset_key = jax.random.split(key, 2)
             observation = env_state.observation
             legal_action_mask = env_state.legal_action_mask
             model_output = predict_fn(observation)
-            model_output = assert_batch_axis_sharded(
-                model_output,
-                parallel,
-                batch_axis=0,
-                label="selfplay step model_output",
-            )
+            model_output = assert_batch_axis_sharded(model_output, parallel, batch_axis=0, label="selfplay step model_output")
             search_output = _run_model_search(env_state, model_output, recurrent_fn, dirichlet_recurrent_fn, search_key, config) # search happens here!
-            search_output = assert_batch_axis_sharded(
-                search_output,
-                parallel,
-                batch_axis=0,
-                label="selfplay step search_output",
-            )
+            search_output = assert_batch_axis_sharded(search_output, parallel, batch_axis=0, label="selfplay step search_output")
 
             actor = env_state.current_player
             reset_keys = parallel.split(reset_key, config.selfplay.batch_size)
             env_state = jax.vmap(auto_reset(env.step, env.init))(env_state, search_output.played_action, reset_keys)
-            env_state = assert_batch_axis_sharded(
-                env_state,
-                parallel,
-                batch_axis=0,
-                label="selfplay step reset env_state",
-            )
+            env_state = assert_batch_axis_sharded(env_state, parallel, batch_axis=0, label="selfplay step reset env_state")
             reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
             discount = -jnp.ones_like(reward)
             discount = jnp.where(env_state.terminated, 0.0, discount)
@@ -258,12 +238,7 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
                 discount=discount,
                 **search_output._asdict(),
             )
-            frame = assert_batch_axis_sharded(
-                frame,
-                parallel,
-                batch_axis=0,
-                label="selfplay step frame",
-            )
+            frame = assert_batch_axis_sharded(frame, parallel, batch_axis=0, label="selfplay step frame")
             return env_state, frame
 
         return step_fn
@@ -273,40 +248,20 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
         init_keys = parallel.split(rng_key, config.selfplay.batch_size)
         env_state = jax.vmap(env.init)(init_keys)
         env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
-        env_state = assert_batch_axis_sharded(
-            env_state,
-            parallel,
-            batch_axis=0,
-            label="selfplay init env_state",
-        )
+        env_state = assert_batch_axis_sharded(env_state, parallel, batch_axis=0, label="selfplay init env_state")
         return env_state
 
     @nnx.jit
     def rollout(model: nnx.Module, env_state: pgx.State, rng_key: jax.Array):
-        env_state = assert_batch_axis_sharded(
-            env_state,
-            parallel,
-            batch_axis=0,
-            label="rollout env_state",
-        )
+        env_state = assert_batch_axis_sharded(env_state, parallel, batch_axis=0, label="rollout env_state")
         step_keys = jax.random.split(rng_key, config.selfplay.max_num_steps)
         env_state, data = jax.lax.scan(step_fn_factory(model), env_state, step_keys)
-        env_state = assert_batch_axis_sharded(
-            env_state,
-            parallel,
-            batch_axis=0,
-            label="rollout output env_state",
-        )
+        env_state = assert_batch_axis_sharded(env_state, parallel, batch_axis=0, label="rollout output env_state")
         data = jax.tree_util.tree_map(
             lambda leaf: leaf.swapaxes(0, 1) if isinstance(leaf, jax.Array) else leaf,
             data,
         )
-        data = assert_batch_axis_sharded(
-            data,
-            parallel,
-            batch_axis=0,
-            label="rollout output data",
-        )
+        data = assert_batch_axis_sharded(data, parallel, batch_axis=0, label="rollout output data")
         return env_state, data # (batch, max_num_steps, ...) sharded along the batch
 
     @nnx.jit
@@ -314,11 +269,6 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
         rollout_rng, init_key = jax.random.split(rng_key)
         env_state = init_env(init_key)
         _, data = rollout(model, env_state, rollout_rng)
-        return assert_batch_axis_sharded(
-            data,
-            parallel,
-            batch_axis=0,
-            label="selfplay output data",
-        )
+        return assert_batch_axis_sharded(data, parallel, batch_axis=0, label="selfplay output data")
 
     return selfplay

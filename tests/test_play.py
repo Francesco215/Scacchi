@@ -93,12 +93,7 @@ def test_scalar_gumbel_search_preserves_batch_sharding_without_collectives():
         assert collective not in hlo_text
 
     output = jax.jit(run)(env_state, model_output, rng_key)
-    output = assert_batch_axis_sharded(
-        output,
-        parallel,
-        batch_axis=0,
-        label="scalar gumbel output",
-    )
+    output = assert_batch_axis_sharded(output, parallel, batch_axis=0, label="scalar gumbel output")
     assert output.action_weights.shape == (batch_size, num_actions)
     assert output.played_action.shape == (batch_size,)
 

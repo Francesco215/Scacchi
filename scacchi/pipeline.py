@@ -20,12 +20,7 @@ def make_minibatches(
     if samples.obs.ndim < 2:
         raise ValueError("minibatching requires samples shaped [batch, time, ...].")
 
-    samples = assert_batch_axis_sharded(
-        samples,
-        parallel,
-        batch_axis=0,
-        label="minibatch samples",
-    )
+    samples = assert_batch_axis_sharded(samples, parallel, batch_axis=0, label="minibatch samples")
     batch_size = samples.obs.shape[0]
     num_steps = samples.obs.shape[1]
     device_count = parallel.device_count if parallel.enabled else 1
@@ -163,22 +158,12 @@ def train_minibatches(
     parallel: BatchParallel | None = None,
 ) -> TrainMetrics:
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
-    minibatches = assert_batch_axis_sharded(
-        minibatches,
-        parallel,
-        batch_axis=1,
-        label="train minibatches",
-    )
+    minibatches = assert_batch_axis_sharded(minibatches, parallel, batch_axis=1, label="train minibatches")
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def scan_step(state, minibatch):
         model, optimizer = state
-        minibatch = assert_batch_axis_sharded(
-            minibatch,
-            parallel,
-            batch_axis=0,
-            label="train minibatch",
-        )
+        minibatch = assert_batch_axis_sharded(minibatch, parallel, batch_axis=0, label="train minibatch")
         metrics = train(model, optimizer, minibatch, config)
         return (model, optimizer), metrics
 

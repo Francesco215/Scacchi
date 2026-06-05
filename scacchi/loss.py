@@ -114,23 +114,13 @@ def make_compute_input_for_lossfn(
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
 
     def compute_loss_input(data: SelfplayOutput) -> Sample:
-        data = assert_batch_axis_sharded(
-            data,
-            parallel,
-            batch_axis=0,
-            label="loss input data",
-        )
+        data = assert_batch_axis_sharded(data, parallel, batch_axis=0, label="loss input data")
 
         def assert_native_targets(
             label: str,
             native_fields: _NativeTargetFields,
         ) -> _NativeTargetFields:
-            return assert_batch_axis_sharded(
-                native_fields,
-                parallel,
-                batch_axis=0,
-                label=label,
-            )
+            return assert_batch_axis_sharded(native_fields, parallel, batch_axis=0, label=label)
 
         value_mask = jnp.cumsum(data.terminated[:, ::-1], axis=1)[:, ::-1] >= 1
         legal_policy_mask = jnp.any(data.legal_action_mask, axis=-1)
@@ -184,12 +174,7 @@ def make_compute_input_for_lossfn(
         terminal_parent_targets = config.training.losses.terminal_parent_targets
         if terminal_edge_targets or terminal_parent_targets:
             native_defaults = native_fields_from_beta(beta_q_target, beta_v_target)
-            native_defaults = assert_batch_axis_sharded(
-                native_defaults,
-                parallel,
-                batch_axis=0,
-                label="loss native_defaults",
-            )
+            native_defaults = assert_batch_axis_sharded(native_defaults, parallel, batch_axis=0, label="loss native_defaults")
             native_targets = _native_fields_from_values(
                 native_target_values,
                 native_defaults,
@@ -309,26 +294,11 @@ def make_compute_input_for_lossfn(
             outcome_mask=value_mask,
             **native_target_values,
         )
-        sample = assert_batch_axis_sharded(
-            sample,
-            parallel,
-            batch_axis=0,
-            label="loss sample before native defaults",
-        )
+        sample = assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="loss sample before native defaults")
         native_fields = _native_target_fields(sample)
-        native_fields = assert_batch_axis_sharded(
-            native_fields,
-            parallel,
-            batch_axis=0,
-            label="loss native_fields final",
-        )
+        native_fields = assert_batch_axis_sharded(native_fields, parallel, batch_axis=0, label="loss native_fields final")
         sample = _with_native_defaults(sample, native_fields)
-        sample = assert_batch_axis_sharded(
-            sample,
-            parallel,
-            batch_axis=0,
-            label="loss sample after native defaults",
-        )
+        sample = assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="loss sample after native defaults")
         if data.tree_data is None:
             return sample
 
@@ -337,22 +307,12 @@ def make_compute_input_for_lossfn(
             tree.beta_Q_target,
             tree.beta_V_target,
         )
-        tree_native_defaults = assert_batch_axis_sharded(
-            tree_native_defaults,
-            parallel,
-            batch_axis=0,
-            label="loss tree native_defaults",
-        )
+        tree_native_defaults = assert_batch_axis_sharded(tree_native_defaults, parallel, batch_axis=0, label="loss tree native_defaults")
         sample = _concat_sample_rows(
             sample._replace(value_mask=sample.value_loss_mask),
             _tree_as_sample(tree, tree_native_defaults),
         )
-        return assert_batch_axis_sharded(
-            sample,
-            parallel,
-            batch_axis=0,
-            label="loss sample after tree concat",
-        )
+        return assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="loss sample after tree concat")
 
     return compute_loss_input
 

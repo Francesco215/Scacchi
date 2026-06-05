@@ -14,7 +14,7 @@ model:
   resnet_v2: true
 
 selfplay:
-  batch_size: 128
+  batch_size: 2048
   max_num_steps: 128
   action_source: posterior_sample
 

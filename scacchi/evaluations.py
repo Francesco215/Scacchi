@@ -100,19 +100,9 @@ def _make_model_mcts_policy(
     search_config = _with_eval_num_simulations(config, num_simulations)
     predict = lambda obs: _predict(model, obs)
     search_state = _searchable_eval_state(env_state)
-    search_state = assert_batch_axis_sharded(
-        search_state,
-        parallel,
-        batch_axis=0,
-        label="eval search_state",
-    )
+    search_state = assert_batch_axis_sharded(search_state, parallel, batch_axis=0, label="eval search_state")
     model_output = predict(search_state.observation)
-    model_output = assert_batch_axis_sharded(
-        model_output,
-        parallel,
-        batch_axis=0,
-        label="eval model_output",
-    )
+    model_output = assert_batch_axis_sharded(model_output, parallel, batch_axis=0, label="eval model_output")
     search_output = _run_model_search(
         env_state=search_state,
         model_output=model_output,
@@ -121,12 +111,7 @@ def _make_model_mcts_policy(
         rng_key=rng_key,
         config=search_config, #TODO: make sure that the eval path has a different search config
     )
-    return assert_batch_axis_sharded(
-        search_output,
-        parallel,
-        batch_axis=0,
-        label="eval search_output",
-    )
+    return assert_batch_axis_sharded(search_output, parallel, batch_axis=0, label="eval search_output")
 
 
 def _model_eval_action(env, config, model, rng_key, env_state, parallel):
@@ -159,12 +144,7 @@ def make_mcts_evaluate(
         init_keys = parallel.split(init_key, eval_batch_size)
         env_state = jax.vmap(env.init)(init_keys)
         env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
-        env_state = assert_batch_axis_sharded(
-            env_state,
-            parallel,
-            batch_axis=0,
-            label="eval env_state",
-        )
+        env_state = assert_batch_axis_sharded(env_state, parallel, batch_axis=0, label="eval env_state")
         returns = jnp.zeros_like(env_state.terminated, dtype=jnp.float32)
 
         def body_fn(val):
@@ -196,12 +176,7 @@ def make_mcts_evaluate(
                 env_state,
                 action,
             )
-            env_state = assert_batch_axis_sharded(
-                env_state,
-                parallel,
-                batch_axis=0,
-                label="eval stepped_env_state",
-            )
+            env_state = assert_batch_axis_sharded(env_state, parallel, batch_axis=0, label="eval stepped_env_state")
             reward = env_state.rewards[
                 jnp.arange(eval_batch_size),
                 my_player,
@@ -215,11 +190,6 @@ def make_mcts_evaluate(
             body_fn,
             (key, env_state, returns),
         )
-        return assert_batch_axis_sharded(
-            returns,
-            parallel,
-            batch_axis=0,
-            label="eval returns",
-        )
+        return assert_batch_axis_sharded(returns, parallel, batch_axis=0, label="eval returns")
 
     return evaluate
