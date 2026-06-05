@@ -9,13 +9,15 @@ from typing import TYPE_CHECKING, Any
 
 import jax
 import orbax.checkpoint as ocp
+from omegaconf import OmegaConf
 import pgx
 from flax import nnx
 
 from .network import build_model
+from .types import Config, config_to_dict, load_config
 
 if TYPE_CHECKING:
-    from .train import Config
+    from .types import Config
 
 
 def _suppress_orbax_logs() -> None:
@@ -36,7 +38,7 @@ class NoOpCheckpointManager(ocp.CheckpointManager):
 
     def __init__(self, directory: Path, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
-        self._directory = directory
+        self._directory: Path = directory
 
     @property
     def directory(self) -> Path:
@@ -90,12 +92,12 @@ def build_checkpoint_manager(
 ) -> ocp.CheckpointManager:
     _suppress_orbax_logs()
     options = _checkpoint_manager_options(
-        max_to_keep=config.ckpt_max_to_keep,
-        save_interval_steps=config.ckpt_save_interval_steps,
-        save_on_steps=(config.max_num_iters - 1,),
+        max_to_keep=config.checkpointing.max_to_keep,
+        save_interval_steps=config.checkpointing.save_interval_steps,
+        save_on_steps=(config.run.max_num_iters - 1,),
     )
     item_names = ("model", "optimizer", "rngs", "meta")
-    if config.ckpt_max_to_keep == 0:
+    if config.checkpointing.max_to_keep == 0:
         return NoOpCheckpointManager(ckpt_dir)
     return ocp.CheckpointManager(ckpt_dir, options=options, item_names=item_names)
 
@@ -113,7 +115,7 @@ def maybe_save(
     if not manager.should_save(step):
         return
     meta: dict[str, Any] = {
-        "config": config.model_dump(),
+        "config": config_to_dict(config),
         "step": step,
         "hours": hours,
         "frames": frames,
@@ -167,8 +169,6 @@ def from_pretrained(
         rngs = nnx.Rngs(0)
     checkpoint_path = str(Path(checkpoint_path).resolve())
 
-    from .train import Config, normalize_config_dict  # local import avoids circular
-
     options = _checkpoint_manager_options(read_only=True)
     with ocp.CheckpointManager(checkpoint_path, options=options) as manager:
         step = manager.latest_step()
@@ -178,11 +178,7 @@ def from_pretrained(
         meta_restored = manager.restore(
             step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
         )
-        config = Config.model_validate(
-            normalize_config_dict(meta_restored["meta"]["config"]),
-            extra="ignore",
-            context={"model_construction_only": True},
-        )
+        config = load_config(OmegaConf.create(meta_restored["meta"]["config"]))
         model = build_model(
             config,
             num_actions=env.num_actions,

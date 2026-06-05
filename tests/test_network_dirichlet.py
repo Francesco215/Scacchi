@@ -13,7 +13,7 @@ from scacchi.network import (
     outcome_utility,
     policy_value_from_output,
 )
-from scacchi.train import Config
+from scacchi.types import Config, EnvConfig, ModelConfig, SearchConfig
 
 
 def test_dirichlet_from_logits_uses_squared_softplus_concentration():
@@ -100,13 +100,13 @@ def test_az_dirichlet_net_shapes_and_unit_alphas():
 
 def test_build_model_supports_az_dirichlet_for_go_wdl3():
     config = Config(
-        env_id="go",
-        board_size=8,
-        network="aznet_dirichlet",
-        search_policy="dirichlet_thompson",
-        num_outcomes=None,
-        num_channels=8,
-        num_layers=1,
+        env=EnvConfig(id="go", board_size=8, num_outcomes=None),
+        model=ModelConfig(
+            network="aznet_dirichlet",
+            num_channels=8,
+            num_layers=1,
+        ),
+        search=SearchConfig(policy="dirichlet_thompson"),
     )
 
     model = build_model(
@@ -122,12 +122,13 @@ def test_build_model_supports_az_dirichlet_for_go_wdl3():
 
 def test_dirichlet_thompson_null_hex_outcomes_builds_legacy_two_outcome_head():
     config = Config(
-        env_id="hex",
-        network="boardlaw_dirichlet",
-        search_policy="dirichlet_thompson",
-        num_outcomes=None,
-        num_channels=16,
-        num_layers=2,
+        env=EnvConfig(id="hex", num_outcomes=None),
+        model=ModelConfig(
+            network="boardlaw_dirichlet",
+            num_channels=16,
+            num_layers=2,
+        ),
+        search=SearchConfig(policy="dirichlet_thompson"),
     )
 
     model = build_model(
@@ -143,14 +144,15 @@ def test_dirichlet_thompson_null_hex_outcomes_builds_legacy_two_outcome_head():
 
 def test_legacy_dirichlet_head_init_matches_runstate_initial_concentration():
     config = Config(
-        env_id="hex",
-        network="boardlaw_dirichlet",
-        search_policy="dirichlet_thompson",
-        num_outcomes=2,
-        num_channels=16,
-        num_layers=2,
-        legacy_dirichlet_head_init=True,
-        rezero_kernel_init="orthogonal",
+        env=EnvConfig(id="hex", num_outcomes=2),
+        model=ModelConfig(
+            network="boardlaw_dirichlet",
+            num_channels=16,
+            num_layers=2,
+            legacy_dirichlet_head_init=True,
+            rezero_kernel_init="orthogonal",
+        ),
+        search=SearchConfig(policy="dirichlet_thompson"),
     )
     model = build_model(
         config,

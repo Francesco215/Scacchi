@@ -1,8 +1,8 @@
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from scacchi import checkpoint
+from scacchi.types import CheckpointingConfig, Config, RunConfig
 
 
 def test_build_checkpoint_manager_uses_multihost_orbax_options(
@@ -23,10 +23,9 @@ def test_build_checkpoint_manager_uses_multihost_orbax_options(
             captured["options"] = options
             captured["item_names"] = item_names
 
-    config = SimpleNamespace(
-        ckpt_max_to_keep=3,
-        ckpt_save_interval_steps=7,
-        max_num_iters=11,
+    config = Config(
+        run=RunConfig(max_num_iters=11),
+        checkpointing=CheckpointingConfig(max_to_keep=3, save_interval_steps=7),
     )
     monkeypatch.setattr(checkpoint.jax, "process_count", lambda: 2)
     monkeypatch.setattr(checkpoint.ocp, "CheckpointManager", FakeCheckpointManager)
@@ -50,10 +49,9 @@ def test_disabled_checkpoint_manager_does_not_construct_orbax(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    config = SimpleNamespace(
-        ckpt_max_to_keep=0,
-        ckpt_save_interval_steps=7,
-        max_num_iters=11,
+    config = Config(
+        run=RunConfig(max_num_iters=11),
+        checkpointing=CheckpointingConfig(max_to_keep=0, save_interval_steps=7),
     )
 
     def fail_if_constructed(*args: Any, **kwargs: Any) -> None:

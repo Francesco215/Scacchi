@@ -161,7 +161,11 @@ def make_dirichlet_recurrent_fn(env, predict_fn, config):
         terminal_parent_outcome = terminal_outcome_from_reward(reward, alpha_v.shape[-1])
         terminal_child_outcome = flip_outcome(terminal_parent_outcome)
         outcome_dist = jnp.where(env_state.terminated[..., None], terminal_child_outcome, nonterminal_outcome)
-        evidence_weight = jnp.where(env_state.terminated, jnp.asarray(config.kappa_terminal, dtype=outcome_dist.dtype), jnp.asarray(config.kappa_leaf, dtype=outcome_dist.dtype))
+        evidence_weight = jnp.where(
+            env_state.terminated,
+            jnp.asarray(config.search.constants.kappa_terminal, dtype=outcome_dist.dtype),
+            jnp.asarray(config.search.constants.kappa_leaf, dtype=outcome_dist.dtype),
+        )
         root_action = jnp.where(embedding.root_action == NO_PARENT,action,embedding.root_action)
         depth_parity = 1 - embedding.depth_parity
 
@@ -277,7 +281,7 @@ def _select_posterior_tree_played_action(
 
 def make_selfplay(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
-    if is_posterior_tree_policy(config.search_policy):
+    if is_posterior_tree_policy(config.search.policy):
         raise ValueError("Posterior tree policy is not supported for self-play")
 
     def step_fn_factory(model: nnx.Module):
@@ -296,7 +300,7 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             search_output = _run_model_search(env_state, model_output, recurrent_fn, dirichlet_recurrent_fn, search_key, posterior_key, action_key, config)
 
             actor = env_state.current_player
-            reset_keys = parallel.split(reset_key, config.selfplay_batch_size)
+            reset_keys = parallel.split(reset_key, config.selfplay.batch_size)
             env_state = jax.vmap(auto_reset(env.step, env.init))(env_state, search_output.played_action, reset_keys)
             env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
             reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
@@ -317,13 +321,13 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
 
     @nnx.jit
     def init_env(rng_key: jax.Array):
-        init_keys = parallel.split(rng_key, config.selfplay_batch_size)
+        init_keys = parallel.split(rng_key, config.selfplay.batch_size)
         env_state = jax.vmap(env.init)(init_keys)
         return env_state
 
     @nnx.jit
     def rollout(model: nnx.Module, env_state: pgx.State, rng_key: jax.Array):
-        step_keys = jax.random.split(rng_key, config.max_num_steps)
+        step_keys = jax.random.split(rng_key, config.selfplay.max_num_steps)
         env_state, data = jax.lax.scan(step_fn_factory(model), env_state, step_keys)
         return env_state, data # (max_num_steps, batch, ...) sharded along the batch
 

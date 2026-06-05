@@ -103,9 +103,9 @@ def _empty_posterior_targets(
 
 
 def _num_outcomes_for_config(config) -> int:
-    num_outcomes = getattr(config, "num_outcomes", None)
+    num_outcomes = config.env.num_outcomes
     if num_outcomes is None:
-        return 2 if config.env_id == "hex" else 3
+        return 2 if config.env.id == "hex" else 3
     return num_outcomes
 
 
@@ -220,7 +220,7 @@ def _run_scalar_gumbel_search(
         rng_key=rng_key,
         root=root,
         recurrent_fn=recurrent_fn,
-        num_simulations=config.num_simulations,
+        num_simulations=config.search.num_simulations,
         invalid_actions=~env_state.legal_action_mask,
         qtransform=mctx.qtransform_completed_by_mix_value,
         gumbel_scale=1.0,
@@ -258,16 +258,16 @@ def _run_dirichlet_search(
     root = _make_dirichlet_root(env_state, logits, alpha_v, alpha_q)
     action_value_prior = alpha_q
 
-    if config.search_policy == "dirichlet_thompson":
+    if config.search.policy == "dirichlet_thompson":
         policy_output = dirichlet_q_policy(
             params=(),
             rng_key=search_key,
             root=root,
             recurrent_fn=recurrent_fn,
             action_value_prior=action_value_prior,
-            num_simulations=config.num_simulations,
+            num_simulations=config.search.num_simulations,
             invalid_actions=~env_state.legal_action_mask,
-            num_search_blocks=getattr(config, "num_search_blocks", 1),
+            num_search_blocks=config.search.num_blocks,
         )
         q_evidence_sum = policy_output.q_evidence_sum
         action_alpha_post = policy_output.alpha_search
@@ -278,7 +278,7 @@ def _run_dirichlet_search(
             rng_key=search_key,
             root=root,
             recurrent_fn=recurrent_fn,
-            num_simulations=config.num_simulations,
+            num_simulations=config.search.num_simulations,
             invalid_actions=~env_state.legal_action_mask,
             qtransform=mctx.qtransform_completed_by_mix_value,
             gumbel_scale=1.0,
@@ -294,9 +294,9 @@ def _run_dirichlet_search(
         posterior_key,
         action_alpha_post,
         env_state.legal_action_mask,
-        config.policy_mc_samples,
+        config.search.monte_carlo.policy_samples,
     )
-    if config.search_policy == "gumbel":
+    if config.search.policy == "gumbel":
         policy_target = policy_output.action_weights
     else:
         policy_target = posterior_policy_target
@@ -307,7 +307,7 @@ def _run_dirichlet_search(
         posterior_policy_target,
     )
     played_action = _select_played_action(
-        config.selfplay_action_source if action_source is None else action_source,
+        config.selfplay.action_source if action_source is None else action_source,
         action_key,
         posterior_policy_target,
         env_state.legal_action_mask,
@@ -319,7 +319,7 @@ def _run_dirichlet_search(
         beta_Q_target=beta_Q_target,
         beta_V_target=beta_V_target,
         q_loss_weight=_q_loss_weight_from_mode(
-            getattr(config, "q_loss_weight_mode", "policy"),
+            config.training.losses.q_loss_weight_mode,
             q_evidence_sum,
             posterior_policy_target,
         ),
@@ -370,7 +370,7 @@ def _run_model_eval_search(
 ) -> _SearchStepOutput:
     if (
         len(model_output) == 3
-        and getattr(config, "search_policy", "gumbel") == "dirichlet_thompson"
+        and config.search.policy == "dirichlet_thompson"
     ):
         search_key, posterior_key = jax.random.split(rng_key)
         return _run_dirichlet_search(
@@ -481,21 +481,17 @@ def _run_fused_posterior_tree_search(
             root_alpha_q=root_alpha_q[ix],
             tree_index=ix,
             rng=rng,
-            leaf_value_mode=getattr(config, "leaf_value_mode", "alpha"),
-            kappa_leaf=float(getattr(config, "kappa_leaf", 1.0)),
-            kappa_terminal=float(getattr(config, "kappa_terminal", 8.0)),
-            epsilon_terminal=float(getattr(config, "epsilon_terminal", 1e-6)),
+            leaf_value_mode=config.search.leaf_value_mode,
+            kappa_leaf=float(config.search.constants.kappa_leaf),
+            kappa_terminal=float(config.search.constants.kappa_terminal),
+            epsilon_terminal=float(config.search.constants.epsilon_terminal),
             state_posterior_kappa_n=float(
-                getattr(config, "state_posterior_kappa_n", 9.0)
+                config.search.constants.state_posterior_kappa_n
             ),
-            policy_mc_samples=getattr(config, "policy_mc_samples"),
-            backup_mc_samples=getattr(
-                config,
-                "backup_mc_samples",
-                getattr(config, "policy_mc_samples"),
-            ),
-            commit=getattr(config, "selfplay_action_source"),
-            categorical_draw_rule=getattr(config, "categorical_draw_rule", "policy_prior"),
+            policy_mc_samples=config.search.monte_carlo.policy_samples,
+            backup_mc_samples=config.search.monte_carlo.backup_samples,
+            commit=config.selfplay.action_source,
+            categorical_draw_rule=config.search.constants.categorical_draw_rule,
         )
         for ix, state in enumerate(root_states)
     )
@@ -503,9 +499,9 @@ def _run_fused_posterior_tree_search(
     _run_fused_search_loop(
         trees,
         transition_evaluator=transition_evaluator,
-        num_simulations=int(getattr(config, "num_simulations")),
+        num_simulations=int(config.search.num_simulations),
         eval_batch_size=_eval_batch_size(config, len(trees)),
-        inflight_limit=int(getattr(config, "inflight_limit", 1)),
+        inflight_limit=int(config.search.inflight_limit),
     )
 
     finished = [tree.finish_native() for tree in trees]
@@ -885,12 +881,12 @@ def _run_dqaz_posterior_tree_search(
         dqaz.SearchConfig(
             action_size=action_size,
             observation_shape=tuple(root_observations.shape[1:]),
-            simulations_per_root=int(getattr(config, "num_simulations")),
-            posterior_best_samples=int(getattr(config, "policy_mc_samples")),
-            kappa_n=float(getattr(config, "state_posterior_kappa_n", 9.0)),
+            simulations_per_root=int(config.search.num_simulations),
+            posterior_best_samples=int(config.search.monte_carlo.policy_samples),
+            kappa_n=float(config.search.constants.state_posterior_kappa_n),
             seed=seed,
             debug=bool(getattr(config, "debug", False)),
-            max_pending_requests_per_root=int(getattr(config, "inflight_limit", 1)),
+            max_pending_requests_per_root=int(config.search.inflight_limit),
         )
     )
     root_offsets, root_actions, root_q = _compact_valid_actions_and_q_from_mask_np(
@@ -1020,8 +1016,8 @@ def _run_dqaz_posterior_tree_search(
         terminal_alpha = _terminal_alpha_from_arrays(
             np.asarray(child_rewards[:active_size], dtype=np.float32),
             current_players,
-            epsilon=float(getattr(config, "epsilon_terminal", 1e-6)),
-            kappa=float(getattr(config, "kappa_terminal", 8.0)),
+            epsilon=float(config.search.constants.epsilon_terminal),
+            kappa=float(config.search.constants.kappa_terminal),
         )
         if profile_search:
             profile_times["terminal_alpha"] += time.perf_counter() - start
@@ -1052,7 +1048,7 @@ def _run_dqaz_posterior_tree_search(
                     backup_batch,
                     root_batch_size=batch_size,
                     eval_batch_size=eval_batch_size,
-                    num_simulations=int(getattr(config, "num_simulations")),
+                    num_simulations=int(config.search.num_simulations),
                 )
                 if profile_search:
                     profile_times["pad_backup"] += time.perf_counter() - start
@@ -1080,8 +1076,8 @@ def _run_dqaz_posterior_tree_search(
                     jnp.asarray(backup_inputs.path_mask, dtype=jnp.bool_),
                     jnp.asarray(backup_inputs.leaf_alpha, dtype=jnp.float32),
                     jnp.asarray(backup_inputs.leaf_players, dtype=jnp.int32),
-                    float(getattr(config, "state_posterior_kappa_n", 9.0)),
-                    sample_count=int(getattr(config, "policy_mc_samples")),
+                    float(config.search.constants.state_posterior_kappa_n),
+                    sample_count=int(config.search.monte_carlo.policy_samples),
                     max_depth=int(backup_batch.max_depth),
                 )
                 if profile_search:
@@ -1152,7 +1148,7 @@ def _run_dqaz_posterior_tree_search(
             flush=True,
         )
 
-    commit = getattr(config, "selfplay_action_source")
+    commit = config.selfplay.action_source
     if commit in ("posterior_best", "search_action"):
         commit = "posterior_argmax"
     results = engine.finish(tree_ids, commit=commit)
@@ -1666,7 +1662,7 @@ def _select_active_states(
 
 
 def _eval_batch_size(config: Any, num_trees: int) -> int:
-    configured = getattr(config, "search_eval_batch_size", None)
+    configured = config.search.eval_batch_size
     if configured is None:
         return max(1, num_trees)
     return max(1, int(configured))

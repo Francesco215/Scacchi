@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import jax
 import jax.numpy as jnp
 import optax
@@ -20,6 +18,49 @@ from scacchi.loss import (
 )
 from scacchi.pipeline import _fixed_replay_window, make_minibatches
 from scacchi.play import SelfplayOutput
+from scacchi.types import (
+    Config,
+    ModelConfig,
+    SearchConfig,
+    SearchConstantsConfig,
+    SelfplayConfig,
+    TrainingConfig,
+    TrainingLossConfig,
+)
+
+
+def _loss_config(
+    *,
+    max_num_steps: int = 1,
+    policy_loss_weight: float = 1.0,
+    value_dir_kl_weight: float = 0.0,
+    q_dir_kl_weight: float = 0.0,
+    value_outcome_weight: float = 0.0,
+    q_outcome_weight: float = 0.0,
+    categorical_epsilon: float = 1e-4,
+    terminal_edge_targets: bool = False,
+    terminal_parent_targets: bool = False,
+) -> Config:
+    return Config(
+        model=ModelConfig(network="boardlaw_dirichlet"),
+        selfplay=SelfplayConfig(max_num_steps=max_num_steps),
+        search=SearchConfig(
+            constants=SearchConstantsConfig(
+                categorical_epsilon=categorical_epsilon,
+            ),
+        ),
+        training=TrainingConfig(
+            losses=TrainingLossConfig(
+                policy_weight=policy_loss_weight,
+                value_dir_kl_weight=value_dir_kl_weight,
+                q_dir_kl_weight=q_dir_kl_weight,
+                value_outcome_weight=value_outcome_weight,
+                q_outcome_weight=q_outcome_weight,
+                terminal_edge_targets=terminal_edge_targets,
+                terminal_parent_targets=terminal_parent_targets,
+            ),
+        ),
+    )
 
 
 def _sample_posterior_fields(num_rows: int, num_actions: int = 2, num_outcomes: int = 2):
@@ -67,7 +108,7 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
         ),
         discount=-jnp.ones((3, 2)),
     )
-    config = SimpleNamespace(max_num_steps=3, selfplay_batch_size=2)
+    config = _loss_config(max_num_steps=3)
 
     sample = make_compute_input_for_lossfn(config)(data)
 
@@ -116,7 +157,7 @@ def test_compute_loss_input_appends_tree_rows_with_separate_loss_masks():
         discount=jnp.zeros((1, 1)),
         tree_data=tree_data,
     )
-    config = SimpleNamespace(max_num_steps=1, selfplay_batch_size=1)
+    config = _loss_config(max_num_steps=1)
 
     sample = make_compute_input_for_lossfn(config)(data)
 
@@ -139,7 +180,7 @@ def test_compute_loss_input_trains_root_search_targets_before_terminal_result():
         q_loss_weight=jnp.ones((2, 3, 4)) / 4.0,
         discount=-jnp.ones((2, 3)),
     )
-    config = SimpleNamespace(max_num_steps=2, selfplay_batch_size=3)
+    config = _loss_config(max_num_steps=2)
 
     sample = make_compute_input_for_lossfn(config)(data)
 
@@ -161,11 +202,7 @@ def test_compute_loss_input_can_mark_played_terminal_edge_categorical():
         q_loss_weight=jnp.zeros((2, 1, 3)),
         discount=jnp.array([[-1.0], [0.0]]),
     )
-    config = SimpleNamespace(
-        max_num_steps=2,
-        selfplay_batch_size=1,
-        terminal_edge_targets=True,
-    )
+    config = _loss_config(max_num_steps=2, terminal_edge_targets=True)
 
     sample = make_compute_input_for_lossfn(config)(data)
 
@@ -190,11 +227,7 @@ def test_compute_loss_input_can_mark_terminal_winning_parent_categorical():
         q_loss_weight=jnp.zeros((2, 1, 3)),
         discount=jnp.array([[-1.0], [0.0]]),
     )
-    config = SimpleNamespace(
-        max_num_steps=2,
-        selfplay_batch_size=1,
-        terminal_parent_targets=True,
-    )
+    config = _loss_config(max_num_steps=2, terminal_parent_targets=True)
 
     sample = make_compute_input_for_lossfn(config)(data)
 
@@ -437,7 +470,7 @@ def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
             [[1.0, 1000.0], [1.0, 1000.0], [1.0, 1000.0]],
         ]
     )
-    config = SimpleNamespace(
+    config = _loss_config(
         policy_loss_weight=0.0,
         value_dir_kl_weight=1.0,
         q_dir_kl_weight=1.0,
@@ -490,7 +523,7 @@ def test_dirichlet_kl_losses_ignore_huge_and_nonfinite_terms():
             [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
         ]
     )
-    config = SimpleNamespace(
+    config = _loss_config(
         policy_loss_weight=0.0,
         value_dir_kl_weight=1.0,
         q_dir_kl_weight=1.0,
@@ -525,7 +558,7 @@ def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():
     logits = jnp.array([[0.0, 0.0]])
     alpha_v = jnp.ones((1, 2))
     alpha_q = jnp.ones((1, 2, 2))
-    config = SimpleNamespace(
+    config = _loss_config(
         policy_loss_weight=1.0,
         value_dir_kl_weight=0.0,
         q_dir_kl_weight=0.0,
@@ -564,7 +597,7 @@ def test_native_categorical_targets_use_dirichlet_density_nll():
     logits = jnp.zeros((1, 2))
     alpha_v = jnp.array([[1.5, 2.0, 4.0]])
     alpha_q = jnp.array([[[1.0, 1.5, 3.0], [3.0, 1.0, 1.0]]])
-    config = SimpleNamespace(
+    config = _loss_config(
         policy_loss_weight=0.0,
         value_dir_kl_weight=1.0,
         q_dir_kl_weight=1.0,
@@ -597,7 +630,7 @@ def test_debug_outcome_losses_use_dirichlet_mean_nll_not_density():
     alpha_q = jnp.array([[[0.1, 0.2, 0.7], [0.3, 0.3, 0.4]]])
     concentrated_alpha_v = alpha_v * 10.0
     concentrated_alpha_q = alpha_q * 10.0
-    config = SimpleNamespace(
+    config = _loss_config(
         policy_loss_weight=0.0,
         value_dir_kl_weight=0.0,
         q_dir_kl_weight=0.0,

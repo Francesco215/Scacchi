@@ -1,4 +1,5 @@
 from typing import Any
+from dataclasses import replace
 
 from flax import nnx
 import jax
@@ -17,15 +18,12 @@ def _predict(model: Any, obs: jax.Array):
 
 
 def _with_eval_num_simulations(config, num_simulations: int | None):
-    if num_simulations is None or num_simulations == config.num_simulations:
+    if num_simulations is None or num_simulations == config.search.num_simulations:
         return config
-    if hasattr(config, "model_copy"):
-        return config.model_copy(update={"num_simulations": num_simulations})
-    from types import SimpleNamespace
-
-    values = dict(vars(config))
-    values["num_simulations"] = num_simulations
-    return SimpleNamespace(**values)
+    return replace(
+        config,
+        search=replace(config.search, num_simulations=num_simulations),
+    )
 
 
 def _replace_legal_action_mask(env_state, legal_action_mask: jax.Array):
@@ -154,11 +152,9 @@ def _posterior_tree_eval_action(
 
 def make_mcts_evaluate(env, config, baseline_model):
     search_config = config
-    eval_batch_size = int(
-        getattr(config, "eval_batch_size", config.selfplay_batch_size)
-    )
+    eval_batch_size = int(config.eval.batch_size)
 
-    if is_posterior_tree_policy(getattr(config, "search_policy", "gumbel")):
+    if is_posterior_tree_policy(config.search.policy):
         @nnx.jit
         def evaluate_leaves(model: Any, obs: jax.Array):
             return _predict(model, obs)

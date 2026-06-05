@@ -188,8 +188,8 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
         minibatches = make_minibatches(
             samples,
             perm_key,
-            config.training_batch_size,
-            getattr(config, "max_updates_per_iter", None),
+            config.training.batch_size,
+            config.training.max_updates_per_iter,
             parallel,
         )
         return train_minibatches(model, optimizer, minibatches, config, parallel)

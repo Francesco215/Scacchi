@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 if TYPE_CHECKING:
-    from .train import Config
+    from .types import Config
 
 
 def _unit_dirichlet_concentration_logit(num_outcomes: int) -> float:
@@ -495,55 +495,54 @@ def build_model(
     rngs: nnx.Rngs,
 ) -> nnx.Module:
     def dirichlet_num_outcomes() -> int:
-        num_outcomes = config.num_outcomes
+        num_outcomes = config.env.num_outcomes
         if num_outcomes is None:
-            posterior_tree_search = getattr(config, "search_policy", "gumbel") in (
-                "posterior_tree",
-            )
-            if posterior_tree_search:
-                return 3
-            return 2 if config.env_id == "hex" else 3
+            return 2 if config.env.id == "hex" else 3
         return num_outcomes
 
-    if config.network == "aznet":
+    if config.model.network == "aznet":
         return AZNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
-            num_channels=config.num_channels,
-            num_blocks=config.num_layers,
-            resnet_v2=config.resnet_v2,
+            num_channels=config.model.num_channels,
+            num_blocks=config.model.num_layers,
+            resnet_v2=config.model.resnet_v2,
             rngs=rngs,
         )
-    if config.network == "aznet_dirichlet":
+    if config.model.network == "aznet_dirichlet":
         return AZDirichletNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
             num_outcomes=dirichlet_num_outcomes(),
-            num_channels=config.num_channels,
-            num_blocks=config.num_layers,
-            resnet_v2=config.resnet_v2,
-            dirichlet_concentration_clip=config.dirichlet_concentration_clip,
+            num_channels=config.model.num_channels,
+            num_blocks=config.model.num_layers,
+            resnet_v2=config.model.resnet_v2,
+            dirichlet_concentration_clip=(
+                config.training.regularization.dirichlet_concentration_clip
+            ),
             rngs=rngs,
         )
-    if config.network == "boardlaw":
+    if config.model.network == "boardlaw":
         return BoardlawNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
-            width=config.num_channels,
-            depth=config.num_layers,
-            rezero_kernel_init=getattr(config, "rezero_kernel_init", "variance_scaling"),
+            width=config.model.num_channels,
+            depth=config.model.num_layers,
+            rezero_kernel_init=config.model.rezero_kernel_init,
             rngs=rngs,
         )
-    if config.network == "boardlaw_dirichlet":
+    if config.model.network == "boardlaw_dirichlet":
         return BoardlawDirichletNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
             num_outcomes=dirichlet_num_outcomes(),
-            width=config.num_channels,
-            depth=config.num_layers,
-            dirichlet_concentration_clip=config.dirichlet_concentration_clip,
-            legacy_dirichlet_head_init=getattr(config, "legacy_dirichlet_head_init", False),
-            rezero_kernel_init=getattr(config, "rezero_kernel_init", "variance_scaling"),
+            width=config.model.num_channels,
+            depth=config.model.num_layers,
+            dirichlet_concentration_clip=(
+                config.training.regularization.dirichlet_concentration_clip
+            ),
+            legacy_dirichlet_head_init=config.model.legacy_dirichlet_head_init,
+            rezero_kernel_init=config.model.rezero_kernel_init,
             rngs=rngs,
         )
-    raise ValueError(f"unknown network: {config.network!r}")
+    raise ValueError(f"unknown network: {config.model.network!r}")

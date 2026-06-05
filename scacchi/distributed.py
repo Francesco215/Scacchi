@@ -69,7 +69,7 @@ def make_batch_parallel(config: Any, axis_name: str = "batch") -> BatchParallel:
 
     mesh = jax.make_mesh((len(devices),), (axis_name,))
     parallel = BatchParallel(enabled=True, axis_name=axis_name, mesh=mesh)
-    for batch_size in [config.selfplay_batch_size, config.training_batch_size]:
+    for batch_size in [config.selfplay.batch_size, config.training.batch_size]:
         assert batch_size % len(devices) == 0, f"batch_size ({batch_size}) must be divisible by number of devices ({len(devices)})"
     return parallel
 

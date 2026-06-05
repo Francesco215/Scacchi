@@ -99,26 +99,26 @@ def make_compute_input_for_lossfn(config):
         )
 
         def body_fn(carry: jax.Array, i: jax.Array) -> tuple[jax.Array, jax.Array]:
-            ix = config.max_num_steps - i - 1
+            ix = config.selfplay.max_num_steps - i - 1
             value = data.reward[ix] + data.discount[ix] * carry
             return value, value
 
         _, value_tgt = jax.lax.scan(
             body_fn,
             jnp.zeros(data.reward.shape[1], dtype=data.reward.dtype),
-            jnp.arange(config.max_num_steps),
+            jnp.arange(config.selfplay.max_num_steps),
         )
         value_tgt = value_tgt[::-1, :]
         policy_tgt = jnp.asarray(data.action_weights)
         policy_loss_mask = legal_policy_mask & search_loss_mask
         value_loss_mask = search_loss_mask
-        loss_mask_mode = getattr(config, "loss_mask_mode", "search")
+        loss_mask_mode = config.training.losses.loss_mask_mode
         if loss_mask_mode == "value":
             policy_loss_mask = value_mask
             value_loss_mask = value_mask
         elif loss_mask_mode != "search":
             raise ValueError(f"unknown loss_mask_mode: {loss_mask_mode!r}")
-        if getattr(config, "policy_target_mode", "search") == "winner_action":
+        if config.training.losses.policy_target_mode == "winner_action":
             policy_tgt = jax.nn.one_hot(
                 data.played_action,
                 data.action_weights.shape[-1],
@@ -138,8 +138,8 @@ def make_compute_input_for_lossfn(config):
         v_target_outcome = data.v_target_outcome
         v_target_distance = data.v_target_distance
 
-        terminal_edge_targets = getattr(config, "terminal_edge_targets", False)
-        terminal_parent_targets = getattr(config, "terminal_parent_targets", False)
+        terminal_edge_targets = config.training.losses.terminal_edge_targets
+        terminal_parent_targets = config.training.losses.terminal_parent_targets
         if terminal_edge_targets or terminal_parent_targets:
             native_defaults = native_fields_from_beta(beta_q_target, beta_v_target)
             q_target_kind = (
@@ -605,7 +605,7 @@ def _compute_dirichlet_losses(
     policy_target_entropy = _masked_mean(policy_target_entropy, policy_loss_mask)
     policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
 
-    categorical_epsilon = float(getattr(config, "categorical_epsilon", 1e-4))
+    categorical_epsilon = float(config.search.constants.categorical_epsilon)
     value_dir_kl = _native_dirichlet_loss(
         data.beta_V_target,
         alpha_v,
@@ -626,7 +626,7 @@ def _compute_dirichlet_losses(
     )
     q_row_mask = (
         value_loss_mask
-        if getattr(config, "loss_mask_mode", "search") == "value"
+        if config.training.losses.loss_mask_mode == "value"
         else search_loss_mask
     )
     q_weights = jnp.where(
@@ -636,7 +636,7 @@ def _compute_dirichlet_losses(
     )
     q_metric_mask = q_weights > 0
     q_dir_kl_mask = _bounded_loss_mask(q_dir_kl, q_metric_mask)
-    q_dir_kl_reduction = getattr(config, "q_dir_kl_reduction", "weighted")
+    q_dir_kl_reduction = config.training.losses.q_dir_kl_reduction
     if q_dir_kl_reduction == "masked_mean":
         q_dir_kl_loss = _bounded_masked_mean(q_dir_kl, q_metric_mask)
     elif q_dir_kl_reduction == "weighted":
@@ -675,11 +675,11 @@ def _compute_dirichlet_losses(
     q_loss_weight_mean = _masked_mean(data.q_loss_weight, q_metric_mask)
 
     total_loss = (
-        config.policy_loss_weight * policy_loss
-        + config.value_dir_kl_weight * value_dir_kl_loss
-        + config.q_dir_kl_weight * q_dir_kl_loss
-        + getattr(config, "value_outcome_weight", 0.0) * value_outcome_loss
-        + getattr(config, "q_outcome_weight", 0.0) * q_outcome_loss
+        config.training.losses.policy_weight * policy_loss
+        + config.training.losses.value_dir_kl_weight * value_dir_kl_loss
+        + config.training.losses.q_dir_kl_weight * q_dir_kl_loss
+        + config.training.losses.value_outcome_weight * value_outcome_loss
+        + config.training.losses.q_outcome_weight * q_outcome_loss
     )
     metrics = TrainMetrics(
         policy_loss=policy_loss,
