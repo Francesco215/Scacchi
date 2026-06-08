@@ -6,8 +6,8 @@ Refactor search and gameplay around these concepts:
 
 ```python
 nn_evaluator = make_nn_evaluator(nn_config)
-search_algo = make_search_algo(search_config)
-player = Player(nn_evaluator, search_algo, target_builder, action_committer)
+search = make_search(env, predict_fn, search_config)
+player = Player(search, action_committer)
 output = play(env, player_1, player_2, ...)
 ```
 
@@ -18,11 +18,23 @@ baseline/opponent player.
 The main architectural rule is:
 
 - search improves root estimates
-- target building converts search evidence into training targets
+- search converts model priors into posterior targets
 - action commitment decides which move is actually played
 - play advances the environment and records trajectory data
 
-Search should not own action commitment or loss weighting.
+Search should not own action commitment or training loss reduction choices.
+
+## Initial Scope
+
+Focus the first implementation on the JAX/MCTX search paths:
+
+- scalar Gumbel
+- Dirichlet Gumbel
+- Dirichlet Thompson
+
+Keep DQAZ on the existing compatibility path for now. DQAZ has extra native
+engine/export semantics, so it should be migrated after the search/play
+boundary is working for Gumbel and Dirichlet search.
 
 ## Current Surface Area
 
@@ -115,7 +127,7 @@ adapter detail or be moved into external action commitment.
 - trajectory data (`obs`, `reward`, `terminated`, `discount`)
 - action data (`played_action`, `legal_action_mask`)
 - policy targets (`action_weights`, `search_loss_mask`)
-- Dirichlet targets (`beta_Q_target`, `beta_V_target`, native target fields)
+- Dirichlet targets (`beta_Q_target`, `beta_V_target`, target metadata fields)
 - DQAZ tree training data and diagnostics
 
 That output can stay as the training-facing compatibility type for a while, but
@@ -137,8 +149,6 @@ Keep in `search.*`:
 Move out of search:
 
 - `selfplay.action_source`
-- `search.*.policy_samples`
-- `search.*.policy_sample_chunk_size`
 - `training.losses.q_loss_weight_mode` stays in training/loss config
 
 Proposed replacements:
@@ -155,6 +165,11 @@ training.targets.posterior_policy_samples:
 training.targets.posterior_policy_sample_chunk_size:
   int | None
 ```
+
+The posterior policy sample fields can also stay inside the active search config
+if we treat them as part of producing the posterior policy target. The important
+boundary is that action commitment and loss reduction choices do not live in
+search.
 
 `posterior_best` and `posterior_argmax` should collapse to one public name. The
 old spelling can remain as a compatibility alias for one migration.
@@ -180,51 +195,73 @@ Expected behavior:
 - Scalar networks fill `logits` and `value`.
 - Dirichlet networks fill `logits`, `alpha_v`, and `alpha_q`.
 
-This can start as helper functions rather than a class:
+This can start as a helper function rather than a class:
 
 ```python
-predict(model, obs) -> raw model output
-normalize_model_output(raw) -> EvaluatorOutput
+predict(model, obs) -> EvaluatorOutput
 ```
 
-### Search Algorithm
+### Search Function
 
-The search algorithm is built from the active search config once.
+The bound search function is built from the environment, the model-bound
+prediction function, and the active search config.
 
 ```python
-search_algo = make_search_algo(active_search_config)
+search = make_search(env, predict_fn, active_search_config)
 ```
 
 Runtime signature:
 
 ```python
-search_result = search_algo(
+search_output = search(
     root_state=env_state,
-    root_eval=evaluator_output,
-    transition_evaluator=transition_evaluator,
     rng_key=search_key,
 )
 ```
 
-`transition_evaluator(states, actions)` returns child states and child
-`EvaluatorOutput`. For MCTX search this wraps `jax.vmap(env.step)` and the NN
-evaluator. For DQAZ this is also the natural transition batch interface.
-
-Search returns raw improved estimates:
+`make_search(...)` bakes in the expansion logic. For the current MCTX paths,
+that means it builds the same recurrent functions already used in the code:
 
 ```python
-class SearchResult(NamedTuple):
-    search_action: jax.Array
-    search_policy: jax.Array
-    search_loss_mask: jax.Array
+make_recurrent_fn(env, predict_fn)
+make_dirichlet_recurrent_fn_from_constants(env, predict_fn, search_cfg.constants)
+```
 
-    q_evidence_sum: jax.Array | None = None
-    action_value_target_prior: jax.Array | None = None
-    action_alpha_post: jax.Array | None = None
+With the new evaluator contract, these factories keep their role but consume
+`EvaluatorOutput` fields instead of unpacking raw model tuples directly. The
+Dirichlet recurrent builder should take the active search constants directly,
+not the full global config.
 
-    beta_Q_target: jax.Array | None = None
-    beta_V_target: jax.Array | None = None
+Scalar Gumbel search uses the scalar recurrent function. Dirichlet Gumbel and
+Dirichlet Thompson search use the Dirichlet recurrent function. DQAZ is the
+exception for now: it is not an MCTX recurrent search, so its search closure can
+keep adapting to the existing native posterior-tree transition/evaluation path
+behind the DQAZ adapter.
 
+Search evaluates the root position itself, runs the configured search, and
+returns improved predictions shaped like the model heads plus training metadata.
+
+```python
+class SearchOutput(NamedTuple):
+    posterior: PosteriorTargets
+    diagnostics: SearchDiagnostics | None = None
+
+
+class PosteriorTargets(NamedTuple):
+    prediction: PosteriorPrediction
+    metadata: TargetMetadata | None = None
+
+
+class PosteriorPrediction(NamedTuple):
+    policy: jax.Array
+    value: jax.Array | None = None
+    alpha_v: jax.Array | None = None
+    alpha_q: jax.Array | None = None
+
+
+class TargetMetadata(NamedTuple):
+    mask: jax.Array | None = None
+    q_weight: jax.Array | None = None
     q_target_kind: jax.Array | None = None
     q_target_weight: jax.Array | None = None
     q_target_outcome: jax.Array | None = None
@@ -233,103 +270,56 @@ class SearchResult(NamedTuple):
     v_target_weight: jax.Array | None = None
     v_target_outcome: jax.Array | None = None
     v_target_distance: jax.Array | None = None
-
     tree_data: TreeTrainingData | None = None
-    diagnostics: SearchDiagnostics | None = None
 ```
 
 Field meaning:
 
-- `search_action`: raw action selected by the search algorithm.
-- `search_policy`: visit policy, Gumbel policy, posterior policy, or DQAZ
-  exported root policy.
-- `q_evidence_sum`: evidence accumulated by Dirichlet search per root action.
-- `action_value_target_prior`: action Dirichlet prior after root child prior
-  correction.
-- `action_alpha_post`: action posterior after prior plus evidence.
-- `beta_Q_target` and `beta_V_target`: allowed for DQAZ because the native
-  engine already exports target-shaped data. JAX/MCTX paths can leave these
-  empty and let target building compute them.
-- native target fields: DQAZ categorical/Dirichlet metadata.
-- `tree_data`: optional extra rows for training.
-- `diagnostics`: search metrics only.
+- `posterior.prediction.policy` is `pi_search`. It is a policy distribution,
+  not logits.
+- For scalar policy/value models, `posterior.prediction.value` is the searched
+  scalar value target when available.
+- For Dirichlet models, `posterior.prediction.alpha_v` and
+  `posterior.prediction.alpha_q` are the searched Dirichlet posteriors for the
+  value and Q heads.
+- `metadata.mask` marks rows/actions with valid search targets.
+- `metadata.q_weight` is the Q-head loss weight.
+- target kind/outcome/distance/weight fields are categorical-vs-Dirichlet
+  target metadata used by the current DQAZ/terminal-target loss path.
+- `metadata.tree_data` contains optional extra tree rows for training.
+- `diagnostics` contains search metrics only.
 
-Search does not return `played_action` and does not return `q_loss_weight`.
-
-### Target Builder
-
-Target building converts search evidence into training labels.
-
-```python
-targets = target_builder(
-    root_eval=evaluator_output,
-    search_result=search_result,
-    legal_action_mask=env_state.legal_action_mask,
-    rng_key=target_key,
-)
-```
-
-Target output:
-
-```python
-class TrainingTargets(NamedTuple):
-    action_weights: jax.Array
-    beta_Q_target: jax.Array
-    beta_V_target: jax.Array
-    q_loss_weight: jax.Array
-    search_loss_mask: jax.Array
-
-    q_target_kind: jax.Array | None = None
-    q_target_weight: jax.Array | None = None
-    q_target_outcome: jax.Array | None = None
-    q_target_distance: jax.Array | None = None
-    v_target_kind: jax.Array | None = None
-    v_target_weight: jax.Array | None = None
-    v_target_outcome: jax.Array | None = None
-    v_target_distance: jax.Array | None = None
-```
+Search does not return `played_action`.
 
 Behavior by search/network type:
 
 - Scalar gumbel:
-  - `action_weights = search_result.search_policy`
-  - `beta_Q_target`, `beta_V_target`, and `q_loss_weight` are zero-shaped
-    Dirichlet compatibility targets.
+  - `posterior.prediction.policy = pi_search`
+  - `posterior.prediction.value` may hold a searched scalar value target if we
+    want scalar value targets from search; otherwise scalar value training can
+    keep using trajectory returns.
 
 - Dirichlet gumbel:
-  - `search_policy = mctx.action_weights`
-  - `q_evidence_sum = q_evidence_sum_from_tree(search_tree)`
-  - posterior policy target is sampled from `action_alpha_post`, unless
-    `posterior_policy_samples == 0`, in which case use `search_policy`.
-  - `beta_Q_target`, `beta_V_target` are computed with `posterior_targets`.
+  - `posterior.prediction.policy = pi_search`
+  - `posterior.prediction.alpha_v = beta_V_target`
+  - `posterior.prediction.alpha_q = beta_Q_target`
 
 - Dirichlet Thompson:
   - search expands with `num_simulations` and `num_blocks`
-  - posterior policy target is sampled from `action_alpha_post`, unless
-    `posterior_policy_samples == 0`, in which case use `search_policy`
-  - `beta_Q_target`, `beta_V_target` are computed with `posterior_targets`.
+  - `posterior.prediction.policy = pi_search`
+  - `posterior.prediction.alpha_v = beta_V_target`
+  - `posterior.prediction.alpha_q = beta_Q_target`
 
 - DQAZ:
-  - start by passing through native exported `action_weights`, `beta_Q_target`,
-    `beta_V_target`, and native target fields
-  - longer term, make the Rust finish/export API return raw posterior data so
-    target building can own the final target policy consistently.
+  - `posterior.prediction.policy = pi_search`
+  - `posterior.prediction.alpha_v = beta_V_target`
+  - `posterior.prediction.alpha_q = beta_Q_target`
+  - categorical solved outcomes and target weights go in `metadata`
 
-`q_loss_weight` is built here because it is training-facing:
-
-```text
-q_loss_weight_mode = evidence_mass -> sum(q_evidence_sum, axis=-1)
-q_loss_weight_mode = policy        -> action_weights
-```
-
-For DQAZ, keep the current sparse-policy behavior initially:
-
-```text
-q_loss_weight = exported root policy over legal actions
-```
-
-Then revisit whether this should become evidence mass once native export can
-provide the right evidence tensor.
+Intermediate values like `q_evidence_sum`, `action_alpha_post`, and
+`action_value_target_prior` stay inside the search implementation. They are not
+part of the public play/training contract unless we explicitly add them as
+diagnostics.
 
 ### Action Committer
 
@@ -337,8 +327,7 @@ Action commitment decides the move to play.
 
 ```python
 action = action_committer(
-    search_result=search_result,
-    targets=targets,
+    posterior=search_output.posterior,
     legal_action_mask=env_state.legal_action_mask,
     rng_key=commit_key,
 )
@@ -347,10 +336,14 @@ action = action_committer(
 Supported commitment types:
 
 ```text
-posterior_argmax -> argmax(targets.action_weights)
-posterior_sample -> sample(targets.action_weights)
-search_action    -> search_result.search_action
+posterior_argmax -> argmax(posterior.prediction.policy)
+posterior_sample -> sample(posterior.prediction.policy)
 ```
+
+The old `search_action` mode needs a migration decision. Either drop it, or keep
+it as a compatibility-only mode by adding an optional backend action field to
+metadata for backends that expose one. The core `SearchOutput` shape should not
+grow raw search internals just for this mode.
 
 Every mode goes through `legalize_action(action, legal_action_mask)`.
 
@@ -359,30 +352,18 @@ temporarily for tests.
 
 ### Player
 
-The player composes evaluator, search, target building, and action commitment.
+The player composes a bound search function and action commitment. The model,
+environment, evaluator, and search config are already baked into `search`.
 
 ```python
 class PlayerOutput(NamedTuple):
     action: jax.Array
-    action_weights: jax.Array | None = None
-    beta_Q_target: jax.Array | None = None
-    beta_V_target: jax.Array | None = None
-    q_loss_weight: jax.Array | None = None
-    search_loss_mask: jax.Array | None = None
-    tree_data: TreeTrainingData | None = None
+    posterior: PosteriorTargets | None = None
     diagnostics: SearchDiagnostics | None = None
-    q_target_kind: jax.Array | None = None
-    q_target_weight: jax.Array | None = None
-    q_target_outcome: jax.Array | None = None
-    q_target_distance: jax.Array | None = None
-    v_target_kind: jax.Array | None = None
-    v_target_weight: jax.Array | None = None
-    v_target_outcome: jax.Array | None = None
-    v_target_distance: jax.Array | None = None
 ```
 
-For training self-play, all target fields are present. For eval, only `action`
-is required; policy/target fields may be `None`.
+For training self-play, `posterior` is present. For eval, only `action` is
+required; posterior fields may be `None`.
 
 Because batched positions can contain both current players, `play` usually has
 to evaluate both players for the whole batch and select row-wise by
@@ -390,37 +371,35 @@ to evaluate both players for the whole batch and select row-wise by
 PyTree structure for a given play mode. Eval players can both use a minimal
 `PlayerOutput(action=...)` schema.
 
-To keep NNX simple, prefer a player spec/factory over storing model state in the
-player:
+The player API can be small:
 
 ```python
-learner_player = make_model_player(env, search_algo, target_builder, committer)
-output = learner_player(model, env_state, key)
+player = make_player(search, committer)
+output = player(env_state, key)
 ```
 
-The baseline player can also use this signature, with `baseline_model` passed as
-its model argument. A simple policy-only baseline player can ignore search and
-commit from masked logits.
+The player calls `search(env_state, search_key)`, commits from
+`search_output.posterior.prediction.policy`, and stores the full posterior for
+training self-play. A simple policy-only baseline can still be represented as a
+different bound search function that returns a `SearchOutput` with only a policy
+posterior.
 
 ### Play
 
 Generic play should own environment progression only.
 
 ```python
-play_output = play(
+training_samples, eval_metrics = play(
     env,
     player_1,
     player_2,
-    model_1,
-    model_2,
     rng_key,
-    batch_size=batch_size,
-    max_steps=max_steps,
-    reset_mode="auto_reset" | "none",
-    stop_mode="fixed_steps" | "all_done",
-    collect_mode="training" | "returns",
+    play_config,
 )
 ```
+
+`play_config` owns batch size, maximum steps, reset behavior, stop behavior, and
+whether training samples or eval metrics are populated.
 
 Step behavior:
 
@@ -428,7 +407,7 @@ Step behavior:
    collected.
 2. Build a searchable state. For eval/all-done mode, terminal rows get a dummy
    legal action because their actions are discarded.
-3. Split keys for player 1, player 2, targets, commitment, and reset.
+3. Split keys for player 1, player 2, commitment, and reset.
 4. Evaluate both players on the searchable state.
 5. Select action row-wise with `env_state.current_player`.
 6. Validate/legalize action.
@@ -437,39 +416,42 @@ Step behavior:
 9. Record reward, discount, termination, selected action, and selected player
    training fields.
 
-Training/self-play output should remain compatible with `SelfplayOutput`:
+The base output has both sides of the collection contract:
 
 ```python
-class TrainingPlayOutput(NamedTuple):
+class TrainingSamples(NamedTuple):
     obs: jax.Array
-    reward: jax.Array
-    terminated: jax.Array
-    action_weights: jax.Array
-    played_action: jax.Array
+    posterior: PosteriorTargets
     legal_action_mask: jax.Array
-    beta_Q_target: jax.Array
-    beta_V_target: jax.Array
-    q_loss_weight: jax.Array
-    discount: jax.Array
-    tree_data: TreeTrainingData | None = None
-    search_loss_mask: jax.Array | None = None
-    search_diagnostics: SearchDiagnostics | None = None
-    native target fields...
+    played_action: jax.Array | None = None
+
+
+class EvalMetrics(NamedTuple):
+    avg_return: jax.Array
+    win_rate: jax.Array
+    draw_rate: jax.Array
+    lose_rate: jax.Array
+
+
+play(...) -> tuple[TrainingSamples | None, EvalMetrics | None]
 ```
 
-Evaluation output can be smaller:
+Then expose thin wrappers:
 
 ```python
-class EvalPlayOutput(NamedTuple):
-    returns: jax.Array
-    invalid_action: jax.Array
-    num_steps: jax.Array | None = None
+play_training(...) -> TrainingSamples
+play_eval(...) -> EvalMetrics
 ```
 
-`make_selfplay` becomes a wrapper around `play(learner, learner, ...)`.
+For the first implementation, keep a compatibility adapter from
+`TrainingSamples` to the existing `SelfplayOutput` fields. Longer term,
+`loss.py` should consume `samples.obs`, `samples.posterior.prediction`, and
+`samples.posterior.metadata` directly.
+
+`make_selfplay` becomes a wrapper around `play_training(learner, learner, ...)`.
 
 `make_mcts_evaluate` becomes a wrapper around
-`play(learner, baseline, ..., collect_mode="returns")`.
+`play_eval(learner, baseline, ...)`.
 
 ## Function Reduction Estimate
 
@@ -499,9 +481,8 @@ Likely moved/renamed rather than deleted:
 ```text
 _select_played_action        -> commit_action
 _legalize_played_action      -> legalize_action
-_q_loss_weight_from_mode     -> build_q_loss_weight
 _search_loss_mask            -> target/search utility
-_empty_posterior_targets     -> scalar target builder utility
+_empty_posterior_targets     -> scalar posterior utility
 make_recurrent_fn            -> search/evaluator transition helper
 make_dirichlet_recurrent_fn  -> search/evaluator transition helper
 _searchable_eval_state       -> play utility
@@ -534,7 +515,7 @@ play_search.py:
   net in file: -150 to -250
   note: much of this is DQAZ backend code and remains
 
-new player/search/target modules:
+new player/search modules:
   expected: +250 to +450 lines
 
 pipeline.py:
@@ -558,13 +539,13 @@ semantic coupling and making the data flow testable stage by stage.
 
 ### Phase 1: Introduce Stage Types And Utilities
 
-Add the new `SearchResult`, `TrainingTargets`, and `PlayerOutput` types.
+Add the new `SearchOutput`, `PosteriorTargets`, `PosteriorPrediction`,
+`TargetMetadata`, and `PlayerOutput` types.
 
 Move or wrap these helpers without changing behavior:
 
 - `legalize_action`
 - `commit_action`
-- `build_q_loss_weight`
 - scalar empty Dirichlet compatibility targets
 - posterior policy target builder
 
@@ -575,33 +556,36 @@ Keep old names as compatibility shims for tests.
 Add:
 
 ```python
-make_search_algo(search_cfg)
+make_search(env, predict_fn, search_cfg)
 ```
 
 Dispatch by concrete config type:
 
 ```python
-GumbelSearchConfig -> gumbel search closure
-DirichletThompsonSearchConfig -> Dirichlet Thompson closure
-DQAZSearchConfig -> DQAZ search closure
+GumbelSearchConfig -> bound gumbel search closure
+DirichletThompsonSearchConfig -> bound Dirichlet Thompson closure
 ```
 
-The returned search function should not inspect the global `Config` object.
-Static config values should be closed over once.
+The returned search function should not inspect the global `Config` object and
+should not receive recurrent functions at call time. Static config values,
+environment stepping, and model prediction are closed over once.
 
 This phase removes `_search_value`, `_search_kind`, and most dynamic active
 config lookups from the hot path.
 
-### Phase 3: Target Builder And Action Commitment
+### Phase 3: Posterior Metadata And Action Commitment
 
 Add:
 
 ```python
-make_target_builder(target_cfg, loss_cfg, env_cfg)
 make_action_committer(commitment_cfg)
 ```
 
-Move `policy_samples` and `policy_sample_chunk_size` into target config.
+Make each search backend populate `PosteriorTargets` and `TargetMetadata`
+directly. The current `q_loss_weight`, `search_loss_mask`, and categorical
+target fields become metadata. Keep a compatibility adapter that maps
+`TrainingSamples` back to the existing `SelfplayOutput` field names until
+`loss.py` is migrated.
 
 Rename:
 
@@ -616,20 +600,17 @@ action_source maps to action_commitment_type with a deprecation note
 posterior_best maps to posterior_argmax
 ```
 
-### Phase 4: Model Player
+### Phase 4: Player
 
 Add:
 
 ```python
-make_model_player(env, evaluator, search_algo, target_builder, action_committer)
+make_player(search, action_committer)
 ```
 
-The model player should return complete training fields in self-play mode and
-minimal fields in eval mode.
-
-Also add a policy-only player for PGX baselines if we want eval without MCTS for
-the opponent. If current behavior must be preserved, the baseline player should
-use the same search player path as the learner.
+The player should return complete posterior fields in self-play mode and
+minimal fields in eval mode. Policy-only baselines can be implemented as bound
+search functions that skip tree search and return masked policy predictions.
 
 ### Phase 5: Generic Play
 
@@ -642,30 +623,29 @@ self-play:
   players: learner, learner
   reset_mode: auto_reset
   stop_mode: fixed_steps
-  collect_mode: training
+  wrapper: play_training(...) -> TrainingSamples
 
 eval:
   players: learner, baseline
   reset_mode: none
   stop_mode: all_done
-  collect_mode: returns
+  wrapper: play_eval(...) -> EvalMetrics
 ```
 
 Keep `make_selfplay` and `make_mcts_evaluate` as public wrappers first. They can
-be simplified after callers move to `play`.
+be simplified after callers move to `play_training` and `play_eval`.
 
 ### Phase 6: Tests And Scripts
 
 Update tests in this order:
 
 1. Add unit tests for `commit_action` and `legalize_action`.
-2. Add unit tests for target building with scalar gumbel and Dirichlet
+2. Add unit tests for posterior construction with scalar gumbel and Dirichlet
    Thompson.
 3. Update self-play tests to call the player/play API.
 4. Update eval tests to call generic play utilities.
-5. Update DQAZ tests to use `make_search_algo(DQAZSearchConfig(...))` or keep a
-   compatibility wrapper until the native export contract is cleaned up.
-6. Update `scripts/fig_8.py` last. It currently has a custom eval loop that the
+5. Leave DQAZ tests on the compatibility wrapper for the first pass.
+6. Update `scripts/fig_8.py` later. It currently has a custom eval loop that the
    new player/play API should replace cleanly.
 
 ## DQAZ-Specific Caveats
@@ -678,8 +658,8 @@ Initial compromise:
 - `make_dqaz_search` may still call the native finish/export path.
 - Treat exported action as `search_action`.
 - Keep external action commitment in Python for self-play/eval where possible.
-- Pass native `action_weights`, `beta_Q_target`, `beta_V_target`, and target
-  metadata through the target builder.
+- Map native exported `action_weights`, `beta_Q_target`, `beta_V_target`, and
+  target metadata into `PosteriorTargets`.
 
 Longer-term cleanup:
 
@@ -724,11 +704,13 @@ Do not start by rewriting `play`.
 
 Start with the search boundary:
 
-1. Add `SearchResult`.
-2. Add `TrainingTargets`.
-3. Add `make_search_algo(active_search_cfg)`.
-4. Add `make_target_builder(...)`.
-5. Add `commit_action(...)`.
+1. Add `SearchOutput`, `PosteriorTargets`, `PosteriorPrediction`, and
+   `TargetMetadata`.
+2. Add a compatibility adapter from `TrainingSamples` to current
+   `SelfplayOutput` target fields.
+3. Add `make_search(env, predict_fn, active_search_cfg)`.
+4. Add `commit_action(...)`.
+5. Add `make_player(search, action_committer)`.
 6. Make current `make_selfplay` use these pieces while still returning
    `SelfplayOutput`.
 
