@@ -4,6 +4,7 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import digamma, gammaln
+from jaxtyping import Array, Bool, Float, Int
 import optax
 
 from .dirichlet_tree.native import (
@@ -14,49 +15,45 @@ from .dirichlet_tree.native import (
     native_fields_from_beta,
 )
 from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, assert_batch_axis_sharded
-from .play import SelfplayOutput
+from .play import TrainingSamples
 
 
 DIRICHLET_KL_LOSS_CUTOFF = 1000.0
 
 
 class Sample(NamedTuple):
-    obs: jax.Array
-    policy_tgt: jax.Array
-    value_tgt: jax.Array
-    played_action: jax.Array
-    policy_mask: jax.Array
-    value_mask: jax.Array
-    beta_Q_target: jax.Array
-    beta_V_target: jax.Array
-    q_loss_weight: jax.Array
-    policy_loss_mask: jax.Array | None = None
-    value_loss_mask: jax.Array | None = None
-    search_loss_mask: jax.Array | None = None
-    outcome_mask: jax.Array | None = None
-    q_target_kind: jax.Array | None = None
-    q_target_weight: jax.Array | None = None
-    q_target_outcome: jax.Array | None = None
-    q_target_distance: jax.Array | None = None
-    v_target_kind: jax.Array | None = None
-    v_target_weight: jax.Array | None = None
-    v_target_outcome: jax.Array | None = None
-    v_target_distance: jax.Array | None = None
-
-    @property
-    def q_evidence_mass(self) -> jax.Array:
-        return self.q_loss_weight
+    obs: Float[Array, "..."]
+    policy_tgt: Float[Array, "*batch action"]
+    value_tgt: Float[Array, "*batch"]
+    played_action: Int[Array, "*batch"]
+    policy_mask: Bool[Array, "*batch action"]
+    value_mask: Bool[Array, "*batch"]
+    beta_Q_target: Float[Array, "*batch action outcome"]
+    beta_V_target: Float[Array, "*batch outcome"]
+    q_loss_weight: Float[Array, "*batch action"]
+    policy_loss_mask: Bool[Array, "*batch"] | None = None
+    value_loss_mask: Bool[Array, "*batch"] | None = None
+    search_loss_mask: Bool[Array, "*batch"] | None = None
+    outcome_mask: Bool[Array, "*batch"] | None = None
+    q_target_kind: Int[Array, "*batch action"] | None = None
+    q_target_weight: Float[Array, "*batch action"] | None = None
+    q_target_outcome: Int[Array, "*batch action"] | None = None
+    q_target_distance: Int[Array, "*batch action"] | None = None
+    v_target_kind: Int[Array, "*batch"] | None = None
+    v_target_weight: Float[Array, "*batch"] | None = None
+    v_target_outcome: Int[Array, "*batch"] | None = None
+    v_target_distance: Int[Array, "*batch"] | None = None
 
 
 class _NativeTargetFields(NamedTuple):
-    q_target_kind: jax.Array
-    q_target_weight: jax.Array
-    q_target_outcome: jax.Array
-    q_target_distance: jax.Array
-    v_target_kind: jax.Array
-    v_target_weight: jax.Array
-    v_target_outcome: jax.Array
-    v_target_distance: jax.Array
+    q_target_kind: Int[Array, "*batch action"]
+    q_target_weight: Float[Array, "*batch action"]
+    q_target_outcome: Int[Array, "*batch action"]
+    q_target_distance: Int[Array, "*batch action"]
+    v_target_kind: Int[Array, "*batch"]
+    v_target_weight: Float[Array, "*batch"]
+    v_target_outcome: Int[Array, "*batch"]
+    v_target_distance: Int[Array, "*batch"]
 
 
 _NATIVE_TARGET_FIELD_NAMES = _NativeTargetFields._fields
@@ -79,32 +76,51 @@ _TREE_TO_SAMPLE_FIELDS = {
 
 
 class TrainMetrics(NamedTuple):
-    policy_loss: jax.Array
-    value_loss: jax.Array
-    policy_nll_loss: jax.Array
-    policy_kl_hat: jax.Array
-    policy_target_entropy: jax.Array
-    value_dir_kl_loss: jax.Array
-    q_dir_kl_loss: jax.Array
-    value_outcome_loss: jax.Array
-    q_outcome_loss: jax.Array
-    alpha_V_concentration: jax.Array
-    alpha_Q_concentration: jax.Array
-    q_loss_weight_mean: jax.Array
-    search_path_depth_mean: jax.Array
-    search_path_depth_p50: jax.Array
-    search_path_depth_p90: jax.Array
-    search_path_depth_max: jax.Array
-    search_expanded_nodes: jax.Array
-    search_terminal_fraction: jax.Array
-    search_root_policy_entropy: jax.Array
-    search_root_gamma: jax.Array
-    search_root_downstream_eval_count: jax.Array
-    search_root_q_concentration: jax.Array
+    policy_loss: Float[Array, "*batch"]
+    value_loss: Float[Array, "*batch"]
+    policy_nll_loss: Float[Array, "*batch"]
+    policy_kl_hat: Float[Array, "*batch"]
+    policy_target_entropy: Float[Array, "*batch"]
+    value_dir_kl_loss: Float[Array, "*batch"]
+    q_dir_kl_loss: Float[Array, "*batch"]
+    value_outcome_loss: Float[Array, "*batch"]
+    q_outcome_loss: Float[Array, "*batch"]
+    alpha_V_concentration: Float[Array, "*batch"]
+    alpha_Q_concentration: Float[Array, "*batch"]
+    q_loss_weight_mean: Float[Array, "*batch"]
+    search_path_depth_mean: Float[Array, "*batch"]
+    search_path_depth_p50: Float[Array, "*batch"]
+    search_path_depth_p90: Float[Array, "*batch"]
+    search_path_depth_max: Float[Array, "*batch"]
+    search_expanded_nodes: Float[Array, "*batch"]
+    search_terminal_fraction: Float[Array, "*batch"]
+    search_root_policy_entropy: Float[Array, "*batch"]
+    search_root_gamma: Float[Array, "*batch"]
+    search_root_downstream_eval_count: Float[Array, "*batch"]
+    search_root_q_concentration: Float[Array, "*batch"]
 
-    @property
-    def q_evidence_mass_mean(self) -> jax.Array:
-        return self.q_loss_weight_mean
+def _num_outcomes_for_config(config: Any) -> int:
+    num_outcomes = config.env.num_outcomes
+    if num_outcomes is None:
+        return 2 if config.env.id == "hex" else 3
+    return int(num_outcomes)
+
+
+def _empty_posterior_targets(
+    policy_target: jax.Array,
+    num_outcomes: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    q_loss_weight = policy_target * jnp.asarray(0.0, dtype=policy_target.dtype)
+    beta_q = jnp.broadcast_to(
+        q_loss_weight[..., None],
+        policy_target.shape + (num_outcomes,),
+    )
+    beta_v_seed = jnp.sum(q_loss_weight, axis=-1, keepdims=True)
+    beta_v = jnp.broadcast_to(
+        beta_v_seed,
+        policy_target.shape[:-1] + (num_outcomes,),
+    )
+    return beta_q, beta_v, q_loss_weight
 
 
 def make_compute_input_for_lossfn(
@@ -113,8 +129,28 @@ def make_compute_input_for_lossfn(
 ):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
 
-    def compute_loss_input(data: SelfplayOutput) -> Sample:
-        data = assert_batch_axis_sharded(data, parallel, batch_axis=0, label="loss input data")
+    def compute_loss_input(source: TrainingSamples) -> Sample:
+        source = assert_batch_axis_sharded(
+            source,
+            parallel,
+            batch_axis=0,
+            label="loss input data",
+        )
+        prediction = source.posterior.prediction
+        metadata = source.posterior.metadata
+
+        def metadata_value(field: str) -> Any | None:
+            return None if metadata is None else getattr(metadata, field)
+
+        policy = prediction.policy
+        beta_q_target = prediction.alpha_q
+        beta_v_target = prediction.alpha_v
+        q_loss_weight = metadata_value("q_weight")
+        if beta_q_target is None or beta_v_target is None or q_loss_weight is None:
+            beta_q_target, beta_v_target, q_loss_weight = _empty_posterior_targets(
+                policy,
+                _num_outcomes_for_config(config),
+            )
 
         def assert_native_targets(
             label: str,
@@ -122,12 +158,13 @@ def make_compute_input_for_lossfn(
         ) -> _NativeTargetFields:
             return assert_batch_axis_sharded(native_fields, parallel, batch_axis=0, label=label)
 
-        value_mask = jnp.cumsum(data.terminated[:, ::-1], axis=1)[:, ::-1] >= 1
-        legal_policy_mask = jnp.any(data.legal_action_mask, axis=-1)
-        policy_target_mask = jnp.sum(data.action_weights, axis=-1) > 0
+        value_mask = jnp.cumsum(source.terminated[:, ::-1], axis=1)[:, ::-1] >= 1
+        legal_policy_mask = jnp.any(source.legal_action_mask, axis=-1)
+        policy_target_mask = jnp.sum(policy, axis=-1) > 0
+        metadata_mask = metadata_value("mask")
         search_loss_mask = (
-            data.search_loss_mask
-            if data.search_loss_mask is not None
+            metadata_mask
+            if metadata_mask is not None
             else policy_target_mask
         )
 
@@ -147,8 +184,8 @@ def make_compute_input_for_lossfn(
             )
             return values[::-1]
 
-        value_tgt = jax.vmap(trajectory_value_targets)(data.reward, data.discount)
-        policy_tgt = jnp.asarray(data.action_weights)
+        value_tgt = jax.vmap(trajectory_value_targets)(source.reward, source.discount)
+        policy_tgt = jnp.asarray(policy)
         policy_loss_mask = legal_policy_mask & search_loss_mask
         value_loss_mask = search_loss_mask
         loss_mask_mode = config.training.losses.loss_mask_mode
@@ -159,16 +196,15 @@ def make_compute_input_for_lossfn(
             raise ValueError(f"unknown loss_mask_mode: {loss_mask_mode!r}")
         if config.training.losses.policy_target_mode == "winner_action":
             policy_tgt = jax.nn.one_hot(
-                data.played_action,
-                data.action_weights.shape[-1],
-                dtype=data.action_weights.dtype,
+                source.played_action,
+                policy.shape[-1],
+                dtype=policy.dtype,
             )
             policy_loss_mask = legal_policy_mask & value_mask & (value_tgt > 0)
 
-        beta_q_target = data.beta_Q_target
-        beta_v_target = data.beta_V_target
-        q_loss_weight = data.q_loss_weight
-        native_target_values = _native_target_values(data)
+        native_target_values = {
+            field: metadata_value(field) for field in _NATIVE_TARGET_FIELD_NAMES
+        }
 
         terminal_edge_targets = config.training.losses.terminal_edge_targets
         terminal_parent_targets = config.training.losses.terminal_parent_targets
@@ -180,7 +216,7 @@ def make_compute_input_for_lossfn(
                 native_defaults,
             )
             num_outcomes = beta_v_target.shape[-1]
-            rounded_reward = jnp.round(data.reward).astype(jnp.int32)
+            rounded_reward = jnp.round(source.reward).astype(jnp.int32)
             if num_outcomes == 2:
                 outcome_index = (rounded_reward + 1) // 2
             elif num_outcomes == 3:
@@ -188,11 +224,11 @@ def make_compute_input_for_lossfn(
             else:
                 raise ValueError(f"unsupported outcome count: {num_outcomes}")
             played_action_mask = jax.nn.one_hot(
-                data.played_action,
+                source.played_action,
                 beta_q_target.shape[-2],
                 dtype=bool,
             )
-            terminal_action_mask = data.terminated[..., None] & played_action_mask
+            terminal_action_mask = source.terminated[..., None] & played_action_mask
             native_targets = assert_native_targets(
                 "loss native_targets after defaults",
                 native_targets,
@@ -237,7 +273,7 @@ def make_compute_input_for_lossfn(
             )
 
         if terminal_parent_targets:
-            terminal_win_mask = data.terminated & (data.reward > 0)
+            terminal_win_mask = source.terminated & (source.reward > 0)
             policy_tgt = jnp.where(
                 terminal_win_mask[..., None],
                 played_action_mask.astype(policy_tgt.dtype),
@@ -279,11 +315,11 @@ def make_compute_input_for_lossfn(
             native_target_values = native_targets._asdict()
 
         sample = Sample(
-            obs=data.obs,
+            obs=source.obs,
             policy_tgt=policy_tgt,
             value_tgt=value_tgt,
-            played_action=data.played_action,
-            policy_mask=data.legal_action_mask,
+            played_action=source.played_action,
+            policy_mask=source.legal_action_mask,
             value_mask=value_mask,
             beta_Q_target=beta_q_target,
             beta_V_target=beta_v_target,
@@ -299,10 +335,11 @@ def make_compute_input_for_lossfn(
         native_fields = assert_batch_axis_sharded(native_fields, parallel, batch_axis=0, label="loss native_fields final")
         sample = _with_native_defaults(sample, native_fields)
         sample = assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="loss sample after native defaults")
-        if data.tree_data is None:
+        tree_data = metadata_value("tree_data")
+        if tree_data is None:
             return sample
 
-        tree = data.tree_data
+        tree = tree_data
         tree_native_defaults = native_fields_from_beta(
             tree.beta_Q_target,
             tree.beta_V_target,
@@ -368,11 +405,12 @@ def _native_fields_from_values(
     values: dict[str, jax.Array | None],
     defaults: dict[str, jax.Array],
 ) -> _NativeTargetFields:
+    def value_or_default(field: str) -> jax.Array:
+        value = values[field]
+        return defaults[field] if value is None else value
+
     return _NativeTargetFields(
-        **{
-            field: defaults[field] if values[field] is None else values[field]
-            for field in _NATIVE_TARGET_FIELD_NAMES
-        }
+        *(value_or_default(field) for field in _NATIVE_TARGET_FIELD_NAMES)
     )
 
 
@@ -538,7 +576,9 @@ def _compute_dirichlet_losses(
     policy_target_entropy = _masked_mean(policy_target_entropy, policy_loss_mask)
     policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
 
-    categorical_epsilon = float(config.search.active_constants().categorical_epsilon)
+    categorical_epsilon = float(
+        config.selfplay.search.active_constants().categorical_epsilon
+    )
     value_dir_kl = _native_dirichlet_loss(
         data.beta_V_target,
         alpha_v,

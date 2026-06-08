@@ -13,7 +13,15 @@ from scacchi.network import (
     outcome_utility,
     policy_value_from_output,
 )
-from scacchi.types import Config, EnvConfig, ModelConfig, SearchConfig
+from scacchi.types import (
+    Config,
+    EnvConfig,
+    ModelConfig,
+    Network,
+    RezeroKernelInit,
+    SearchConfig,
+    SearchKind,
+)
 
 
 def test_dirichlet_from_logits_uses_squared_softplus_concentration():
@@ -102,11 +110,11 @@ def test_build_model_supports_az_dirichlet_for_go_wdl3():
     config = Config(
         env=EnvConfig(id="go", board_size=8, num_outcomes=None),
         model=ModelConfig(
-            network="aznet_dirichlet",
+            network=Network.aznet_dirichlet,
             num_channels=8,
             num_layers=1,
         ),
-        search=SearchConfig(kind="dirichlet_thompson"),
+        search=SearchConfig(kind=SearchKind.dirichlet_thompson),
     )
 
     model = build_model(
@@ -124,11 +132,11 @@ def test_dirichlet_thompson_null_hex_outcomes_builds_legacy_two_outcome_head():
     config = Config(
         env=EnvConfig(id="hex", num_outcomes=None),
         model=ModelConfig(
-            network="boardlaw_dirichlet",
+            network=Network.boardlaw_dirichlet,
             num_channels=16,
             num_layers=2,
         ),
-        search=SearchConfig(kind="dirichlet_thompson"),
+        search=SearchConfig(kind=SearchKind.dirichlet_thompson),
     )
 
     model = build_model(
@@ -146,13 +154,13 @@ def test_legacy_dirichlet_head_init_matches_runstate_initial_concentration():
     config = Config(
         env=EnvConfig(id="hex", num_outcomes=2),
         model=ModelConfig(
-            network="boardlaw_dirichlet",
+            network=Network.boardlaw_dirichlet,
             num_channels=16,
             num_layers=2,
             legacy_dirichlet_head_init=True,
-            rezero_kernel_init="orthogonal",
+            rezero_kernel_init=RezeroKernelInit.orthogonal,
         ),
-        search=SearchConfig(kind="dirichlet_thompson"),
+        search=SearchConfig(kind=SearchKind.dirichlet_thompson),
     )
     model = build_model(
         config,

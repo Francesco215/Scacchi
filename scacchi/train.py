@@ -15,7 +15,6 @@
 import os
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, cast
 
@@ -50,7 +49,7 @@ from .evaluations import make_mcts_evaluate
 from .logger import build_logger, returns_metrics
 from .network import build_model
 from .pipeline import make_training_iteration
-from .types import Config, EvalBaseline, RngSplitMode, load_config
+from .types import Config, EvalBaseline, load_config
 
 
 def report_jax_backend() -> None:
@@ -373,7 +372,6 @@ def main(cfg: DictConfig) -> None:
                             "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
                             "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
                             "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
-                            "train/q_evidence_mass_mean": train_metrics.q_evidence_mass_mean.mean().item(),
                             "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
                             "search/path_depth_mean": train_metrics.search_path_depth_mean.mean().item(),
                             "search/path_depth_p50": train_metrics.search_path_depth_p50.mean().item(),

@@ -20,22 +20,20 @@ model:
 selfplay:
   batch_size: 4096  # Number of games advanced in parallel.
   max_num_steps: 25  # 5x5 Hex has at most 25 placements.
-  action_source: posterior_sample  # Self-play action source: posterior_argmax/posterior_best, posterior_sample, or search_action.
+  action_commitment_type: posterior_sample  # Self-play commitment: posterior_argmax, posterior_sample, or search_action.
+  search:
+    kind: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
 
-search:
-  kind: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
+    dirichlet_thompson:
+      num_simulations: 32  # Search simulations per root.
+      num_blocks: 8  # Dirichlet Thompson search blocks.
 
-  dirichlet_thompson:
-    num_simulations: 32  # Search simulations per root.
-    num_blocks: 8  # Dirichlet Thompson search blocks.
-
-    constants:
-      kappa_leaf: 1.0  # Nonterminal evidence mass used by Dirichlet-Q search.
-      kappa_terminal: 8.0  # Terminal evidence mass used by Dirichlet-Q search.
+      constants:
+        kappa_leaf: 1.0  # Nonterminal evidence mass used by Dirichlet-Q search.
+        kappa_terminal: 8.0  # Terminal evidence mass used by Dirichlet-Q search.
 
 training:
   batch_size: 1024  # Learner minibatch size; multiple updates per fresh self-play batch.
-  replay_buffer_size: 1  # Train on the latest self-play batch only.
   learning_rate: 1e-3  # Adam learning rate used by solved scalar Boardlaw runs.
   grad_clip_norm: 1.0  # Keep Dirichlet-head fine tuning stable.
 

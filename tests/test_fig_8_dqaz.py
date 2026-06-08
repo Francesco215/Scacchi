@@ -1,15 +1,28 @@
 import argparse
 
+from flax import nnx
+import jax
 import jax.numpy as jnp
 import numpy as np
+import pgx
 
+from scacchi.network import BoardlawNet
 from scripts.fig_8 import (
     _coerce_dqaz_wdl3_output,
     _nonnegative_int_csv,
     _tree_size_plot_position,
     _with_dqaz_eval_settings,
+    make_stochastic_mcts_evaluate,
 )
-from scacchi.train import Config
+from scacchi.types import (
+    Config,
+    EnvConfig,
+    EvalConfig,
+    GumbelSearchConfig,
+    ModelConfig,
+    Network,
+    SearchConfig,
+)
 
 
 def test_coerce_dqaz_wdl3_output_inserts_draw_channel_for_hex_lw_heads():
@@ -57,15 +70,18 @@ def test_coerce_dqaz_wdl3_output_floors_tiny_alpha_values():
 
 def test_fig_8_dqaz_settings_enable_jax_backup():
     config = _with_dqaz_eval_settings(
-        Config(env_id="hex", board_size=3, network="boardlaw_dirichlet"),
+        Config(
+            env=EnvConfig(id="hex", board_size=3),
+            model=ModelConfig(network=Network.boardlaw_dirichlet),
+        ),
         eval_batch_size=2,
         tree_size=4,
         search_eval_batch_size=2,
     )
 
-    assert config.search_backend == "dqaz"
-    assert config.search_jax_backup is True
-    assert config.inflight_limit == 4
+    assert config.search.kind == "dqaz"
+    assert config.search.dqaz.jax_backup is True
+    assert config.search.dqaz.inflight_limit == 4
 
 
 def test_tree_size_parser_accepts_zero_candidate_search():
@@ -83,3 +99,46 @@ def test_zero_tree_size_has_custom_plot_position():
     assert _tree_size_plot_position(0) == -0.5
     assert _tree_size_plot_position(1) == 0.0
     assert _tree_size_plot_position(4) == 2.0
+
+
+def test_stochastic_mcts_evaluate_uses_generic_eval_loop_smoke():
+    env = pgx.make("tic_tac_toe")
+    search = SearchConfig(gumbel=GumbelSearchConfig(num_simulations=1))
+    config = Config(
+        model=ModelConfig(
+            network=Network.boardlaw,
+            num_channels=8,
+            num_layers=1,
+        ),
+        eval=EvalConfig(batch_size=2, player_search=search),
+    )
+    target_config = Config(
+        model=ModelConfig(
+            network=Network.boardlaw,
+            num_channels=8,
+            num_layers=1,
+        ),
+        eval=EvalConfig(batch_size=2, player_search=search),
+    )
+    model = BoardlawNet(
+        num_actions=env.num_actions,
+        observation_shape=env.observation_shape,
+        width=8,
+        depth=1,
+        rngs=nnx.Rngs(0),
+    )
+    target_model = BoardlawNet(
+        num_actions=env.num_actions,
+        observation_shape=env.observation_shape,
+        width=8,
+        depth=1,
+        rngs=nnx.Rngs(1),
+    )
+
+    returns = make_stochastic_mcts_evaluate(env, config, target_config, target_model)(
+        jax.random.PRNGKey(2),
+        model,
+    )
+
+    assert returns.shape == (2,)
+    assert jnp.isfinite(returns).all()

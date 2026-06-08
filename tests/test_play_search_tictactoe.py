@@ -6,11 +6,14 @@ import pgx
 from scacchi.dirichlet_tree.native import OUTCOME_DRAW, TARGET_CATEGORICAL
 from scacchi.play_search import _run_posterior_tree_search_step
 from scacchi.types import (
+    ActionCommitmentType,
     Config,
     DQAZSearchConfig,
     ModelConfig,
+    Network,
     SearchConfig,
     SearchConstantsConfig,
+    SearchKind,
     SelfplayConfig,
 )
 
@@ -31,10 +34,12 @@ def test_pgx_tic_tac_toe_forced_draw_root_uses_solved_policy():
         state = env.step(state, jnp.asarray(action, dtype=jnp.int32))
     root = jax.tree_util.tree_map(lambda value: value[None, ...], state)
     config = Config(
-        model=ModelConfig(network="boardlaw_dirichlet"),
-        selfplay=SelfplayConfig(action_source="posterior_argmax"),
+        model=ModelConfig(network=Network.boardlaw_dirichlet),
+        selfplay=SelfplayConfig(
+            action_commitment_type=ActionCommitmentType.posterior_argmax,
+        ),
         search=SearchConfig(
-            kind="dqaz",
+            kind=SearchKind.dqaz,
             dqaz=DQAZSearchConfig(
                 num_simulations=1,
                 policy_samples=8,

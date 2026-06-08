@@ -17,7 +17,7 @@ import math
 import os
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,15 +30,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from scacchi.checkpoint import _suppress_orbax_logs, from_pretrained
 from scacchi.dirichlet_q_search import posterior_sample_action
 from scacchi.envs import make_env
-from scacchi.evaluations import _make_model_mcts_policy
+from scacchi.evaluations import make_mcts_evaluate
 from scacchi.network import build_model
+from scacchi.play import searchable_eval_state
 from scacchi.play_search import _run_posterior_tree_search_step
-from scacchi.train import Config, normalize_config_dict
+from scacchi.play_search import make_search_player
+from scacchi.types import (
+    ActionCommitmentType,
+    Config,
+    EvalBaseline,
+    SearchKind,
+    load_config,
+)
 
 
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints/hex_bs8_boardlaw_dirichlet_c1024_l8_seed0")
@@ -56,13 +65,8 @@ class LoadedCheckpoint:
     model: nnx.Module
 
 
-def _positive_int_csv(value: str) -> tuple[int, ...]:
-    values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
-    if not values:
-        raise argparse.ArgumentTypeError("expected at least one integer")
-    if any(v <= 0 for v in values):
-        raise argparse.ArgumentTypeError("values must be positive integers")
-    return values
+def _config_from_raw(raw: Any) -> Config:
+    return load_config(OmegaConf.create(raw))
 
 
 def _nonnegative_int_csv(value: str) -> tuple[int, ...]:
@@ -115,11 +119,7 @@ def _load_model_at_step(
             args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
         )
         meta = restored_meta["meta"]
-        config = Config.model_validate(
-            normalize_config_dict(meta["config"]),
-            extra="ignore",
-            context={"model_construction_only": True},
-        )
+        config = _config_from_raw(meta["config"])
         model = build_model(
             config,
             num_actions=env.num_actions,
@@ -149,11 +149,7 @@ def _load_config_at_step(checkpoint_dir: Path, step: int) -> Config:
             step,
             args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
         )
-    return Config.model_validate(
-        normalize_config_dict(restored_meta["meta"]["config"]),
-        extra="ignore",
-        context={"model_construction_only": True},
-    )
+    return _config_from_raw(restored_meta["meta"]["config"])
 
 
 def _with_eval_settings(
@@ -163,12 +159,40 @@ def _with_eval_settings(
     tree_size: int,
     num_search_blocks: int,
 ) -> Config:
-    return config.model_copy(
-        update={
-            "eval_batch_size": eval_batch_size,
-            "num_simulations": tree_size,
-            "num_search_blocks": num_search_blocks,
-        }
+    search = config.eval.player_search
+    eval_config = replace(config.eval, batch_size=eval_batch_size)
+    if search.kind == SearchKind.gumbel:
+        search = replace(
+            search,
+            gumbel=replace(search.gumbel, num_simulations=tree_size),
+        )
+        return replace(
+            config,
+            search=search,
+            eval=replace(eval_config, player_search=search),
+        )
+    if search.kind == SearchKind.dirichlet_thompson:
+        search = replace(
+            search,
+            dirichlet_thompson=replace(
+                search.dirichlet_thompson,
+                num_simulations=tree_size,
+                num_blocks=num_search_blocks,
+            ),
+        )
+        return replace(
+            config,
+            search=search,
+            eval=replace(eval_config, player_search=search),
+        )
+    search = replace(
+        search,
+        dqaz=replace(search.dqaz, num_simulations=max(1, tree_size)),
+    )
+    return replace(
+        config,
+        search=search,
+        eval=replace(eval_config, player_search=search),
     )
 
 
@@ -179,19 +203,31 @@ def _with_dqaz_eval_settings(
     tree_size: int,
     search_eval_batch_size: int,
 ) -> Config:
-    return config.model_copy(
-        update={
-            "eval_batch_size": eval_batch_size,
-            "num_simulations": tree_size,
-            "num_search_blocks": 1,
-            "search_policy": "posterior_tree",
-            "search_backend": "dqaz",
-            "search_eval_batch_size": search_eval_batch_size,
-            "search_pad_to_eval_batch": True,
-            "search_jax_backup": True,
-            "inflight_limit": max(1, tree_size),
-            "selfplay_action_source": "posterior_argmax",
-        }
+    search = replace(
+        config.search,
+        kind=SearchKind.dqaz,
+        dqaz=replace(
+            config.search.dqaz,
+            num_simulations=max(1, tree_size),
+            inflight_limit=max(1, tree_size),
+            eval_batch_size=search_eval_batch_size,
+            pad_to_eval_batch=True,
+            jax_backup=True,
+        ),
+    )
+    return replace(
+        config,
+        eval=replace(
+            config.eval,
+            batch_size=eval_batch_size,
+            player_search=search,
+            player_action_commitment_type=ActionCommitmentType.posterior_argmax,
+        ),
+        selfplay=replace(
+            config.selfplay,
+            action_commitment_type=ActionCommitmentType.posterior_argmax,
+        ),
+        search=search,
     )
 
 
@@ -249,82 +285,19 @@ def make_stochastic_mcts_evaluate(
     target_config: Config,
     target_model: nnx.Module,
 ):
-    """Evaluate ``model`` against ``target_model`` with sampled final actions.
+    """Evaluate ``model`` against ``target_model`` with sampled final actions."""
 
-    The search implementation is reused from ``scacchi.evaluations``. We ignore
-    the deterministic ``policy.action`` field and sample from ``action_weights``
-    for both players instead.
-    """
-
-    eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
-
-    @nnx.jit
-    def evaluate(rng_key: jax.Array, model: nnx.Module) -> jax.Array:
-        my_player = 0
-
-        key, init_key = jax.random.split(rng_key)
-        init_keys = jax.random.split(init_key, eval_batch_size)
-        env_state = jax.vmap(env.init)(init_keys)
-
-        def body_fn(val):
-            key, env_state, returns = val
-            key, my_search_key, target_search_key, my_sample_key, target_sample_key = (
-                jax.random.split(key, 5)
-            )
-
-            my_policy = _make_model_mcts_policy(
-                env,
-                config,
-                model,
-                my_search_key,
-                env_state,
-                config.num_simulations,
-            )
-            target_policy = _make_model_mcts_policy(
-                env,
-                target_config,
-                target_model,
-                target_search_key,
-                env_state,
-                target_config.num_simulations,
-            )
-
-            my_weights = _normalize_action_weights(
-                my_policy.action_weights,
-                env_state.legal_action_mask,
-            )
-            target_weights = _normalize_action_weights(
-                target_policy.action_weights,
-                env_state.legal_action_mask,
-            )
-            my_action = posterior_sample_action(
-                my_sample_key,
-                my_weights,
-                env_state.legal_action_mask,
-            )
-            target_action = posterior_sample_action(
-                target_sample_key,
-                target_weights,
-                env_state.legal_action_mask,
-            )
-
-            is_my_turn = env_state.current_player == my_player
-            action = jnp.where(is_my_turn, my_action, target_action)
-            env_state = jax.vmap(env.step)(env_state, action)
-            returns = returns + env_state.rewards[
-                jnp.arange(eval_batch_size),
-                my_player,
-            ]
-            return key, env_state, returns
-
-        _, _, returns = nnx.while_loop(
-            lambda x: ~(x[1].terminated.all()),
-            body_fn,
-            (key, env_state, jnp.zeros(eval_batch_size)),
-        )
-        return returns
-
-    return evaluate
+    eval_config = replace(
+        config,
+        eval=replace(
+            config.eval,
+            baseline=EvalBaseline.checkpoint,
+            baseline_search=target_config.eval.player_search,
+            player_action_commitment_type=ActionCommitmentType.posterior_sample,
+            baseline_action_commitment_type=ActionCommitmentType.posterior_sample,
+        ),
+    )
+    return make_mcts_evaluate(env, eval_config, target_model, parallel=None)
 
 
 def make_stochastic_dqaz_evaluate(
@@ -335,7 +308,7 @@ def make_stochastic_dqaz_evaluate(
 ):
     """Evaluate candidate dqaz search against the existing target search path."""
 
-    eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
+    eval_batch_size = int(config.eval.batch_size)
     env_step = jax.jit(jax.vmap(env.step))
 
     @nnx.jit
@@ -349,14 +322,17 @@ def make_stochastic_dqaz_evaluate(
 
     @nnx.jit
     def target_policy(model: Any, rng_key: jax.Array, env_state):
-        return _make_model_mcts_policy(
+        player = make_search_player(
             env,
-            target_config,
             model,
-            rng_key,
-            env_state,
-            target_config.num_simulations,
+            target_config.eval.player_search,
+            target_config.eval.player_action_commitment_type,
+            q_loss_weight_mode=str(target_config.training.losses.q_loss_weight_mode),
         )
+        player_output = player(searchable_eval_state(env_state), rng_key)
+        if player_output.posterior is None:
+            raise ValueError("target search player must return posterior targets")
+        return player_output.posterior.prediction.policy
 
     def candidate_policy(model: Any, rng_key: jax.Array, env_state):
         def leaf_evaluator(obs: jax.Array):
@@ -398,8 +374,8 @@ def make_stochastic_dqaz_evaluate(
             candidate_seconds += time.perf_counter() - start
 
             start = time.perf_counter()
-            target_output = target_policy(target_model, target_search_key, env_state)
-            jax.block_until_ready(target_output.action_weights)
+            target_policy_weights = target_policy(target_model, target_search_key, env_state)
+            jax.block_until_ready(target_policy_weights)
             target_seconds += time.perf_counter() - start
 
             my_weights = _normalize_action_weights(
@@ -407,7 +383,7 @@ def make_stochastic_dqaz_evaluate(
                 env_state.legal_action_mask,
             )
             target_weights = _normalize_action_weights(
-                target_output.action_weights,
+                target_policy_weights,
                 env_state.legal_action_mask,
             )
             my_action = posterior_sample_action(
@@ -723,7 +699,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
         raise FileNotFoundError(f"checkpoint steps not found: {missing}")
 
     base_config = _load_config_at_step(checkpoint_dir, steps[0])
-    env = make_env(base_config.env_id, base_config.board_size)
+    env = make_env(base_config.env.id, base_config.env.board_size)
     candidate_search_eval_batch_size = (
         args.search_eval_batch_size
         if args.search_backend != "dqaz" or args.search_eval_batch_size is not None

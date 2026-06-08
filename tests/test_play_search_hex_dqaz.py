@@ -9,12 +9,15 @@ from scacchi.play_search import (
     _run_posterior_tree_search_step,
 )
 from scacchi.types import (
+    ActionCommitmentType,
     Config,
     DQAZSearchConfig,
     EnvConfig,
     ModelConfig,
+    Network,
     SearchConfig,
     SearchConstantsConfig,
+    SearchKind,
     SelfplayConfig,
 )
 
@@ -85,10 +88,12 @@ def test_pgx_hex_dqaz_wdl3_smoke():
 
     config = Config(
         env=EnvConfig(id="hex", board_size=3, num_outcomes=3),
-        model=ModelConfig(network="boardlaw_dirichlet"),
-        selfplay=SelfplayConfig(action_source="posterior_argmax"),
+        model=ModelConfig(network=Network.boardlaw_dirichlet),
+        selfplay=SelfplayConfig(
+            action_commitment_type=ActionCommitmentType.posterior_argmax,
+        ),
         search=SearchConfig(
-            kind="dqaz",
+            kind=SearchKind.dqaz,
             dqaz=DQAZSearchConfig(
                 num_simulations=2,
                 policy_samples=4,

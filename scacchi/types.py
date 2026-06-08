@@ -19,8 +19,7 @@ class RezeroKernelInit(StrEnum):
     orthogonal = "orthogonal"
 
 
-class SelfplayActionSource(StrEnum):
-    posterior_best = "posterior_best"
+class ActionCommitmentType(StrEnum):
     posterior_argmax = "posterior_argmax"
     posterior_sample = "posterior_sample"
     search_action = "search_action"
@@ -56,11 +55,6 @@ class EvalBaseline(StrEnum):
     checkpoint = "checkpoint"
     pgx = "pgx"
     none = "none"
-
-
-class RngSplitMode(StrEnum):
-    three_way = "three_way"
-    legacy_eval_train = "legacy_eval_train"
 
 
 def _require_ge(name: str, value: int | None, minimum: int) -> None:
@@ -100,17 +94,6 @@ class ModelConfig:
     resnet_v2: bool = True
     legacy_dirichlet_head_init: bool = False
     rezero_kernel_init: RezeroKernelInit = RezeroKernelInit.variance_scaling
-
-
-
-@dataclass
-class SelfplayConfig:
-    batch_size: int = 1024
-    max_num_steps: int = 256
-    action_source: SelfplayActionSource = SelfplayActionSource.posterior_best
-
-    def __post_init__(self) -> None:
-        _require_ge("selfplay.batch_size", self.batch_size, 1)
 
 
 
@@ -227,6 +210,17 @@ class SearchConfig:
 
 
 @dataclass
+class SelfplayConfig:
+    batch_size: int = 1024
+    max_num_steps: int = 256
+    search: SearchConfig = field(default_factory=SearchConfig)
+    action_commitment_type: ActionCommitmentType = ActionCommitmentType.posterior_argmax
+
+    def __post_init__(self) -> None:
+        _require_ge("selfplay.batch_size", self.batch_size, 1)
+
+
+@dataclass
 class TrainingLossConfig:
     policy_weight: float = 1.0
     value_dir_kl_weight: float = 0.0
@@ -276,7 +270,6 @@ class TrainingRegularizationConfig:
 class TrainingConfig:
     batch_size: int = 4096
     max_updates_per_iter: int | None = None
-    replay_buffer_size: int = 1
     learning_rate: float = 0.001
     lr_decay_after_iters: int | None = None
     lr_decay_factor: float = 1.0
@@ -289,7 +282,6 @@ class TrainingConfig:
     def __post_init__(self) -> None:
         _require_ge("training.batch_size", self.batch_size, 1)
         _require_ge("training.max_updates_per_iter", self.max_updates_per_iter, 1)
-        _require_ge("training.replay_buffer_size", self.replay_buffer_size, 1)
         _require_gt("training.learning_rate", self.learning_rate, 0.0)
         _require_ge("training.lr_decay_after_iters", self.lr_decay_after_iters, 1)
         _require_gt("training.lr_decay_factor", self.lr_decay_factor, 0.0)
@@ -300,6 +292,14 @@ class TrainingConfig:
 class EvalConfig:
     interval: int = 5
     batch_size: int = 16
+    player_search: SearchConfig = field(default_factory=SearchConfig)
+    baseline_search: SearchConfig = field(default_factory=SearchConfig)
+    player_action_commitment_type: ActionCommitmentType = (
+        ActionCommitmentType.posterior_argmax
+    )
+    baseline_action_commitment_type: ActionCommitmentType = (
+        ActionCommitmentType.posterior_argmax
+    )
     baseline: EvalBaseline = EvalBaseline.checkpoint
     baseline_id: str | None = None
     checkpoint_path: str | None = None
@@ -331,11 +331,6 @@ class CheckpointingConfig:
 
 
 @dataclass
-class CompatibilityConfig:
-    rng_split_mode: RngSplitMode = RngSplitMode.three_way
-
-
-@dataclass
 class TrainConfig:
     run: RunConfig = field(default_factory=RunConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
@@ -346,9 +341,19 @@ class TrainConfig:
     eval: EvalConfig = field(default_factory=EvalConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
-    compatibility: CompatibilityConfig = field(default_factory=CompatibilityConfig)
 
     def __post_init__(self) -> None:
+        default_search = SearchConfig()
+        if self.search == default_search:
+            self.search = self.selfplay.search
+        else:
+            if self.selfplay.search == default_search:
+                self.selfplay.search = self.search
+            if self.eval.player_search == default_search:
+                self.eval.player_search = self.search
+            if self.eval.baseline_search == default_search:
+                self.eval.baseline_search = self.search
+
         dirichlet_networks = {Network.aznet_dirichlet, Network.boardlaw_dirichlet}
         active_weights = self.training.losses.active_dirichlet_weights()
         if self.model.network not in dirichlet_networks and active_weights:
@@ -359,8 +364,16 @@ class TrainConfig:
                 "weights to 0.0 or use model.network='aznet_dirichlet' or "
                 "model.network='boardlaw_dirichlet'."
             )
-        if self.search.kind in {SearchKind.dirichlet_thompson, SearchKind.dqaz}:
-            assert self.model.network in dirichlet_networks, f"{self.search.kind!r} search requires model.network='aznet_dirichlet' or model.network='boardlaw_dirichlet'."
+        for name, search in (
+            ("selfplay.search", self.selfplay.search),
+            ("eval.player_search", self.eval.player_search),
+        ):
+            if search.kind in {SearchKind.dirichlet_thompson, SearchKind.dqaz}:
+                assert self.model.network in dirichlet_networks, (
+                    f"{name}.kind={search.kind!r} requires "
+                    "model.network='aznet_dirichlet' or "
+                    "model.network='boardlaw_dirichlet'."
+                )
         if self.eval.baseline == EvalBaseline.none and self.eval.interval != 0:
             raise ValueError("eval.baseline=none requires eval.interval=0.")
 
@@ -368,7 +381,47 @@ class TrainConfig:
 Config = TrainConfig
 
 
+def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
+    aliased = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    if not isinstance(aliased, DictConfig):
+        return cfg
+
+    def copy_node(value: Any) -> Any:
+        return OmegaConf.create(OmegaConf.to_container(value, resolve=False))
+
+    selfplay = aliased.get("selfplay")
+    if selfplay is None:
+        selfplay = OmegaConf.create({})
+        aliased["selfplay"] = selfplay
+    eval_cfg = aliased.get("eval")
+    if eval_cfg is None:
+        eval_cfg = OmegaConf.create({})
+        aliased["eval"] = eval_cfg
+
+    search_alias = aliased.get("search")
+    if search_alias is None and isinstance(selfplay, DictConfig) and "search" in selfplay:
+        search_alias = selfplay["search"]
+        aliased["search"] = copy_node(search_alias)
+    if search_alias is None and isinstance(eval_cfg, DictConfig) and "player_search" in eval_cfg:
+        search_alias = eval_cfg["player_search"]
+        aliased["search"] = copy_node(search_alias)
+
+    if search_alias is not None:
+        if isinstance(selfplay, DictConfig) and "search" not in selfplay:
+            selfplay["search"] = copy_node(search_alias)
+        if isinstance(eval_cfg, DictConfig):
+            if "player_search" not in eval_cfg:
+                eval_cfg["player_search"] = copy_node(search_alias)
+            if "baseline_search" not in eval_cfg:
+                eval_cfg["baseline_search"] = copy_node(search_alias)
+    elif isinstance(eval_cfg, DictConfig) and "player_search" in eval_cfg:
+        if "baseline_search" not in eval_cfg:
+            eval_cfg["baseline_search"] = copy_node(eval_cfg["player_search"])
+    return aliased
+
+
 def load_config(cfg: DictConfig) -> TrainConfig:
+    cfg = _apply_config_aliases(cfg)
     merged = OmegaConf.merge(OmegaConf.structured(TrainConfig), cfg)
     return cast(TrainConfig, OmegaConf.to_object(merged))
 

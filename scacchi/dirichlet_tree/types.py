@@ -27,11 +27,6 @@ class TreeTrainingData(NamedTuple):
     v_target_outcome: jax.Array | None = None
     v_target_distance: jax.Array | None = None
 
-    @property
-    def q_evidence_mass(self) -> jax.Array:
-        return self.q_loss_weight
-
-
 class SearchDiagnostics(NamedTuple):
     path_depth_mean: jax.Array
     path_depth_p50: jax.Array

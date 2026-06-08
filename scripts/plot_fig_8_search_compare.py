@@ -11,7 +11,7 @@ import csv
 import math
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import matplotlib
 
@@ -124,14 +124,15 @@ def _plot(
     for label, rows in rows_by_label.items():
         if not rows:
             continue
+        style = styles[label]
         method_handles[label] = (
             Line2D(
                 [0],
                 [0],
                 color="0.18",
-                linestyle=styles[label]["linestyle"],
-                marker=styles[label]["marker"],
-                linewidth=styles[label]["linewidth"],
+                linestyle=cast(str, style["linestyle"]),
+                marker=cast(str, style["marker"]),
+                linewidth=cast(float, style["linewidth"]),
                 label=label,
             )
         )

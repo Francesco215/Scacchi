@@ -31,10 +31,11 @@ driver, policy target export, and tree-derived training targets.
   checkpointing, evaluation, and training loop.
 - `scacchi/network.py`: neural network definitions, including the
   policy/value/Q Dirichlet model.
-- `scacchi/play.py`: self-play generation and search integration.
+- `scacchi/play.py`: training and evaluation play loops.
+- `scacchi/play_search.py`: evaluator, search, player, and action commitment
+  boundaries.
 - `scacchi/pipeline.py`: replay/minibatch handling and per-iteration training.
 - `scacchi/loss.py`: policy, scalar value, Dirichlet KL, and outcome losses.
-- `scacchi/posterior_tree.py`: Python posterior-tree search implementation.
 - `scacchi/dirichlet_tree/`: compatibility helpers for native categorical
   target metadata and shared training-output containers.
 - `scacchi/configs/`: Hydra YAML configs, currently centered on Hex.

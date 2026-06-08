@@ -5,7 +5,7 @@ from einops import rearrange
 
 from .loss import Sample, TrainMetrics, make_compute_input_for_lossfn, train
 from .play import make_selfplay
-from .play import SelfplayOutput
+from .play import TrainingSamples
 from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, assert_batch_axis_sharded
 
 
@@ -47,78 +47,6 @@ def make_minibatches(
     return minibatches
 
 
-def _concat_selfplay_outputs(outputs: list[SelfplayOutput]) -> SelfplayOutput:
-    if len(outputs) == 1:
-        return outputs[0]
-
-    def concat_batch(*xs):
-        return jnp.concatenate(xs, axis=0)
-
-    tree_data = None
-    if outputs[0].tree_data is not None:
-        tree_data = jax.tree_util.tree_map(
-            concat_batch,
-            *(output.tree_data for output in outputs),
-        )
-
-    search_loss_mask = None
-    if outputs[0].search_loss_mask is not None:
-        search_loss_mask = concat_batch(
-            *(output.search_loss_mask for output in outputs),
-        )
-
-    search_diagnostics = None
-    if outputs[0].search_diagnostics is not None:
-        search_diagnostics = jax.tree_util.tree_map(
-            concat_batch,
-            *(output.search_diagnostics for output in outputs),
-        )
-
-    def concat_optional(name: str):
-        first = getattr(outputs[0], name)
-        if first is None:
-            return None
-        return concat_batch(*(getattr(output, name) for output in outputs))
-
-    return SelfplayOutput(
-        obs=concat_batch(*(output.obs for output in outputs)),
-        reward=concat_batch(*(output.reward for output in outputs)),
-        terminated=concat_batch(*(output.terminated for output in outputs)),
-        action_weights=concat_batch(*(output.action_weights for output in outputs)),
-        played_action=concat_batch(*(output.played_action for output in outputs)),
-        legal_action_mask=concat_batch(*(output.legal_action_mask for output in outputs)),
-        beta_Q_target=concat_batch(*(output.beta_Q_target for output in outputs)),
-        beta_V_target=concat_batch(*(output.beta_V_target for output in outputs)),
-        q_loss_weight=concat_batch(*(output.q_loss_weight for output in outputs)),
-        discount=concat_batch(*(output.discount for output in outputs)),
-        tree_data=tree_data,
-        search_loss_mask=search_loss_mask,
-        search_diagnostics=search_diagnostics,
-        q_target_kind=concat_optional("q_target_kind"),
-        q_target_weight=concat_optional("q_target_weight"),
-        q_target_outcome=concat_optional("q_target_outcome"),
-        q_target_distance=concat_optional("q_target_distance"),
-        v_target_kind=concat_optional("v_target_kind"),
-        v_target_weight=concat_optional("v_target_weight"),
-        v_target_outcome=concat_optional("v_target_outcome"),
-        v_target_distance=concat_optional("v_target_distance"),
-    )
-
-
-def _fixed_replay_window(
-    outputs: list[SelfplayOutput],
-    replay_buffer_size: int,
-) -> list[SelfplayOutput]:
-    if not outputs:
-        raise ValueError("replay buffer is empty")
-    if replay_buffer_size <= 1:
-        return [outputs[-1]]
-    window = outputs[-replay_buffer_size:]
-    if len(window) == replay_buffer_size:
-        return window
-    return [window[0]] * (replay_buffer_size - len(window)) + window
-
-
 def _mean_or_zero(value: jax.Array | None, dtype) -> jax.Array:
     if value is None:
         return jnp.asarray(0.0, dtype=dtype)
@@ -127,7 +55,7 @@ def _mean_or_zero(value: jax.Array | None, dtype) -> jax.Array:
 
 def _with_search_diagnostics(
     metrics: TrainMetrics,
-    data: SelfplayOutput,
+    data: TrainingSamples,
 ) -> TrainMetrics:
     diagnostics = data.search_diagnostics
     if diagnostics is None:
@@ -180,10 +108,10 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
     def train_from_selfplay_data(
         model: nnx.Module,
         optimizer: nnx.Optimizer,
-        data: SelfplayOutput,
+        data: TrainingSamples,
         perm_key: jax.Array,
     ) -> TrainMetrics:
-        samples = compute_input_for_lossfn(data) # it digests the data in such a way that it prepares the input for the loss function
+        samples = compute_input_for_lossfn(data)
         minibatches = make_minibatches(
             samples,
             perm_key,
@@ -191,7 +119,8 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
             config.training.max_updates_per_iter,
             parallel,
         )
-        return train_minibatches(model, optimizer, minibatches, config, parallel)
+        metrics = train_minibatches(model, optimizer, minibatches, config, parallel)
+        return _with_search_diagnostics(metrics, data)
 
     def training_iteration(
         model: nnx.Module,

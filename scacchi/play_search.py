@@ -1,11 +1,13 @@
 import os
 import time
 from functools import partial
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, NamedTuple, cast
 
 import dqaz
+from flax import nnx
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int
 import mctx
 import numpy as np
 import pgx
@@ -14,6 +16,7 @@ from .dirichlet_q_search import (
     NO_PARENT,
     NodeEmbedding,
     dirichlet_q_policy,
+    flip_outcome,
     outcome_mean,
     outcome_utility,
     posterior_best_action,
@@ -22,6 +25,7 @@ from .dirichlet_q_search import (
     posterior_targets,
     q_evidence_sum_from_tree,
     root_action_value_priors_from_tree,
+    terminal_outcome_from_reward,
 )
 from .dirichlet_tree.native import (
     NO_DISTANCE,
@@ -32,13 +36,63 @@ from .dirichlet_tree.native import (
 from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
 from .dqaz_jax_backup import BackupArrays, apply_batched_backup_block
 from .network import policy_value_from_output
-from .types import SearchKind
+from .types import (
+    DirichletThompsonSearchConfig,
+    GumbelSearchConfig,
+    SearchConfig,
+    SearchConstantsConfig,
+    SearchKind,
+)
 
 
 _POSTERIOR_POLICY_TARGET_SAMPLES = 32
-_POSTERIOR_POLICY_TARGET_SAMPLE_CHUNK_SIZE = 32
 _DQAZ_STATE_POSTERIOR_KAPPA_N = 9.0
 _DQAZ_EPSILON_TERMINAL = 1e-6
+
+
+class EvaluatorOutput(NamedTuple):
+    logits: Float[Array, "*batch action"]
+    value: Float[Array, "*batch"] | None = None
+    alpha_v: Float[Array, "*batch outcome"] | None = None
+    alpha_q: Float[Array, "*batch action outcome"] | None = None
+
+
+class PosteriorPrediction(NamedTuple):
+    policy: Float[Array, "*batch action"]
+    value: Float[Array, "*batch"] | None = None
+    alpha_v: Float[Array, "*batch outcome"] | None = None
+    alpha_q: Float[Array, "*batch action outcome"] | None = None
+
+
+class TargetMetadata(NamedTuple):
+    mask: Bool[Array, "*batch"] | None = None
+    q_weight: Float[Array, "*batch action"] | None = None
+    search_action: Int[Array, "*batch"] | None = None
+    q_target_kind: Int[Array, "*batch action"] | None = None
+    q_target_weight: Float[Array, "*batch action"] | None = None
+    q_target_outcome: Int[Array, "*batch action"] | None = None
+    q_target_distance: Int[Array, "*batch action"] | None = None
+    v_target_kind: Int[Array, "*batch"] | None = None
+    v_target_weight: Float[Array, "*batch"] | None = None
+    v_target_outcome: Int[Array, "*batch"] | None = None
+    v_target_distance: Int[Array, "*batch"] | None = None
+    tree_data: TreeTrainingData | None = None
+
+
+class PosteriorTargets(NamedTuple):
+    prediction: PosteriorPrediction
+    metadata: TargetMetadata | None = None
+
+
+class SearchOutput(NamedTuple):
+    posterior: PosteriorTargets
+    diagnostics: SearchDiagnostics | None = None
+
+
+class PlayerOutput(NamedTuple):
+    action: Int[Array, "*batch"]
+    posterior: PosteriorTargets | None = None
+    diagnostics: SearchDiagnostics | None = None
 
 
 class _SearchStepOutput(NamedTuple):
@@ -79,11 +133,6 @@ class PosteriorTreeBatchOutput(NamedTuple):
     v_target_outcome: jax.Array | None = None
     v_target_distance: jax.Array | None = None
 
-    @property
-    def q_evidence_mass(self) -> jax.Array:
-        return self.q_loss_weight
-
-
 class _DQAZBackupInputs(NamedTuple):
     tree_ids: np.ndarray
     node_ids: np.ndarray
@@ -113,28 +162,125 @@ _NATIVE_TARGET_FIELD_NAMES = (
 )
 
 
-def _empty_posterior_targets(
-    policy_target: jax.Array,
-    num_outcomes: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    q_loss_weight = policy_target * jnp.asarray(0.0, dtype=policy_target.dtype)
-    beta_q = jnp.broadcast_to(
-        q_loss_weight[..., None],
-        policy_target.shape + (num_outcomes,),
+def evaluator_output_from_model_output(model_output: Any) -> EvaluatorOutput:
+    if isinstance(model_output, EvaluatorOutput):
+        return model_output
+    if len(model_output) == 2:
+        logits, value = policy_value_from_output(model_output)
+        return EvaluatorOutput(logits=logits, value=value)
+    logits, alpha_v, alpha_q = model_output
+    return EvaluatorOutput(
+        logits=logits,
+        value=outcome_utility(outcome_mean(alpha_v)),
+        alpha_v=alpha_v,
+        alpha_q=alpha_q,
     )
-    beta_v_seed = jnp.sum(q_loss_weight, axis=-1, keepdims=True)
-    beta_v = jnp.broadcast_to(
-        beta_v_seed,
-        policy_target.shape[:-1] + (num_outcomes,),
-    )
-    return beta_q, beta_v, q_loss_weight
 
 
-def _num_outcomes_for_config(config) -> int:
-    num_outcomes = config.env.num_outcomes
-    if num_outcomes is None:
-        return 2 if config.env.id == "hex" else 3
-    return num_outcomes
+def make_evaluator(model: Any) -> Callable[[jax.Array], EvaluatorOutput]:
+    def evaluator(obs: jax.Array) -> EvaluatorOutput:
+        if isinstance(model, nnx.Module):
+            return evaluator_output_from_model_output(model(obs, train=False))
+        return evaluator_output_from_model_output(model(obs))
+
+    return evaluator
+
+
+def _required_output(value: jax.Array | None, name: str) -> jax.Array:
+    if value is None:
+        raise ValueError(f"evaluator output is missing {name}")
+    return value
+
+
+def _masked_logits(logits: jax.Array, legal_action_mask: jax.Array) -> jax.Array:
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    return jnp.where(legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+
+
+def make_recurrent_fn(env, evaluator: Callable[[jax.Array], EvaluatorOutput]):
+    def recurrent_fn(_, rng_key: jax.Array, action: jax.Array, env_state: pgx.State):
+        del rng_key
+
+        current_player = env_state.current_player
+        env_state = jax.vmap(env.step)(env_state, action)
+        prediction = evaluator(env_state.observation)
+        logits = _masked_logits(prediction.logits, env_state.legal_action_mask)
+        value = _required_output(prediction.value, "value")
+
+        reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), current_player]
+        value = jnp.where(env_state.terminated, 0.0, value)
+        discount = -jnp.ones_like(value)
+        discount = jnp.where(env_state.terminated, 0.0, discount)
+
+        fn_output = mctx.RecurrentFnOutput(
+            reward=reward,
+            discount=discount,
+            prior_logits=logits,
+            value=value,
+        )
+        return fn_output, env_state
+
+    return recurrent_fn
+
+
+def make_dirichlet_recurrent_fn_from_constants(
+    env,
+    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    constants: SearchConstantsConfig,
+):
+    kappa_terminal = float(constants.kappa_terminal)
+    kappa_leaf = float(constants.kappa_leaf)
+
+    def recurrent_fn(_, rng_key: jax.Array, action: jax.Array, embedding: NodeEmbedding):
+        del rng_key
+
+        current_player = embedding.state.current_player
+        env_state = jax.vmap(env.step)(embedding.state, action)
+        prediction = evaluator(env_state.observation)
+        logits = _masked_logits(prediction.logits, env_state.legal_action_mask)
+        alpha_v = _required_output(prediction.alpha_v, "alpha_v")
+        alpha_q = _required_output(prediction.alpha_q, "alpha_q")
+
+        reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), current_player]
+        nonterminal_outcome = outcome_mean(alpha_v)
+        terminal_parent_outcome = terminal_outcome_from_reward(reward, alpha_v.shape[-1])
+        terminal_child_outcome = flip_outcome(terminal_parent_outcome)
+        outcome_dist = jnp.where(
+            env_state.terminated[..., None],
+            terminal_child_outcome,
+            nonterminal_outcome,
+        )
+        evidence_weight = jnp.where(
+            env_state.terminated,
+            jnp.asarray(kappa_terminal, dtype=outcome_dist.dtype),
+            jnp.asarray(kappa_leaf, dtype=outcome_dist.dtype),
+        )
+        root_action = jnp.where(embedding.root_action == NO_PARENT, action, embedding.root_action)
+        depth_parity = 1 - embedding.depth_parity
+
+        value = outcome_utility(outcome_dist)
+        value = jnp.where(env_state.terminated, 0.0, value)
+        discount = -jnp.ones_like(value)
+        discount = jnp.where(env_state.terminated, 0.0, discount)
+
+        next_embedding = NodeEmbedding(
+            state=env_state,
+            outcome_dist=outcome_dist,
+            alpha_V_prior=alpha_v,
+            evidence_weight=evidence_weight,
+            root_action=root_action,
+            depth_parity=depth_parity,
+            alpha_Q_prior=alpha_q,
+        )
+        fn_output = mctx.RecurrentFnOutput(
+            reward=reward,
+            discount=discount,
+            prior_logits=logits,
+            value=value,
+        )
+        return fn_output, next_embedding
+
+    return recurrent_fn
 
 
 def _search_value(config: Any, name: str, default: Any) -> Any:
@@ -149,21 +295,12 @@ def _policy_target_samples(config: Any) -> int:
     return int(_search_value(config, "policy_samples", _POSTERIOR_POLICY_TARGET_SAMPLES))
 
 
-def _policy_target_sample_chunk_size(config: Any, policy_samples: int) -> int:
-    value = _search_value(
-        config,
-        "policy_sample_chunk_size",
-        _POSTERIOR_POLICY_TARGET_SAMPLE_CHUNK_SIZE,
-    )
-    return policy_samples if value is None else int(value)
-
-
 def _search_kind(config: Any) -> SearchKind:
     return config.search.kind
 
 
 def _selfplay_action_source(config: Any) -> str:
-    return str(config.selfplay.action_source)
+    return str(config.selfplay.action_commitment_type)
 
 
 def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
@@ -183,25 +320,29 @@ def _native_target_kwargs_from_output(output: Any) -> dict[str, jax.Array]:
     return {name: field_or_default(name) for name in _NATIVE_TARGET_FIELD_NAMES}
 
 
-def _select_played_action(
-    action_source: str,
+def commit_action(
+    action_commitment_type: str,
     rng_key: jax.Array,
-    action_weights: jax.Array,
+    policy: jax.Array,
     legal_action_mask: jax.Array,
-    search_action: jax.Array,
+    search_action: jax.Array | None = None,
 ) -> jax.Array:
-    if action_source in ("posterior_best", "posterior_argmax"):
-        selected = posterior_best_action(action_weights, legal_action_mask)
-    elif action_source == "posterior_sample":
-        selected = posterior_sample_action(rng_key, action_weights, legal_action_mask)
-    elif action_source == "search_action":
+    if action_commitment_type == "posterior_argmax":
+        selected = posterior_best_action(policy, legal_action_mask)
+    elif action_commitment_type == "posterior_sample":
+        selected = posterior_sample_action(rng_key, policy, legal_action_mask)
+    elif action_commitment_type == "search_action":
+        if search_action is None:
+            raise ValueError("search_action commitment requires a backend action")
         selected = search_action
     else:
-        raise ValueError(f"unknown selfplay_action_source: {action_source!r}")
-    return _legalize_played_action(selected, legal_action_mask)
+        raise ValueError(
+            f"unknown action_commitment_type: {action_commitment_type!r}"
+        )
+    return legalize_action(selected, legal_action_mask)
 
 
-def _legalize_played_action(
+def legalize_action(
     action: jax.Array,
     legal_action_mask: jax.Array,
 ) -> jax.Array:
@@ -220,6 +361,62 @@ def _legalize_played_action(
     )[..., 0]
     selected = jnp.where(in_bounds & selected_is_legal, action, first_legal)
     return jnp.where(has_legal_action, selected, jnp.zeros_like(selected))
+
+
+def make_action_committer(action_commitment_type: str):
+    def action_committer(
+        posterior: PosteriorTargets,
+        legal_action_mask: jax.Array,
+        rng_key: jax.Array,
+    ) -> jax.Array:
+        metadata = posterior.metadata
+        search_action = None if metadata is None else metadata.search_action
+        return commit_action(
+            action_commitment_type,
+            rng_key,
+            posterior.prediction.policy,
+            legal_action_mask,
+            search_action,
+        )
+
+    return action_committer
+
+
+def make_player(search, action_committer):
+    def player(env_state: pgx.State, rng_key: jax.Array) -> PlayerOutput:
+        search_key, action_key = jax.random.split(rng_key)
+        search_output = search(root_state=env_state, rng_key=search_key)
+        action = action_committer(
+            search_output.posterior,
+            env_state.legal_action_mask,
+            action_key,
+        )
+        return PlayerOutput(
+            action=action,
+            posterior=search_output.posterior,
+            diagnostics=search_output.diagnostics,
+        )
+
+    return player
+
+
+def make_search_player(
+    env,
+    model: Any,
+    search_cfg: SearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
+    action_commitment_type: Any,
+    *,
+    q_loss_weight_mode: str = "policy",
+):
+    return make_player(
+        make_search(
+            env,
+            make_evaluator(model),
+            search_cfg,
+            q_loss_weight_mode=q_loss_weight_mode,
+        ),
+        make_action_committer(str(action_commitment_type)),
+    )
 
 
 def _make_dirichlet_root(
@@ -258,87 +455,50 @@ def _q_loss_weight_from_mode(
     raise ValueError(f"unknown q_loss_weight_mode: {mode!r}")
 
 
-def _run_scalar_gumbel_search(
+def _run_dirichlet_search_output(
     *,
     env_state: pgx.State,
-    model_output,
+    prediction: EvaluatorOutput,
     recurrent_fn,
     rng_key: jax.Array,
-    config,
-) -> _SearchStepOutput:
-    logits, value = policy_value_from_output(model_output)
-    root = mctx.RootFnOutput(
-        prior_logits=logits,
-        value=value,
-        embedding=env_state,
-    )
-    policy_output = mctx.gumbel_muzero_policy(
-        params=(),
-        rng_key=rng_key,
-        root=root,
-        recurrent_fn=recurrent_fn,
-        num_simulations=int(_search_value(config, "num_simulations", 32)),
-        invalid_actions=~env_state.legal_action_mask,
-        qtransform=mctx.qtransform_completed_by_mix_value,
-        gumbel_scale=float(_search_value(config, "gumbel_scale", 1.0)),
-    )
-    policy_target = policy_output.action_weights
-    beta_Q_target, beta_V_target, q_loss_weight = _empty_posterior_targets(
-        policy_target,
-        _num_outcomes_for_config(config),
-    )
-    return _SearchStepOutput(
-        action_weights=policy_target,
-        played_action=_legalize_played_action(
-            policy_output.action,
-            env_state.legal_action_mask,
-        ),
-        beta_Q_target=beta_Q_target,
-        beta_V_target=beta_V_target,
-        q_loss_weight=q_loss_weight,
-        search_loss_mask=_search_loss_mask(policy_target),
-    )
-
-
-def _run_dirichlet_search(
-    *,
-    env_state: pgx.State,
-    model_output,
-    recurrent_fn,
-    rng_key: jax.Array,
-    config,
-    action_source: str,
-) -> _SearchStepOutput:
-    logits, alpha_v, alpha_q = model_output
-    root = _make_dirichlet_root(env_state, logits, alpha_v, alpha_q)
+    search_kind: SearchKind,
+    search_cfg: GumbelSearchConfig | DirichletThompsonSearchConfig,
+    q_loss_weight_mode: str,
+) -> SearchOutput:
+    alpha_v = _required_output(prediction.alpha_v, "alpha_v")
+    alpha_q = _required_output(prediction.alpha_q, "alpha_q")
+    root = _make_dirichlet_root(env_state, prediction.logits, alpha_v, alpha_q)
     action_value_prior = alpha_q
-    search_kind = _search_kind(config)
 
-    search_key, posterior_key, action_key = jax.random.split(rng_key, 3)
+    search_key, posterior_key, _action_key = jax.random.split(rng_key, 3)
     if search_kind == SearchKind.dirichlet_thompson:
+        if not isinstance(search_cfg, DirichletThompsonSearchConfig):
+            raise ValueError("Dirichlet Thompson search requires its active config")
         policy_output = dirichlet_q_policy(
             params=(),
             rng_key=search_key,
             root=root,
             recurrent_fn=recurrent_fn,
             action_value_prior=action_value_prior,
-            num_simulations=int(_search_value(config, "num_simulations", 32)),
+            num_simulations=int(search_cfg.num_simulations),
             invalid_actions=~env_state.legal_action_mask,
-            num_search_blocks=int(_search_value(config, "num_blocks", 1)),
+            num_search_blocks=int(search_cfg.num_blocks),
         )
         q_evidence_sum = policy_output.q_evidence_sum
         action_alpha_post = policy_output.alpha_search
         action_value_target_prior = action_alpha_post - q_evidence_sum
     elif search_kind == SearchKind.gumbel:
+        if not isinstance(search_cfg, GumbelSearchConfig):
+            raise ValueError("Gumbel search requires its active config")
         policy_output = mctx.gumbel_muzero_policy(
             params=(),
             rng_key=search_key,
             root=root,
             recurrent_fn=recurrent_fn,
-            num_simulations=int(_search_value(config, "num_simulations", 32)),
+            num_simulations=int(search_cfg.num_simulations),
             invalid_actions=~env_state.legal_action_mask,
             qtransform=mctx.qtransform_completed_by_mix_value,
-            gumbel_scale=float(_search_value(config, "gumbel_scale", 1.0)),
+            gumbel_scale=float(search_cfg.gumbel_scale),
         )
         q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
         action_value_target_prior = root_action_value_priors_from_tree(
@@ -352,19 +512,22 @@ def _run_dirichlet_search(
             "Use the posterior-tree search entry point for DQAZ."
         )
 
-    policy_samples = _policy_target_samples(config)
+    policy_samples = int(
+        getattr(search_cfg, "policy_samples", _POSTERIOR_POLICY_TARGET_SAMPLES)
+    )
     if policy_samples == 0:
-        posterior_policy_target = policy_output.action_weights
+        posterior_policy_target = cast(jax.Array, policy_output.action_weights)
     else:
+        chunk_size = search_cfg.policy_sample_chunk_size
         posterior_policy_target = posterior_best_policy_target(
             posterior_key,
             action_alpha_post,
             env_state.legal_action_mask,
             policy_samples,
-            chunk_size=_policy_target_sample_chunk_size(config, policy_samples),
+            chunk_size=policy_samples if chunk_size is None else int(chunk_size),
         )
     if search_kind == SearchKind.gumbel:
-        policy_target = policy_output.action_weights
+        policy_target = cast(jax.Array, policy_output.action_weights)
     else:
         policy_target = posterior_policy_target
     beta_Q_target, beta_V_target = posterior_targets(
@@ -373,61 +536,111 @@ def _run_dirichlet_search(
         q_evidence_sum,
         posterior_policy_target,
     )
-    played_action = _select_played_action(
-        action_source,
-        action_key,
-        posterior_policy_target,
-        env_state.legal_action_mask,
-        policy_output.action,
-    )
-    return _SearchStepOutput(
-        action_weights=policy_target,
-        played_action=played_action,
-        beta_Q_target=beta_Q_target,
-        beta_V_target=beta_V_target,
-        q_loss_weight=_q_loss_weight_from_mode(
-            config.training.losses.q_loss_weight_mode,
-            q_evidence_sum,
-            posterior_policy_target,
+    return SearchOutput(
+        posterior=PosteriorTargets(
+            prediction=PosteriorPrediction(
+                policy=policy_target,
+                alpha_v=beta_V_target,
+                alpha_q=beta_Q_target,
+            ),
+            metadata=TargetMetadata(
+                mask=_search_loss_mask(policy_target),
+                q_weight=_q_loss_weight_from_mode(
+                    q_loss_weight_mode,
+                    q_evidence_sum,
+                    posterior_policy_target,
+                ),
+                search_action=cast(jax.Array, policy_output.action),
+            ),
         ),
-        search_loss_mask=_search_loss_mask(policy_target),
     )
 
 
-def _run_model_search(
-    env_state: pgx.State,
-    model_output,
-    scalar_recurrent_fn,
-    dirichlet_recurrent_fn,
-    rng_key: jax.Array,
-    config,
-) -> _SearchStepOutput:
-    search_kind = _search_kind(config)
-    if search_kind == SearchKind.dqaz:
-        raise RuntimeError(
-            "DQAZ search uses the native posterior-tree path, not the JAX "
-            "model-search path."
-        )
-    if len(model_output) == 2:
-        if search_kind != SearchKind.gumbel:
-            raise ValueError(
-                f"{search_kind!r} search requires a Dirichlet network output."
+def _active_jax_search_config(
+    search_cfg: SearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
+) -> tuple[SearchKind, GumbelSearchConfig | DirichletThompsonSearchConfig]:
+    if isinstance(search_cfg, SearchConfig):
+        if search_cfg.kind == SearchKind.dqaz:
+            raise RuntimeError(
+                "DQAZ remains on the posterior-tree compatibility path."
             )
-        return _run_scalar_gumbel_search(
-            env_state=env_state,
-            model_output=model_output,
-            recurrent_fn=scalar_recurrent_fn,
-            rng_key=rng_key,
-            config=config,
-        )
-    return _run_dirichlet_search(
-        env_state=env_state,
-        model_output=model_output,
-        recurrent_fn=dirichlet_recurrent_fn,
-        rng_key=rng_key,
-        config=config,
-        action_source=_selfplay_action_source(config), 
+        active = search_cfg.active()
+        if not isinstance(active, (GumbelSearchConfig, DirichletThompsonSearchConfig)):
+            raise RuntimeError("JAX search requires a Gumbel or Dirichlet config.")
+        return search_cfg.kind, active
+    if isinstance(search_cfg, GumbelSearchConfig):
+        return SearchKind.gumbel, search_cfg
+    return SearchKind.dirichlet_thompson, search_cfg
+
+
+def make_search(
+    env,
+    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    search_cfg: SearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
+    *,
+    q_loss_weight_mode: str = "policy",
+) -> Callable[..., SearchOutput]:
+    search_kind, active_search_cfg = _active_jax_search_config(search_cfg)
+    scalar_recurrent_fn = make_recurrent_fn(env, evaluator)
+    dirichlet_recurrent_fn = make_dirichlet_recurrent_fn_from_constants(
+        env,
+        evaluator,
+        active_search_cfg.constants,
     )
+
+    def search(*, root_state: pgx.State, rng_key: jax.Array) -> SearchOutput:
+        prediction = evaluator(root_state.observation)
+        if prediction.alpha_q is None:
+            if search_kind != SearchKind.gumbel:
+                raise ValueError(
+                    f"{search_kind!r} search requires a Dirichlet evaluator."
+                )
+            if not isinstance(active_search_cfg, GumbelSearchConfig):
+                raise ValueError("scalar Gumbel search requires Gumbel config")
+            value = _required_output(prediction.value, "value")
+            root = mctx.RootFnOutput(
+                prior_logits=prediction.logits,
+                value=value,
+                embedding=root_state,
+            )
+            policy_output = mctx.gumbel_muzero_policy(
+                params=(),
+                rng_key=rng_key,
+                root=root,
+                recurrent_fn=scalar_recurrent_fn,
+                num_simulations=int(active_search_cfg.num_simulations),
+                invalid_actions=~root_state.legal_action_mask,
+                qtransform=mctx.qtransform_completed_by_mix_value,
+                gumbel_scale=float(active_search_cfg.gumbel_scale),
+            )
+            policy_target = cast(jax.Array, policy_output.action_weights)
+            search_action = cast(jax.Array, policy_output.action)
+            return SearchOutput(
+                posterior=PosteriorTargets(
+                    prediction=PosteriorPrediction(
+                        policy=policy_target,
+                        value=value,
+                    ),
+                    metadata=TargetMetadata(
+                        mask=_search_loss_mask(policy_target),
+                        search_action=legalize_action(
+                            search_action,
+                            root_state.legal_action_mask,
+                        ),
+                    ),
+                ),
+            )
+        return _run_dirichlet_search_output(
+            env_state=root_state,
+            prediction=prediction,
+            recurrent_fn=dirichlet_recurrent_fn,
+            rng_key=rng_key,
+            search_kind=search_kind,
+            search_cfg=active_search_cfg,
+            q_loss_weight_mode=q_loss_weight_mode,
+        )
+
+    return search
 
 
 def _run_posterior_tree_search_step(

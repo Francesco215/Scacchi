@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -90,7 +91,7 @@ def make_env(env_id: str, board_size: int | None = None):
         return pgx.go.Go(size=go_size, komi=7.5)
 
     if env_id != "hex":
-        return pgx.make(env_id)
+        return pgx.make(cast(Any, env_id))
 
     assert board_size is not None
 
@@ -119,6 +120,6 @@ def make_env(env_id: str, board_size: int | None = None):
             _x=x,
         )
 
-    env._init = _init
-    env._step = _step
+    cast(Any, env)._init = _init
+    cast(Any, env)._step = _step
     return env

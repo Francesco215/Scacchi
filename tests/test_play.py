@@ -1,19 +1,36 @@
 from typing import NamedTuple
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
-import mctx
+import pgx
 import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
 from scacchi.dirichlet_q_search import posterior_sample_action
 from scacchi.distributed import BatchParallel, assert_batch_axis_sharded
+from scacchi.network import BoardlawNet
+from scacchi.play import TrainingSamples, play, make_selfplay
 from scacchi.play_search import (
-    _legalize_played_action,
-    _run_scalar_gumbel_search,
-    _select_played_action,
+    EvaluatorOutput,
+    PlayerOutput,
+    PosteriorPrediction,
+    PosteriorTargets,
+    TargetMetadata,
+    commit_action,
+    legalize_action,
+    make_search,
 )
-from scacchi.types import Config, EnvConfig, GumbelSearchConfig, SearchConfig
+from scacchi.types import (
+    ActionCommitmentType,
+    Config,
+    EnvConfig,
+    GumbelSearchConfig,
+    ModelConfig,
+    Network,
+    SearchConfig,
+    SelfplayConfig,
+)
 
 
 _COLLECTIVE_HLO_NAMES = (
@@ -31,20 +48,30 @@ _COLLECTIVE_HLO_NAMES = (
 
 
 class _ToySearchState(NamedTuple):
+    observation: jax.Array
     legal_action_mask: jax.Array
+    current_player: jax.Array
+    rewards: jax.Array
+    terminated: jax.Array
 
 
-def _toy_scalar_recurrent_fn(_, rng_key, action, embedding: _ToySearchState):
-    del rng_key, action
-    prior_logits = embedding.legal_action_mask.astype(jnp.float32) * 0.0
-    value = jnp.sum(prior_logits, axis=-1)
-    output = mctx.RecurrentFnOutput(
-        reward=value,
-        discount=value - 1.0,
-        prior_logits=prior_logits,
-        value=value,
+class _ToySearchEnv:
+    def step(self, state: _ToySearchState, action: jax.Array) -> _ToySearchState:
+        del action
+        return _ToySearchState(
+            observation=state.observation + 1.0,
+            legal_action_mask=state.legal_action_mask,
+            current_player=state.current_player,
+            rewards=state.rewards,
+            terminated=state.terminated,
+        )
+
+
+def _toy_scalar_evaluator(obs: jax.Array) -> EvaluatorOutput:
+    return EvaluatorOutput(
+        logits=jnp.zeros((obs.shape[0], 3), dtype=obs.dtype),
+        value=jnp.zeros((obs.shape[0],), dtype=obs.dtype),
     )
-    return output, embedding
 
 
 def test_scalar_gumbel_search_preserves_batch_sharding_without_collectives():
@@ -60,45 +87,54 @@ def test_scalar_gumbel_search_preserves_batch_sharding_without_collectives():
     matrix_sharding = NamedSharding(mesh, PartitionSpec("batch", None))
     vector_sharding = NamedSharding(mesh, PartitionSpec("batch"))
     env_state = _ToySearchState(
+        observation=jax.device_put(
+            jnp.zeros((batch_size, 1), dtype=jnp.float32),
+            matrix_sharding,
+        ),
         legal_action_mask=jax.device_put(
             jnp.ones((batch_size, num_actions), dtype=jnp.bool_),
             matrix_sharding,
-        )
-    )
-    model_output = (
-        jax.device_put(
-            jnp.zeros((batch_size, num_actions), dtype=jnp.float32),
+        ),
+        current_player=jax.device_put(
+            jnp.zeros((batch_size,), dtype=jnp.int32),
+            vector_sharding,
+        ),
+        rewards=jax.device_put(
+            jnp.zeros((batch_size, 2), dtype=jnp.float32),
             matrix_sharding,
         ),
-        jax.device_put(jnp.zeros((batch_size,), dtype=jnp.float32), vector_sharding),
+        terminated=jax.device_put(
+            jnp.zeros((batch_size,), dtype=jnp.bool_),
+            vector_sharding,
+        ),
     )
-    config = Config(
-        env=EnvConfig(id="toy", num_outcomes=2),
-        search=SearchConfig(gumbel=GumbelSearchConfig(num_simulations=2)),
+    search = make_search(
+        _ToySearchEnv(),
+        _toy_scalar_evaluator,
+        GumbelSearchConfig(num_simulations=2),
     )
 
-    def run(env_state, model_output, rng_key):
-        return _run_scalar_gumbel_search(
-            env_state=env_state,
-            model_output=model_output,
-            recurrent_fn=_toy_scalar_recurrent_fn,
-            rng_key=rng_key,
-            config=config,
-        )
+    def run(env_state, rng_key):
+        return search(root_state=env_state, rng_key=rng_key)
 
     rng_key = jax.random.PRNGKey(0)
-    lowered = jax.jit(run).lower(env_state, model_output, rng_key)
-    hlo_text = lowered.compiler_ir(dialect="hlo").as_hlo_text().lower()
+    lowered = jax.jit(run).lower(env_state, rng_key)
+    compiler_ir = lowered.compiler_ir(dialect="hlo")
+    assert compiler_ir is not None
+    hlo_text = compiler_ir.as_hlo_text().lower()
     for collective in _COLLECTIVE_HLO_NAMES:
         assert collective not in hlo_text
 
-    output = jax.jit(run)(env_state, model_output, rng_key)
+    output = jax.jit(run)(env_state, rng_key)
     output = assert_batch_axis_sharded(output, parallel, batch_axis=0, label="scalar gumbel output")
-    assert output.action_weights.shape == (batch_size, num_actions)
-    assert output.played_action.shape == (batch_size,)
+    metadata = output.posterior.metadata
+    assert metadata is not None
+    assert metadata.search_action is not None
+    assert output.posterior.prediction.policy.shape == (batch_size, num_actions)
+    assert metadata.search_action.shape == (batch_size,)
 
 
-def test_select_played_action_samples_posterior_target():
+def test_commit_action_samples_posterior_target():
     key = jax.random.PRNGKey(0)
     action_weights = jnp.array(
         [
@@ -109,7 +145,7 @@ def test_select_played_action_samples_posterior_target():
     legal_action_mask = jnp.ones_like(action_weights, dtype=jnp.bool_)
     search_action = jnp.array([0, 0], dtype=jnp.int32)
 
-    played_action = _select_played_action(
+    played_action = commit_action(
         "posterior_sample",
         key,
         action_weights,
@@ -122,12 +158,18 @@ def test_select_played_action_samples_posterior_target():
     assert not jnp.array_equal(played_action, search_action)
 
 
-def test_select_played_action_can_use_search_action():
+@pytest.mark.parametrize(
+    ("legal_action_mask", "expected"),
+    [
+        (jnp.array([[True, True, True]]), jnp.array([2], dtype=jnp.int32)),
+        (jnp.array([[False, True, False]]), jnp.array([1], dtype=jnp.int32)),
+    ],
+)
+def test_commit_action_can_use_search_action(legal_action_mask, expected):
     action_weights = jnp.array([[0.0, 1.0, 0.0]])
-    legal_action_mask = jnp.ones_like(action_weights, dtype=jnp.bool_)
     search_action = jnp.array([2], dtype=jnp.int32)
 
-    played_action = _select_played_action(
+    played_action = commit_action(
         "search_action",
         jax.random.PRNGKey(0),
         action_weights,
@@ -135,26 +177,10 @@ def test_select_played_action_can_use_search_action():
         search_action,
     )
 
-    assert jnp.array_equal(played_action, search_action)
+    assert jnp.array_equal(played_action, expected)
 
 
-def test_select_played_action_legalizes_search_action():
-    action_weights = jnp.array([[0.0, 1.0, 0.0]])
-    legal_action_mask = jnp.array([[False, True, False]])
-    search_action = jnp.array([2], dtype=jnp.int32)
-
-    played_action = _select_played_action(
-        "search_action",
-        jax.random.PRNGKey(0),
-        action_weights,
-        legal_action_mask,
-        search_action,
-    )
-
-    assert jnp.array_equal(played_action, jnp.array([1], dtype=jnp.int32))
-
-
-def test_legalize_played_action_handles_out_of_bounds_and_terminal_rows():
+def test_legalize_action_handles_out_of_bounds_and_terminal_rows():
     legal_action_mask = jnp.array(
         [
             [False, True, False],
@@ -164,17 +190,83 @@ def test_legalize_played_action_handles_out_of_bounds_and_terminal_rows():
     )
     action = jnp.array([-1, 9, 2], dtype=jnp.int32)
 
-    played_action = _legalize_played_action(action, legal_action_mask)
+    played_action = legalize_action(action, legal_action_mask)
 
     assert jnp.array_equal(played_action, jnp.array([1, 2, 0], dtype=jnp.int32))
 
 
-def test_select_played_action_rejects_unknown_source():
-    with pytest.raises(ValueError, match="selfplay_action_source"):
-        _select_played_action(
-            "unknown",
+def test_commit_action_rejects_removed_posterior_best_alias():
+    with pytest.raises(ValueError, match="action_commitment_type"):
+        commit_action(
+            "posterior_best",
             jax.random.PRNGKey(0),
             jnp.array([[1.0]]),
             jnp.array([[True]]),
             jnp.array([0], dtype=jnp.int32),
         )
+
+
+def test_play_dispatches_training_mode():
+    env = pgx.make("tic_tac_toe")
+
+    def player(env_state, key: jax.Array) -> PlayerOutput:
+        del key
+        policy = env_state.legal_action_mask.astype(jnp.float32)
+        policy = policy / jnp.sum(policy, axis=-1, keepdims=True)
+        return PlayerOutput(
+            action=jnp.argmax(env_state.legal_action_mask, axis=-1).astype(jnp.int32),
+            posterior=PosteriorTargets(
+                prediction=PosteriorPrediction(policy=policy),
+                metadata=TargetMetadata(
+                    mask=jnp.any(env_state.legal_action_mask, axis=-1),
+                ),
+            ),
+            diagnostics=None,
+        )
+
+    training = play(
+        env,
+        player,
+        player,
+        jax.random.PRNGKey(0),
+        mode="training",
+        batch_size=2,
+        max_num_steps=1,
+    )
+
+    assert isinstance(training, TrainingSamples)
+    assert training.obs.shape[:2] == (2, 1)
+    assert training.posterior.prediction.policy.shape == (2, 1, env.num_actions)
+
+
+def test_make_selfplay_delegates_to_play_training_smoke():
+    env = pgx.make("tic_tac_toe")
+    search = SearchConfig(gumbel=GumbelSearchConfig(num_simulations=1))
+    config = Config(
+        env=EnvConfig(id="tic_tac_toe", num_outcomes=3),
+        model=ModelConfig(
+            network=Network.boardlaw,
+            num_channels=8,
+            num_layers=1,
+        ),
+        selfplay=SelfplayConfig(
+            batch_size=2,
+            max_num_steps=1,
+            search=search,
+            action_commitment_type=ActionCommitmentType.posterior_argmax,
+        ),
+    )
+    model = BoardlawNet(
+        num_actions=env.num_actions,
+        observation_shape=env.observation_shape,
+        width=8,
+        depth=1,
+        rngs=nnx.Rngs(0),
+    )
+
+    data = make_selfplay(env, config)(model, jax.random.PRNGKey(1))
+
+    assert data.obs.shape[:2] == (2, 1)
+    assert data.played_action.shape == (2, 1)
+    assert data.legal_action_mask.shape == (2, 1, env.num_actions)
+    assert data.posterior.prediction.policy.shape == (2, 1, env.num_actions)

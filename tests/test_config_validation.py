@@ -2,7 +2,7 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import ConfigKeyError, ValidationError
 
 from scacchi.envs import make_env
@@ -16,7 +16,9 @@ def _config(values: dict) -> Config:
 
 def test_config_yaml_loads_into_nested_runtime_config():
     cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "config.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
+    loaded = OmegaConf.load(cfg_path)
+    assert isinstance(loaded, DictConfig)
+    config = load_config(loaded)
 
     assert config.run.seed == 1
     assert config.run.max_num_iters == 2000
@@ -27,17 +29,26 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.model.num_channels == 128
     assert config.model.num_layers == 6
     assert config.model.compute_dtype == "float32"
-    assert config.selfplay.batch_size == 65_536
+    assert config.selfplay.batch_size == 2048
     assert config.selfplay.max_num_steps == 128
-    assert config.selfplay.action_source == "posterior_sample"
+    assert config.selfplay.action_commitment_type == "posterior_sample"
+    assert config.selfplay.search.kind == "dirichlet_thompson"
+    assert config.selfplay.search.dirichlet_thompson.num_simulations == 4
+    assert config.selfplay.search.dirichlet_thompson.num_blocks == 4
+    assert config.selfplay.search.dirichlet_thompson.policy_samples == 1
+    assert config.selfplay.search.dirichlet_thompson.policy_sample_chunk_size == 1
+    assert config.selfplay.search.dirichlet_thompson.constants.kappa_leaf == 1.0
+    assert config.selfplay.search.dirichlet_thompson.constants.kappa_terminal == 8.0
+    assert config.eval.player_search.kind == "dirichlet_thompson"
+    assert config.eval.baseline_search.kind == "dirichlet_thompson"
     assert config.search.kind == "dirichlet_thompson"
     assert config.search.dirichlet_thompson.num_simulations == 4
     assert config.search.dirichlet_thompson.num_blocks == 4
-    assert config.search.dirichlet_thompson.policy_samples == 0
-    assert config.search.dirichlet_thompson.policy_sample_chunk_size == 32
+    assert config.search.dirichlet_thompson.policy_samples == 1
+    assert config.search.dirichlet_thompson.policy_sample_chunk_size == 1
     assert config.search.dirichlet_thompson.constants.kappa_leaf == 1.0
     assert config.search.dirichlet_thompson.constants.kappa_terminal == 8.0
-    assert config.training.batch_size == 65_536
+    assert config.training.batch_size == 4096
     assert config.training.max_updates_per_iter == 1
     assert config.training.learning_rate == 1e-3
     assert config.training.grad_clip_norm == 1.0
@@ -54,7 +65,6 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.logging.wandb.enabled is True
     assert config.checkpointing.max_to_keep == 50
     assert config.checkpointing.save_interval_steps == 100
-    assert config.compatibility.rng_split_mode == "legacy_eval_train"
 
 
 def test_make_env_supports_custom_go8():
@@ -116,13 +126,62 @@ def test_unknown_nested_config_keys_are_rejected():
         _config({"search": {"gumbel": {"constants": {"unknown": 1.0}}}})
 
 
+def test_legacy_top_level_search_populates_play_mode_search_configs():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {
+                "kind": "dirichlet_thompson",
+                "dirichlet_thompson": {"num_simulations": 7},
+            },
+        }
+    )
+
+    assert config.search.kind == "dirichlet_thompson"
+    assert config.selfplay.search.kind == "dirichlet_thompson"
+    assert config.eval.player_search.kind == "dirichlet_thompson"
+    assert config.eval.baseline_search.kind == "dirichlet_thompson"
+    assert config.selfplay.search.dirichlet_thompson.num_simulations == 7
+    assert config.eval.player_search.dirichlet_thompson.num_simulations == 7
+    assert config.eval.baseline_search.dirichlet_thompson.num_simulations == 7
+
+
+def test_nested_selfplay_search_populates_top_level_compatibility_alias():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {"num_simulations": 9},
+                }
+            },
+        }
+    )
+
+    assert config.selfplay.search.kind == "dirichlet_thompson"
+    assert config.search.kind == "dirichlet_thompson"
+    assert config.eval.player_search.kind == "dirichlet_thompson"
+    assert config.search.dirichlet_thompson.num_simulations == 9
+
+
 @pytest.mark.parametrize(
     "key",
-    ["sample_one_step_per_game", "sample_one_step_global", "return_suffix_mode"],
+    [
+        "sample_one_step_per_game",
+        "sample_one_step_global",
+        "return_suffix_mode",
+        "replay_buffer_size",
+    ],
 )
 def test_removed_sampled_rollout_training_keys_are_rejected(key):
     with pytest.raises(ConfigKeyError, match=key):
         _config({"training": {key: True}})
+
+
+def test_removed_compatibility_config_is_rejected():
+    with pytest.raises(ConfigKeyError, match="compatibility"):
+        _config({"compatibility": {"rng_split_mode": "legacy_eval_train"}})
 
 
 def test_scalar_network_rejects_dirichlet_loss_weights():
@@ -285,23 +344,33 @@ def test_grad_clip_norm_can_be_disabled():
     assert config.training.grad_clip_norm is None
 
 
-def test_posterior_sample_action_source_is_valid():
+def test_posterior_sample_action_commitment_type_is_valid():
     config = _config(
         {
             "model": {"network": "boardlaw_dirichlet"},
-            "selfplay": {"action_source": "posterior_sample"},
+            "selfplay": {"action_commitment_type": "posterior_sample"},
         }
     )
 
-    assert config.selfplay.action_source == "posterior_sample"
+    assert config.selfplay.action_commitment_type == "posterior_sample"
 
 
-def test_selfplay_action_source_must_be_known():
-    with pytest.raises(ValidationError, match="posterior_sample"):
+def test_legacy_action_source_is_rejected():
+    with pytest.raises(ConfigKeyError, match="action_source"):
         _config(
             {
                 "model": {"network": "boardlaw_dirichlet"},
-                "selfplay": {"action_source": "unknown"},
+                "selfplay": {"action_source": "posterior_sample"},
+            }
+        )
+
+
+def test_selfplay_action_commitment_type_must_be_known():
+    with pytest.raises(ValidationError, match="posterior_argmax"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "selfplay": {"action_commitment_type": "posterior_best"},
             }
         )
 

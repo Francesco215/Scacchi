@@ -355,7 +355,7 @@ class ReZeroResidual(nnx.Module):
         self.alpha = nnx.Param(jnp.zeros(()))
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        return x + self.alpha * self.linear(jax.nn.relu(x))
+        return x + self.alpha[...] * self.linear(jax.nn.relu(x))
 
 
 class BoardlawNet(nnx.Module):

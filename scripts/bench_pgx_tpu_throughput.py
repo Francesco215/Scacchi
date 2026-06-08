@@ -17,7 +17,7 @@ import os
 import socket
 import statistics
 import time
-from typing import Iterable
+from typing import Any, Iterable, cast
 
 import jax
 import jax.numpy as jnp
@@ -62,7 +62,7 @@ def _allgather(value: jax.Array, enabled: bool) -> np.ndarray:
 
 
 def _make_benchmark(env_id: str, batch_per_device: int, steps: int, action_mode: str):
-    env = pgx.make(env_id)
+    env = pgx.make(cast(Any, env_id))
 
     def init_device(key):
         keys = jax.random.split(key, batch_per_device)

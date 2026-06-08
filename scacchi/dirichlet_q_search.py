@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import chex
 import jax
@@ -8,14 +8,13 @@ import jax.numpy as jnp
 from mctx._src import action_selection
 from mctx._src import base
 from mctx._src import search as mctx_search
-import pgx
 
 
 NO_PARENT = -1
 
 
 class NodeEmbedding(NamedTuple):
-    state: pgx.State
+    state: Any
     outcome_dist: jax.Array
     alpha_V_prior: jax.Array
     evidence_weight: jax.Array
@@ -197,7 +196,7 @@ def dirichlet_root_action_selection(
     alpha_post = action_value_prior + q_evidence
     phi = jax.random.dirichlet(rng_key, alpha_post)
     score = outcome_utility(phi)
-    return action_selection.masked_argmax(score, tree.root_invalid_actions)
+    return cast(jax.Array, action_selection.masked_argmax(score, tree.root_invalid_actions))
 
 
 def policy_prior_interior_action_selection(
@@ -226,12 +225,14 @@ def _dirichlet_q_search_block(
     max_depth: int | None = None,
     loop_fn=jax.lax.fori_loop,
 ) -> DirichletQSearchOutput:
-    root = root.replace(
+    root = base.RootFnOutput(
         prior_logits=jnp.where(
             invalid_actions,
             jnp.finfo(root.prior_logits.dtype).min,
             root.prior_logits,
-        )
+        ),
+        value=root.value,
+        embedding=root.embedding,
     )
     search_tree = mctx_search.search(
         params=params,

@@ -17,12 +17,14 @@ from scacchi.loss import (
     _dirichlet_kl,
     make_compute_input_for_lossfn,
 )
-from scacchi.pipeline import _fixed_replay_window, make_minibatches
-from scacchi.play import SelfplayOutput
+from scacchi.pipeline import make_minibatches
+from scacchi.play import TrainingSamples
+from scacchi.play_search import PosteriorPrediction, PosteriorTargets, TargetMetadata
 from scacchi.types import (
     Config,
     GumbelSearchConfig,
     ModelConfig,
+    Network,
     SearchConfig,
     SearchConstantsConfig,
     SelfplayConfig,
@@ -52,7 +54,7 @@ def _loss_config(
     terminal_parent_targets: bool = False,
 ) -> Config:
     return Config(
-        model=ModelConfig(network="boardlaw_dirichlet"),
+        model=ModelConfig(network=Network.boardlaw_dirichlet),
         selfplay=SelfplayConfig(max_num_steps=max_num_steps),
         search=SearchConfig(
             gumbel=GumbelSearchConfig(
@@ -83,8 +85,61 @@ def _sample_posterior_fields(num_rows: int, num_actions: int = 2, num_outcomes: 
     }
 
 
+def _training_samples(
+    *,
+    obs,
+    reward,
+    terminated,
+    action_weights,
+    played_action,
+    legal_action_mask,
+    beta_Q_target,
+    beta_V_target,
+    q_loss_weight,
+    discount,
+    tree_data=None,
+    search_loss_mask=None,
+    q_target_kind=None,
+    q_target_weight=None,
+    q_target_outcome=None,
+    q_target_distance=None,
+    v_target_kind=None,
+    v_target_weight=None,
+    v_target_outcome=None,
+    v_target_distance=None,
+) -> TrainingSamples:
+    return TrainingSamples(
+        obs=obs,
+        reward=reward,
+        terminated=terminated,
+        discount=discount,
+        posterior=PosteriorTargets(
+            prediction=PosteriorPrediction(
+                policy=action_weights,
+                alpha_v=beta_V_target,
+                alpha_q=beta_Q_target,
+            ),
+            metadata=TargetMetadata(
+                mask=search_loss_mask,
+                q_weight=q_loss_weight,
+                tree_data=tree_data,
+                q_target_kind=q_target_kind,
+                q_target_weight=q_target_weight,
+                q_target_outcome=q_target_outcome,
+                q_target_distance=q_target_distance,
+                v_target_kind=v_target_kind,
+                v_target_weight=v_target_weight,
+                v_target_outcome=v_target_outcome,
+                v_target_distance=v_target_distance,
+            ),
+        ),
+        played_action=played_action,
+        legal_action_mask=legal_action_mask,
+    )
+
+
 def test_compute_loss_input_preserves_root_legal_action_mask():
-    data = SelfplayOutput(
+    data = _training_samples(
         obs=jnp.zeros((2, 3, 1)),
         reward=jnp.zeros((2, 3)),
         terminated=jnp.array(
@@ -135,12 +190,19 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
     config = _loss_config(max_num_steps=3)
 
     sample = make_compute_input_for_lossfn(config)(data)
+    metadata = data.posterior.metadata
+    alpha_q = data.posterior.prediction.alpha_q
+    alpha_v = data.posterior.prediction.alpha_v
+    assert metadata is not None
+    assert alpha_q is not None
+    assert alpha_v is not None
+    assert metadata.q_weight is not None
 
     assert jnp.array_equal(sample.policy_mask, data.legal_action_mask)
     assert jnp.array_equal(sample.played_action, data.played_action)
-    assert jnp.array_equal(sample.beta_Q_target, data.beta_Q_target)
-    assert jnp.array_equal(sample.beta_V_target, data.beta_V_target)
-    assert jnp.array_equal(sample.q_loss_weight, data.q_loss_weight)
+    assert jnp.array_equal(sample.beta_Q_target, alpha_q)
+    assert jnp.array_equal(sample.beta_V_target, alpha_v)
+    assert jnp.array_equal(sample.q_loss_weight, metadata.q_weight)
     assert jnp.array_equal(
         sample.value_mask,
         jnp.array(
@@ -152,12 +214,47 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
     )
 
 
+def test_compute_loss_input_accepts_training_samples():
+    policy = jnp.array([[[0.25, 0.75]]])
+    beta_q = jnp.array([[[[1.0, 2.0], [3.0, 4.0]]]])
+    beta_v = jnp.array([[[5.0, 6.0]]])
+    q_weight = jnp.array([[[0.0, 1.0]]])
+    samples = TrainingSamples(
+        obs=jnp.zeros((1, 1, 1)),
+        reward=jnp.array([[1.0]]),
+        terminated=jnp.array([[True]]),
+        discount=jnp.array([[0.0]]),
+        posterior=PosteriorTargets(
+            prediction=PosteriorPrediction(
+                policy=policy,
+                alpha_v=beta_v,
+                alpha_q=beta_q,
+            ),
+            metadata=TargetMetadata(
+                mask=jnp.array([[True]]),
+                q_weight=q_weight,
+            ),
+        ),
+        played_action=jnp.array([[1]]),
+        legal_action_mask=jnp.ones((1, 1, 2), dtype=jnp.bool_),
+    )
+    config = _loss_config(max_num_steps=1)
+
+    sample = make_compute_input_for_lossfn(config)(samples)
+
+    assert jnp.array_equal(sample.policy_tgt, policy)
+    assert jnp.array_equal(sample.beta_Q_target, beta_q)
+    assert jnp.array_equal(sample.beta_V_target, beta_v)
+    assert jnp.array_equal(sample.q_loss_weight, q_weight)
+    assert jnp.array_equal(sample.search_loss_mask, jnp.array([[True]]))
+
+
 def test_compute_loss_input_preserves_sample_batch_sharding():
     device_count = jax.device_count()
     mesh = _batch_mesh()
     parallel = BatchParallel(enabled=True, mesh=mesh)
     batch_size = max(device_count * 2, 2)
-    data = SelfplayOutput(
+    data = _training_samples(
         obs=jnp.zeros((batch_size, 2, 1), dtype=jnp.float32),
         reward=jnp.zeros((batch_size, 2), dtype=jnp.float32),
         terminated=jnp.zeros((batch_size, 2), dtype=jnp.bool_),
@@ -185,7 +282,9 @@ def test_compute_loss_input_preserves_sample_batch_sharding():
 
     with parallel.mesh_context():
         lowered = jax.jit(compute).lower(data)
-        hlo_text = lowered.compiler_ir(dialect="hlo").as_hlo_text().lower()
+        compiler_ir = lowered.compiler_ir(dialect="hlo")
+        assert compiler_ir is not None
+        hlo_text = compiler_ir.as_hlo_text().lower()
         for collective in (
             "all-gather",
             "all_gather",
@@ -220,7 +319,7 @@ def test_compute_loss_input_appends_tree_rows_with_separate_loss_masks():
         search_loss_mask=jnp.array([[True, False]]),
         outcome_mask=jnp.array([[False, True]]),
     )
-    data = SelfplayOutput(
+    data = _training_samples(
         obs=jnp.array([[[1.0]]]),
         reward=jnp.array([[1.0]]),
         terminated=jnp.array([[True]]),
@@ -244,7 +343,7 @@ def test_compute_loss_input_appends_tree_rows_with_separate_loss_masks():
 
 
 def test_compute_loss_input_trains_root_search_targets_before_terminal_result():
-    data = SelfplayOutput(
+    data = _training_samples(
         obs=jnp.zeros((3, 2, 1)),
         reward=jnp.zeros((3, 2)),
         terminated=jnp.zeros((3, 2), dtype=jnp.bool_),
@@ -266,7 +365,7 @@ def test_compute_loss_input_trains_root_search_targets_before_terminal_result():
 
 
 def test_compute_loss_input_can_mark_played_terminal_edge_categorical():
-    data = SelfplayOutput(
+    data = _training_samples(
         obs=jnp.zeros((1, 2, 1)),
         reward=jnp.array([[0.0, 1.0]]),
         terminated=jnp.array([[False, True]]),
@@ -291,7 +390,7 @@ def test_compute_loss_input_can_mark_played_terminal_edge_categorical():
 
 
 def test_compute_loss_input_can_mark_terminal_winning_parent_categorical():
-    data = SelfplayOutput(
+    data = _training_samples(
         obs=jnp.zeros((1, 2, 1)),
         reward=jnp.array([[0.0, 1.0]]),
         terminated=jnp.array([[False, True]]),
@@ -360,6 +459,7 @@ def test_make_minibatches_shuffles_rows_without_dropping_masked_samples():
         jnp.sort(minibatches.obs[..., 0].reshape(-1)),
         jnp.arange(8, dtype=jnp.float32),
     )
+    assert minibatches.policy_loss_mask is not None
     assert jnp.sum(minibatches.policy_loss_mask) == 2
 
 
@@ -399,7 +499,9 @@ def test_batch_parallel_minibatches_are_sharded_and_communication_free():
 
     with parallel.mesh_context():
         lowered = jax.jit(build_minibatches).lower(sample, jax.random.PRNGKey(0))
-        hlo_text = lowered.compiler_ir(dialect="hlo").as_hlo_text().lower()
+        compiler_ir = lowered.compiler_ir(dialect="hlo")
+        assert compiler_ir is not None
+        hlo_text = compiler_ir.as_hlo_text().lower()
         for collective in (
             "all-gather",
             "all_gather",
@@ -421,14 +523,21 @@ def test_batch_parallel_minibatches_are_sharded_and_communication_free():
     assert minibatches.obs.shape == (3, training_batch_size, 1)
     assert isinstance(minibatches.obs.sharding, NamedSharding)
     if device_count > 1:
-        assert parallel.sharding_for(
+        obs_sharding = parallel.sharding_for(
             minibatches.obs.ndim,
             batch_axis=1,
-        ).is_equivalent_to(minibatches.obs.sharding, minibatches.obs.ndim)
-        assert parallel.sharding_for(
+        )
+        assert obs_sharding is not None
+        assert obs_sharding.is_equivalent_to(
+            minibatches.obs.sharding,
+            minibatches.obs.ndim,
+        )
+        beta_q_sharding = parallel.sharding_for(
             minibatches.beta_Q_target.ndim,
             batch_axis=1,
-        ).is_equivalent_to(
+        )
+        assert beta_q_sharding is not None
+        assert beta_q_sharding.is_equivalent_to(
             minibatches.beta_Q_target.sharding,
             minibatches.beta_Q_target.ndim,
         )
@@ -497,7 +606,9 @@ def test_native_defaults_preserve_beta_batch_sharding():
 
     with parallel.mesh_context():
         lowered = jax.jit(build_defaults).lower(beta_q, beta_v)
-        hlo_text = lowered.compiler_ir(dialect="hlo").as_hlo_text().lower()
+        compiler_ir = lowered.compiler_ir(dialect="hlo")
+        assert compiler_ir is not None
+        hlo_text = compiler_ir.as_hlo_text().lower()
         for collective in (
             "all-gather",
             "all_gather",
@@ -516,23 +627,6 @@ def test_native_defaults_preserve_beta_batch_sharding():
     defaults = assert_batch_axis_sharded(defaults, parallel, batch_axis=0, label="native defaults")
     assert defaults["q_target_weight"].shape == (batch_size, 3, 2)
     assert defaults["v_target_weight"].shape == (batch_size, 3)
-
-
-def test_fixed_replay_window_pads_early_batches_to_stable_shape():
-    first = object()
-    second = object()
-    third = object()
-    fourth = object()
-    fifth = object()
-
-    assert _fixed_replay_window([first], 4) == [first, first, first, first]
-    assert _fixed_replay_window([first, second], 4) == [first, first, first, second]
-    assert _fixed_replay_window([first, second, third, fourth, fifth], 4) == [
-        second,
-        third,
-        fourth,
-        fifth,
-    ]
 
 
 def test_policy_loss_ignores_illegal_logits():
