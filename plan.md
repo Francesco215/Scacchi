@@ -5,8 +5,8 @@
 Refactor search and gameplay around these concepts:
 
 ```python
-nn_evaluator = make_nn_evaluator(nn_config)
-search = make_search(env, predict_fn, search_config)
+evaluator = make_evaluator(model)
+search = make_search(env, evaluator, play_mode.search)
 player = Player(search, action_committer)
 output = play(env, player_1, player_2, ...)
 ```
@@ -43,7 +43,7 @@ The relevant current files are:
 ```text
 scacchi/play.py            274 lines
 scacchi/play_search.py    1497 lines
-scacchi/evaluations.py     195 lines
+scacchi/evaluations.py     218 lines
 scacchi/pipeline.py        205 lines
 scacchi/loss.py            657 lines
 scacchi/types.py           382 lines
@@ -135,9 +135,14 @@ internally it should be assembled from smaller stage outputs.
 
 ## Config Boundary
 
-Search config should only describe search expansion and search backend behavior.
+`SearchConfig` should be a reusable subsection of each play mode, not the single
+top-level source of truth. Self-play and evaluation can legitimately use
+different search settings, and the eval baseline can use a third search setting.
 
-Keep in `search.*`:
+Search config should only describe search expansion and posterior construction
+behavior.
+
+Keep in each `SearchConfig`:
 
 - `kind`
 - gumbel: `num_simulations`, `gumbel_scale`, search constants
@@ -148,22 +153,68 @@ Keep in `search.*`:
 
 Move out of search:
 
-- `selfplay.action_source`
+- action commitment
 - `training.losses.q_loss_weight_mode` stays in training/loss config
 
-Proposed replacements:
+Proposed play config shape:
 
-```text
-selfplay.action_commitment_type:
-  posterior_argmax
-  posterior_sample
-  search_action
+```python
+@dataclass
+class SelfplayConfig:
+    batch_size: int
+    max_num_steps: int
+    search: SearchConfig
+    action_commitment_type: ActionCommitmentType
 
-training.targets.posterior_policy_samples:
-  int, with 0 meaning "use the search policy directly"
 
-training.targets.posterior_policy_sample_chunk_size:
-  int | None
+@dataclass
+class EvalConfig:
+    interval: int
+    batch_size: int
+    player_search: SearchConfig
+    baseline_search: SearchConfig
+    player_action_commitment_type: ActionCommitmentType
+    baseline_action_commitment_type: ActionCommitmentType
+    baseline: EvalBaseline
+    baseline_id: str | None = None
+```
+
+Example YAML shape:
+
+```yaml
+selfplay:
+  batch_size: 16384
+  max_num_steps: 128
+  action_commitment_type: posterior_sample
+  search:
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 4
+      num_blocks: 4
+      posterior_policy:
+        samples: 0
+        sample_chunk_size: 32
+      constants:
+        kappa_leaf: 1.0
+        kappa_terminal: 8.0
+
+eval:
+  interval: 10
+  batch_size: 1024
+  baseline: pgx
+  baseline_id: gardner_chess_v0
+  player_action_commitment_type: posterior_argmax
+  baseline_action_commitment_type: posterior_argmax
+  player_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 64
+      gumbel_scale: 1.0
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0
 ```
 
 The posterior policy sample fields can also stay inside the active search config
@@ -172,7 +223,23 @@ boundary is that action commitment and loss reduction choices do not live in
 search.
 
 `posterior_best` and `posterior_argmax` should collapse to one public name. The
-old spelling can remain as a compatibility alias for one migration.
+old spelling can remain as a compatibility alias for one migration. The current
+top-level `config.search` can also stay as a temporary compatibility alias, but
+new code should read `config.selfplay.search`, `config.eval.player_search`, and
+`config.eval.baseline_search`.
+
+Construction then becomes:
+
+```python
+selfplay_search = make_search(env, learner_evaluator, config.selfplay.search)
+selfplay_player = make_player(selfplay_search, selfplay_committer)
+
+eval_player_search = make_search(env, learner_evaluator, config.eval.player_search)
+eval_player = make_player(eval_player_search, eval_player_committer)
+
+baseline_search = make_search(env, baseline_evaluator, config.eval.baseline_search)
+baseline_player = make_player(baseline_search, baseline_committer)
+```
 
 ## Stage Contracts
 
@@ -195,19 +262,19 @@ Expected behavior:
 - Scalar networks fill `logits` and `value`.
 - Dirichlet networks fill `logits`, `alpha_v`, and `alpha_q`.
 
-This can start as a helper function rather than a class:
+This can start as a model-bound helper function rather than a class:
 
 ```python
-predict(model, obs) -> EvaluatorOutput
+evaluator(obs) -> EvaluatorOutput
 ```
 
 ### Search Function
 
-The bound search function is built from the environment, the model-bound
-prediction function, and the active search config.
+The bound search function is built from the environment, a model-bound
+evaluator, and the selected search config for the current play mode.
 
 ```python
-search = make_search(env, predict_fn, active_search_config)
+search = make_search(env, evaluator, play_mode_search_config)
 ```
 
 Runtime signature:
@@ -223,14 +290,18 @@ search_output = search(
 that means it builds the same recurrent functions already used in the code:
 
 ```python
-make_recurrent_fn(env, predict_fn)
-make_dirichlet_recurrent_fn_from_constants(env, predict_fn, search_cfg.constants)
+make_recurrent_fn(env, evaluator)
+make_dirichlet_recurrent_fn_from_constants(env, evaluator, search_cfg.constants)
 ```
 
 With the new evaluator contract, these factories keep their role but consume
 `EvaluatorOutput` fields instead of unpacking raw model tuples directly. The
 Dirichlet recurrent builder should take the active search constants directly,
 not the full global config.
+
+The caller should not pass a separate raw `predict_fn` or recurrent function.
+`make_search(...)` uses `search_cfg` to choose the scalar, Dirichlet, or later
+DQAZ evaluator/search adapter internally.
 
 Scalar Gumbel search uses the scalar recurrent function. Dirichlet Gumbel and
 Dirichlet Thompson search use the Dirichlet recurrent function. DQAZ is the
@@ -455,85 +526,173 @@ For the first implementation, keep a compatibility adapter from
 
 ## Function Reduction Estimate
 
-High-confidence functions/classes to remove or replace after the first complete
-migration:
+The estimate changes now that the first implementation deliberately keeps DQAZ
+on the compatibility path. Several old helpers are ugly, but they are still
+used by `_run_posterior_tree_search_step` and the native DQAZ export path, so
+they should not be counted as first-pass deletions.
+
+Current measured surface:
 
 ```text
-1.  _search_value
-2.  _search_constant
-3.  _search_kind
-4.  _selfplay_action_source
-5.  _run_model_search
-6.  _make_model_mcts_policy
-7.  _model_eval_action
-8.  _with_eval_num_simulations
-9.  _stack_optional_tree
-10. _stack_selfplay_frames
-11. _concat_selfplay_time
-12. _concat_selfplay_outputs
-13. _fixed_replay_window
-14. _SearchStepOutput
-15. PosteriorTreeBatchOutput
+core files:
+  scacchi/play.py            274 lines
+  scacchi/play_search.py    1497 lines
+  scacchi/evaluations.py     218 lines
+  scacchi/pipeline.py        205 lines
+  scacchi/loss.py            657 lines
+  scacchi/types.py           382 lines
+
+nearby tests:
+  tests/test_play.py                 180 lines
+  tests/test_evaluations.py          161 lines
+  tests/test_config_validation.py    353 lines
 ```
 
-Likely moved/renamed rather than deleted:
+First-pass scope:
+
+- add `make_search(env, evaluator, search_cfg)` for scalar Gumbel, Dirichlet
+  Gumbel, and Dirichlet Thompson
+- add `make_player(search, action_committer)`
+- add generic `play(...)`, `play_training(...)`, and `play_eval(...)`
+- move search outputs to `PosteriorTargets`
+- nest search configs under `selfplay` and `eval`
+- keep adapters for `SelfplayOutput`, current loss input, DQAZ, and old tests
+
+High-confidence first-pass deletes:
 
 ```text
-_select_played_action        -> commit_action
-_legalize_played_action      -> legalize_action
-_search_loss_mask            -> target/search utility
-_empty_posterior_targets     -> scalar posterior utility
-make_recurrent_fn            -> search/evaluator transition helper
-make_dirichlet_recurrent_fn  -> search/evaluator transition helper
-_searchable_eval_state       -> play utility
-_step_active_eval_rows       -> play utility
-_poison_eval_returns         -> eval collector utility
-_run_posterior_tree_search_step -> DQAZ search factory or compatibility shim
+1. _stack_optional_tree
+2. _stack_selfplay_frames
+3. _concat_selfplay_time
+4. _make_model_mcts_policy
+5. _model_eval_action
+6. _with_eval_num_simulations
+7. _with_eval_search_kind
+8. _baseline_eval_search_config
+```
+
+Likely first-pass replacements or shims, not hard deletes:
+
+```text
+_run_model_search             -> make_search-backed compatibility wrapper
+_SearchStepOutput             -> SearchOutput adapter for old callers
+_run_scalar_gumbel_search     -> scalar gumbel search closure or shim
+_run_dirichlet_search         -> Dirichlet search closure or shim
+_select_played_action         -> commit_action shim
+_legalize_played_action       -> legalize_action shim
+_search_loss_mask             -> target metadata utility
+_empty_posterior_targets      -> scalar/Dirichlet posterior utility
+_q_loss_weight_from_mode      -> target metadata or loss adapter utility
+_native_target_kwargs_from_output -> DQAZ compatibility adapter
+_searchable_eval_state        -> generic play utility
+_step_active_eval_rows        -> generic play utility
+_poison_eval_returns          -> eval collector utility
+_concat_selfplay_outputs      -> TrainingSamples/SelfplayOutput adapter
+_fixed_replay_window          -> replay buffer utility or delete if unused
+```
+
+Must stay during the DQAZ compatibility phase:
+
+```text
+_search_value
+_search_constant
+_search_kind
+_selfplay_action_source
+PosteriorTreeBatchOutput
+_run_posterior_tree_search_step
+_run_dqaz_posterior_tree_search
+_dqaz_output_to_posterior_batch
 ```
 
 Estimated deletion count:
 
-- first pass with compatibility shims: remove 8 to 10 functions
-- final cleanup after tests/scripts migrate: remove 15 to 18 functions/classes
+- first pass: hard-delete about 6 to 8 functions and replace another 8 to 12
+  with shims or moved utilities
+- final cleanup after loss, tests, scripts, and DQAZ migrate: remove about 18 to
+  25 functions/classes
 
-Estimated line-count impact:
+Estimated first-pass line-count impact:
 
 ```text
 play.py:
   current: 274 lines
-  expected: 220 to 300 lines depending on whether generic play lives here
-  net: -50 to +30
+  expected: 230 to 320 lines
+  net: -40 to +50
+  reason: old self-play helpers go away, generic play and wrappers arrive
 
 evaluations.py:
-  current: 195 lines
-  expected: 60 to 90 lines
-  net: -105 to -135
+  current: 218 lines
+  expected: 45 to 80 lines
+  net: -140 to -175
+  reason: eval becomes a thin player/play wrapper
 
 play_search.py:
   current: 1497 lines
-  expected: 1250 to 1350 lines if target/action dispatch moves out
-  net in file: -150 to -250
-  note: much of this is DQAZ backend code and remains
+  expected: 1450 to 1580 lines
+  net: -50 to +80
+  reason: Gumbel/Dirichlet get a cleaner factory, but DQAZ and old shims stay
 
-new player/search modules:
-  expected: +250 to +450 lines
+new player/search/play modules:
+  expected: +180 to +320 lines if split out
+  note: this is absorbed into existing files if we keep the refactor local
 
 pipeline.py:
   current: 205 lines
-  expected: 155 to 190 lines if unused replay helpers are removed
-  net: -15 to -50
+  expected: 180 to 240 lines
+  net: -25 to +35
+  reason: replay/loss adapters may temporarily offset helper deletion
 
-types.py/configs/tests:
-  expected: +30 to +80 lines for renamed config fields and aliases
+loss.py:
+  current: 657 lines
+  expected first pass: 650 to 730 lines
+  net: -10 to +70
+  reason: likely keeps current Sample/SelfplayOutput path through an adapter
+
+types.py/configs:
+  current: 382 lines
+  expected: 450 to 520 lines
+  net: +70 to +140
+  reason: nested play search configs plus temporary aliases/validation
+
+tests:
+  current nearby tests: 694 lines
+  expected: 740 to 850 lines
+  net: +45 to +155
+  reason: new factory/player/play tests while compatibility tests still exist
 ```
 
-Net estimate:
+Net first-pass estimate:
 
-- compatibility phase: roughly -50 to +150 lines
-- final cleanup phase: roughly -100 to -250 lines
+- if split into new modules: roughly +100 to +300 lines
+- if kept mostly in existing files: roughly +50 to +220 lines
 
-The main benefit is not raw line-count reduction. The main benefit is removing
-semantic coupling and making the data flow testable stage by stage.
+This pass is likely a temporary line-count increase. That is acceptable because
+we are deliberately buying compatibility while changing the boundaries.
+
+Final cleanup estimate after the compatibility layer is removed:
+
+```text
+delete old SelfplayOutput adapters and old _SearchStepOutput path:   -80 to -140
+delete old eval-specific MCTS action path:                           -120 to -175
+delete top-level search config aliases and old action_source names:   -30 to -70
+let loss consume TrainingSamples/PosteriorTargets directly:           -40 to -120
+migrate or split DQAZ helpers from generic play_search.py:            -80 to -200
+```
+
+Expected final net versus the current codebase:
+
+- conservative cleanup: about -150 to -350 lines
+- if DQAZ is split cleanly and native export adapters shrink: about -250 to
+  -500 lines
+
+The main benefit is still not raw line-count reduction. The main benefit is that
+the hard boundaries become testable:
+
+- evaluator: model output normalization
+- search: prior to posterior conversion
+- player: posterior to action commitment
+- play: environment stepping and collection
+- loss/eval: consume the appropriate collected output
 
 ## Migration Plan
 
@@ -556,7 +715,7 @@ Keep old names as compatibility shims for tests.
 Add:
 
 ```python
-make_search(env, predict_fn, search_cfg)
+make_search(env, evaluator, search_cfg)
 ```
 
 Dispatch by concrete config type:
@@ -567,11 +726,12 @@ DirichletThompsonSearchConfig -> bound Dirichlet Thompson closure
 ```
 
 The returned search function should not inspect the global `Config` object and
-should not receive recurrent functions at call time. Static config values,
-environment stepping, and model prediction are closed over once.
+should not receive raw prediction or recurrent functions at call time. Static
+config values, environment stepping, and model evaluation are closed over once.
 
 This phase removes `_search_value`, `_search_kind`, and most dynamic active
-config lookups from the hot path.
+config lookups from the new Gumbel/Dirichlet hot path. Those helpers can stay
+in `play_search.py` temporarily for the DQAZ compatibility path.
 
 ### Phase 3: Posterior Metadata And Action Commitment
 
@@ -708,7 +868,7 @@ Start with the search boundary:
    `TargetMetadata`.
 2. Add a compatibility adapter from `TrainingSamples` to current
    `SelfplayOutput` target fields.
-3. Add `make_search(env, predict_fn, active_search_cfg)`.
+3. Add `make_search(env, evaluator, play_mode_search_cfg)`.
 4. Add `commit_action(...)`.
 5. Add `make_player(search, action_committer)`.
 6. Make current `make_selfplay` use these pieces while still returning
