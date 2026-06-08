@@ -2,12 +2,15 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from omegaconf import OmegaConf
 
 from scacchi.evaluations import (
+    _baseline_eval_search_config,
     _poison_eval_returns,
     _searchable_eval_state,
     _step_active_eval_rows,
 )
+from scacchi.types import load_config
 
 
 class ToyState(NamedTuple):
@@ -115,3 +118,44 @@ def test_poison_eval_returns_makes_all_returns_nan_after_invalid_action():
     returns = _poison_eval_returns(jnp.array([1.0, -1.0]), jnp.array(True))
 
     assert jnp.isnan(returns).all()
+
+
+def test_pgx_baseline_eval_uses_scalar_gumbel_search_with_same_budget():
+    config = load_config(
+        OmegaConf.create(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {"num_simulations": 4},
+                },
+                "eval": {"baseline": "pgx"},
+            }
+        )
+    )
+
+    baseline_config = _baseline_eval_search_config(config)
+
+    assert config.search.kind == "dirichlet_thompson"
+    assert baseline_config.search.kind == "gumbel"
+    assert baseline_config.search.gumbel.num_simulations == 4
+
+
+def test_checkpoint_baseline_eval_keeps_configured_search_kind():
+    config = load_config(
+        OmegaConf.create(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {"num_simulations": 4},
+                },
+                "eval": {"baseline": "checkpoint"},
+            }
+        )
+    )
+
+    baseline_config = _baseline_eval_search_config(config)
+
+    assert baseline_config.search.kind == "dirichlet_thompson"
+    assert baseline_config.search.dirichlet_thompson.num_simulations == 4

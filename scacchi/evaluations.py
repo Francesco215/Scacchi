@@ -13,6 +13,7 @@ from .distributed import (
 )
 from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
 from .play_search import _run_model_search
+from .types import EvalBaseline, SearchKind
 
 
 def _predict(model: Any, obs: jax.Array):
@@ -34,6 +35,26 @@ def _with_eval_num_simulations(config, num_simulations: int | None):
             config.search,
             **{search_kind: replace(active_search, num_simulations=num_simulations)},
         ),
+    )
+
+
+def _with_eval_search_kind(config, search_kind: SearchKind):
+    if config.search.kind == search_kind:
+        return config
+    return replace(config, search=replace(config.search, kind=search_kind))
+
+
+def _baseline_eval_search_config(config):
+    if config.eval.baseline != EvalBaseline.pgx:
+        return config
+    if config.search.kind == SearchKind.gumbel:
+        return config
+
+    # PGX baselines expose scalar policy/value heads, not Dirichlet heads.
+    num_simulations = max(1, int(config.search.active().num_simulations))
+    return _with_eval_num_simulations(
+        _with_eval_search_kind(config, SearchKind.gumbel),
+        num_simulations,
     )
 
 
@@ -109,7 +130,7 @@ def _make_model_mcts_policy(
         scalar_recurrent_fn=make_recurrent_fn(env, predict),
         dirichlet_recurrent_fn=make_dirichlet_recurrent_fn(env, predict, search_config),
         rng_key=rng_key,
-        config=search_config, #TODO: make sure that the eval path has a different search config
+        config=search_config,
     )
     return assert_batch_axis_sharded(search_output, parallel, batch_axis=0, label="eval search_output")
 
@@ -134,6 +155,8 @@ def make_mcts_evaluate(
 ):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     eval_batch_size = int(config.eval.batch_size)
+    model_eval_config = config
+    baseline_eval_config = _baseline_eval_search_config(config)
 
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: nnx.Module):
@@ -153,7 +176,7 @@ def make_mcts_evaluate(
 
             my_action = _model_eval_action(
                 env,
-                config,
+                model_eval_config,
                 model,
                 my_key,
                 env_state,
@@ -161,7 +184,7 @@ def make_mcts_evaluate(
             )
             opp_action = _model_eval_action(
                 env,
-                config,
+                baseline_eval_config,
                 baseline_model,
                 opp_key,
                 env_state,
