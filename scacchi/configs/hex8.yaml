@@ -62,6 +62,11 @@ training:
 eval:
   interval: 1
   batch_size: 256
+  baseline: checkpoint
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 4
 
 logging:
   interval: 1

@@ -49,6 +49,12 @@ training:
 eval:
   interval: 1  # Evaluate often enough to monitor convergence without dominating runtime.
   batch_size: 512  # Number of evaluation games run in parallel.
+  baseline: checkpoint  # Solved Hex checkpoints are scalar Boardlaw baselines.
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      policy_sample_chunk_size: 1  # Unused for scalar baselines; keeps this explicit override from aliasing to self-play search.
 
 logging:
   interval: 1  # Log training metrics every N iterations.

@@ -67,6 +67,28 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.checkpointing.save_interval_steps == 100
 
 
+@pytest.mark.parametrize(
+    ("config_name", "eval_simulations"),
+    [
+        ("hex", 32),
+        ("hex5", 4),
+        ("hex6", 4),
+        ("hex8", 4),
+    ],
+)
+def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
+    config_name: str,
+    eval_simulations: int,
+):
+    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / f"{config_name}.yaml"
+    config = load_config(OmegaConf.load(cfg_path))
+
+    assert config.selfplay.search.kind == "dirichlet_thompson"
+    assert config.eval.baseline == "checkpoint"
+    assert config.eval.baseline_search.kind == "gumbel"
+    assert config.eval.baseline_search.gumbel.num_simulations == eval_simulations
+
+
 def test_make_env_supports_custom_go8():
     env = make_env("go", 8)
 
