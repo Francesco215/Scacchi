@@ -71,6 +71,7 @@ def make_batch_parallel(config: Any, axis_name: str = "batch") -> BatchParallel:
         (len(devices),),
         (axis_name,),
         axis_types=(AxisType.Auto,),
+        devices=devices,
     )
     parallel = BatchParallel(enabled=True, axis_name=axis_name, mesh=mesh)
     batch_sizes = {

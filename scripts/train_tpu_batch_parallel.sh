@@ -15,6 +15,8 @@ TPU_ZONE="${SCACCHI_TPU_ZONE:-us-central2-b}"
 TPU_PROJECT="${SCACCHI_TPU_PROJECT:-my-phd-research-o}"
 SYNC="${SCACCHI_SYNC:-1}"
 DRY_RUN="${SCACCHI_DRY_RUN:-0}"
+TPU_RUNTIME_METRICS_PORTS="${TPU_RUNTIME_METRICS_PORTS:-8431,8432,8433,8434}"
+CLEAR_TPU_LOCKFILE="${SCACCHI_CLEAR_TPU_LOCKFILE:-1}"
 
 if [[ -n "${SCACCHI_EOPOD:-}" ]]; then
   EOPOD="${SCACCHI_EOPOD}"
@@ -97,7 +99,11 @@ quote_remote() {
   printf "%q" "$1"
 }
 
-REMOTE_ENV=("PYTHONPATH=${REPO_DIR}" "JAX_PLATFORMS=tpu,cpu")
+REMOTE_ENV=(
+  "PYTHONPATH=${REPO_DIR}"
+  "JAX_PLATFORMS=tpu,cpu"
+  "TPU_RUNTIME_METRICS_PORTS=${TPU_RUNTIME_METRICS_PORTS}"
+)
 for name in \
   SCACCHI_PROFILE_DIR \
   SCACCHI_PROFILE_START_ITER \
@@ -119,11 +125,16 @@ REMOTE_CMD="cd $(quote_remote "${REPO_DIR}") &&${REMOTE_ENV_STR} $(quote_remote 
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "Would run:"
-  echo "  ${EOPOD} run --worker all ${REMOTE_CMD}"
+  echo "  ${EOPOD} run --worker all --retry 1 ${REMOTE_CMD}"
   exit 0
 fi
 
-"${EOPOD}" run --worker all "${REMOTE_CMD}"
+if [[ "${CLEAR_TPU_LOCKFILE}" == "1" ]]; then
+  "${EOPOD}" run --worker all "sudo rm -f /tmp/libtpu_lockfile"
+fi
+
+# In this eopod version, --retry is implemented as the total attempt count.
+"${EOPOD}" run --worker all --retry 1 "${REMOTE_CMD}"
 
 if [[ -n "${SCACCHI_PROFILE_DIR:-}" ]]; then
   echo "Profile traces were written under ${SCACCHI_PROFILE_DIR} on the selected TPU workers."

@@ -299,10 +299,7 @@ def test_repeated_search_blocks_aggregate_evidence_and_carry_posterior():
     expected_evidence = block_1.q_evidence_sum + block_2.q_evidence_sum
     assert jnp.allclose(repeated.q_evidence_sum, expected_evidence)
     assert jnp.allclose(repeated.alpha_search, block_2.alpha_search)
-    assert jnp.allclose(
-        repeated.search_tree.extra_data.action_value_prior,
-        block_1.alpha_search,
-    )
+    assert repeated.search_tree is None
 
 
 def test_single_search_block_matches_one_block_policy():
@@ -429,6 +426,39 @@ def test_posterior_best_policy_target_masks_invalid_actions():
     assert policy_target.shape == (1, 3)
     assert jnp.allclose(policy_target[0, 1], 0.0)
     assert jnp.allclose(policy_target.sum(axis=-1), 1.0)
+
+
+def test_posterior_best_policy_target_chunk_size_matches_full_chunk():
+    alpha_Q_post = jnp.array(
+        [
+            [[1.0, 2.0], [5.0, 1.0], [2.0, 2.0]],
+            [[3.0, 1.0], [1.0, 4.0], [2.0, 1.0]],
+        ]
+    )
+    legal_action_mask = jnp.array(
+        [
+            [True, True, False],
+            [True, False, True],
+        ]
+    )
+    key = jax.random.PRNGKey(3)
+
+    full_chunk = posterior_best_policy_target(
+        key,
+        alpha_Q_post,
+        legal_action_mask,
+        num_samples=7,
+        chunk_size=7,
+    )
+    chunked = posterior_best_policy_target(
+        key,
+        alpha_Q_post,
+        legal_action_mask,
+        num_samples=7,
+        chunk_size=3,
+    )
+
+    assert jnp.allclose(chunked, full_chunk)
 
 
 def test_posterior_best_action_is_argmax_policy_target_and_masks_invalid():

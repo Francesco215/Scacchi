@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import jax.numpy as jnp
 import pytest
 from omegaconf import OmegaConf
 from omegaconf.errors import ConfigKeyError, ValidationError
@@ -25,15 +26,18 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.model.network == "aznet_dirichlet"
     assert config.model.num_channels == 128
     assert config.model.num_layers == 6
-    assert config.selfplay.batch_size == 128
+    assert config.model.compute_dtype == "float32"
+    assert config.selfplay.batch_size == 65_536
     assert config.selfplay.max_num_steps == 128
     assert config.selfplay.action_source == "posterior_sample"
     assert config.search.kind == "dirichlet_thompson"
     assert config.search.dirichlet_thompson.num_simulations == 4
-    assert config.search.dirichlet_thompson.num_blocks == 8
+    assert config.search.dirichlet_thompson.num_blocks == 4
+    assert config.search.dirichlet_thompson.policy_samples == 0
+    assert config.search.dirichlet_thompson.policy_sample_chunk_size == 32
     assert config.search.dirichlet_thompson.constants.kappa_leaf == 1.0
     assert config.search.dirichlet_thompson.constants.kappa_terminal == 8.0
-    assert config.training.batch_size == 16_384
+    assert config.training.batch_size == 65_536
     assert config.training.max_updates_per_iter == 1
     assert config.training.learning_rate == 1e-3
     assert config.training.grad_clip_norm == 1.0
@@ -44,7 +48,7 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.training.losses.terminal_parent_targets is True
     assert config.training.regularization.dirichlet_concentration_clip == 300.0
     assert config.eval.interval == 10
-    assert config.eval.batch_size == 128
+    assert config.eval.batch_size == 1024
     assert config.eval.baseline == "pgx"
     assert config.eval.baseline_id == "gardner_chess_v0"
     assert config.logging.wandb.enabled is True
@@ -59,6 +63,28 @@ def test_make_env_supports_custom_go8():
     assert env.id == "go_8x8"
     assert env.num_actions == 65
     assert env.observation_shape == (8, 8, 17)
+
+
+def test_gardner_pgx_eval_baseline_matches_env_action_space():
+    env = make_env("gardner_chess")
+    config = _config(
+        {
+            "env": {"id": "gardner_chess"},
+            "model": {"network": "aznet_dirichlet"},
+            "search": {"kind": "dirichlet_thompson"},
+            "eval": {
+                "interval": 1,
+                "baseline": "pgx",
+                "baseline_id": "gardner_chess_v0",
+            },
+        }
+    )
+
+    baseline = _load_eval_baseline(config, env)
+    observation = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
+    output = baseline(observation)
+    logits = output[0] if isinstance(output, tuple) else output
+    assert logits.shape == (1, env.num_actions)
 
 
 def test_incompatible_pgx_eval_baseline_raises():
@@ -88,6 +114,15 @@ def test_flat_config_keys_are_rejected():
 def test_unknown_nested_config_keys_are_rejected():
     with pytest.raises(ConfigKeyError, match="unknown"):
         _config({"search": {"gumbel": {"constants": {"unknown": 1.0}}}})
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["sample_one_step_per_game", "sample_one_step_global", "return_suffix_mode"],
+)
+def test_removed_sampled_rollout_training_keys_are_rejected(key):
+    with pytest.raises(ConfigKeyError, match=key):
+        _config({"training": {key: True}})
 
 
 def test_scalar_network_rejects_dirichlet_loss_weights():
@@ -140,6 +175,90 @@ def test_num_search_blocks_must_be_positive():
                 "search": {
                     "kind": "dirichlet_thompson",
                     "dirichlet_thompson": {"num_blocks": 0},
+                },
+            }
+        )
+
+
+def test_dirichlet_thompson_allows_zero_simulations_for_prior_only_probe():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {
+                "kind": "dirichlet_thompson",
+                "dirichlet_thompson": {"num_simulations": 0},
+            },
+        }
+    )
+
+    assert config.search.dirichlet_thompson.num_simulations == 0
+
+
+def test_dirichlet_thompson_simulations_must_be_non_negative():
+    with pytest.raises(ValueError, match="search.dirichlet_thompson.num_simulations"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {"num_simulations": -1},
+                },
+            }
+        )
+
+
+def test_dirichlet_thompson_allows_zero_policy_samples_for_search_policy_targets():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {
+                "kind": "dirichlet_thompson",
+                "dirichlet_thompson": {"policy_samples": 0},
+            },
+        }
+    )
+
+    assert config.search.dirichlet_thompson.policy_samples == 0
+
+
+def test_dirichlet_thompson_policy_samples_must_be_non_negative():
+    with pytest.raises(ValueError, match="search.dirichlet_thompson.policy_samples"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {"policy_samples": -1},
+                },
+            }
+        )
+
+
+def test_dirichlet_thompson_allows_null_policy_sample_chunk_size_for_full_chunk():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {
+                "kind": "dirichlet_thompson",
+                "dirichlet_thompson": {"policy_sample_chunk_size": None},
+            },
+        }
+    )
+
+    assert config.search.dirichlet_thompson.policy_sample_chunk_size is None
+
+
+def test_dirichlet_thompson_policy_sample_chunk_size_must_be_positive_when_set():
+    with pytest.raises(
+        ValueError,
+        match="search.dirichlet_thompson.policy_sample_chunk_size",
+    ):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {"policy_sample_chunk_size": 0},
                 },
             }
         )

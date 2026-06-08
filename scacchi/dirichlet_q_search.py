@@ -362,19 +362,58 @@ def posterior_best_policy_target(
     alpha_Q_post: jax.Array,
     legal_action_mask: jax.Array,
     num_samples: int,
+    *,
+    chunk_size: int | None = None,
 ) -> jax.Array:
-    phi = jax.random.dirichlet(
-        rng_key,
-        alpha_Q_post,
-        shape=(num_samples, *alpha_Q_post.shape[:-1]),
-    )
-    scores = outcome_utility(phi)
-    scores = mask_invalid_scores(scores, legal_action_mask[None, ...])
-    best_action = jnp.argmax(scores, axis=-1)
+    if num_samples < 1:
+        raise ValueError(f"num_samples must be >= 1, got {num_samples}")
+    if chunk_size is None:
+        chunk_size = num_samples
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+    chunk_size = min(chunk_size, num_samples)
 
     num_actions = alpha_Q_post.shape[-2]
-    action_hits = jax.nn.one_hot(best_action, num_actions, dtype=alpha_Q_post.dtype)
-    target = jnp.mean(action_hits, axis=0)
+
+    def sample_chunk(
+        total_hits: jax.Array,
+        chunk: tuple[chex.PRNGKey, jax.Array],
+    ) -> tuple[jax.Array, None]:
+        keys, valid_samples = chunk
+        phi = jax.vmap(lambda key: jax.random.dirichlet(key, alpha_Q_post))(keys)
+        scores = outcome_utility(phi)
+        scores = mask_invalid_scores(scores, legal_action_mask[None, ...])
+        best_action = jnp.argmax(scores, axis=-1)
+        action_hits = jax.nn.one_hot(
+            best_action,
+            num_actions,
+            dtype=alpha_Q_post.dtype,
+        )
+        valid_weight = valid_samples.astype(alpha_Q_post.dtype).reshape(
+            (chunk_size,) + (1,) * (action_hits.ndim - 1)
+        )
+        return total_hits + jnp.sum(action_hits * valid_weight, axis=0), None
+
+    num_chunks = (num_samples + chunk_size - 1) // chunk_size
+    padded_sample_count = num_chunks * chunk_size
+    sample_keys = jax.random.split(rng_key, num_samples)
+    pad_count = padded_sample_count - num_samples
+    if pad_count:
+        sample_keys = jnp.concatenate([sample_keys, sample_keys[:pad_count]], axis=0)
+    sample_keys = jnp.reshape(
+        sample_keys,
+        (num_chunks, chunk_size) + sample_keys.shape[1:],
+    )
+    valid_samples = jnp.arange(padded_sample_count) < num_samples
+    valid_samples = jnp.reshape(valid_samples, (num_chunks, chunk_size))
+
+    initial_hits = jnp.zeros(alpha_Q_post.shape[:-1], dtype=alpha_Q_post.dtype)
+    total_hits, _ = jax.lax.scan(
+        sample_chunk,
+        initial_hits,
+        (sample_keys, valid_samples),
+    )
+    target = total_hits / jnp.asarray(num_samples, dtype=alpha_Q_post.dtype)
     target = jnp.where(legal_action_mask, target, 0.0)
 
     target_sum = jnp.sum(target, axis=-1, keepdims=True)

@@ -36,6 +36,7 @@ from .types import SearchKind
 
 
 _POSTERIOR_POLICY_TARGET_SAMPLES = 32
+_POSTERIOR_POLICY_TARGET_SAMPLE_CHUNK_SIZE = 32
 _DQAZ_STATE_POSTERIOR_KAPPA_N = 9.0
 _DQAZ_EPSILON_TERMINAL = 1e-6
 
@@ -148,6 +149,15 @@ def _policy_target_samples(config: Any) -> int:
     return int(_search_value(config, "policy_samples", _POSTERIOR_POLICY_TARGET_SAMPLES))
 
 
+def _policy_target_sample_chunk_size(config: Any, policy_samples: int) -> int:
+    value = _search_value(
+        config,
+        "policy_sample_chunk_size",
+        _POSTERIOR_POLICY_TARGET_SAMPLE_CHUNK_SIZE,
+    )
+    return policy_samples if value is None else int(value)
+
+
 def _search_kind(config: Any) -> SearchKind:
     return config.search.kind
 
@@ -242,7 +252,7 @@ def _q_loss_weight_from_mode(
     posterior_policy_target: jax.Array,
 ) -> jax.Array:
     if mode == "evidence_mass":
-        return jnp.sum(q_evidence_sum, axis=-1)
+        return jnp.sum(q_evidence_sum, axis=-1) + jnp.zeros_like(posterior_policy_target)
     if mode == "policy":
         return posterior_policy_target
     raise ValueError(f"unknown q_loss_weight_mode: {mode!r}")
@@ -342,12 +352,17 @@ def _run_dirichlet_search(
             "Use the posterior-tree search entry point for DQAZ."
         )
 
-    posterior_policy_target = posterior_best_policy_target(
-        posterior_key,
-        action_alpha_post,
-        env_state.legal_action_mask,
-        _policy_target_samples(config),
-    )
+    policy_samples = _policy_target_samples(config)
+    if policy_samples == 0:
+        posterior_policy_target = policy_output.action_weights
+    else:
+        posterior_policy_target = posterior_best_policy_target(
+            posterior_key,
+            action_alpha_post,
+            env_state.legal_action_mask,
+            policy_samples,
+            chunk_size=_policy_target_sample_chunk_size(config, policy_samples),
+        )
     if search_kind == SearchKind.gumbel:
         policy_target = policy_output.action_weights
     else:

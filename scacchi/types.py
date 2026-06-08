@@ -95,6 +95,7 @@ class ModelConfig:
     network: Network = Network.aznet
     num_channels: int = 128
     num_layers: int = 6
+    compute_dtype: str = "float32"
     # TODO: remove the three config below and settle on some defaults in the code
     resnet_v2: bool = True
     legacy_dirichlet_head_init: bool = False
@@ -107,6 +108,9 @@ class SelfplayConfig:
     batch_size: int = 1024
     max_num_steps: int = 256
     action_source: SelfplayActionSource = SelfplayActionSource.posterior_best
+
+    def __post_init__(self) -> None:
+        _require_ge("selfplay.batch_size", self.batch_size, 1)
 
 
 
@@ -133,11 +137,17 @@ class GumbelSearchConfig:
 
     # Used when Gumbel search runs against a Dirichlet network and produces
     # posterior targets. Ignored by scalar policy/value models.
+    policy_sample_chunk_size: int | None = 32
     constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
     gumbel_scale: float = 1.0
 
     def __post_init__(self) -> None:
         _require_ge("search.gumbel.num_simulations", self.num_simulations, 1)
+        _require_ge(
+            "search.gumbel.policy_sample_chunk_size",
+            self.policy_sample_chunk_size,
+            1,
+        )
         _require_gt("search.gumbel.gumbel_scale", self.gumbel_scale, 0.0)
 
 
@@ -146,16 +156,22 @@ class DirichletThompsonSearchConfig:
     num_simulations: int = 32
     num_blocks: int = 1
     policy_samples: int = 32
+    policy_sample_chunk_size: int | None = 32
     constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
 
     def __post_init__(self) -> None:
         _require_ge(
             "search.dirichlet_thompson.num_simulations",
             self.num_simulations,
-            1,
+            0,
         )
         _require_ge("search.dirichlet_thompson.num_blocks", self.num_blocks, 1)
-        _require_ge("search.dirichlet_thompson.policy_samples", self.policy_samples, 1)
+        _require_ge("search.dirichlet_thompson.policy_samples", self.policy_samples, 0)
+        _require_ge(
+            "search.dirichlet_thompson.policy_sample_chunk_size",
+            self.policy_sample_chunk_size,
+            1,
+        )
 
 
 @dataclass
