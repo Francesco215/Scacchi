@@ -1,8 +1,10 @@
+import inspect
 from typing import Any, Callable, Literal, NamedTuple
 
 from flax import nnx
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 from pgx.experimental import auto_reset
 
@@ -41,6 +43,23 @@ class EvalMetrics(NamedTuple):
 
 Player = Callable[[Any, jax.Array], PlayerOutput]
 PlayMode = Literal["training", "eval"]
+
+
+def _local_search_shard_map(**kwargs):
+    """Build an nnx.shard_map for local per-device search.
+
+    MCTX's local search body has varying scalar carry values inside while loops.
+    The shard-map checker is useful for proving manual axis types, but here it
+    rejects a valid local-only search before lowering. Newer JAX names the
+    checker toggle `check_vma`; older versions used `check_rep`.
+    """
+
+    parameters = inspect.signature(nnx.shard_map).parameters
+    if "check_vma" in parameters:
+        return nnx.shard_map(**kwargs, check_vma=False)
+    if "check_rep" in parameters:
+        return nnx.shard_map(**kwargs, check_rep=False)
+    return nnx.shard_map(**kwargs)
 
 
 def _replace_legal_action_mask(
@@ -399,6 +418,52 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             config.selfplay.action_commitment_type,
             q_loss_weight_mode=str(config.training.losses.q_loss_weight_mode),
         )
+
+    # TODO: this part is super ugly but it works. Let's think on how to remove it safely
+    if parallel.enabled:
+        if parallel.mesh is None:
+            raise RuntimeError("batch-parallel self-play requires a mesh.")
+        if int(config.selfplay.batch_size) % parallel.device_count != 0:
+            raise ValueError(
+                "selfplay.batch_size must be divisible by the batch-parallel "
+                f"device count ({parallel.device_count})."
+            )
+        local_batch_size = int(config.selfplay.batch_size) // parallel.device_count
+        if local_batch_size < 1:
+            raise ValueError(
+                "selfplay.batch_size must be at least the batch-parallel device count."
+            )
+
+        # MCTX uses dynamic gathers/scatters over its leading batch dimension.
+        # If it sees a globally sharded [batch, ...] array, XLA inserts
+        # cross-device collectives inside the search loop. shard_map gives each
+        # device a local [local_batch, ...] search problem and stitches the
+        # resulting samples back into a global batch-sharded pytree.
+        @_local_search_shard_map(
+            mesh=parallel.mesh,
+            in_specs=(PartitionSpec(), PartitionSpec(parallel.axis_name, None)),
+            out_specs=PartitionSpec(parallel.axis_name),
+        )
+        def local_selfplay(
+            model: nnx.Module,
+            device_rng_keys: jax.Array,
+        ) -> TrainingSamples:
+            rng_key = device_rng_keys[0]
+            return play_training(
+                env,
+                training_player(model),
+                rng_key,
+                batch_size=local_batch_size,
+                max_num_steps=int(config.selfplay.max_num_steps),
+                parallel=DISABLED_BATCH_PARALLEL,
+            )
+
+        @nnx.jit
+        def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
+            device_rng_keys = jax.random.split(rng_key, parallel.device_count)
+            return local_selfplay(model, device_rng_keys)
+
+        return selfplay
 
     @nnx.jit
     def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:

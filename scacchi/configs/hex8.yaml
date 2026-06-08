@@ -25,7 +25,7 @@ model:
   rezero_kernel_init: orthogonal
 
 selfplay:
-  batch_size: 4096
+  batch_size: 16_384
   max_num_steps: 64
   action_commitment_type: posterior_sample
   search:
@@ -40,7 +40,7 @@ selfplay:
         kappa_terminal: 8.0
 
 training:
-  batch_size: 1024
+  batch_size: 8192
   learning_rate: 1e-3
   grad_clip_norm: 1.0
 
@@ -60,8 +60,10 @@ training:
     dirichlet_concentration_clip: 100.0
 
 eval:
+  # Disable eval for throughput tests; eval.interval=1 was included in tqdm
+  # wall time and used only 4 games/device on a 64-device slice.
   interval: 1
-  batch_size: 256
+  batch_size: 1024
   baseline: checkpoint
   baseline_search:
     kind: gumbel
@@ -75,5 +77,5 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 50
+  max_to_keep: 0
   save_interval_steps: 100

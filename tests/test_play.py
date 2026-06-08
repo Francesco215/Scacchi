@@ -270,3 +270,54 @@ def test_make_selfplay_delegates_to_play_training_smoke():
     assert data.played_action.shape == (2, 1)
     assert data.legal_action_mask.shape == (2, 1, env.num_actions)
     assert data.posterior.prediction.policy.shape == (2, 1, env.num_actions)
+
+
+def test_batch_parallel_selfplay_lowers_without_search_collectives():
+    device_count = jax.device_count()
+    mesh = jax.make_mesh(
+        (device_count,),
+        ("batch",),
+        axis_types=(AxisType.Auto,),
+    )
+    parallel = BatchParallel(enabled=True, mesh=mesh)
+    env = pgx.make("tic_tac_toe")
+    batch_size = max(device_count * 2, 2)
+    config = Config(
+        env=EnvConfig(id="tic_tac_toe", num_outcomes=3),
+        model=ModelConfig(
+            network=Network.boardlaw,
+            num_channels=8,
+            num_layers=1,
+        ),
+        selfplay=SelfplayConfig(
+            batch_size=batch_size,
+            max_num_steps=1,
+            search=SearchConfig(gumbel=GumbelSearchConfig(num_simulations=1)),
+            action_commitment_type=ActionCommitmentType.posterior_argmax,
+        ),
+    )
+    model = BoardlawNet(
+        num_actions=env.num_actions,
+        observation_shape=env.observation_shape,
+        width=8,
+        depth=1,
+        rngs=nnx.Rngs(0),
+    )
+    selfplay = make_selfplay(env, config, parallel=parallel)
+
+    with jax.set_mesh(mesh):
+        compiled = selfplay.lower(model, jax.random.PRNGKey(0)).compile()
+        hlo_text = compiled.as_text().lower()
+        for collective in _COLLECTIVE_HLO_NAMES:
+            assert collective not in hlo_text
+
+        data = selfplay(model, jax.random.PRNGKey(1))
+        data = assert_batch_axis_sharded(
+            data,
+            parallel,
+            batch_axis=0,
+            label="batch-parallel selfplay",
+        )
+
+    assert data.obs.shape[:2] == (batch_size, 1)
+    assert data.posterior.prediction.policy.shape == (batch_size, 1, env.num_actions)
