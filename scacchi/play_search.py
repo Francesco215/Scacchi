@@ -307,6 +307,14 @@ def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
     return jnp.sum(action_weights, axis=-1) > 0
 
 
+def _gumbel_qtransform(search_cfg: GumbelSearchConfig):
+    return partial(
+        mctx.qtransform_completed_by_mix_value,
+        value_scale=float(search_cfg.completed_q_value_scale),
+        rescale_values=bool(search_cfg.completed_q_rescale_values),
+    )
+
+
 def _native_target_kwargs_from_output(output: Any) -> dict[str, jax.Array]:
     native_defaults = native_fields_from_beta(
         output.beta_Q_target,
@@ -497,7 +505,7 @@ def _run_dirichlet_search_output(
             recurrent_fn=recurrent_fn,
             num_simulations=int(search_cfg.num_simulations),
             invalid_actions=~env_state.legal_action_mask,
-            qtransform=mctx.qtransform_completed_by_mix_value,
+            qtransform=_gumbel_qtransform(search_cfg),
             gumbel_scale=float(search_cfg.gumbel_scale),
         )
         q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
@@ -610,7 +618,7 @@ def make_search(
                 recurrent_fn=scalar_recurrent_fn,
                 num_simulations=int(active_search_cfg.num_simulations),
                 invalid_actions=~root_state.legal_action_mask,
-                qtransform=mctx.qtransform_completed_by_mix_value,
+                qtransform=_gumbel_qtransform(active_search_cfg),
                 gumbel_scale=float(active_search_cfg.gumbel_scale),
             )
             policy_target = cast(jax.Array, policy_output.action_weights)

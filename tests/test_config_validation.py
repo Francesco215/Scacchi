@@ -67,6 +67,35 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.checkpointing.save_interval_steps == 100
 
 
+def test_go9x9_gumbel_config_matches_paper_level_recipe():
+    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "go9x9_gumbel.yaml"
+    config = load_config(OmegaConf.load(cfg_path))
+
+    assert config.run.max_num_iters == 400
+    assert config.env.id == "go_9x9"
+    assert config.env.board_size == 9
+    assert config.model.network == "aznet"
+    assert config.model.num_channels == 128
+    assert config.model.num_layers == 6
+    assert config.model.resnet_v2 is True
+    assert config.selfplay.batch_size == 1024
+    assert config.selfplay.max_num_steps == 256
+    assert config.selfplay.action_commitment_type == "search_action"
+    assert config.selfplay.search.kind == "gumbel"
+    assert config.selfplay.search.gumbel.num_simulations == 32
+    assert config.selfplay.search.gumbel.completed_q_value_scale == 0.1
+    assert config.selfplay.search.gumbel.completed_q_rescale_values is False
+    assert config.training.batch_size == 4096
+    assert config.training.max_updates_per_iter is None
+    assert config.training.learning_rate == 1e-3
+    assert config.eval.baseline == "pgx"
+    assert config.eval.baseline_id == "go_9x9_v0"
+    assert config.eval.player_search.kind == "gumbel"
+    assert config.eval.player_search.gumbel.num_simulations == 32
+    assert config.eval.baseline_search.kind == "gumbel"
+    assert config.eval.baseline_search.gumbel.num_simulations == 32
+
+
 @pytest.mark.parametrize(
     ("config_name", "eval_simulations"),
     [

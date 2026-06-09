@@ -1,0 +1,77 @@
+# PGX Go 9x9 Gumbel AlphaZero recipe on the current Scacchi runtime.
+# Matches the paper-level hyperparameters where this repo exposes the knob.
+
+run:
+  seed: 1
+  max_num_iters: 400
+
+env:
+  id: go_9x9
+  board_size: 9
+  num_outcomes: 3
+
+model:
+  network: aznet
+  num_channels: 128
+  num_layers: 6
+  resnet_v2: true
+
+selfplay:
+  batch_size: 1024
+  max_num_steps: 256
+  action_commitment_type: search_action
+  search:
+    kind: gumbel
+
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0
+      completed_q_value_scale: 0.1
+      completed_q_rescale_values: false
+
+training:
+  batch_size: 4096
+  max_updates_per_iter: null
+  learning_rate: 1e-3
+  grad_clip_norm: null
+
+  losses:
+    policy_weight: 1.0
+    value_dir_kl_weight: 0.0
+    q_dir_kl_weight: 0.0
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
+    policy_target_mode: search
+    loss_mask_mode: search
+
+eval:
+  interval: 10
+  batch_size: 128
+  baseline: pgx
+  baseline_id: go_9x9_v0
+  player_action_commitment_type: search_action
+  baseline_action_commitment_type: search_action
+  player_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0
+      completed_q_value_scale: 0.1
+      completed_q_rescale_values: false
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0
+      completed_q_value_scale: 0.1
+      completed_q_rescale_values: false
+
+logging:
+  interval: 1
+  wandb:
+    enabled: true
+    project: scacchi-az
+
+checkpointing:
+  max_to_keep: 50
+  save_interval_steps: 50

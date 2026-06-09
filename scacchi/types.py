@@ -123,6 +123,8 @@ class GumbelSearchConfig:
     policy_sample_chunk_size: int | None = 32
     constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
     gumbel_scale: float = 1.0
+    completed_q_value_scale: float = 0.1
+    completed_q_rescale_values: bool = True
 
     def __post_init__(self) -> None:
         _require_ge("search.gumbel.num_simulations", self.num_simulations, 1)
@@ -132,6 +134,11 @@ class GumbelSearchConfig:
             1,
         )
         _require_gt("search.gumbel.gumbel_scale", self.gumbel_scale, 0.0)
+        _require_gt(
+            "search.gumbel.completed_q_value_scale",
+            self.completed_q_value_scale,
+            0.0,
+        )
 
 
 @dataclass
