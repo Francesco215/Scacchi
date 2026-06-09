@@ -30,11 +30,9 @@ selfplay:
   action_commitment_type: posterior_sample
   search:
     kind: dirichlet_thompson
-
     dirichlet_thompson:
       num_simulations: 4
       num_blocks: 8
-
       constants:
         kappa_leaf: 1.0
         kappa_terminal: 8.0

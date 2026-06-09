@@ -8,6 +8,8 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 import orbax.checkpoint as ocp
 from omegaconf import OmegaConf
 import pgx
@@ -102,6 +104,23 @@ def build_checkpoint_manager(
     return ocp.CheckpointManager(ckpt_dir, options=options, item_names=item_names)
 
 
+def _rng_key_to_checkpoint_value(rng_key: jax.Array) -> np.ndarray:
+    key_data = rng_key
+    if jax.dtypes.issubdtype(rng_key.dtype, jax.dtypes.prng_key):
+        key_data = jax.random.key_data(rng_key)
+    return np.asarray(jax.device_get(key_data))
+
+
+def _rng_key_from_checkpoint_value(value: Any, template: jax.Array) -> jax.Array:
+    if jax.dtypes.issubdtype(template.dtype, jax.dtypes.prng_key):
+        key_data = jnp.asarray(value, dtype=jnp.uint32)
+        return jax.random.wrap_key_data(
+            key_data,
+            impl=jax.random.key_impl(template),
+        )
+    return jnp.asarray(value, dtype=template.dtype)
+
+
 def maybe_save(
     manager: ocp.CheckpointManager,
     step: int,
@@ -123,7 +142,7 @@ def maybe_save(
     save_args = ocp.args.Composite(
         model=ocp.args.StandardSave(nnx.state(model)),
         optimizer=ocp.args.StandardSave(nnx.state(optimizer)),
-        rngs=ocp.args.StandardSave({"key": rng_key}),
+        rngs=ocp.args.StandardSave({"key": _rng_key_to_checkpoint_value(rng_key)}),
         meta=ocp.args.JsonSave(meta),
     )
     manager.save(step, args=save_args)
@@ -146,13 +165,15 @@ def restore(
         args=ocp.args.Composite(
             model=ocp.args.StandardRestore(nnx.state(model)),
             optimizer=ocp.args.StandardRestore(nnx.state(optimizer)),
-            rngs=ocp.args.StandardRestore({"key": rng_key}),
+            rngs=ocp.args.StandardRestore(
+                {"key": _rng_key_to_checkpoint_value(rng_key)}
+            ),
             meta=ocp.args.JsonRestore(),
         ),
     )
     nnx.update(model, restored["model"])
     nnx.update(optimizer, restored["optimizer"])
-    rng_key = restored["rngs"]["key"]
+    rng_key = _rng_key_from_checkpoint_value(restored["rngs"]["key"], rng_key)
     meta = restored["meta"]
     print(f"Restored checkpoint from step {step}.")
     return step + 1, rng_key, float(meta["hours"]), int(meta["frames"])

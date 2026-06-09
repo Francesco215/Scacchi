@@ -1,8 +1,47 @@
 from pathlib import Path
 from typing import Any
 
+import jax
+import numpy as np
+
 from scacchi import checkpoint
 from scacchi.types import CheckpointingConfig, Config, RunConfig
+
+
+def test_rng_key_checkpoint_value_is_host_numpy_array() -> None:
+    rng_key = jax.random.PRNGKey(7)
+
+    value = checkpoint._rng_key_to_checkpoint_value(rng_key)
+
+    assert isinstance(value, np.ndarray)
+    assert value.dtype == np.uint32
+    np.testing.assert_array_equal(value, np.asarray([0, 7], dtype=np.uint32))
+
+
+def test_rng_key_restore_returns_jax_key_with_template_dtype() -> None:
+    template = jax.random.PRNGKey(0)
+    value = np.asarray([123, 456], dtype=np.uint32)
+
+    restored = checkpoint._rng_key_from_checkpoint_value(value, template)
+
+    assert isinstance(restored, jax.Array)
+    assert restored.dtype == template.dtype
+    np.testing.assert_array_equal(np.asarray(jax.device_get(restored)), value)
+
+
+def test_typed_rng_key_checkpoint_round_trip() -> None:
+    rng_key = jax.random.key(7)
+
+    value = checkpoint._rng_key_to_checkpoint_value(rng_key)
+    restored = checkpoint._rng_key_from_checkpoint_value(value, rng_key)
+
+    assert isinstance(value, np.ndarray)
+    assert restored.dtype == rng_key.dtype
+    assert jax.random.key_impl(restored) == jax.random.key_impl(rng_key)
+    np.testing.assert_array_equal(
+        np.asarray(jax.random.key_data(restored)),
+        np.asarray(jax.random.key_data(rng_key)),
+    )
 
 
 def test_build_checkpoint_manager_uses_multihost_orbax_options(

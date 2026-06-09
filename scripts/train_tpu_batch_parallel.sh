@@ -206,8 +206,12 @@ if [[ "${SYNC}" == "1" ]]; then
 
   (
     cd "${LOCAL_REPO_DIR}"
-    git ls-files \
+    {
+      git ls-files --cached
+      git ls-files --others --exclude-standard
+    } \
       | awk '!/^(baselines|checkpoints|wandb)\//' \
+      | sort -u \
       | while IFS= read -r path; do
           [[ -f "${path}" ]] && printf '%s\n' "${path}"
         done \
@@ -221,7 +225,7 @@ if [[ "${SYNC}" == "1" ]]; then
   )
 
   if [[ -s "${file_list}" ]]; then
-    echo "Syncing tracked files:"
+    echo "Syncing files:"
     sed 's/^/  /' "${file_list}"
   fi
   if [[ -s "${delete_list}" ]]; then

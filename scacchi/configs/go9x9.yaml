@@ -11,52 +11,67 @@ env:
   num_outcomes: 3
 
 model:
-  network: aznet
+  network: aznet_dirichlet
   num_channels: 128
   num_layers: 6
   resnet_v2: true
 
 selfplay:
-  batch_size: 1024
+  batch_size: 8_192
   max_num_steps: 256
   action_commitment_type: search_action
   search:
-    kind: gumbel
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 4
+      num_blocks: 8
+      constants:
+        kappa_leaf: 1.0
+        kappa_terminal: 8.0
+
     gumbel:
       num_simulations: 32
       gumbel_scale: 1.0
       completed_q_value_scale: 0.1
       completed_q_rescale_values: false
 
+
 training:
-  batch_size: 4096
+  batch_size: 32_768
   max_updates_per_iter: null
   learning_rate: 1e-3
   grad_clip_norm: null
 
   losses:
     policy_weight: 1.0
-    value_dir_kl_weight: 0.0
-    q_dir_kl_weight: 0.0
-    value_outcome_weight: 0.0
-    q_outcome_weight: 0.0
-    policy_target_mode: search
-    loss_mask_mode: search
-
+    value_dir_kl_weight: 1.0
+    q_dir_kl_weight: 1.0
+    value_outcome_weight: 0.25
+    q_outcome_weight: 0.1
+    q_loss_weight_mode: evidence_mass
+    q_dir_kl_reduction: masked_mean
+    loss_mask_mode: value
+    terminal_edge_targets: true
+    terminal_parent_targets: true
+    
+    
 eval:
   interval: 10
-  batch_size: 128
+  batch_size: 2048
   baseline: pgx
   baseline_id: go_9x9_v0
   player_action_commitment_type: search_action
   baseline_action_commitment_type: search_action
+  
   player_search:
-    kind: gumbel
-    gumbel:
-      num_simulations: 32
-      gumbel_scale: 1.0
-      completed_q_value_scale: 0.1
-      completed_q_rescale_values: false
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 4
+      num_blocks: 8
+      constants:
+        kappa_leaf: 1.0
+        kappa_terminal: 8.0
+        
   baseline_search:
     kind: gumbel
     gumbel:
@@ -72,5 +87,5 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 50
+  max_to_keep: 0
   save_interval_steps: 50

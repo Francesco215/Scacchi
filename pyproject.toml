@@ -7,7 +7,7 @@ requires-python = "==3.13.*"
 dependencies = [
     "dqaz",
     "einops",
-    "jax[cuda]>=0.10.0",
+    "jax[tpu]>=0.10.0",
     "matplotlib",
     "tqdm",
     "wandb",
