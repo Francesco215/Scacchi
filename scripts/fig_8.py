@@ -1,0 +1,920 @@
+"""Reproduce the Fig. 8 test-time search sweep for the 8x8 Hex checkpoints.
+
+
+Jones (2021) Fig. 8 varies the evaluation-time tree size for fixed agents.
+This version keeps the 8x8 Boardlaw-Dirichlet architecture fixed and uses the
+saved training checkpoints as the curves. Elo is reported relative to the
+latest ``checkpoints/8_solved`` model, which is anchored at Elo 0 and always
+uses a fixed 512-simulation test-time search.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import numpy as np
+import orbax.checkpoint as ocp
+from flax import nnx
+from omegaconf import OmegaConf
+from tqdm import tqdm
+
+from scacchi.checkpoint import _suppress_orbax_logs, from_pretrained
+from scacchi.dirichlet_q_search import posterior_sample_action
+from scacchi.envs import make_env
+from scacchi.evaluations import make_mcts_evaluate
+from scacchi.network import build_model
+from scacchi.play import searchable_eval_state
+from scacchi.play_search import _run_posterior_tree_search_step
+from scacchi.play_search import make_search_player
+from scacchi.types import (
+    ActionCommitmentType,
+    Config,
+    EvalBaseline,
+    SearchKind,
+    load_config,
+)
+
+
+DEFAULT_CHECKPOINT_DIR = Path("checkpoints/hex_bs8_boardlaw_dirichlet_c1024_l8_seed0")
+DEFAULT_TARGET_DIR = Path("checkpoints/8_solved")
+DEFAULT_OUT_DIR = Path("artifacts/fig_8")
+DEFAULT_TREE_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+
+
+@dataclass(frozen=True)
+class LoadedCheckpoint:
+    step: int
+    hours: float
+    frames: int
+    config: Config
+    model: nnx.Module
+
+
+def _config_from_raw(raw: Any) -> Config:
+    return load_config(OmegaConf.create(raw))
+
+
+def _nonnegative_int_csv(value: str) -> tuple[int, ...]:
+    values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    if any(v < 0 for v in values):
+        raise argparse.ArgumentTypeError("values must be nonnegative integers")
+    return values
+
+
+def _int_csv(value: str) -> tuple[int, ...]:
+    values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not values:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    return values
+
+
+def _checkpoint_steps(checkpoint_dir: Path) -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            int(path.name)
+            for path in checkpoint_dir.iterdir()
+            if path.is_dir() and path.name.isdigit()
+        )
+    )
+
+
+def _load_model_at_step(
+    checkpoint_dir: Path,
+    step: int,
+    env: Any,
+    *,
+    rng_seed: int = 0,
+) -> LoadedCheckpoint:
+    """Load one exact Orbax checkpoint step.
+
+    ``scacchi.checkpoint.from_pretrained`` loads the latest step only, so this
+    mirrors that helper while keeping the requested checkpoint step explicit.
+    """
+
+    _suppress_orbax_logs()
+    checkpoint_dir = checkpoint_dir.resolve()
+    with ocp.CheckpointManager(str(checkpoint_dir)) as manager:
+        if step not in set(manager.all_steps()):
+            raise FileNotFoundError(f"checkpoint step {step} not found in {checkpoint_dir}")
+
+        restored_meta = manager.restore(
+            step,
+            args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
+        )
+        meta = restored_meta["meta"]
+        config = _config_from_raw(meta["config"])
+        model = build_model(
+            config,
+            num_actions=env.num_actions,
+            observation_shape=env.observation_shape,
+            rngs=nnx.Rngs(rng_seed),
+        )
+        restored = manager.restore(
+            step,
+            args=ocp.args.Composite(model=ocp.args.StandardRestore(nnx.state(model))),
+        )
+    nnx.update(model, restored["model"])
+    return LoadedCheckpoint(
+        step=step,
+        hours=float(meta.get("hours", math.nan)),
+        frames=int(meta.get("frames", 0)),
+        config=config,
+        model=model,
+    )
+
+
+def _load_config_at_step(checkpoint_dir: Path, step: int) -> Config:
+    _suppress_orbax_logs()
+    with ocp.CheckpointManager(str(checkpoint_dir.resolve())) as manager:
+        if step not in set(manager.all_steps()):
+            raise FileNotFoundError(f"checkpoint step {step} not found in {checkpoint_dir}")
+        restored_meta = manager.restore(
+            step,
+            args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
+        )
+    return _config_from_raw(restored_meta["meta"]["config"])
+
+
+def _with_eval_settings(
+    config: Config,
+    *,
+    eval_batch_size: int,
+    tree_size: int,
+    num_search_blocks: int,
+) -> Config:
+    search = config.eval.player_search
+    eval_config = replace(config.eval, batch_size=eval_batch_size)
+    if search.kind == SearchKind.gumbel:
+        search = replace(
+            search,
+            gumbel=replace(search.gumbel, num_simulations=tree_size),
+        )
+        return replace(
+            config,
+            search=search,
+            eval=replace(eval_config, player_search=search),
+        )
+    if search.kind == SearchKind.dirichlet_thompson:
+        search = replace(
+            search,
+            dirichlet_thompson=replace(
+                search.dirichlet_thompson,
+                num_simulations=tree_size,
+                num_blocks=num_search_blocks,
+            ),
+        )
+        return replace(
+            config,
+            search=search,
+            eval=replace(eval_config, player_search=search),
+        )
+    search = replace(
+        search,
+        dqaz=replace(search.dqaz, num_simulations=max(1, tree_size)),
+    )
+    return replace(
+        config,
+        search=search,
+        eval=replace(eval_config, player_search=search),
+    )
+
+
+def _with_dqaz_eval_settings(
+    config: Config,
+    *,
+    eval_batch_size: int,
+    tree_size: int,
+    search_eval_batch_size: int,
+) -> Config:
+    search = replace(
+        config.search,
+        kind=SearchKind.dqaz,
+        dqaz=replace(
+            config.search.dqaz,
+            num_simulations=max(1, tree_size),
+            inflight_limit=max(1, tree_size),
+            eval_batch_size=search_eval_batch_size,
+            pad_to_eval_batch=True,
+            jax_backup=True,
+        ),
+    )
+    return replace(
+        config,
+        eval=replace(
+            config.eval,
+            batch_size=eval_batch_size,
+            player_search=search,
+            player_action_commitment_type=ActionCommitmentType.posterior_argmax,
+        ),
+        selfplay=replace(
+            config.selfplay,
+            action_commitment_type=ActionCommitmentType.posterior_argmax,
+        ),
+        search=search,
+    )
+
+
+def _coerce_dqaz_wdl3_output(
+    model_output,
+    *,
+    draw_alpha: float = 0.05,
+    min_alpha: float = 0.05,
+):
+    """Convert Hex two-outcome Dirichlet heads to the WDL3 shape dqaz expects."""
+
+    def floor_alpha(alpha: jax.Array) -> jax.Array:
+        if min_alpha <= 0.0:
+            return alpha
+        return jnp.maximum(alpha, jnp.asarray(min_alpha, dtype=alpha.dtype))
+
+    logits, alpha_v, alpha_q = model_output
+    if alpha_v.shape[-1] == 3 and alpha_q.shape[-1] == 3:
+        return logits, floor_alpha(alpha_v), floor_alpha(alpha_q)
+    if alpha_v.shape[-1] != 2 or alpha_q.shape[-1] != 2:
+        raise ValueError(
+            "dqaz search expects two-outcome Hex heads or WDL3 heads; got "
+            f"alpha_V shape {alpha_v.shape} and alpha_Q shape {alpha_q.shape}"
+        )
+
+    value_draw = jnp.full(
+        (*alpha_v.shape[:-1], 1),
+        draw_alpha,
+        dtype=alpha_v.dtype,
+    )
+    q_draw = jnp.full(
+        (*alpha_q.shape[:-1], 1),
+        draw_alpha,
+        dtype=alpha_q.dtype,
+    )
+    alpha_v = jnp.concatenate([alpha_v[..., :1], value_draw, alpha_v[..., 1:]], axis=-1)
+    alpha_q = jnp.concatenate([alpha_q[..., :1], q_draw, alpha_q[..., 1:]], axis=-1)
+    return logits, floor_alpha(alpha_v), floor_alpha(alpha_q)
+
+
+def _normalize_action_weights(
+    action_weights: jax.Array,
+    legal_action_mask: jax.Array,
+) -> jax.Array:
+    weights = jnp.where(legal_action_mask, action_weights, 0.0)
+    total = jnp.sum(weights, axis=-1, keepdims=True)
+    legal_count = jnp.sum(legal_action_mask, axis=-1, keepdims=True)
+    fallback = legal_action_mask.astype(weights.dtype) / jnp.maximum(legal_count, 1)
+    return jnp.where(total > 0, weights / jnp.maximum(total, 1e-8), fallback)
+
+
+def make_stochastic_mcts_evaluate(
+    env: Any,
+    config: Config,
+    target_config: Config,
+    target_model: nnx.Module,
+):
+    """Evaluate ``model`` against ``target_model`` with sampled final actions."""
+
+    eval_config = replace(
+        config,
+        eval=replace(
+            config.eval,
+            baseline=EvalBaseline.checkpoint,
+            baseline_search=target_config.eval.player_search,
+            player_action_commitment_type=ActionCommitmentType.posterior_sample,
+            baseline_action_commitment_type=ActionCommitmentType.posterior_sample,
+        ),
+    )
+    return make_mcts_evaluate(env, eval_config, target_model, parallel=None)
+
+
+def make_stochastic_dqaz_evaluate(
+    env: Any,
+    config: Config,
+    target_config: Config,
+    target_model: nnx.Module,
+):
+    """Evaluate candidate dqaz search against the existing target search path."""
+
+    eval_batch_size = int(config.eval.batch_size)
+    env_step = jax.jit(jax.vmap(env.step))
+
+    @nnx.jit
+    def evaluate_leaves(model: Any, obs: jax.Array):
+        return model(obs, train=False)
+
+    @nnx.jit
+    def evaluate_transitions(model: Any, states, actions: jax.Array):
+        child_states = jax.vmap(env.step)(states, actions)
+        return child_states, model(child_states.observation, train=False)
+
+    @nnx.jit
+    def target_policy(model: Any, rng_key: jax.Array, env_state):
+        player = make_search_player(
+            env,
+            model,
+            target_config.eval.player_search,
+            target_config.eval.player_action_commitment_type,
+            q_loss_weight_mode=str(target_config.training.losses.q_loss_weight_mode),
+        )
+        player_output = player(searchable_eval_state(env_state), rng_key)
+        if player_output.posterior is None:
+            raise ValueError("target search player must return posterior targets")
+        return player_output.posterior.prediction.policy
+
+    def candidate_policy(model: Any, rng_key: jax.Array, env_state):
+        def leaf_evaluator(obs: jax.Array):
+            return _coerce_dqaz_wdl3_output(evaluate_leaves(model, obs))
+
+        def transition_evaluator(states, actions: jax.Array):
+            child_states, model_output = evaluate_transitions(model, states, actions)
+            return child_states, _coerce_dqaz_wdl3_output(model_output)
+
+        return _run_posterior_tree_search_step(
+            env=env,
+            config=config,
+            env_state=env_state,
+            leaf_evaluator=leaf_evaluator,
+            transition_evaluator=transition_evaluator,
+            search_key=rng_key,
+            device_put_cpu=lambda value: value,
+        )
+
+    def evaluate(rng_key: jax.Array, model: nnx.Module):
+        my_player = 0
+        candidate_seconds = 0.0
+        target_seconds = 0.0
+        num_plies = 0
+
+        key, init_key = jax.random.split(rng_key)
+        init_keys = jax.random.split(init_key, eval_batch_size)
+        env_state = jax.vmap(env.init)(init_keys)
+        returns = jnp.zeros(eval_batch_size)
+
+        while not bool(np.asarray(jax.device_get(env_state.terminated)).all()):
+            key, my_search_key, target_search_key, my_sample_key, target_sample_key = (
+                jax.random.split(key, 5)
+            )
+
+            start = time.perf_counter()
+            my_policy = candidate_policy(model, my_search_key, env_state)
+            jax.block_until_ready(my_policy.action_weights)
+            candidate_seconds += time.perf_counter() - start
+
+            start = time.perf_counter()
+            target_policy_weights = target_policy(target_model, target_search_key, env_state)
+            jax.block_until_ready(target_policy_weights)
+            target_seconds += time.perf_counter() - start
+
+            my_weights = _normalize_action_weights(
+                my_policy.action_weights,
+                env_state.legal_action_mask,
+            )
+            target_weights = _normalize_action_weights(
+                target_policy_weights,
+                env_state.legal_action_mask,
+            )
+            my_action = posterior_sample_action(
+                my_sample_key,
+                my_weights,
+                env_state.legal_action_mask,
+            )
+            target_action = posterior_sample_action(
+                target_sample_key,
+                target_weights,
+                env_state.legal_action_mask,
+            )
+
+            is_my_turn = env_state.current_player == my_player
+            action = jnp.where(is_my_turn, my_action, target_action)
+            env_state = env_step(env_state, action)
+            returns = returns + env_state.rewards[
+                jnp.arange(eval_batch_size),
+                my_player,
+            ]
+            num_plies += 1
+
+        return np.asarray(jax.device_get(returns)), {
+            "candidate_search_seconds": candidate_seconds,
+            "target_search_seconds": target_seconds,
+            "num_plies": num_plies,
+        }
+
+    return evaluate
+
+
+def returns_to_score(avg_return: float) -> float:
+    return 0.5 * (avg_return + 1.0)
+
+
+def score_to_elo(score: float, *, eps: float = 1e-3) -> float:
+    clipped = min(max(score, eps), 1.0 - eps)
+    return 400.0 * math.log10(clipped / (1.0 - clipped))
+
+
+def _result_key(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    return (
+        int(row["checkpoint_step"]),
+        int(row["tree_size"]),
+        int(row["num_search_blocks"]),
+        int(row["target_tree_size"]),
+        int(row["target_num_search_blocks"]),
+    )
+
+
+def _load_existing_results(
+    path: Path,
+    *,
+    target_tree_size: int,
+    target_num_search_blocks: int,
+    candidate_search_backend: str,
+    search_eval_batch_size: int | None,
+    candidate_search_jax_backup: bool,
+) -> dict[tuple[int, int, int, int, int], dict[str, Any]]:
+    if not path.exists():
+        return {}
+    results: dict[tuple[int, int, int, int, int], dict[str, Any]] = {}
+    incompatible = 0
+    backend_incompatible = 0
+    with path.open() as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if (
+                int(row.get("target_tree_size", -1)) != target_tree_size
+                or int(row.get("target_num_search_blocks", -1)) != target_num_search_blocks
+            ):
+                incompatible += 1
+                continue
+            row_backend = str(row.get("candidate_search_backend", "checkpoint"))
+            row_eval_batch = row.get("search_eval_batch_size")
+            if row_eval_batch is not None:
+                row_eval_batch = int(row_eval_batch)
+            row_jax_backup = bool(row.get("candidate_search_jax_backup", False))
+            if (
+                row_backend != candidate_search_backend
+                or row_eval_batch != search_eval_batch_size
+                or row_jax_backup != candidate_search_jax_backup
+            ):
+                backend_incompatible += 1
+                continue
+            results[_result_key(row)] = row
+    if incompatible:
+        raise ValueError(
+            f"{path} contains {incompatible} rows from a different target-search "
+            "configuration; rerun with --overwrite or choose a new --out-dir"
+        )
+    if backend_incompatible:
+        raise ValueError(
+            f"{path} contains {backend_incompatible} rows from a different candidate "
+            "search backend or search eval batch size; rerun with --overwrite or "
+            "choose a new --out-dir"
+        )
+    return results
+
+
+def _append_result(path: Path, row: dict[str, Any]) -> None:
+    with path.open("a") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+        f.flush()
+
+
+def _write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    rows = list(rows)
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    extras = sorted({key for row in rows for key in row.keys()} - set(fieldnames))
+    fieldnames.extend(extras)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=tuple(fieldnames))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _tree_size_plot_position(tree_size: int) -> float:
+    if tree_size == 0:
+        return -0.5
+    if tree_size < 0:
+        raise ValueError(f"tree_size must be nonnegative, got {tree_size}")
+    return math.log2(tree_size)
+
+
+def _plot_curves(rows: list[dict[str, Any]], out_path: Path) -> None:
+    if not rows:
+        raise ValueError("no rows to plot")
+    steps = sorted({int(row["checkpoint_step"]) for row in rows})
+    tree_sizes = sorted({int(row["tree_size"]) for row in rows})
+    cmap = plt.get_cmap("viridis")
+    colors = {
+        step: cmap(i / max(1, len(steps) - 1))
+        for i, step in enumerate(steps)
+    }
+
+    fig, ax = plt.subplots(figsize=(9.4, 6.2))
+    endpoints: list[tuple[int, float, float, Any]] = []
+    for step in steps:
+        step_rows = sorted(
+            (row for row in rows if int(row["checkpoint_step"]) == step),
+            key=lambda row: int(row["tree_size"]),
+        )
+        xs = np.array(
+            [_tree_size_plot_position(int(row["tree_size"])) for row in step_rows],
+            dtype=np.float64,
+        )
+        ys = np.array([row["elo_vs_target"] for row in step_rows], dtype=np.float64)
+        ax.plot(
+            xs,
+            ys,
+            marker="o",
+            markersize=3.8,
+            linewidth=1.3,
+            alpha=0.82,
+            color=colors[step],
+        )
+        if len(xs):
+            endpoints.append((step, float(xs[-1]), float(ys[-1]), colors[step]))
+
+    ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.55)
+    ax.set_xticks([_tree_size_plot_position(tree_size) for tree_size in tree_sizes])
+    ax.set_xticklabels([str(tree_size) for tree_size in tree_sizes])
+    ax.set_xlabel("Test-time tree size (search simulations)")
+    target_tree_sizes = sorted({int(row["target_tree_size"]) for row in rows})
+    target_label = (
+        str(target_tree_sizes[0])
+        if len(target_tree_sizes) == 1
+        else ",".join(str(v) for v in target_tree_sizes)
+    )
+    ax.set_ylabel("Elo vs. checkpoints/8_solved (target = 0)")
+    ax.set_title(
+        "Fig. 8 reproduction: checkpoint curves, "
+        f"target search fixed at {target_label}"
+    )
+    ax.grid(True, which="both", alpha=0.22)
+    ax.margins(x=0.08, y=0.08)
+
+    y_min, y_max = ax.get_ylim()
+    min_gap = 0.035 * (y_max - y_min)
+    label_positions: list[tuple[int, float, float, float, Any]] = []
+    last_y = -math.inf
+    for step, x, y, color in sorted(endpoints, key=lambda item: item[2]):
+        label_y = max(y, last_y + min_gap)
+        label_positions.append((step, x, y, label_y, color))
+        last_y = label_y
+    overflow = label_positions[-1][3] - y_max if label_positions else 0.0
+    if overflow > 0:
+        label_positions = [
+            (step, x, y, label_y - overflow, color)
+            for step, x, y, label_y, color in label_positions
+        ]
+    for step, x, y, label_y, color in label_positions:
+        ax.annotate(
+            str(step),
+            xy=(x, y),
+            xytext=(x + 0.08, label_y),
+            textcoords="data",
+            color=color,
+            fontsize=8.5,
+            va="center",
+            arrowprops={
+                "arrowstyle": "-",
+                "color": color,
+                "alpha": 0.55,
+                "lw": 0.8,
+                "shrinkA": 0,
+                "shrinkB": 3,
+            },
+        )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_heatmap(rows: list[dict[str, Any]], out_path: Path) -> None:
+    steps = sorted({int(row["checkpoint_step"]) for row in rows})
+    tree_sizes = sorted({int(row["tree_size"]) for row in rows})
+    target_tree_sizes = sorted({int(row["target_tree_size"]) for row in rows})
+    target_label = (
+        str(target_tree_sizes[0])
+        if len(target_tree_sizes) == 1
+        else ",".join(str(v) for v in target_tree_sizes)
+    )
+    lookup = {
+        (int(row["checkpoint_step"]), int(row["tree_size"])): float(row["elo_vs_target"])
+        for row in rows
+    }
+    values = np.array(
+        [[lookup.get((step, tree_size), np.nan) for tree_size in tree_sizes] for step in steps],
+        dtype=np.float64,
+    )
+
+    fig, ax = plt.subplots(figsize=(9.4, 5.8))
+    im = ax.imshow(values, aspect="auto", origin="lower", cmap="viridis")
+    ax.set_xticks(np.arange(len(tree_sizes)))
+    ax.set_xticklabels([str(v) for v in tree_sizes])
+    ax.set_yticks(np.arange(len(steps)))
+    ax.set_yticklabels([str(v) for v in steps])
+    ax.set_xlabel("Test-time tree size")
+    ax.set_ylabel("Checkpoint step")
+    ax.set_title(f"Elo vs. checkpoints/8_solved, target search fixed at {target_label}")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Elo")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _summarize_returns(
+    returns: np.ndarray,
+    *,
+    checkpoint: LoadedCheckpoint,
+    tree_size: int,
+    num_search_blocks: int,
+    target_tree_size: int,
+    target_num_search_blocks: int,
+    seed: int,
+    candidate_search_backend: str,
+    search_eval_batch_size: int | None,
+    candidate_search_jax_backup: bool,
+    elapsed_seconds: float,
+    num_plies: int | None,
+    candidate_search_seconds: float | None,
+    target_search_seconds: float | None,
+) -> dict[str, Any]:
+    avg_return = float(np.mean(returns))
+    score = returns_to_score(avg_return)
+    wins = int(np.sum(returns == 1))
+    draws = int(np.sum(returns == 0))
+    losses = int(np.sum(returns == -1))
+    return {
+        "checkpoint_step": checkpoint.step,
+        "checkpoint_frames": checkpoint.frames,
+        "checkpoint_hours": checkpoint.hours,
+        "tree_size": int(tree_size),
+        "num_search_blocks": int(num_search_blocks),
+        "target_tree_size": int(target_tree_size),
+        "target_num_search_blocks": int(target_num_search_blocks),
+        "eval_games": int(returns.size),
+        "seed": int(seed),
+        "candidate_search_backend": candidate_search_backend,
+        "search_eval_batch_size": search_eval_batch_size,
+        "candidate_search_jax_backup": candidate_search_jax_backup,
+        "elapsed_seconds": float(elapsed_seconds),
+        "num_plies": num_plies,
+        "candidate_search_seconds": candidate_search_seconds,
+        "target_search_seconds": target_search_seconds,
+        "avg_return": avg_return,
+        "score_vs_target": score,
+        "elo_vs_target": score_to_elo(score),
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "target": str(DEFAULT_TARGET_DIR),
+    }
+
+
+def run(args: argparse.Namespace) -> list[dict[str, Any]]:
+    checkpoint_dir = args.checkpoint_dir
+    target_dir = args.target_dir
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    all_steps = _checkpoint_steps(checkpoint_dir)
+    steps = args.checkpoint_steps or all_steps
+    missing = sorted(set(steps) - set(all_steps))
+    if missing:
+        raise FileNotFoundError(f"checkpoint steps not found: {missing}")
+
+    base_config = _load_config_at_step(checkpoint_dir, steps[0])
+    env = make_env(base_config.env.id, base_config.env.board_size)
+    candidate_search_eval_batch_size = (
+        args.search_eval_batch_size
+        if args.search_backend != "dqaz" or args.search_eval_batch_size is not None
+        else args.eval_games * env.num_actions
+    )
+    candidate_search_jax_backup = args.search_backend == "dqaz"
+
+    results_path = out_dir / "fig_8_results.jsonl"
+    csv_path = out_dir / "fig_8_results.csv"
+    if args.overwrite and results_path.exists():
+        results_path.unlink()
+    results = _load_existing_results(
+        results_path,
+        target_tree_size=args.target_tree_size,
+        target_num_search_blocks=args.target_num_search_blocks,
+        candidate_search_backend=args.search_backend,
+        search_eval_batch_size=candidate_search_eval_batch_size,
+        candidate_search_jax_backup=candidate_search_jax_backup,
+    )
+
+    target_model = from_pretrained(str(target_dir), env, rngs=nnx.Rngs(args.seed))
+
+    pending_steps = [
+        step
+        for step in steps
+        if any(
+            args.overwrite
+            or (
+                step,
+                tree_size,
+                args.num_search_blocks,
+                args.target_tree_size,
+                args.target_num_search_blocks,
+            )
+            not in results
+            for tree_size in args.tree_sizes
+        )
+    ]
+    checkpoints = {
+        step: _load_model_at_step(checkpoint_dir, step, env, rng_seed=args.seed)
+        for step in tqdm(pending_steps, desc="load checkpoints", dynamic_ncols=True)
+    }
+
+    for tree_size in tqdm(args.tree_sizes, desc="tree size", dynamic_ncols=True):
+        if args.search_backend == "dqaz":
+            assert candidate_search_eval_batch_size is not None
+            eval_config = _with_dqaz_eval_settings(
+                base_config,
+                eval_batch_size=args.eval_games,
+                tree_size=tree_size,
+                search_eval_batch_size=candidate_search_eval_batch_size,
+            )
+        else:
+            eval_config = _with_eval_settings(
+                base_config,
+                eval_batch_size=args.eval_games,
+                tree_size=tree_size,
+                num_search_blocks=args.num_search_blocks,
+            )
+        target_eval_config = _with_eval_settings(
+            base_config,
+            eval_batch_size=args.eval_games,
+            tree_size=args.target_tree_size,
+            num_search_blocks=args.target_num_search_blocks,
+        )
+        if args.search_backend == "dqaz":
+            evaluate = make_stochastic_dqaz_evaluate(
+                env,
+                eval_config,
+                target_eval_config,
+                target_model,
+            )
+        else:
+            evaluate = make_stochastic_mcts_evaluate(
+                env,
+                eval_config,
+                target_eval_config,
+                target_model,
+            )
+        for step in tqdm(steps, desc=f"tree {tree_size}", leave=False):
+            key = (
+                step,
+                tree_size,
+                args.num_search_blocks,
+                args.target_tree_size,
+                args.target_num_search_blocks,
+            )
+            if key in results and not args.overwrite:
+                continue
+            checkpoint = checkpoints[step]
+            eval_seed = args.seed + 1009 * step + 9176 * tree_size
+            start = time.perf_counter()
+            timing: dict[str, Any] = {}
+            if args.search_backend == "dqaz":
+                returns, timing = evaluate(jax.random.PRNGKey(eval_seed), checkpoint.model)
+            else:
+                returns = np.asarray(
+                    jax.device_get(evaluate(jax.random.PRNGKey(eval_seed), checkpoint.model))
+                )
+            elapsed_seconds = time.perf_counter() - start
+            row = _summarize_returns(
+                returns,
+                checkpoint=checkpoint,
+                tree_size=tree_size,
+                num_search_blocks=args.num_search_blocks,
+                target_tree_size=args.target_tree_size,
+                target_num_search_blocks=args.target_num_search_blocks,
+                seed=eval_seed,
+                candidate_search_backend=args.search_backend,
+                search_eval_batch_size=candidate_search_eval_batch_size,
+                candidate_search_jax_backup=candidate_search_jax_backup,
+                elapsed_seconds=elapsed_seconds,
+                num_plies=timing.get("num_plies"),
+                candidate_search_seconds=timing.get("candidate_search_seconds"),
+                target_search_seconds=timing.get("target_search_seconds"),
+            )
+            row["target"] = str(target_dir)
+            results[key] = row
+            _append_result(results_path, row)
+
+    rows = sorted(results.values(), key=lambda row: (row["checkpoint_step"], row["tree_size"]))
+    _write_csv(csv_path, rows)
+    _plot_curves(rows, out_dir / "fig_8.png")
+    _plot_heatmap(rows, out_dir / "fig_8_heatmap.png")
+    with (out_dir / "fig_8_summary.json").open("w") as f:
+        json.dump(
+            {
+                "checkpoint_dir": str(checkpoint_dir),
+                "target_dir": str(target_dir),
+                "target_elo": 0,
+                "target_tree_size": args.target_tree_size,
+                "target_num_search_blocks": args.target_num_search_blocks,
+                "candidate_search_backend": args.search_backend,
+                "search_eval_batch_size": candidate_search_eval_batch_size,
+                "candidate_search_jax_backup": candidate_search_jax_backup,
+                "tree_sizes": list(args.tree_sizes),
+                "num_search_blocks": args.num_search_blocks,
+                "eval_games": args.eval_games,
+                "num_points": len(rows),
+                "pngs": ["fig_8.png", "fig_8_heatmap.png"],
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
+    return rows
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
+    parser.add_argument("--target-dir", type=Path, default=DEFAULT_TARGET_DIR)
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument("--checkpoint-steps", type=_int_csv, default=None)
+    parser.add_argument("--tree-sizes", type=_nonnegative_int_csv, default=DEFAULT_TREE_SIZES)
+    parser.add_argument("--eval-games", type=int, default=256)
+    parser.add_argument(
+        "--num-search-blocks",
+        type=int,
+        default=1,
+        help="Use 1 so the plotted tree size equals num_simulations.",
+    )
+    parser.add_argument(
+        "--target-tree-size",
+        type=int,
+        default=512,
+        help="Fixed test-time tree size for the target model.",
+    )
+    parser.add_argument(
+        "--target-num-search-blocks",
+        type=int,
+        default=1,
+        help="Use 1 so the target tree size equals target num_simulations.",
+    )
+    parser.add_argument(
+        "--search-backend",
+        choices=("checkpoint", "dqaz"),
+        default="checkpoint",
+        help="Candidate search backend. 'checkpoint' preserves the checkpoint config path.",
+    )
+    parser.add_argument(
+        "--search-eval-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Leaf-evaluation batch size for dqaz candidate search; defaults to "
+            "eval-games times action count."
+        ),
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args()
+    if args.eval_games <= 0:
+        parser.error("--eval-games must be positive")
+    if args.num_search_blocks <= 0:
+        parser.error("--num-search-blocks must be positive")
+    if args.target_tree_size <= 0:
+        parser.error("--target-tree-size must be positive")
+    if args.target_num_search_blocks <= 0:
+        parser.error("--target-num-search-blocks must be positive")
+    if args.search_eval_batch_size is not None and args.search_eval_batch_size <= 0:
+        parser.error("--search-eval-batch-size must be positive")
+    if args.search_backend == "dqaz" and any(tree_size == 0 for tree_size in args.tree_sizes):
+        parser.error("--tree-sizes 0 is only supported with --search-backend checkpoint")
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    rows = run(args)
+    if not rows:
+        raise SystemExit("no results produced")
+    print(f"wrote {args.out_dir / 'fig_8.png'}")
+    print(f"wrote {args.out_dir / 'fig_8_heatmap.png'}")
+
+
+if __name__ == "__main__":
+    main()

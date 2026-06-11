@@ -1,0 +1,70 @@
+# Best completed 5x5 non-Gumbel Boardlaw-Dirichlet recipe from notebook.md.
+# Mirrors W&B run azcxc9xp / hex5_dqthompson_outcome_seed9101.
+# This is dirichlet_thompson, not the removed Python wavefront backend.
+
+run:
+  seed: 9101
+  max_num_iters: 100
+
+env:
+  id: hex
+  board_size: 5
+  num_outcomes: 3
+
+model:
+  network: boardlaw_dirichlet
+  num_channels: 128
+  num_layers: 8
+  resnet_v2: true
+
+selfplay:
+  batch_size: 8192
+  max_num_steps: 25
+  action_commitment_type: posterior_argmax
+  search:
+    kind: dirichlet_thompson
+
+    dirichlet_thompson:
+      num_simulations: 4
+      num_blocks: 8
+
+      constants:
+        kappa_leaf: 1.0
+        kappa_terminal: 8.0
+
+training:
+  batch_size: 1024
+  learning_rate: 1e-3
+  grad_clip_norm: 1.0
+
+  losses:
+    policy_weight: 1.0
+    value_dir_kl_weight: 1.0
+    q_dir_kl_weight: 1.0
+    value_outcome_weight: 1.0
+    q_outcome_weight: 0.25
+    terminal_edge_targets: false
+    terminal_parent_targets: false
+    policy_target_mode: search
+
+  regularization:
+    dirichlet_concentration_clip: 8.0
+
+eval:
+  interval: 5
+  batch_size: 256
+  baseline: checkpoint
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 4
+
+logging:
+  interval: 1
+  wandb:
+    enabled: true
+    project: scacchi-az
+
+checkpointing:
+  max_to_keep: 0
+  save_interval_steps: 50

@@ -1,134 +1,78 @@
+from dataclasses import replace
+
 from flax import nnx
 import jax
-import jax.numpy as jnp
-import mctx
 
-from .dirichlet_q_search import (
-    DirichletQSearchOutput,
-    NO_PARENT,
-    NodeEmbedding,
-    dirichlet_q_policy,
-    outcome_mean,
-    outcome_utility,
-    posterior_best_action,
-    posterior_best_policy_target,
+from .distributed import (
+    DISABLED_BATCH_PARALLEL,
+    BatchParallel,
+    assert_batch_axis_sharded,
 )
-from .network import policy_value_from_output
-from .play import make_dirichlet_recurrent_fn, make_recurrent_fn
+from .play import play_eval
+from .play_search import (
+    make_search_player,
+)
+from .types import EvalBaseline, SearchConfig, SearchKind
 
 
-def _make_mcts_policy(predict, recurrent_fn, rng_key, env_state, num_simulations):
-    logits, value = policy_value_from_output(predict(env_state.observation))
-    root = mctx.RootFnOutput(
-        prior_logits=logits,
-        value=value,
-        embedding=env_state,
-    )
-    return mctx.gumbel_muzero_policy(
-        params=(),
-        rng_key=rng_key,
-        root=root,
-        recurrent_fn=recurrent_fn,
-        num_simulations=num_simulations,
-        invalid_actions=~env_state.legal_action_mask,
-        qtransform=mctx.qtransform_completed_by_mix_value,
-        gumbel_scale=1.,
-    )
+def baseline_search_config(config) -> SearchConfig:
+    search_config = config.eval.baseline_search
+    if config.eval.baseline != EvalBaseline.pgx:
+        return search_config
+    if search_config.kind == SearchKind.gumbel:
+        return search_config
 
-
-def _make_model_mcts_policy(env, config, model, rng_key, env_state, num_simulations):
-    predict = lambda obs: model(obs, train=False)
-    model_output = predict(env_state.observation)
-    if (
-        len(model_output) == 3
-        and getattr(config, "search_policy", "gumbel") == "dirichlet_thompson"
-    ):
-        search_key, posterior_key = jax.random.split(rng_key)
-        logits, alpha_v, alpha_q = model_output
-        root_outcome = outcome_mean(alpha_v)
-        value = outcome_utility(root_outcome)
-        root_embedding = NodeEmbedding(
-            state=env_state,
-            outcome_dist=root_outcome,
-            alpha_V_prior=alpha_v,
-            evidence_weight=jnp.zeros_like(value),
-            root_action=jnp.full_like(env_state.current_player, NO_PARENT),
-            depth_parity=jnp.zeros_like(env_state.current_player),
-            alpha_Q_prior=alpha_q,
-        )
-        root = mctx.RootFnOutput(
-            prior_logits=logits,
-            value=value,
-            embedding=root_embedding,
-        )
-        action_value_prior = alpha_q
-        policy = dirichlet_q_policy(
-            params=(),
-            rng_key=search_key,
-            root=root,
-            recurrent_fn=make_dirichlet_recurrent_fn(env, predict, config),
-            action_value_prior=action_value_prior,
-            num_simulations=num_simulations,
-            invalid_actions=~env_state.legal_action_mask,
-            num_search_blocks=getattr(config, "num_search_blocks", 1),
-        )
-        policy_target = posterior_best_policy_target(
-            posterior_key,
-            policy.alpha_search,
-            env_state.legal_action_mask,
-            config.policy_mc_samples,
-        )
-        return DirichletQSearchOutput(
-            action=posterior_best_action(policy_target, env_state.legal_action_mask),
-            action_weights=policy_target,
-            search_tree=policy.search_tree,
-            q_evidence_sum=policy.q_evidence_sum,
-            alpha_search=policy.alpha_search,
-            explored_action_mask=policy.explored_action_mask,
-        )
-    return _make_mcts_policy(
-        predict,
-        make_recurrent_fn(env, predict),
-        rng_key,
-        env_state,
-        num_simulations,
+    # PGX baselines expose scalar policy/value heads, not Dirichlet heads.
+    num_simulations = max(1, int(search_config.active().num_simulations))
+    return replace(
+        search_config,
+        kind=SearchKind.gumbel,
+        gumbel=replace(search_config.gumbel, num_simulations=num_simulations),
     )
 
 
-def make_mcts_evaluate(env, config, baseline_model):
-    eval_batch_size = int(getattr(config, "eval_batch_size", config.selfplay_batch_size))
+def make_mcts_evaluate(
+    env,
+    config,
+    baseline_model,
+    parallel: BatchParallel | None = None,
+):
+    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
+    eval_batch_size = int(config.eval.batch_size)
+    player_search_config = config.eval.player_search
+    player_action_commitment_type = config.eval.player_action_commitment_type
+    opponent_search_config = baseline_search_config(config)
+    opponent_action_commitment_type = config.eval.baseline_action_commitment_type
+
+    def search_player(model, search_config, action_commitment_type):
+        return make_search_player(
+            env,
+            model,
+            search_config,
+            action_commitment_type,
+            q_loss_weight_mode=str(config.training.losses.q_loss_weight_mode),
+        )
 
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: nnx.Module):
         """MCTS evaluation: model search vs pretrained opponent."""
-        my_player = 0
-
-        key, init_key = jax.random.split(rng_key)
-        init_keys = jax.random.split(init_key, eval_batch_size)
-        env_state = jax.vmap(env.init)(init_keys)
-       
-        def body_fn(val):
-            key, env_state, returns = val
-            key, my_key, opp_key = jax.random.split(key, 3)
-
-            my_policy = _make_model_mcts_policy(env, config, model, my_key, env_state, config.num_simulations)
-            opp_policy = _make_model_mcts_policy(env, config, baseline_model, opp_key, env_state, config.num_simulations)
-            
-            is_my_turn = env_state.current_player == my_player
-            action = jnp.where(is_my_turn, my_policy.action, opp_policy.action)
-
-            env_state = jax.vmap(env.step)(env_state, action)
-            returns = returns + env_state.rewards[
-                jnp.arange(eval_batch_size),
-                my_player,
-            ]
-            return key, env_state, returns
-
-        _, _, returns = nnx.while_loop(
-            lambda x: ~(x[1].terminated.all()),
-            body_fn,
-            (key, env_state, jnp.zeros(eval_batch_size)),
+        metrics = play_eval(
+            env,
+            search_player(model, player_search_config, player_action_commitment_type),
+            search_player(
+                baseline_model,
+                opponent_search_config,
+                opponent_action_commitment_type,
+            ),
+            rng_key,
+            batch_size=eval_batch_size,
+            parallel=parallel,
         )
-        return returns
+        return assert_batch_axis_sharded(
+            metrics.returns,
+            parallel,
+            batch_axis=0,
+            label="eval returns",
+        )
 
-    return evaluate    
+    return evaluate

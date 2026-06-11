@@ -1,35 +1,67 @@
-env_id: hex
-board_size: 8
-network: boardlaw_dirichlet
-num_outcomes: null
-seed: 0
-max_num_iters: 2000
-num_channels: 1024
-num_layers: 8
-resnet_v2: true
-selfplay_batch_size: 4096
-num_simulations: 4
-max_num_steps: 64
-num_search_blocks: 8
-policy_mc_samples: 32
-c_leaf: 1.0
-c_terminal: 8.0
-selfplay_action_source: posterior_sample
-search_policy: dirichlet_thompson
-training_batch_size: 1024
-learning_rate: 1e-3
-grad_clip_norm: 1.0
-policy_loss_weight: 1.0
-value_dir_kl_weight: 1.0
-q_dir_kl_weight: 1.0
-value_outcome_weight: 0.25
-q_outcome_weight: 0.10
-dirichlet_concentration_clip: 100.0
-dirichlet_kl_loss_cutoff: 1000.0
-log_interval: 1
-eval_interval: 1
-eval_batch_size: 256
-wandb_enabled: true
-wandb_project: scacchi-az
-ckpt_max_to_keep: 0
-ckpt_save_interval_steps: 50
+# Dirichlet Thompson Hex training config.
+# Action-selection symbols are explicit enum values. Use posterior_argmax or
+# posterior_sample where those modes are accepted; there is no posterior_mean mode.
+
+run:
+  seed: 0  # Random seed for model init, self-play, and search sampling.
+  max_num_iters: 80  # Training budget, below the requested 100-step cap.
+
+env:
+  id: hex  # PGX environment id.
+  board_size: 5  # Hex board side length.
+  num_outcomes: 3  # WDL outcome dimension for Dirichlet value/Q heads.
+
+model:
+  network: boardlaw_dirichlet  # Network architecture with policy, value-Dirichlet, and Q-Dirichlet heads.
+  num_channels: 512  # Hidden width.
+  num_layers: 8  # ReZero residual depth.
+  resnet_v2: true  # Ignored by Boardlaw models, kept for schema consistency.
+
+selfplay:
+  batch_size: 4096  # Number of games advanced in parallel.
+  max_num_steps: 25  # 5x5 Hex has at most 25 placements.
+  action_commitment_type: posterior_sample  # Self-play commitment: posterior_argmax, posterior_sample, or search_action.
+  search:
+    kind: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
+
+    dirichlet_thompson:
+      num_simulations: 32  # Search simulations per root.
+      num_blocks: 8  # Dirichlet Thompson search blocks.
+
+      constants:
+        kappa_leaf: 1.0  # Nonterminal evidence mass used by Dirichlet-Q search.
+        kappa_terminal: 8.0  # Terminal evidence mass used by Dirichlet-Q search.
+
+training:
+  batch_size: 1024  # Learner minibatch size; multiple updates per fresh self-play batch.
+  learning_rate: 1e-3  # Adam learning rate used by solved scalar Boardlaw runs.
+  grad_clip_norm: 1.0  # Keep Dirichlet-head fine tuning stable.
+
+  losses:
+    policy_weight: 0.05  # Keep noisy early policy targets auxiliary during bootstrap.
+    value_dir_kl_weight: 5.0  # Keep the WDL state posterior as a primary signal.
+    q_dir_kl_weight: 5.0  # Keep action-Q posteriors as a primary signal.
+    policy_target_mode: search  # Use the search-improved policy target.
+
+  regularization:
+    dirichlet_concentration_clip: 8.0  # Bound Dirichlet confidence during fine tuning.
+
+eval:
+  interval: 1  # Evaluate often enough to monitor convergence without dominating runtime.
+  batch_size: 512  # Number of evaluation games run in parallel.
+  baseline: checkpoint  # Solved Hex checkpoints are scalar Boardlaw baselines.
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      policy_sample_chunk_size: 1  # Unused for scalar baselines; keeps this explicit override from aliasing to self-play search.
+
+logging:
+  interval: 1  # Log training metrics every N iterations.
+  wandb:
+    enabled: false
+    project: scacchi-az
+
+checkpointing:
+  max_to_keep: 0  # Number of checkpoints to retain; 0 disables retention.
+  save_interval_steps: 50  # Save checkpoint every N iterations when retention is enabled.

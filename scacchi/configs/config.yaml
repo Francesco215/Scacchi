@@ -1,0 +1,68 @@
+run:
+  seed: 1
+  max_num_iters: 2000
+
+env:
+  id: gardner_chess
+  board_size: 5
+  num_outcomes: 3
+
+model:
+  network: aznet_dirichlet
+  num_channels: 128
+  num_layers: 6
+  resnet_v2: true
+
+selfplay:
+  batch_size: 2048
+  max_num_steps: 128
+  action_commitment_type: posterior_sample
+  search:
+    kind: dirichlet_thompson
+
+    dirichlet_thompson:
+      num_simulations: 4
+      num_blocks: 4
+      policy_samples: 1
+      policy_sample_chunk_size: 1
+
+      constants:
+        kappa_leaf: 1.0
+        kappa_terminal: 8.0
+
+training:
+  batch_size: 4096
+  max_updates_per_iter: 1
+  learning_rate: 1e-3
+  grad_clip_norm: 1.0
+
+  losses:
+    policy_weight: 0.5
+    value_dir_kl_weight: 5.0
+    q_dir_kl_weight: 5.0
+    value_outcome_weight: 0.25
+    q_outcome_weight: 0.1
+    q_loss_weight_mode: evidence_mass
+    q_dir_kl_reduction: masked_mean
+    loss_mask_mode: value
+    terminal_edge_targets: true
+    terminal_parent_targets: true
+
+  regularization:
+    dirichlet_concentration_clip: 300.0
+
+eval:
+  interval: 10
+  batch_size: 1024
+  baseline: pgx
+  baseline_id: gardner_chess_v0
+
+logging:
+  interval: 1
+  wandb:
+    enabled: true
+    project: scacchi-az
+
+checkpointing:
+  max_to_keep: 50
+  save_interval_steps: 100

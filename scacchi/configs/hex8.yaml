@@ -1,0 +1,79 @@
+# 8x8 Boardlaw-Dirichlet recipe from W&B run psjkpp1v / super-vortex-239.
+# Run commit: 9273d197ff5ae0209f3f647f9be27f07a348bade plus the logged
+# diff_9273d197ff5ae0209f3f647f9be27f07a348bade.patch.
+# W&B recorded num_outcomes: null, but that commit resolved null Hex
+# Boardlaw-Dirichlet heads to 2 outcomes. Keep this explicit under current code.
+# Original flat W&B keys c_leaf and c_terminal are mapped to the current
+# kappa_leaf and kappa_terminal schema names. This is dirichlet_thompson,
+# not the removed Python wavefront backend.
+
+run:
+  seed: 0
+  max_num_iters: 2000
+
+env:
+  id: hex
+  board_size: 8
+  num_outcomes: 2
+
+model:
+  network: boardlaw_dirichlet
+  num_channels: 1024
+  num_layers: 8
+  resnet_v2: true
+  legacy_dirichlet_head_init: true
+  rezero_kernel_init: orthogonal
+
+selfplay:
+  batch_size: 16_384
+  max_num_steps: 64
+  action_commitment_type: posterior_sample
+  search:
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 4
+      num_blocks: 8
+      constants:
+        kappa_leaf: 1.0
+        kappa_terminal: 8.0
+
+training:
+  batch_size: 8192
+  learning_rate: 1e-3
+  grad_clip_norm: 1.0
+
+  losses:
+    policy_weight: 1.0
+    value_dir_kl_weight: 1.0
+    q_dir_kl_weight: 1.0
+    value_outcome_weight: 0.25
+    q_outcome_weight: 0.1
+    q_loss_weight_mode: evidence_mass
+    q_dir_kl_reduction: masked_mean
+    loss_mask_mode: value
+    terminal_edge_targets: true
+    terminal_parent_targets: true
+
+  regularization:
+    dirichlet_concentration_clip: 100.0
+
+eval:
+  # Disable eval for throughput tests; eval.interval=1 was included in tqdm
+  # wall time and used only 4 games/device on a 64-device slice.
+  interval: 1
+  batch_size: 1024
+  baseline: checkpoint
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 4
+
+logging:
+  interval: 1
+  wandb:
+    enabled: true
+    project: scacchi-az
+
+checkpointing:
+  max_to_keep: 0
+  save_interval_steps: 100

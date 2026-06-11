@@ -1,767 +1,878 @@
-# Plan: Dirichlet-Q AlphaZero on Hex
+# Search and Play Refactor Plan
 
-## Context
+## Goal
 
-This plan ports the Dirichlet-Q work in `math.md` and `latex/algorithms.tex`
-onto the current Hex-first code path. The starting point is the current
-`distributional` branch, which is an AlphaZero-style Hex trainer using:
-
-- `scacchi/envs.py` for configurable Hex board sizes,
-- `scacchi/network.py` with `AZNet` and the smaller `BoardlawNet`,
-- `scacchi/play.py` with stock `mctx.gumbel_muzero_policy`,
-- `scacchi/loss.py` with policy cross-entropy plus scalar value L2,
-- `scacchi/evaluations.py` with MCTS evaluation against solved checkpoints,
-- `scripts/sweep_hex.sh` and `scripts/plot_sweep.py` for faster iteration.
-
-The Hex paper motivating this path is Andy L. Jones, "Scaling Scaling Laws with
-Board Games" (arXiv:2104.03113). The useful implementation consequence is that
-small Hex boards and Boardlaw-style MLPs provide a much tighter eval loop than
-Gardner chess.
-
-The current custom Hex env uses `board_size=7` by default. It has `50` actions
-for 7x7 Hex: one action per cell plus a disabled trailing action. For 3x3 it
-has `10` actions. The trailing action must stay masked everywhere.
-
-Hex has no draws, so the outcome space should be 2-dimensional:
-
-```text
-[L, W]
-```
-
-The generic formulas from `math.md` still apply with `Z=2` outcomes. Use
+Refactor search and gameplay around these concepts:
 
 ```python
-utility(phi) = phi[..., W] - phi[..., L]
+evaluator = make_evaluator(model)
+search = make_search(env, evaluator, play_mode.search)
+player = Player(search, action_committer)
+output = play(env, player_1, player_2, ...)
 ```
 
-where `L=0` and `W=-1`. Do not hard-code `W_IDX = 2`; that was safe for WDL
-but wrong for Hex.
+For self-play, `player_1` and `player_2` are the same learner player. For
+evaluation, `player_1` is the model being evaluated and `player_2` is the
+baseline/opponent player.
 
-## History Notes From `origin/main`
+The main architectural rule is:
 
-The old main branch is useful as a code source and a warning. The main
-Dirichlet migration from the pre-Dirichlet baseline touched roughly:
+- search improves root estimates
+- search converts model priors into posterior targets
+- action commitment decides which move is actually played
+- play advances the environment and records trajectory data
+
+Search should not own action commitment or training loss reduction choices.
+
+## Initial Scope
+
+Focus the first implementation on the JAX/MCTX search paths:
+
+- scalar Gumbel
+- Dirichlet Gumbel
+- Dirichlet Thompson
+
+Keep DQAZ on the existing compatibility path for now. DQAZ has extra native
+engine/export semantics, so it should be migrated after the search/play
+boundary is working for Gumbel and Dirichlet search.
+
+## Current Surface Area
+
+The relevant current files are:
 
 ```text
-19 files changed, 2119 insertions(+), 181 deletions(-)
+scacchi/play.py            274 lines
+scacchi/play_search.py    1497 lines
+scacchi/evaluations.py     218 lines
+scacchi/pipeline.py        205 lines
+scacchi/loss.py            657 lines
+scacchi/types.py           382 lines
 ```
 
-The largest pieces were:
+Current self-play path:
 
-| Area | Old size |
-|---|---:|
-| `scacchi/dirichlet_q_search.py` | ~500 LoC |
-| `tests/test_full_selection.py` | ~430 LoC |
-| `network.py` changes | ~300 LoC |
-| `loss.py` changes | ~130 LoC |
-| `play.py` changes | ~120 LoC |
+```text
+make_training_iteration
+-> make_selfplay
+-> model(obs, train=False)
+-> _run_model_search(...)
+-> _SearchStepOutput with played_action and targets
+-> auto_reset(env.step, env.init)
+-> SelfplayOutput
+-> make_compute_input_for_lossfn
+-> train_minibatches
+```
 
-Important lessons:
+Current eval path:
 
-- The old full migration merged search, loss, eval, checkpointing, masking, and
-  network changes close together, which made eval regressions hard to isolate.
-- The old Hex support mixed `num_outcomes=2` with WDL-style constants
-  `W_IDX = 2`, which is an immediate correctness risk.
-- `origin/main:scacchi/play.py` currently has self-play wiring issues:
-  `invalid_actions` and `legal_action_mask` are referenced without local
-  definitions.
-- The old code has two different Dirichlet parameterizations in different
-  network paths: ResNet uses `exp(t) * softmax(r)`, while the transformer path
-  uses `1 + softplus(c) * softmax(r)`. For the redo, use the math reference
-  form everywhere unless an experiment explicitly says otherwise.
-- The old `action_masking.py` helper and several search tests are worth
-  reusing, but the root search should be made outcome-dimension generic before
-  porting any old implementation.
+```text
+make_mcts_evaluate
+-> _model_eval_action for learner
+-> _model_eval_action for baseline
+-> _make_model_mcts_policy
+-> _run_model_search(...)
+-> choose action by env_state.current_player
+-> _step_active_eval_rows
+-> returns
+```
 
-## Stage 0 - Legal Policy Masks In Samples (~25-60 LoC)
+Current DQAZ path:
 
-Goal: make the current self-play -> replay sample -> loss path carry the
-minimum legality information needed before changing search or network heads.
-Do not add outcome helpers or a separate action-masking abstraction here. MCTX
-already receives `invalid_actions=~env_state.legal_action_mask` in self-play
-and evaluation; Stage 0 should only make the training loss respect the same
-root legal-action mask.
+```text
+_run_posterior_tree_search_step
+-> _run_dqaz_posterior_tree_search
+-> dqaz.SearchEngine
+-> PGX transition batches
+-> optional JAX backup
+-> engine.finish(commit=...)
+-> _dqaz_output_to_posterior_batch
+```
 
-### 0.1 Store legal policy masks in samples
+Important external callers:
 
-Extend the existing data path instead of introducing a new masking module.
-`SelfplayOutput` should carry the legal action mask from the state used to
-produce the root policy:
+- `tests/test_play.py` imports `_run_scalar_gumbel_search`,
+  `_select_played_action`, and `_legalize_played_action`.
+- `tests/test_play_search_tictactoe.py` and
+  `tests/test_play_search_hex_dqaz.py` import `_run_posterior_tree_search_step`.
+- `scripts/fig_8.py` imports `_make_model_mcts_policy` and
+  `_run_posterior_tree_search_step`.
+
+So the refactor is not only local to `play.py`; tests and `fig_8.py` need either
+compatibility shims or direct migration.
+
+## Current Couplings To Break
+
+`_run_model_search` currently does too much:
+
+- reads `config.search.kind`
+- dispatches between scalar gumbel, Dirichlet gumbel, and Dirichlet Thompson
+- reads active search config values dynamically
+- computes posterior policy targets
+- computes `beta_Q_target` and `beta_V_target`
+- computes `q_loss_weight`
+- selects `played_action`
+
+`_run_dqaz_posterior_tree_search` also commits actions internally:
 
 ```python
-class SelfplayOutput(NamedTuple):
+commit = _selfplay_action_source(config)
+results = engine.finish(tree_ids, commit=commit)
+```
+
+This mixes search result export with the acting policy. That should become an
+adapter detail or be moved into external action commitment.
+
+`SelfplayOutput` is also serving multiple roles:
+
+- trajectory data (`obs`, `reward`, `terminated`, `discount`)
+- action data (`played_action`, `legal_action_mask`)
+- policy targets (`action_weights`, `search_loss_mask`)
+- Dirichlet targets (`beta_Q_target`, `beta_V_target`, target metadata fields)
+- DQAZ tree training data and diagnostics
+
+That output can stay as the training-facing compatibility type for a while, but
+internally it should be assembled from smaller stage outputs.
+
+## Config Boundary
+
+`SearchConfig` should be a reusable subsection of each play mode, not the single
+top-level source of truth. Self-play and evaluation can legitimately use
+different search settings, and the eval baseline can use a third search setting.
+
+Search config should only describe search expansion and posterior construction
+behavior.
+
+Keep in each `SearchConfig`:
+
+- `kind`
+- gumbel: `num_simulations`, `gumbel_scale`, search constants
+- Dirichlet Thompson: `num_simulations`, `num_blocks`, search constants
+- DQAZ: `num_simulations`, `inflight_limit`, `state_posterior_kappa_n`,
+  `eval_batch_size`, `pad_to_eval_batch`, `jax_backup`, `debug`,
+  `epsilon_terminal`, search constants
+
+Move out of search:
+
+- action commitment
+- `training.losses.q_loss_weight_mode` stays in training/loss config
+
+Proposed play config shape:
+
+```python
+@dataclass
+class SelfplayConfig:
+    batch_size: int
+    max_num_steps: int
+    search: SearchConfig
+    action_commitment_type: ActionCommitmentType
+
+
+@dataclass
+class EvalConfig:
+    interval: int
+    batch_size: int
+    player_search: SearchConfig
+    baseline_search: SearchConfig
+    player_action_commitment_type: ActionCommitmentType
+    baseline_action_commitment_type: ActionCommitmentType
+    baseline: EvalBaseline
+    baseline_id: str | None = None
+```
+
+Example YAML shape:
+
+```yaml
+selfplay:
+  batch_size: 16384
+  max_num_steps: 128
+  action_commitment_type: posterior_sample
+  search:
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 4
+      num_blocks: 4
+      posterior_policy:
+        samples: 0
+        sample_chunk_size: 32
+      constants:
+        kappa_leaf: 1.0
+        kappa_terminal: 8.0
+
+eval:
+  interval: 10
+  batch_size: 1024
+  baseline: pgx
+  baseline_id: gardner_chess_v0
+  player_action_commitment_type: posterior_argmax
+  baseline_action_commitment_type: posterior_argmax
+  player_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 64
+      gumbel_scale: 1.0
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0
+```
+
+The posterior policy sample fields can also stay inside the active search config
+if we treat them as part of producing the posterior policy target. The important
+boundary is that action commitment and loss reduction choices do not live in
+search.
+
+`posterior_best` and `posterior_argmax` should collapse to one public name. The
+old spelling can remain as a compatibility alias for one migration. The current
+top-level `config.search` can also stay as a temporary compatibility alias, but
+new code should read `config.selfplay.search`, `config.eval.player_search`, and
+`config.eval.baseline_search`.
+
+Construction then becomes:
+
+```python
+selfplay_search = make_search(env, learner_evaluator, config.selfplay.search)
+selfplay_player = make_player(selfplay_search, selfplay_committer)
+
+eval_player_search = make_search(env, learner_evaluator, config.eval.player_search)
+eval_player = make_player(eval_player_search, eval_player_committer)
+
+baseline_search = make_search(env, baseline_evaluator, config.eval.baseline_search)
+baseline_player = make_player(baseline_search, baseline_committer)
+```
+
+## Stage Contracts
+
+### NN Evaluator
+
+The evaluator owns model invocation and output normalization, not search.
+
+```python
+class EvaluatorOutput(NamedTuple):
+    logits: jax.Array
+    value: jax.Array | None = None
+    alpha_v: jax.Array | None = None
+    alpha_q: jax.Array | None = None
+```
+
+Expected behavior:
+
+- NNX models are called as `model(obs, train=False)`.
+- PGX baseline models are called as `model(obs)`.
+- Scalar networks fill `logits` and `value`.
+- Dirichlet networks fill `logits`, `alpha_v`, and `alpha_q`.
+
+This can start as a model-bound helper function rather than a class:
+
+```python
+evaluator(obs) -> EvaluatorOutput
+```
+
+### Search Function
+
+The bound search function is built from the environment, a model-bound
+evaluator, and the selected search config for the current play mode.
+
+```python
+search = make_search(env, evaluator, play_mode_search_config)
+```
+
+Runtime signature:
+
+```python
+search_output = search(
+    root_state=env_state,
+    rng_key=search_key,
+)
+```
+
+`make_search(...)` bakes in the expansion logic. For the current MCTX paths,
+that means it builds the same recurrent functions already used in the code:
+
+```python
+make_recurrent_fn(env, evaluator)
+make_dirichlet_recurrent_fn_from_constants(env, evaluator, search_cfg.constants)
+```
+
+With the new evaluator contract, these factories keep their role but consume
+`EvaluatorOutput` fields instead of unpacking raw model tuples directly. The
+Dirichlet recurrent builder should take the active search constants directly,
+not the full global config.
+
+The caller should not pass a separate raw `predict_fn` or recurrent function.
+`make_search(...)` uses `search_cfg` to choose the scalar, Dirichlet, or later
+DQAZ evaluator/search adapter internally.
+
+Scalar Gumbel search uses the scalar recurrent function. Dirichlet Gumbel and
+Dirichlet Thompson search use the Dirichlet recurrent function. DQAZ is the
+exception for now: it is not an MCTX recurrent search, so its search closure can
+keep adapting to the existing native posterior-tree transition/evaluation path
+behind the DQAZ adapter.
+
+Search evaluates the root position itself, runs the configured search, and
+returns improved predictions shaped like the model heads plus training metadata.
+
+```python
+class SearchOutput(NamedTuple):
+    posterior: PosteriorTargets
+    diagnostics: SearchDiagnostics | None = None
+
+
+class PosteriorTargets(NamedTuple):
+    prediction: PosteriorPrediction
+    metadata: TargetMetadata | None = None
+
+
+class PosteriorPrediction(NamedTuple):
+    policy: jax.Array
+    value: jax.Array | None = None
+    alpha_v: jax.Array | None = None
+    alpha_q: jax.Array | None = None
+
+
+class TargetMetadata(NamedTuple):
+    mask: jax.Array | None = None
+    q_weight: jax.Array | None = None
+    q_target_kind: jax.Array | None = None
+    q_target_weight: jax.Array | None = None
+    q_target_outcome: jax.Array | None = None
+    q_target_distance: jax.Array | None = None
+    v_target_kind: jax.Array | None = None
+    v_target_weight: jax.Array | None = None
+    v_target_outcome: jax.Array | None = None
+    v_target_distance: jax.Array | None = None
+    tree_data: TreeTrainingData | None = None
+```
+
+Field meaning:
+
+- `posterior.prediction.policy` is `pi_search`. It is a policy distribution,
+  not logits.
+- For scalar policy/value models, `posterior.prediction.value` is the searched
+  scalar value target when available.
+- For Dirichlet models, `posterior.prediction.alpha_v` and
+  `posterior.prediction.alpha_q` are the searched Dirichlet posteriors for the
+  value and Q heads.
+- `metadata.mask` marks rows/actions with valid search targets.
+- `metadata.q_weight` is the Q-head loss weight.
+- target kind/outcome/distance/weight fields are categorical-vs-Dirichlet
+  target metadata used by the current DQAZ/terminal-target loss path.
+- `metadata.tree_data` contains optional extra tree rows for training.
+- `diagnostics` contains search metrics only.
+
+Search does not return `played_action`.
+
+Behavior by search/network type:
+
+- Scalar gumbel:
+  - `posterior.prediction.policy = pi_search`
+  - `posterior.prediction.value` may hold a searched scalar value target if we
+    want scalar value targets from search; otherwise scalar value training can
+    keep using trajectory returns.
+
+- Dirichlet gumbel:
+  - `posterior.prediction.policy = pi_search`
+  - `posterior.prediction.alpha_v = beta_V_target`
+  - `posterior.prediction.alpha_q = beta_Q_target`
+
+- Dirichlet Thompson:
+  - search expands with `num_simulations` and `num_blocks`
+  - `posterior.prediction.policy = pi_search`
+  - `posterior.prediction.alpha_v = beta_V_target`
+  - `posterior.prediction.alpha_q = beta_Q_target`
+
+- DQAZ:
+  - `posterior.prediction.policy = pi_search`
+  - `posterior.prediction.alpha_v = beta_V_target`
+  - `posterior.prediction.alpha_q = beta_Q_target`
+  - categorical solved outcomes and target weights go in `metadata`
+
+Intermediate values like `q_evidence_sum`, `action_alpha_post`, and
+`action_value_target_prior` stay inside the search implementation. They are not
+part of the public play/training contract unless we explicitly add them as
+diagnostics.
+
+### Action Committer
+
+Action commitment decides the move to play.
+
+```python
+action = action_committer(
+    posterior=search_output.posterior,
+    legal_action_mask=env_state.legal_action_mask,
+    rng_key=commit_key,
+)
+```
+
+Supported commitment types:
+
+```text
+posterior_argmax -> argmax(posterior.prediction.policy)
+posterior_sample -> sample(posterior.prediction.policy)
+```
+
+The old `search_action` mode needs a migration decision. Either drop it, or keep
+it as a compatibility-only mode by adding an optional backend action field to
+metadata for backends that expose one. The core `SearchOutput` shape should not
+grow raw search internals just for this mode.
+
+Every mode goes through `legalize_action(action, legal_action_mask)`.
+
+This replaces `_select_played_action`; the old function can remain as a shim
+temporarily for tests.
+
+### Player
+
+The player composes a bound search function and action commitment. The model,
+environment, evaluator, and search config are already baked into `search`.
+
+```python
+class PlayerOutput(NamedTuple):
+    action: jax.Array
+    posterior: PosteriorTargets | None = None
+    diagnostics: SearchDiagnostics | None = None
+```
+
+For training self-play, `posterior` is present. For eval, only `action` is
+required; posterior fields may be `None`.
+
+Because batched positions can contain both current players, `play` usually has
+to evaluate both players for the whole batch and select row-wise by
+`env_state.current_player`. This means both players should return the same
+PyTree structure for a given play mode. Eval players can both use a minimal
+`PlayerOutput(action=...)` schema.
+
+The player API can be small:
+
+```python
+player = make_player(search, committer)
+output = player(env_state, key)
+```
+
+The player calls `search(env_state, search_key)`, commits from
+`search_output.posterior.prediction.policy`, and stores the full posterior for
+training self-play. A simple policy-only baseline can still be represented as a
+different bound search function that returns a `SearchOutput` with only a policy
+posterior.
+
+### Play
+
+Generic play should own environment progression only.
+
+```python
+training_samples, eval_metrics = play(
+    env,
+    player_1,
+    player_2,
+    rng_key,
+    play_config,
+)
+```
+
+`play_config` owns batch size, maximum steps, reset behavior, stop behavior, and
+whether training samples or eval metrics are populated.
+
+Step behavior:
+
+1. Record pre-step observation and legal mask if training data is being
+   collected.
+2. Build a searchable state. For eval/all-done mode, terminal rows get a dummy
+   legal action because their actions are discarded.
+3. Split keys for player 1, player 2, commitment, and reset.
+4. Evaluate both players on the searchable state.
+5. Select action row-wise with `env_state.current_player`.
+6. Validate/legalize action.
+7. Step active rows.
+8. Auto-reset rows only in fixed-horizon self-play mode.
+9. Record reward, discount, termination, selected action, and selected player
+   training fields.
+
+The base output has both sides of the collection contract:
+
+```python
+class TrainingSamples(NamedTuple):
     obs: jax.Array
-    reward: jax.Array
-    terminated: jax.Array
-    action_weights: chex.Array
+    posterior: PosteriorTargets
     legal_action_mask: jax.Array
-    discount: jax.Array
+    played_action: jax.Array | None = None
+
+
+class EvalMetrics(NamedTuple):
+    avg_return: jax.Array
+    win_rate: jax.Array
+    draw_rate: jax.Array
+    lose_rate: jax.Array
+
+
+play(...) -> tuple[TrainingSamples | None, EvalMetrics | None]
 ```
 
-In `play.py`, capture it next to `observation`, before stepping/resetting:
+Then expose thin wrappers:
 
 ```python
-observation = env_state.observation
-legal_action_mask = env_state.legal_action_mask
-...
-return env_state, SelfplayOutput(
-    obs=observation,
-    action_weights=policy_output.action_weights,
-    legal_action_mask=legal_action_mask,
-    ...
-)
+play_training(...) -> TrainingSamples
+play_eval(...) -> EvalMetrics
 ```
 
-Then split `Sample.mask` into explicit masks so the names match their use:
+For the first implementation, keep a compatibility adapter from
+`TrainingSamples` to the existing `SelfplayOutput` fields. Longer term,
+`loss.py` should consume `samples.obs`, `samples.posterior.prediction`, and
+`samples.posterior.metadata` directly.
 
-```python
-class Sample(NamedTuple):
-    obs: jax.Array
-    policy_tgt: chex.Array
-    value_tgt: jax.Array
-    policy_mask: jax.Array      # [T, B, A], legal actions at the sampled root
-    value_mask: jax.Array       # [T, B], positions with a final outcome
-```
+`make_selfplay` becomes a wrapper around `play_training(learner, learner, ...)`.
 
-`make_compute_loss_input` should set:
+`make_mcts_evaluate` becomes a wrapper around
+`play_eval(learner, baseline, ...)`.
 
-```python
-policy_mask=data.legal_action_mask
-value_mask=value_mask
-```
+## Function Reduction Estimate
 
-### 0.2 Apply masks in losses
+The estimate changes now that the first implementation deliberately keeps DQAZ
+on the compatibility path. Several old helpers are ugly, but they are still
+used by `_run_posterior_tree_search_step` and the native DQAZ export path, so
+they should not be counted as first-pass deletions.
 
-Use Optax's `where` argument for the policy cross-entropy:
-
-```python
-policy_loss = optax.softmax_cross_entropy(
-    logits,
-    data.policy_tgt,
-    where=data.policy_mask,
-)
-policy_loss = masked_mean(policy_loss, data.value_mask)
-```
-
-Keep the value loss masked by `value_mask`:
-
-```python
-value_loss = optax.l2_loss(value, data.value_tgt)
-value_loss = masked_mean(value_loss, data.value_mask)
-```
-
-The `where` mask prevents illegal actions from contributing to policy CE. The
-`value_mask` keeps padded/no-outcome time steps out of both losses. This is
-enough for Stage 0 because search-time action legality is already handled by
-MCTX's `invalid_actions`.
-
-### 0.3 Tests
-
-Add focused tests for:
-
-- `SelfplayOutput.legal_action_mask` is copied from the pre-step root state.
-- policy CE ignores illegal logits/targets through `where=data.policy_mask`.
-- value and policy losses ignore timesteps where `value_mask` is false.
-
-Expected files and LoC:
-
-| File | Change |
-|---|---:|
-| `scacchi/play.py` | +5 to +10 |
-| `scacchi/loss.py` | +10 to +20 |
-| `tests/test_loss_masks.py` | +40 to +70 |
-
-## Stage B-Hex - Dirichlet Heads With Scalar MCTX Bridge (~180-260 LoC)
-
-Goal: make the network emit Dirichlet value and Q heads while preserving the
-existing stock MCTX trajectory distribution. This is the first trainable
-Dirichlet checkpoint, but it is not yet the full search rule.
-
-### B.1 Network outputs
-
-Change all model calls from:
-
-```python
-logits, value = model(obs, train=...)
-```
-
-to:
-
-```python
-logits, alpha_V, alpha_Q = model(obs, train=...)
-```
-
-where:
+Current measured surface:
 
 ```text
-alpha_V: [B, Z]
-alpha_Q: [B, A, Z]
-Z = 2 for Hex
+core files:
+  scacchi/play.py            274 lines
+  scacchi/play_search.py    1497 lines
+  scacchi/evaluations.py     218 lines
+  scacchi/pipeline.py        205 lines
+  scacchi/loss.py            657 lines
+  scacchi/types.py           382 lines
+
+nearby tests:
+  tests/test_play.py                 180 lines
+  tests/test_evaluations.py          161 lines
+  tests/test_config_validation.py    353 lines
 ```
 
-Use the math reference parameterization:
+First-pass scope:
 
-```python
-alpha = exp(t) * softmax(r)
+- add `make_search(env, evaluator, search_cfg)` for scalar Gumbel, Dirichlet
+  Gumbel, and Dirichlet Thompson
+- add `make_player(search, action_committer)`
+- add generic `play(...)`, `play_training(...)`, and `play_eval(...)`
+- move search outputs to `PosteriorTargets`
+- nest search configs under `selfplay` and `eval`
+- keep adapters for `SelfplayOutput`, current loss input, DQAZ, and old tests
+
+High-confidence first-pass deletes:
+
+```text
+1. _stack_optional_tree
+2. _stack_selfplay_frames
+3. _concat_selfplay_time
+4. _make_model_mcts_policy
+5. _model_eval_action
+6. _with_eval_num_simulations
+7. _with_eval_search_kind
+8. _baseline_eval_search_config
 ```
 
-Add a helper in `network.py`:
+Likely first-pass replacements or shims, not hard deletes:
 
-```python
-def dirichlet_from_logits(mean_logits, concentration_logit):
-    return jnp.exp(concentration_logit)[..., None] * jax.nn.softmax(mean_logits, axis=-1)
+```text
+_run_model_search             -> make_search-backed compatibility wrapper
+_SearchStepOutput             -> SearchOutput adapter for old callers
+_run_scalar_gumbel_search     -> scalar gumbel search closure or shim
+_run_dirichlet_search         -> Dirichlet search closure or shim
+_select_played_action         -> commit_action shim
+_legalize_played_action       -> legalize_action shim
+_search_loss_mask             -> target metadata utility
+_empty_posterior_targets      -> scalar/Dirichlet posterior utility
+_q_loss_weight_from_mode      -> target metadata or loss adapter utility
+_native_target_kwargs_from_output -> DQAZ compatibility adapter
+_searchable_eval_state        -> generic play utility
+_step_active_eval_rows        -> generic play utility
+_poison_eval_returns          -> eval collector utility
+_concat_selfplay_outputs      -> TrainingSamples/SelfplayOutput adapter
+_fixed_replay_window          -> replay buffer utility or delete if unused
 ```
 
-For `BoardlawNet`, add:
+Must stay during the DQAZ compatibility phase:
 
-- `value_dir_head: Linear(width, Z)`,
-- `value_conc_head: Linear(width, 1)`,
-- `q_dir_head: Linear(width, num_actions * Z)`,
-- `q_conc_head: Linear(width, num_actions)`.
-
-For `AZNet`, mirror the old branch's ResNet approach:
-
-- replace scalar `value_out` with value Dirichlet logits/concentration,
-- add an action-Q tower or a flat Q head off existing body features.
-
-If the first Hex iteration uses only `network: boardlaw`, `AZNet` can be
-updated in the same PR for API consistency but does not need tuning.
-
-### B.2 Scalar bridge into stock MCTX
-
-In `play.py` and `evaluations.py`:
-
-```python
-alpha_V_mean = outcome_mean(alpha_V)
-value = utility(alpha_V_mean)
+```text
+_search_value
+_search_constant
+_search_kind
+_selfplay_action_source
+PosteriorTreeBatchOutput
+_run_posterior_tree_search_step
+_run_dqaz_posterior_tree_search
+_dqaz_output_to_posterior_batch
 ```
 
-Feed that scalar `value` to `mctx.RootFnOutput` and recurrent outputs. Keep
-stock `mctx.gumbel_muzero_policy` and `qtransform_completed_by_mix_value`.
+Estimated deletion count:
 
-Terminal recurrent values stay:
+- first pass: hard-delete about 6 to 8 functions and replace another 8 to 12
+  with shims or moved utilities
+- final cleanup after loss, tests, scripts, and DQAZ migrate: remove about 18 to
+  25 functions/classes
 
-```python
-value = jnp.where(env_state.terminated, 0.0, value)
-discount = jnp.where(env_state.terminated, 0.0, -jnp.ones_like(value))
+Estimated first-pass line-count impact:
+
+```text
+play.py:
+  current: 274 lines
+  expected: 230 to 320 lines
+  net: -40 to +50
+  reason: old self-play helpers go away, generic play and wrappers arrive
+
+evaluations.py:
+  current: 218 lines
+  expected: 45 to 80 lines
+  net: -140 to -175
+  reason: eval becomes a thin player/play wrapper
+
+play_search.py:
+  current: 1497 lines
+  expected: 1450 to 1580 lines
+  net: -50 to +80
+  reason: Gumbel/Dirichlet get a cleaner factory, but DQAZ and old shims stay
+
+new player/search/play modules:
+  expected: +180 to +320 lines if split out
+  note: this is absorbed into existing files if we keep the refactor local
+
+pipeline.py:
+  current: 205 lines
+  expected: 180 to 240 lines
+  net: -25 to +35
+  reason: replay/loss adapters may temporarily offset helper deletion
+
+loss.py:
+  current: 657 lines
+  expected first pass: 650 to 730 lines
+  net: -10 to +70
+  reason: likely keeps current Sample/SelfplayOutput path through an adapter
+
+types.py/configs:
+  current: 382 lines
+  expected: 450 to 520 lines
+  net: +70 to +140
+  reason: nested play search configs plus temporary aliases/validation
+
+tests:
+  current nearby tests: 694 lines
+  expected: 740 to 850 lines
+  net: +45 to +155
+  reason: new factory/player/play tests while compatibility tests still exist
 ```
 
-This stage deliberately leaves search behavior close to the baseline. It tests
-only whether the new heads train and evaluate without shape bugs.
+Net first-pass estimate:
 
-### B.3 Stage-B training targets
+- if split into new modules: roughly +100 to +300 lines
+- if kept mostly in existing files: roughly +50 to +220 lines
 
-Keep the existing MCTX policy target:
+This pass is likely a temporary line-count increase. That is acceptable because
+we are deliberately buying compatibility while changing the boundaries.
 
-```python
-policy_tgt = policy_output.action_weights
+Final cleanup estimate after the compatibility layer is removed:
+
+```text
+delete old SelfplayOutput adapters and old _SearchStepOutput path:   -80 to -140
+delete old eval-specific MCTS action path:                           -120 to -175
+delete top-level search config aliases and old action_source names:   -30 to -70
+let loss consume TrainingSamples/PosteriorTargets directly:           -40 to -120
+migrate or split DQAZ helpers from generic play_search.py:            -80 to -200
 ```
 
-Replace scalar value L2 with outcome losses:
+Expected final net versus the current codebase:
 
-- `L_pi`: cross-entropy between MCTX action weights and policy logits.
-- `L_V_outcome`: cross-entropy between final game outcome and
-  `mean(alpha_V)`.
-- `L_Q_played_outcome`: cross-entropy between final game outcome and
-  `mean(alpha_Q[:, played_action])`.
+- conservative cleanup: about -150 to -350 lines
+- if DQAZ is split cleanly and native export adapters shrink: about -250 to
+  -500 lines
 
-Add `played_action` to `SelfplayOutput`; the Q head should get a direct signal
-before search-derived Q evidence exists.
+The main benefit is still not raw line-count reduction. The main benefit is that
+the hard boundaries become testable:
 
-For Hex, final outcome target is `[L,W]`. The old bootstrapped scalar
-`value_tgt` from `loss.py` can still be reused to construct the class index:
+- evaluator: model output normalization
+- search: prior to posterior conversion
+- player: posterior to action commitment
+- play: environment stepping and collection
+- loss/eval: consume the appropriate collected output
 
-```python
-outcome_idx = (jnp.round(value_tgt).astype(jnp.int32) + 1) // 2
-outcome_tgt = jax.nn.one_hot(outcome_idx, 2)
-```
+## Migration Plan
 
-### B.4 Config and logging
+### Phase 1: Introduce Stage Types And Utilities
+
+Add the new `SearchOutput`, `PosteriorTargets`, `PosteriorPrediction`,
+`TargetMetadata`, and `PlayerOutput` types.
+
+Move or wrap these helpers without changing behavior:
+
+- `legalize_action`
+- `commit_action`
+- scalar empty Dirichlet compatibility targets
+- posterior policy target builder
+
+Keep old names as compatibility shims for tests.
+
+### Phase 2: Search Factory
 
 Add:
 
 ```python
-num_outcomes: int | None = None  # default inferred from env
-policy_loss_weight: float = 1.0
-value_outcome_weight: float = 1.0
-q_outcome_weight: float = 0.25
-dirichlet_concentration_clip: float | None = 8.0
+make_search(env, evaluator, search_cfg)
 ```
 
-Log:
-
-- `train/policy_loss`,
-- `train/value_outcome_loss`,
-- `train/q_outcome_loss`,
-- `train/alpha_V_concentration`,
-- `train/alpha_Q_concentration`.
-
-### B.5 Verification
-
-Use tiny CPU smoke runs locally when no GPU is available:
-
-```bash
-SCACCHI_ALLOW_CPU=1 JAX_PLATFORMS=cpu uv run python -m scacchi.train \
-  board_size=3 selfplay_batch_size=16 eval_batch_size=8 \
-  num_simulations=4 max_num_steps=16 max_num_iters=2 wandb_enabled=false
-```
-
-Then run the normal GPU path for board size 3 or 4. Do not move to Stage A
-until:
-
-- all losses are finite,
-- `mean(alpha_V).sum(-1) ~= 1`,
-- `mean(alpha_Q).sum(-1) ~= 1`,
-- MCTS eval still runs against the solved checkpoint.
-
-Expected files and LoC:
-
-| File | Change |
-|---|---:|
-| `scacchi/network.py` | +70 to +120 |
-| `scacchi/play.py` | +35 to +60 |
-| `scacchi/loss.py` | +60 to +90 |
-| `scacchi/evaluations.py` | +25 to +45 |
-| `scacchi/train.py` / `configs/hex.yaml` | +20 to +35 |
-| tests | +80 to +140 |
-
-## Stage A-Hex - Evidence Side Channel And Posterior-Best Policy (~170-260 LoC)
-
-Goal: use stock MCTX for tree expansion, but reconstruct Dirichlet-Q evidence
-from node embeddings after search. This matches the evidence aggregation in
-`math.md` while still avoiding private MCTX root selection.
-
-### A.1 Node embedding
-
-Replace the bare `pgx.State` MCTX embedding with:
+Dispatch by concrete config type:
 
 ```python
-class NodeEmbedding(NamedTuple):
-    state: pgx.State
-    outcome_dist: jax.Array      # [B, Z], node-local perspective
-    evidence_weight: jax.Array   # [B]
-    root_action: jax.Array       # [B], NO_PARENT at root
-    depth_parity: jax.Array      # [B], 0=root perspective, 1=flipped
-    alpha_Q_prior: jax.Array     # [B, A, Z], useful for later root selection
+GumbelSearchConfig -> bound gumbel search closure
+DirichletThompsonSearchConfig -> bound Dirichlet Thompson closure
 ```
 
-Root embedding:
+The returned search function should not inspect the global `Config` object and
+should not receive raw prediction or recurrent functions at call time. Static
+config values, environment stepping, and model evaluation are closed over once.
+
+This phase removes `_search_value`, `_search_kind`, and most dynamic active
+config lookups from the new Gumbel/Dirichlet hot path. Those helpers can stay
+in `play_search.py` temporarily for the DQAZ compatibility path.
+
+### Phase 3: Posterior Metadata And Action Commitment
+
+Add:
 
 ```python
-outcome_dist = outcome_mean(alpha_V)
-evidence_weight = 0.0
-root_action = NO_PARENT
-depth_parity = 0
-alpha_Q_prior = alpha_Q
+make_action_committer(commitment_cfg)
 ```
 
-Recurrent expansion:
+Make each search backend populate `PosteriorTargets` and `TargetMetadata`
+directly. The current `q_loss_weight`, `search_loss_mask`, and categorical
+target fields become metadata. Keep a compatibility adapter that maps
+`TrainingSamples` back to the existing `SelfplayOutput` field names until
+`loss.py` is migrated.
 
-```python
-env_state = env.step(parent_state, action)
-logits, alpha_V, alpha_Q = model(env_state.observation)
-nonterminal_dist = outcome_mean(alpha_V)
-terminal_parent = terminal_outcome_from_reward(reward, Z)
-terminal_child = flip_outcome(terminal_parent)
-outcome_dist = where(terminated, terminal_child, nonterminal_dist)
-evidence_weight = where(terminated, c_terminal, c_leaf)
-root_action = where(parent.root_action == NO_PARENT, action, parent.root_action)
-depth_parity = 1 - parent.depth_parity
-```
-
-Store terminal outcomes in child-local perspective. The scatter step will flip
-back to root perspective using `depth_parity`.
-
-### A.2 Evidence scatter
-
-After MCTX returns, compute:
-
-```python
-outcome_aligned = where(depth_parity[..., None] == 1,
-                        flip_outcome(outcome_dist),
-                        outcome_dist)
-
-valid = (root_action != NO_PARENT) & (tree.node_visits > 0)
-q_evidence_sum[b, a, :] =
-    sum_n 1[root_action[b,n] == a] * evidence_weight[b,n] * outcome_aligned[b,n,:]
-
-alpha_Q_post = alpha_Q_prior + q_evidence_sum
-```
-
-This is the direct linear evidence update:
+Rename:
 
 ```text
-alpha_a <- alpha_a + lambda * d
+selfplay.action_source -> selfplay.action_commitment_type
 ```
 
-For Hex, `q_evidence_sum.shape == [B, A, 2]`.
-
-### A.3 Posterior-best policy target
-
-Replace MCTX visit/action weights as the policy target:
-
-```python
-phi = random.dirichlet(key, alpha_Q_post, shape=(M, B, A))
-score = phi[..., W] - phi[..., L]
-score = mask_invalid_scores(score, invalid_actions)
-a_star = argmax(score, axis=-1)
-policy_target = histogram(a_star) / M
-```
-
-Default:
-
-```python
-policy_mc_samples: int = 32
-```
-
-Use the unsmoothed histogram for the target, matching the latest math docs. For
-sampling the played self-play action, clip before `log`:
-
-```python
-action_logits = log(clip(policy_target, 1e-8, 1.0))
-```
-
-Add a temporary ablation flag:
-
-```python
-selfplay_action_source: "posterior_best" | "mctx" = "posterior_best"
-```
-
-Default to `"posterior_best"` because that is the algorithm we want, but keep
-the fallback for debugging whether regressions come from target construction or
-from the played-action distribution.
-
-### A.4 Posterior targets to store
-
-Self-play should carry fixed targets, not rebuild moving targets during train:
-
-```python
-policy_target: [T, B, A]
-beta_Q_target: [T, B, A, Z] = alpha_Q_prior + q_evidence_sum
-q_target_mask: [T, B, A] = q_evidence_sum.sum(-1) > 0
-
-v_evidence_sum = (policy_target[..., None] * q_evidence_sum).sum(axis=-2)
-beta_V_target: [T, B, Z] = alpha_V_prior + v_evidence_sum
-value_target_mask: [T, B] = v_evidence_sum.sum(-1) > 0
-```
-
-Keep Stage-B outcome losses available, but make these posterior targets the
-primary artifact produced by search.
-
-### A.5 Verification
-
-Add tests using tiny fake trees:
-
-- evidence routes to the correct root action,
-- parity flips are correct for 2-outcome Hex,
-- terminal child evidence stores child-local outcome and scatters back to
-  root-local outcome,
-- invalid actions never win posterior-best MC sampling,
-- `policy_target.sum(-1) == 1` for rows with legal actions,
-- `beta_Q_target == alpha_Q_prior + q_evidence_sum`.
-
-Expected files and LoC:
-
-| File | Change |
-|---|---:|
-| new `scacchi/dirichlet_q_search.py` or `scacchi/dirichlet_targets.py` | +150 to +220 |
-| `scacchi/play.py` | +60 to +90 |
-| `scacchi/loss.py` | +20 to +40 |
-| `scacchi/train.py` / config | +15 to +30 |
-| tests | +140 to +220 |
-
-## Stage Full-Losses-Hex - Direct Posterior KL Targets (~90-150 LoC)
-
-Goal: train the value and Q Dirichlet heads against the fixed posterior targets
-stored by self-play, as in `math.md` sections 10-15.
-
-### FL.1 Losses
-
-Use:
-
-```python
-L_pi = -sum_a policy_target[a] * log_softmax(policy_logits)[a]
-L_V = KL(Dir(stopgrad(beta_V_target)) || Dir(alpha_V_current))
-L_Q = KL(Dir(stopgrad(beta_Q_target)) || Dir(alpha_Q_current))
-```
-
-Mask:
-
-```python
-L_V only where value_target_mask
-L_Q only where q_target_mask
-```
-
-The Dirichlet KL is:
-
-```python
-KL(Dir(beta) || Dir(alpha))
-```
-
-using `gammaln` and `digamma`, as in `math.md` section 16.
-
-### FL.2 Outcome grounding
-
-Keep the Stage-B final-outcome losses as configurable diagnostics:
-
-```python
-value_outcome_weight: float = 0.0
-q_outcome_weight: float = 0.0
-```
-
-If KL-only training is unstable early, turn them back on with small weights.
-Do not silently mix them into the default final algorithm.
-
-### FL.3 Metrics
-
-Log:
-
-- `train/policy_nll_loss`,
-- `train/policy_kl_hat`,
-- `train/value_dir_kl_loss`,
-- `train/q_dir_kl_loss`,
-- `train/value_target_coverage`,
-- `train/q_target_coverage`,
-- `train/q_evidence_mass_mean`,
-- `train/policy_target_entropy`.
-
-Expected files and LoC:
-
-| File | Change |
-|---|---:|
-| `scacchi/loss.py` | +70 to +100 |
-| `scacchi/play.py` | +10 to +20 |
-| `scacchi/train.py` | +15 to +25 |
-| tests | +80 to +140 |
-
-## Stage Full-Selection-Hex - Thompson Root Search (~160-260 LoC)
-
-Goal: change the search trajectory to match `algorithms.tex` Algorithms 8-10:
-root selection samples from the live Dirichlet posterior instead of using
-Gumbel MuZero root selection.
-
-This should happen after Stage A and Full-Losses are stable, because it changes
-the data distribution.
-
-### FS.1 MCTX private-search wrapper
-
-Add a narrow wrapper around the pinned MCTX private API:
-
-```python
-from mctx._src import action_selection
-from mctx._src import search as mctx_search
-```
-
-Keep this isolated in `scacchi/dirichlet_q_search.py`.
-
-Call:
-
-```python
-mctx_search.search(
-    params=(),
-    rng_key=search_key,
-    root=root,
-    recurrent_fn=recurrent_fn,
-    root_action_selection_fn=dirichlet_root_action_selection,
-    interior_action_selection_fn=policy_prior_interior_action_selection,
-    num_simulations=config.num_simulations,
-    invalid_actions=invalid_actions,
-    extra_data=DirichletRootExtra(alpha_Q_prior=alpha_Q),
-)
-```
-
-### FS.2 Root selector
-
-Inside the unbatched selector:
-
-```python
-q_evidence = q_evidence_sum_unbatched(tree, A, dtype)
-alpha_Q_post = alpha_Q_prior + q_evidence
-phi = random.dirichlet(key, alpha_Q_post)  # [A, Z]
-score = phi[..., -1] - phi[..., 0]
-return masked_argmax(score, tree.root_invalid_actions)
-```
-
-Do not assume `Z=3`.
-
-### FS.3 Interior selector
-
-First implementation:
-
-```python
-policy_prior_interior_action_selection
-```
-
-This uses policy priors and visit balancing, not scalar MCTX Q. It is less
-ambitious but easier to debug: the root is Dirichlet-Q; the interior traversal
-is a policy-guided evidence collector.
-
-Only after root Thompson is stable, add an optional WDL/outcome-native interior
-selector that reconstructs child evidence under each interior action.
-
-### FS.4 Repeated search blocks
-
-Add after single-block root Thompson works:
-
-```python
-num_search_blocks: int = 1
-```
-
-Each block starts from the previous block's root posterior:
-
-```python
-alpha_Q_post = alpha_Q_post + block_q_evidence
-```
-
-This implements Algorithm 10 from `algorithms.tex` and gives a simple knob for
-larger search budgets without changing the loss code.
-
-### FS.5 Verification
-
-Tests:
-
-- with `num_simulations=1`, selected action equals `argmax U(phi_a)` for the
-  sampled Dirichlet draw;
-- after one expansion, only the selected root action receives evidence;
-- invalid trailing Hex action is never selected;
-- batched and unbatched evidence sums agree on a toy tree;
-- Gumbel Stage-A and Thompson Stage-FS share the same target/loss code after
-  search returns.
-
-Expected files and LoC:
-
-| File | Change |
-|---|---:|
-| `scacchi/dirichlet_q_search.py` | +120 to +190 |
-| `scacchi/play.py` | +20 to +40 |
-| `scacchi/evaluations.py` | +20 to +35 |
-| config | +10 |
-| tests | +160 to +240 |
-
-## Stage Eval-Hex - Fast Regression Loop (~80-160 LoC)
-
-Goal: make eval quality visible quickly enough to catch regressions at the
-stage where they are introduced.
-
-### E.1 Evaluation modes
-
-Keep the current MCTS-vs-pretrained checkpoint eval and add explicit modes:
-
-```python
-eval_mode: "mcts_vs_checkpoint" | "sample_vs_checkpoint" | "selfplay_ablation"
-eval_action_selection: "argmax" | "sample"
-```
-
-For Dirichlet-Q model eval:
-
-- Stage B/A can use the scalar bridge or posterior-best policy depending on
-  the stage.
-- Stage Full-Selection should call the Dirichlet search wrapper.
-- The opponent checkpoint can stay scalar AlphaZero; it does not need a
-  synthetic Q head unless it uses Dirichlet search.
-
-### E.2 Sweep script
-
-Extend `scripts/sweep_hex.sh` with method knobs:
-
-```bash
-method=az | dq_stage_b | dq_stage_a | dq_thompson
-policy_mc_samples=...
-c_leaf=...
-c_terminal=...
-selfplay_action_source=...
-```
-
-Keep board-size sweeps small initially:
+Keep old YAML support temporarily:
 
 ```text
-board_size=3,4 for correctness
-board_size=5,6 for learning signal
-board_size=7 after the stage is stable
+action_source maps to action_commitment_type with a deprecation note
+posterior_best maps to posterior_argmax
 ```
 
-### E.3 Plotting
+### Phase 4: Player
 
-`scripts/plot_sweep.py` already plots Elo-like curves against the solved
-checkpoint. Add grouping by `method` or W&B tags so AlphaZero and Dirichlet-Q
-curves can be compared on the same board size.
+Add:
 
-Expected files and LoC:
-
-| File | Change |
-|---|---:|
-| `scacchi/evaluations.py` | +40 to +80 |
-| `scacchi/train.py` / config | +20 to +40 |
-| `scripts/sweep_hex.sh` | +20 to +40 |
-| `scripts/plot_sweep.py` | +20 to +40 |
-
-## Recommended PR Sequence
-
-1. Stage 0 only: outcome/masking helpers and tests.
-2. Stage B-Hex: network heads, scalar MCTX bridge, outcome losses.
-3. Stage A-Hex: embedding evidence, posterior-best target, posterior target
-   storage; still stock MCTX root selection.
-4. Full-Losses-Hex: direct Dirichlet KL losses from stored beta targets.
-5. Full-Selection-Hex: Thompson root selector through isolated MCTX private API.
-6. Repeated blocks and WDL/outcome-native interior selection only after root
-   Thompson evals are stable.
-
-Each PR should be evaled on board sizes 3 and 4 before moving on. Do not rely
-on board size 7 as the first signal; it is useful after the plumbing is known
-to be correct.
-
-## Total LoC Estimate
-
-For a complete Hex-first implementation:
-
-| Stage | Production LoC | Test / script LoC |
-|---|---:|---:|
-| Stage 0 | 70-120 | 140-220 |
-| Stage B-Hex | 180-260 | 80-140 |
-| Stage A-Hex | 170-260 | 140-220 |
-| Full-Losses-Hex | 90-150 | 80-140 |
-| Full-Selection-Hex | 160-260 | 160-240 |
-| Eval-Hex | 80-160 | 20-60 |
-| Total | 750-1210 | 620-1020 |
-
-The old main implementation added around 2100 production/test lines from the
-pre-Dirichlet baseline. A cleaner Hex-only redo should still land near that
-total once tests and eval scripts are included, but the production core should
-be closer to 800-1200 LoC because checkpointing, transformer experiments, and
-Gardner-specific compatibility are not part of the first pass.
-
-## End-To-End Verification Checklist
-
-Run after every stage:
-
-```bash
-SCACCHI_ALLOW_CPU=1 JAX_PLATFORMS=cpu uv run pytest
+```python
+make_player(search, action_committer)
 ```
 
-Tiny training smoke:
+The player should return complete posterior fields in self-play mode and
+minimal fields in eval mode. Policy-only baselines can be implemented as bound
+search functions that skip tree search and return masked policy predictions.
 
-```bash
-SCACCHI_ALLOW_CPU=1 JAX_PLATFORMS=cpu uv run python -m scacchi.train \
-  board_size=3 selfplay_batch_size=16 eval_batch_size=8 \
-  num_simulations=4 max_num_steps=16 max_num_iters=2 wandb_enabled=false
+### Phase 5: Generic Play
+
+Implement generic play with two players.
+
+Required modes:
+
+```text
+self-play:
+  players: learner, learner
+  reset_mode: auto_reset
+  stop_mode: fixed_steps
+  wrapper: play_training(...) -> TrainingSamples
+
+eval:
+  players: learner, baseline
+  reset_mode: none
+  stop_mode: all_done
+  wrapper: play_eval(...) -> EvalMetrics
 ```
 
-GPU smoke:
+Keep `make_selfplay` and `make_mcts_evaluate` as public wrappers first. They can
+be simplified after callers move to `play_training` and `play_eval`.
 
-```bash
-uv run python -m scacchi.train \
-  board_size=3 selfplay_batch_size=1024 eval_batch_size=64 \
-  num_simulations=16 max_num_steps=32 max_num_iters=10 wandb_enabled=false
-```
+### Phase 6: Tests And Scripts
 
-Check at each stage:
+Update tests in this order:
 
-- no NaN or inf losses,
-- no invalid trailing Hex action is sampled,
-- policy targets sum to 1 over legal actions,
-- Dirichlet means sum to 1,
-- Dirichlet concentrations stay finite,
-- target masks have nonzero coverage,
-- eval returns are not degenerate all wins or all losses at initialization,
-- board size 3 improves or at least does not regress versus AlphaZero under
-  the same sample budget before moving to larger boards.
+1. Add unit tests for `commit_action` and `legalize_action`.
+2. Add unit tests for posterior construction with scalar gumbel and Dirichlet
+   Thompson.
+3. Update self-play tests to call the player/play API.
+4. Update eval tests to call generic play utilities.
+5. Leave DQAZ tests on the compatibility wrapper for the first pass.
+6. Update `scripts/fig_8.py` later. It currently has a custom eval loop that the
+   new player/play API should replace cleanly.
+
+## DQAZ-Specific Caveats
+
+DQAZ is the hardest part to make conceptually clean because the native engine
+currently exports target-shaped data and selects actions in `engine.finish`.
+
+Initial compromise:
+
+- `make_dqaz_search` may still call the native finish/export path.
+- Treat exported action as `search_action`.
+- Keep external action commitment in Python for self-play/eval where possible.
+- Map native exported `action_weights`, `beta_Q_target`, `beta_V_target`, and
+  target metadata into `PosteriorTargets`.
+
+Longer-term cleanup:
+
+- Change native export so `finish` does not need a commitment type.
+- Export root posterior/policy data independently from committed action.
+- Let Python action commitment choose the final move for all search algorithms.
+
+## Risks
+
+JAX/NNX tracing:
+
+- closures over static config are fine, but changing `num_simulations`,
+  `num_blocks`, or posterior sample counts recompiles
+- returned PyTree schemas must be stable across `jax.lax.scan` and
+  `nnx.while_loop`
+
+Heterogeneous players:
+
+- batched play may contain rows for both players at once
+- easiest implementation evaluates both players every step and selects row-wise
+- both player outputs need the same structure for fields that are collected
+
+Terminal eval rows:
+
+- current eval gives terminal rows a dummy legal action and discards their moves
+- generic play needs to preserve that behavior
+
+Training compatibility:
+
+- `loss.py` currently consumes `SelfplayOutput`
+- keep a compatibility output with the same fields until the loss input builder
+  is refactored separately
+
+Config compatibility:
+
+- configs and tests currently use `selfplay.action_source`
+- keep alias handling for one migration to avoid breaking every config at once
+
+## Recommended First Patch
+
+Do not start by rewriting `play`.
+
+Start with the search boundary:
+
+1. Add `SearchOutput`, `PosteriorTargets`, `PosteriorPrediction`, and
+   `TargetMetadata`.
+2. Add a compatibility adapter from `TrainingSamples` to current
+   `SelfplayOutput` target fields.
+3. Add `make_search(env, evaluator, play_mode_search_cfg)`.
+4. Add `commit_action(...)`.
+5. Add `make_player(search, action_committer)`.
+6. Make current `make_selfplay` use these pieces while still returning
+   `SelfplayOutput`.
+
+Once self-play behavior is unchanged under the new stages, introduce the
+two-player `play` loop and migrate eval.

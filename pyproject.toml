@@ -3,10 +3,11 @@ name = "Chess-in-Jax"
 version = "0.1.0"
 description = "A chess engine in Jax"
 readme = "README.md"
-requires-python = "==3.11.*"
+requires-python = "==3.13.*"
 dependencies = [
+    "dqaz",
     "einops",
-    "jax[cuda12-local]==0.7.2",
+    "jax[tpu]>=0.10.0",
     "matplotlib",
     "tqdm",
     "wandb",
@@ -16,7 +17,7 @@ dependencies = [
     "ipykernel>=7.1.0",
     "mctx ==0.0.6",
     "pgx>=2.6.0",
-    "flax",
+    "flax>=0.12.7",
     "optax",
     "dm-haiku",
     "jaxtyping>=0.3.9",
@@ -32,6 +33,7 @@ scacchi-train = "scacchi.train:main"
 package = true
 
 [tool.uv.sources]
+dqaz = { path = "dqaz", editable = true }
 optax = { git = "https://github.com/google-deepmind/optax.git" }
 dm-haiku = { git = "https://github.com/google-deepmind/dm-haiku.git" }
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import chex
 import jax
@@ -8,14 +8,13 @@ import jax.numpy as jnp
 from mctx._src import action_selection
 from mctx._src import base
 from mctx._src import search as mctx_search
-import pgx
 
 
 NO_PARENT = -1
 
 
 class NodeEmbedding(NamedTuple):
-    state: pgx.State
+    state: Any
     outcome_dist: jax.Array
     alpha_V_prior: jax.Array
     evidence_weight: jax.Array
@@ -197,7 +196,7 @@ def dirichlet_root_action_selection(
     alpha_post = action_value_prior + q_evidence
     phi = jax.random.dirichlet(rng_key, alpha_post)
     score = outcome_utility(phi)
-    return action_selection.masked_argmax(score, tree.root_invalid_actions)
+    return cast(jax.Array, action_selection.masked_argmax(score, tree.root_invalid_actions))
 
 
 def policy_prior_interior_action_selection(
@@ -226,12 +225,14 @@ def _dirichlet_q_search_block(
     max_depth: int | None = None,
     loop_fn=jax.lax.fori_loop,
 ) -> DirichletQSearchOutput:
-    root = root.replace(
+    root = base.RootFnOutput(
         prior_logits=jnp.where(
             invalid_actions,
             jnp.finfo(root.prior_logits.dtype).min,
             root.prior_logits,
-        )
+        ),
+        value=root.value,
+        embedding=root.embedding,
     )
     search_tree = mctx_search.search(
         params=params,
@@ -291,33 +292,37 @@ def dirichlet_q_policy(
         action_value_prior = action_alpha_prior
     elif action_alpha_prior is not None:
         raise ValueError("pass only one of action_value_prior or action_alpha_prior")
+    if num_simulations < 0:
+        raise ValueError(f"num_simulations must be >= 0, got {num_simulations}")
+    if num_simulations == 0:
+        del params, root, recurrent_fn, max_depth, loop_fn
+        q_evidence_total = jnp.zeros_like(action_value_prior)
+        alpha_search = action_value_prior
+        sampled_outcome = jax.random.dirichlet(rng_key, alpha_search)
+        score = outcome_utility(sampled_outcome)
+        action = action_selection.masked_argmax(score, invalid_actions)
+        action_weights = jax.nn.one_hot(
+            action,
+            action_value_prior.shape[-2],
+            dtype=action_value_prior.dtype,
+        )
+        return DirichletQSearchOutput(
+            action=action,
+            action_weights=action_weights,
+            search_tree=None,
+            q_evidence_sum=q_evidence_total,
+            alpha_search=alpha_search,
+            explored_action_mask=jnp.zeros(action_value_prior.shape[:-1], dtype=bool),
+        )
 
-    block_keys = (
-        rng_key[None, ...]
-        if num_search_blocks == 1
-        else jax.random.split(rng_key, num_search_blocks)
-    )
-    explored_action_mask = jnp.zeros(action_value_prior.shape[:-1], dtype=bool)
-    block_output = _dirichlet_q_search_block(
-        params=params,
-        rng_key=block_keys[0],
-        root=root,
-        recurrent_fn=recurrent_fn,
-        action_value_prior=action_value_prior,
-        explored_action_mask=explored_action_mask,
-        num_simulations=num_simulations,
-        invalid_actions=invalid_actions,
-        max_depth=max_depth,
-        loop_fn=loop_fn,
-    )
-    q_evidence_total = block_output.q_evidence_sum
-    alpha_base = block_output.alpha_search
-    explored_action_mask = block_output.explored_action_mask
+    block_keys = jax.random.split(rng_key, num_search_blocks)
+    initial_explored_action_mask = jnp.zeros(action_value_prior.shape[:-1], dtype=bool)
 
-    for block_index in range(1, num_search_blocks):
+    def block_body(carry, block_key):
+        alpha_base, explored_action_mask, q_evidence_total, _ = carry
         block_output = _dirichlet_q_search_block(
             params=params,
-            rng_key=block_keys[block_index],
+            rng_key=block_key,
             root=root,
             recurrent_fn=recurrent_fn,
             action_value_prior=alpha_base,
@@ -327,17 +332,26 @@ def dirichlet_q_policy(
             max_depth=max_depth,
             loop_fn=loop_fn,
         )
-        q_evidence_total = q_evidence_total + block_output.q_evidence_sum
-        alpha_base = block_output.alpha_search
-        explored_action_mask = block_output.explored_action_mask
+        next_carry = (
+            block_output.alpha_search,
+            block_output.explored_action_mask,
+            q_evidence_total + block_output.q_evidence_sum,
+            block_output.action_weights,
+        )
+        return next_carry, ()
 
-    alpha_search = alpha_base
+    zero_q_evidence = jnp.zeros_like(action_value_prior)
+    zero_action_weights = jnp.zeros_like(root.prior_logits)
+    ( alpha_search, explored_action_mask, q_evidence_total, action_weights), _ = jax.lax.scan(
+        block_body,(action_value_prior, initial_explored_action_mask, zero_q_evidence, zero_action_weights),block_keys,
+    )
+
     score = outcome_utility(outcome_mean(alpha_search))
     action = action_selection.masked_argmax(score, invalid_actions)
     return DirichletQSearchOutput(
         action=action,
-        action_weights=block_output.action_weights,
-        search_tree=block_output.search_tree,
+        action_weights=action_weights,
+        search_tree=None,
         q_evidence_sum=q_evidence_total,
         alpha_search=alpha_search,
         explored_action_mask=explored_action_mask,
@@ -349,19 +363,58 @@ def posterior_best_policy_target(
     alpha_Q_post: jax.Array,
     legal_action_mask: jax.Array,
     num_samples: int,
+    *,
+    chunk_size: int | None = None,
 ) -> jax.Array:
-    phi = jax.random.dirichlet(
-        rng_key,
-        alpha_Q_post,
-        shape=(num_samples, *alpha_Q_post.shape[:-1]),
-    )
-    scores = outcome_utility(phi)
-    scores = mask_invalid_scores(scores, legal_action_mask[None, ...])
-    best_action = jnp.argmax(scores, axis=-1)
+    if num_samples < 1:
+        raise ValueError(f"num_samples must be >= 1, got {num_samples}")
+    if chunk_size is None:
+        chunk_size = num_samples
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+    chunk_size = min(chunk_size, num_samples)
 
     num_actions = alpha_Q_post.shape[-2]
-    action_hits = jax.nn.one_hot(best_action, num_actions, dtype=alpha_Q_post.dtype)
-    target = jnp.mean(action_hits, axis=0)
+
+    def sample_chunk(
+        total_hits: jax.Array,
+        chunk: tuple[chex.PRNGKey, jax.Array],
+    ) -> tuple[jax.Array, None]:
+        keys, valid_samples = chunk
+        phi = jax.vmap(lambda key: jax.random.dirichlet(key, alpha_Q_post))(keys)
+        scores = outcome_utility(phi)
+        scores = mask_invalid_scores(scores, legal_action_mask[None, ...])
+        best_action = jnp.argmax(scores, axis=-1)
+        action_hits = jax.nn.one_hot(
+            best_action,
+            num_actions,
+            dtype=alpha_Q_post.dtype,
+        )
+        valid_weight = valid_samples.astype(alpha_Q_post.dtype).reshape(
+            (chunk_size,) + (1,) * (action_hits.ndim - 1)
+        )
+        return total_hits + jnp.sum(action_hits * valid_weight, axis=0), None
+
+    num_chunks = (num_samples + chunk_size - 1) // chunk_size
+    padded_sample_count = num_chunks * chunk_size
+    sample_keys = jax.random.split(rng_key, num_samples)
+    pad_count = padded_sample_count - num_samples
+    if pad_count:
+        sample_keys = jnp.concatenate([sample_keys, sample_keys[:pad_count]], axis=0)
+    sample_keys = jnp.reshape(
+        sample_keys,
+        (num_chunks, chunk_size) + sample_keys.shape[1:],
+    )
+    valid_samples = jnp.arange(padded_sample_count) < num_samples
+    valid_samples = jnp.reshape(valid_samples, (num_chunks, chunk_size))
+
+    initial_hits = jnp.zeros(alpha_Q_post.shape[:-1], dtype=alpha_Q_post.dtype)
+    total_hits, _ = jax.lax.scan(
+        sample_chunk,
+        initial_hits,
+        (sample_keys, valid_samples),
+    )
+    target = total_hits / jnp.asarray(num_samples, dtype=alpha_Q_post.dtype)
     target = jnp.where(legal_action_mask, target, 0.0)
 
     target_sum = jnp.sum(target, axis=-1, keepdims=True)

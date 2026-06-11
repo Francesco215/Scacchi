@@ -9,6 +9,8 @@ from typing import Any, Literal, Protocol, Self, TypeGuard
 
 from tqdm import tqdm
 
+from .types import config_to_dict
+
 Scalar = float | int
 
 
@@ -21,8 +23,8 @@ def _to_scalar(value: Any) -> Scalar:
 
 
 def _config_to_dict(config: Any) -> dict[str, Any]:
-    if hasattr(config, "model_dump"):
-        return dict(config.model_dump())
+    if hasattr(config, "__dataclass_fields__"):
+        return config_to_dict(config)
     if hasattr(config, "dict"):
         return dict(config.dict())
     return dict(config)
@@ -177,7 +179,7 @@ class WandbLogger(Logger):
             save_code=True,
         )
         if self._run is not None and getattr(self._run, "name", None):
-            self.run_name = self._run.name
+            self.run_name = str(self._run.name)
         self._initialized = True
         return self
 
@@ -241,10 +243,10 @@ def build_logger(
     training_config: Any,
     dir: str | None = None,
 ) -> Logger:
-    wandb_enabled = bool(getattr(training_config, "wandb_enabled", False))
-    wandb_project = str(getattr(training_config, "wandb_project", "scacchi-az"))
-    log_every = int(getattr(training_config, "log_interval", 1))
-    max_steps = int(getattr(training_config, "max_num_iters"))
+    wandb_enabled = bool(training_config.logging.wandb.enabled)
+    wandb_project = str(training_config.logging.wandb.project)
+    log_every = int(training_config.logging.interval)
+    max_steps = int(training_config.run.max_num_iters)
     config = _config_to_dict(training_config)
 
     if wandb_enabled:
