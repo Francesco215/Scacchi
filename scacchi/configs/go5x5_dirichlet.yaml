@@ -1,24 +1,26 @@
-# PGX Go 9x9 Gumbel AlphaZero recipe on the current Scacchi runtime.
-# Matches the paper-level hyperparameters where this repo exposes the knob.
+# Go 5x5 with Dirichlet-Thompson search and outcome-grounded Dirichlet targets
+# (losses.outcome_dir_targets). CPU-validated recipe, scaled for TPU.
+# Eval is against a uniform-random baseline so progress is visible immediately.
 
 run:
   seed: 1
-  max_num_iters: 400
+  max_num_iters: 200
 
 env:
-  id: go_9x9
-  board_size: 9
+  id: go
+  board_size: 5
   num_outcomes: 3
 
 model:
   network: aznet_dirichlet
+  # Same trunk shape as the go9x9 configs so trunk weights stay transferable.
   num_channels: 128
   num_layers: 6
   resnet_v2: true
 
 selfplay:
   batch_size: 2048
-  max_num_steps: 256
+  max_num_steps: 64
   action_commitment_type: search_action
   search:
     kind: dirichlet_thompson
@@ -29,15 +31,8 @@ selfplay:
         kappa_leaf: 1.0
         kappa_terminal: 8.0
 
-    gumbel:
-      num_simulations: 32
-      gumbel_scale: 1.0
-      completed_q_value_scale: 0.1
-      completed_q_rescale_values: false
-
-
 training:
-  batch_size: 8_192
+  batch_size: 8192
   max_updates_per_iter: null
   learning_rate: 1e-3
   grad_clip_norm: null
@@ -53,18 +48,15 @@ training:
     loss_mask_mode: value
     terminal_edge_targets: true
     terminal_parent_targets: true
-    
-  regularization:
-    dirichlet_concentration_clip: 80.0
-    
+    outcome_dir_targets: true
+
 eval:
-  interval: 10
-  batch_size: 2048
-  baseline: pgx
-  baseline_id: go_9x9_v0
+  interval: 5
+  batch_size: 1024
+  baseline: random
   player_action_commitment_type: search_action
   baseline_action_commitment_type: search_action
-  
+
   player_search:
     kind: dirichlet_thompson
     dirichlet_thompson:
@@ -73,14 +65,14 @@ eval:
       constants:
         kappa_leaf: 1.0
         kappa_terminal: 8.0
-        
+
   baseline_search:
     kind: gumbel
     gumbel:
-      num_simulations: 32
+      num_simulations: 2
       gumbel_scale: 1.0
       completed_q_value_scale: 0.1
-      completed_q_rescale_values: false
+      completed_q_rescale_values: true
 
 logging:
   interval: 1
@@ -89,5 +81,5 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 0
-  save_interval_steps: 50
+  max_to_keep: 50
+  save_interval_steps: 10

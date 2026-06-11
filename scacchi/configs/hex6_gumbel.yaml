@@ -1,24 +1,25 @@
-# PGX Go 9x9 Gumbel AlphaZero recipe on the current Scacchi runtime.
-# Matches the paper-level hyperparameters where this repo exposes the knob.
+# Current-schema port of origin/main scacchi/configs/alphazero_hex.yaml.
+# This is the legacy 6x6 scalar Boardlaw Gumbel AlphaZero recipe.
 
 run:
-  seed: 1
-  max_num_iters: 400
+  seed: 890
+  max_num_iters: 100
 
 env:
-  id: go_9x9
-  board_size: 9
-  num_outcomes: 3
+  id: hex
+  board_size: 6
+  num_outcomes: null
 
 model:
-  network: aznet
+  network: boardlaw
   num_channels: 128
-  num_layers: 6
+  num_layers: 8
   resnet_v2: true
+  rezero_kernel_init: orthogonal
 
 selfplay:
-  batch_size: 1024
-  max_num_steps: 256
+  batch_size: 8192
+  max_num_steps: 32
   action_commitment_type: search_action
   search:
     kind: gumbel
@@ -29,10 +30,9 @@ selfplay:
       completed_q_rescale_values: true
 
 training:
-  batch_size: 4096
-  max_updates_per_iter: null
-  learning_rate: 1e-3
-  grad_clip_norm: null
+  batch_size: 1024
+  learning_rate: 3e-3
+  grad_clip_norm: 1.0
 
   losses:
     policy_weight: 1.0
@@ -40,14 +40,16 @@ training:
     q_dir_kl_weight: 0.0
     value_outcome_weight: 0.0
     q_outcome_weight: 0.0
-    policy_target_mode: search
     loss_mask_mode: value
+    policy_target_mode: search
+
+  regularization:
+    dirichlet_concentration_clip: 100.0
 
 eval:
-  interval: 10
-  batch_size: 1024
-  baseline: pgx
-  baseline_id: go_9x9_v0
+  interval: 1
+  batch_size: 256
+  baseline: checkpoint
   player_action_commitment_type: search_action
   baseline_action_commitment_type: search_action
   player_search:

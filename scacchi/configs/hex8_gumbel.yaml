@@ -1,0 +1,82 @@
+# 8x8 scalar Boardlaw Gumbel AlphaZero recipe based on the Hex 8x8
+# Boardlaw-Dirichlet run psjkpp1v / super-vortex-239.
+
+run:
+  seed: 0
+  max_num_iters: 2000
+
+env:
+  id: hex
+  board_size: 8
+  num_outcomes: 2
+
+model:
+  network: boardlaw
+  num_channels: 1024
+  num_layers: 8
+  resnet_v2: true
+  legacy_dirichlet_head_init: true
+  rezero_kernel_init: orthogonal
+
+selfplay:
+  batch_size: 16_384
+  max_num_steps: 64
+  action_commitment_type: search_action
+  search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0
+      completed_q_value_scale: 0.1
+      completed_q_rescale_values: false
+
+training:
+  batch_size: 8192
+  learning_rate: 3e-4
+  grad_clip_norm: 1.0
+
+  losses:
+    policy_weight: 1.0
+    value_dir_kl_weight: 0.0
+    q_dir_kl_weight: 0.0
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
+    q_loss_weight_mode: evidence_mass
+    q_dir_kl_reduction: masked_mean
+    loss_mask_mode: value
+    terminal_edge_targets: true
+    terminal_parent_targets: true
+
+  regularization:
+    dirichlet_concentration_clip: 100.0
+
+eval:
+  # Disable eval for throughput tests; eval.interval=1 was included in tqdm
+  # wall time and used only 4 games/device on a 64-device slice.
+  interval: 5
+  batch_size: 1024
+  baseline: checkpoint
+  player_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 4
+      gumbel_scale: 1.0
+      completed_q_value_scale: 0.1
+      completed_q_rescale_values: false
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 4
+      gumbel_scale: 1.0
+      completed_q_value_scale: 0.1
+      completed_q_rescale_values: false
+
+logging:
+  interval: 1
+  wandb:
+    enabled: true
+    project: scacchi-az
+
+checkpointing:
+  max_to_keep: 0
+  save_interval_steps: 100
