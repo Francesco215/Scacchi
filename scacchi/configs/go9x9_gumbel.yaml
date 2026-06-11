@@ -44,26 +44,20 @@ training:
     loss_mask_mode: value
 
 eval:
-  interval: 10
+  interval: 1
   batch_size: 1024
   baseline: pgx
   baseline_id: go_9x9_v0
-  player_action_commitment_type: search_action
-  baseline_action_commitment_type: search_action
+  player_action_commitment_type: posterior_sample
+  baseline_action_commitment_type: posterior_sample
   player_search:
-    kind: gumbel
-    gumbel:
-      num_simulations: 32
-      gumbel_scale: 1.0
-      completed_q_value_scale: 0.1
-      completed_q_rescale_values: true
+    kind: policy
+    policy:
+      temperature: 1.0
   baseline_search:
-    kind: gumbel
-    gumbel:
-      num_simulations: 32
-      gumbel_scale: 1.0
-      completed_q_value_scale: 0.1
-      completed_q_rescale_values: true
+    kind: policy
+    policy:
+      temperature: 1.0
 
 logging:
   interval: 1

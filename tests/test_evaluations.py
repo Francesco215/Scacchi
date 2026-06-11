@@ -18,12 +18,15 @@ from scacchi.play import (
 )
 from scacchi.play_search import PlayerOutput
 from scacchi.types import (
+    ActionCommitmentType,
     Config,
     EvalConfig,
     GumbelSearchConfig,
     ModelConfig,
     Network,
+    PolicySearchConfig,
     SearchConfig,
+    SearchKind,
     load_config,
 )
 
@@ -221,6 +224,27 @@ def test_pgx_baseline_eval_uses_scalar_gumbel_search_with_same_budget():
     assert search_config.gumbel.num_simulations == 4
 
 
+def test_pgx_baseline_eval_keeps_policy_search():
+    config = load_config(
+        OmegaConf.create(
+            {
+                "eval": {
+                    "baseline": "pgx",
+                    "baseline_search": {
+                        "kind": "policy",
+                        "policy": {"temperature": 0.75},
+                    },
+                },
+            }
+        )
+    )
+
+    search_config = baseline_search_config(config)
+
+    assert search_config.kind == "policy"
+    assert search_config.policy.temperature == 0.75
+
+
 def test_legacy_top_level_eval_search_remains_compatible():
     config = load_config(
         OmegaConf.create(
@@ -294,6 +318,46 @@ def test_make_mcts_evaluate_delegates_to_play_eval_smoke():
     )
 
     returns = make_mcts_evaluate(env, config, baseline_model)(
+        jax.random.PRNGKey(2),
+        model,
+    )
+
+    assert returns.shape == (2,)
+    assert jnp.isfinite(returns).all()
+
+
+def test_policy_eval_accepts_logits_only_baseline_smoke():
+    env = pgx.make("tic_tac_toe")
+    search = SearchConfig(
+        kind=SearchKind.policy,
+        policy=PolicySearchConfig(temperature=1.0),
+    )
+    config = Config(
+        model=ModelConfig(
+            network=Network.boardlaw,
+            num_channels=8,
+            num_layers=1,
+        ),
+        eval=EvalConfig(
+            batch_size=2,
+            player_search=search,
+            baseline_search=search,
+            player_action_commitment_type=ActionCommitmentType.posterior_argmax,
+            baseline_action_commitment_type=ActionCommitmentType.posterior_argmax,
+        ),
+    )
+    model = BoardlawNet(
+        num_actions=env.num_actions,
+        observation_shape=env.observation_shape,
+        width=8,
+        depth=1,
+        rngs=nnx.Rngs(0),
+    )
+
+    def logits_only_baseline(obs: jax.Array) -> jax.Array:
+        return jnp.zeros((obs.shape[0], env.num_actions), dtype=jnp.float32)
+
+    returns = make_mcts_evaluate(env, config, logits_only_baseline)(
         jax.random.PRNGKey(2),
         model,
     )

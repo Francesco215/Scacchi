@@ -39,6 +39,7 @@ from .network import policy_value_from_output
 from .types import (
     DirichletThompsonSearchConfig,
     GumbelSearchConfig,
+    PolicySearchConfig,
     SearchConfig,
     SearchConstantsConfig,
     SearchKind,
@@ -165,6 +166,8 @@ _NATIVE_TARGET_FIELD_NAMES = (
 def evaluator_output_from_model_output(model_output: Any) -> EvaluatorOutput:
     if isinstance(model_output, EvaluatorOutput):
         return model_output
+    if isinstance(model_output, jax.Array):
+        return EvaluatorOutput(logits=model_output)
     if len(model_output) == 2:
         logits, value = policy_value_from_output(model_output)
         return EvaluatorOutput(logits=logits, value=value)
@@ -195,6 +198,18 @@ def _required_output(value: jax.Array | None, name: str) -> jax.Array:
 def _masked_logits(logits: jax.Array, legal_action_mask: jax.Array) -> jax.Array:
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
     return jnp.where(legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+
+
+def _masked_policy(
+    logits: jax.Array,
+    legal_action_mask: jax.Array,
+    *,
+    temperature: float,
+) -> jax.Array:
+    masked_logits = _masked_logits(logits, legal_action_mask)
+    policy = jax.nn.softmax(masked_logits / float(temperature), axis=-1)
+    has_legal_action = jnp.any(legal_action_mask, axis=-1, keepdims=True)
+    return jnp.where(has_legal_action, policy, jnp.zeros_like(policy))
 
 
 def make_recurrent_fn(env, evaluator: Callable[[jax.Array], EvaluatorOutput]):
@@ -564,18 +579,64 @@ def _run_dirichlet_search_output(
     )
 
 
+def _run_policy_search_output(
+    *,
+    env_state: pgx.State,
+    prediction: EvaluatorOutput,
+    search_cfg: PolicySearchConfig,
+) -> SearchOutput:
+    policy = _masked_policy(
+        prediction.logits,
+        env_state.legal_action_mask,
+        temperature=float(search_cfg.temperature),
+    )
+    search_action = posterior_best_action(policy, env_state.legal_action_mask)
+    return SearchOutput(
+        posterior=PosteriorTargets(
+            prediction=PosteriorPrediction(
+                policy=policy,
+                value=prediction.value,
+                alpha_v=prediction.alpha_v,
+                alpha_q=prediction.alpha_q,
+            ),
+            metadata=TargetMetadata(
+                mask=_search_loss_mask(policy),
+                search_action=legalize_action(
+                    search_action,
+                    env_state.legal_action_mask,
+                ),
+            ),
+        ),
+    )
+
+
 def _active_jax_search_config(
-    search_cfg: SearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
-) -> tuple[SearchKind, GumbelSearchConfig | DirichletThompsonSearchConfig]:
+    search_cfg: (
+        SearchConfig
+        | PolicySearchConfig
+        | GumbelSearchConfig
+        | DirichletThompsonSearchConfig
+    ),
+) -> tuple[
+    SearchKind,
+    PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
+]:
     if isinstance(search_cfg, SearchConfig):
         if search_cfg.kind == SearchKind.dqaz:
             raise RuntimeError(
                 "DQAZ remains on the posterior-tree compatibility path."
             )
         active = search_cfg.active()
-        if not isinstance(active, (GumbelSearchConfig, DirichletThompsonSearchConfig)):
-            raise RuntimeError("JAX search requires a Gumbel or Dirichlet config.")
+        if not isinstance(
+            active,
+            (PolicySearchConfig, GumbelSearchConfig, DirichletThompsonSearchConfig),
+        ):
+            raise RuntimeError(
+                "JAX search requires a policy, Gumbel, or Dirichlet config."
+            )
         return search_cfg.kind, active
+    if isinstance(search_cfg, PolicySearchConfig):
+        return SearchKind.policy, search_cfg
     if isinstance(search_cfg, GumbelSearchConfig):
         return SearchKind.gumbel, search_cfg
     return SearchKind.dirichlet_thompson, search_cfg
@@ -584,11 +645,31 @@ def _active_jax_search_config(
 def make_search(
     env,
     evaluator: Callable[[jax.Array], EvaluatorOutput],
-    search_cfg: SearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
+    search_cfg: (
+        SearchConfig
+        | PolicySearchConfig
+        | GumbelSearchConfig
+        | DirichletThompsonSearchConfig
+    ),
     *,
     q_loss_weight_mode: str = "policy",
 ) -> Callable[..., SearchOutput]:
     search_kind, active_search_cfg = _active_jax_search_config(search_cfg)
+    if search_kind == SearchKind.policy:
+        if not isinstance(active_search_cfg, PolicySearchConfig):
+            raise ValueError("policy search requires PolicySearchConfig")
+
+        def search(*, root_state: pgx.State, rng_key: jax.Array) -> SearchOutput:
+            del rng_key
+            prediction = evaluator(root_state.observation)
+            return _run_policy_search_output(
+                env_state=root_state,
+                prediction=prediction,
+                search_cfg=active_search_cfg,
+            )
+
+        return search
+
     scalar_recurrent_fn = make_recurrent_fn(env, evaluator)
     dirichlet_recurrent_fn = make_dirichlet_recurrent_fn_from_constants(
         env,

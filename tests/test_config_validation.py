@@ -84,16 +84,46 @@ def test_go9x9_gumbel_config_matches_paper_level_recipe():
     assert config.selfplay.search.kind == "gumbel"
     assert config.selfplay.search.gumbel.num_simulations == 32
     assert config.selfplay.search.gumbel.completed_q_value_scale == 0.1
-    assert config.selfplay.search.gumbel.completed_q_rescale_values is False
+    assert config.selfplay.search.gumbel.completed_q_rescale_values is True
     assert config.training.batch_size == 4096
     assert config.training.max_updates_per_iter is None
     assert config.training.learning_rate == 1e-3
     assert config.eval.baseline == "pgx"
     assert config.eval.baseline_id == "go_9x9_v0"
-    assert config.eval.player_search.kind == "gumbel"
-    assert config.eval.player_search.gumbel.num_simulations == 32
-    assert config.eval.baseline_search.kind == "gumbel"
-    assert config.eval.baseline_search.gumbel.num_simulations == 32
+    assert config.eval.player_action_commitment_type == "posterior_sample"
+    assert config.eval.baseline_action_commitment_type == "posterior_sample"
+    assert config.eval.player_search.kind == "policy"
+    assert config.eval.player_search.policy.temperature == 1.0
+    assert config.eval.baseline_search.kind == "policy"
+    assert config.eval.baseline_search.policy.temperature == 1.0
+
+
+def test_simple_policy_eval_fragment_overrides_eval_search_only():
+    cfg_dir = Path(__file__).parents[1] / "scacchi" / "configs"
+    base = OmegaConf.load(cfg_dir / "hex5.yaml")
+    policy_eval = OmegaConf.load(cfg_dir / "eval_mode" / "simple_policy.yaml")
+
+    config = load_config(OmegaConf.merge(base, policy_eval))
+
+    assert config.selfplay.search.kind == "dirichlet_thompson"
+    assert config.eval.player_search.kind == "policy"
+    assert config.eval.player_search.policy.temperature == 1.0
+    assert config.eval.baseline_search.kind == "policy"
+    assert config.eval.baseline_search.policy.temperature == 1.0
+    assert config.eval.player_action_commitment_type == "posterior_sample"
+    assert config.eval.baseline_action_commitment_type == "posterior_sample"
+
+
+def test_policy_search_temperature_must_be_positive():
+    with pytest.raises(ValueError, match="search.policy.temperature"):
+        _config(
+            {
+                "search": {
+                    "kind": "policy",
+                    "policy": {"temperature": 0.0},
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize(

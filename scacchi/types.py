@@ -26,6 +26,7 @@ class ActionCommitmentType(StrEnum):
 
 
 class SearchKind(StrEnum):
+    policy = "policy"
     gumbel = "gumbel"
     dirichlet_thompson = "dirichlet_thompson"
     dqaz = "dqaz"
@@ -115,6 +116,14 @@ class SearchConstantsConfig:
 
 
 @dataclass
+class PolicySearchConfig:
+    temperature: float = 1.0
+
+    def __post_init__(self) -> None:
+        _require_gt("search.policy.temperature", self.temperature, 0.0)
+
+
+@dataclass
 class GumbelSearchConfig:
     num_simulations: int = 32
 
@@ -198,6 +207,7 @@ class DQAZSearchConfig:
 @dataclass
 class SearchConfig:
     kind: SearchKind = SearchKind.gumbel
+    policy: PolicySearchConfig = field(default_factory=PolicySearchConfig)
     gumbel: GumbelSearchConfig = field(default_factory=GumbelSearchConfig)
     dirichlet_thompson: DirichletThompsonSearchConfig = field(
         default_factory=DirichletThompsonSearchConfig
@@ -205,15 +215,22 @@ class SearchConfig:
     dqaz: DQAZSearchConfig = field(default_factory=DQAZSearchConfig)
 
     def active(self) -> (
-        GumbelSearchConfig | DirichletThompsonSearchConfig | DQAZSearchConfig
+        PolicySearchConfig
+        | GumbelSearchConfig
+        | DirichletThompsonSearchConfig
+        | DQAZSearchConfig
     ):
         return cast(
-            GumbelSearchConfig | DirichletThompsonSearchConfig | DQAZSearchConfig,
+            PolicySearchConfig
+            | GumbelSearchConfig
+            | DirichletThompsonSearchConfig
+            | DQAZSearchConfig,
             getattr(self, str(self.kind)),
         )
 
     def active_constants(self) -> SearchConstantsConfig:
-        return self.active().constants
+        active = self.active()
+        return getattr(active, "constants", SearchConstantsConfig())
 
 
 @dataclass

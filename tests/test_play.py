@@ -20,6 +20,7 @@ from scacchi.play_search import (
     commit_action,
     legalize_action,
     make_search,
+    make_search_player,
 )
 from scacchi.types import (
     ActionCommitmentType,
@@ -28,7 +29,9 @@ from scacchi.types import (
     GumbelSearchConfig,
     ModelConfig,
     Network,
+    PolicySearchConfig,
     SearchConfig,
+    SearchKind,
     SelfplayConfig,
 )
 
@@ -132,6 +135,51 @@ def test_scalar_gumbel_search_preserves_batch_sharding_without_collectives():
     assert metadata.search_action is not None
     assert output.posterior.prediction.policy.shape == (batch_size, num_actions)
     assert metadata.search_action.shape == (batch_size,)
+
+
+def test_policy_search_uses_masked_logits_without_tree_search():
+    num_actions = 3
+    env_state = _ToySearchState(
+        observation=jnp.zeros((2, 1), dtype=jnp.float32),
+        legal_action_mask=jnp.array(
+            [
+                [True, True, False],
+                [False, True, True],
+            ]
+        ),
+        current_player=jnp.zeros((2,), dtype=jnp.int32),
+        rewards=jnp.zeros((2, 2), dtype=jnp.float32),
+        terminated=jnp.zeros((2,), dtype=jnp.bool_),
+    )
+
+    def logits_only_model(obs: jax.Array) -> jax.Array:
+        del obs
+        return jnp.array(
+            [
+                [0.0, 2.0, 100.0],
+                [10.0, 0.0, 1.0],
+            ],
+            dtype=jnp.float32,
+        )
+
+    player = make_search_player(
+        _ToySearchEnv(),
+        logits_only_model,
+        SearchConfig(
+            kind=SearchKind.policy,
+            policy=PolicySearchConfig(temperature=1.0),
+        ),
+        ActionCommitmentType.posterior_argmax,
+    )
+
+    output = player(env_state, jax.random.PRNGKey(0))
+
+    assert output.posterior is not None
+    policy = output.posterior.prediction.policy
+    assert policy.shape == (2, num_actions)
+    assert jnp.array_equal(policy > 0.0, env_state.legal_action_mask)
+    assert jnp.allclose(policy.sum(axis=-1), 1.0)
+    assert jnp.array_equal(output.action, jnp.array([1, 2], dtype=jnp.int32))
 
 
 def test_commit_action_samples_posterior_target():

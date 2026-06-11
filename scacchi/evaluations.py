@@ -19,7 +19,7 @@ def baseline_search_config(config) -> SearchConfig:
     search_config = config.eval.baseline_search
     if config.eval.baseline != EvalBaseline.pgx:
         return search_config
-    if search_config.kind == SearchKind.gumbel:
+    if search_config.kind in {SearchKind.policy, SearchKind.gumbel}:
         return search_config
 
     # PGX baselines expose scalar policy/value heads, not Dirichlet heads.
