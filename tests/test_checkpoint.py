@@ -79,9 +79,32 @@ def test_build_checkpoint_manager_uses_multihost_orbax_options(
     assert options.max_to_keep == 3
     assert options.save_interval_steps == 7
     assert options.save_on_steps == frozenset({10})
-    assert options.single_host_load_and_broadcast is True
+    # Pod workers have private disks: process 0 saves alone, no collectives.
+    assert options.single_host_load_and_broadcast is False
     assert options.enable_async_checkpointing is True
     assert options.multiprocessing_options.primary_host == 0
+    assert options.multiprocessing_options.active_processes == {0}
+    assert options.create is False
+
+
+def test_build_checkpoint_manager_multihost_nonprimary_is_noop(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    config = Config(
+        run=RunConfig(max_num_iters=11),
+        checkpointing=CheckpointingConfig(max_to_keep=3, save_interval_steps=7),
+    )
+    monkeypatch.setattr(checkpoint.jax, "process_count", lambda: 2)
+    monkeypatch.setattr(checkpoint.jax, "process_index", lambda: 1)
+
+    def fail_if_constructed(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("non-primary processes must not build orbax managers")
+
+    monkeypatch.setattr(checkpoint.ocp, "CheckpointManager", fail_if_constructed)
+
+    manager = checkpoint.build_checkpoint_manager(config, tmp_path)
+    assert isinstance(manager, checkpoint.NoOpCheckpointManager)
 
 
 def test_disabled_checkpoint_manager_does_not_construct_orbax(

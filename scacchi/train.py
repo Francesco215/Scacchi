@@ -30,7 +30,7 @@ import hydra
 from hydra.utils import get_original_cwd
 import jax
 
-from .distributed import initialize_distributed, make_batch_parallel
+from .distributed import constrain_batch_axis, initialize_distributed, make_batch_parallel
 
 initialize_distributed()
 
@@ -109,7 +109,7 @@ def _block_until_ready(value: Any) -> Any:
     )
 
 
-def _load_eval_baseline(config: Config, env: pgx.Env):
+def _load_eval_baseline(config: Config, env: pgx.Env, parallel=None):
     if config.eval.interval <= 0:
         return None
     if config.eval.baseline == EvalBaseline.none:
@@ -121,6 +121,17 @@ def _load_eval_baseline(config: Config, env: pgx.Env):
             else f"checkpoints/{config.env.board_size}_solved"
         )
         return from_pretrained(checkpoint_path, env, rngs=nnx.Rngs(0))
+    if config.eval.baseline == EvalBaseline.random:
+        num_actions = env.num_actions
+
+        def random_baseline_model(observation: jax.Array):
+            logits = jnp.zeros(
+                (*observation.shape[:1], num_actions),
+                dtype=jnp.float32,
+            )
+            return constrain_batch_axis(logits, parallel, batch_axis=0)
+
+        return random_baseline_model
     if config.eval.baseline == EvalBaseline.pgx:
         baseline_id = config.eval.baseline_id or f"{env.id}_v0"
         try:
@@ -197,7 +208,7 @@ def main(cfg: DictConfig) -> None:
         config.logging.wandb.enabled = False
 
     env = make_env(config.env.id, config.env.board_size)
-    baseline_model = _load_eval_baseline(config, env)
+    baseline_model = _load_eval_baseline(config, env, parallel)
 
     model = build_model(
         config,
@@ -260,6 +271,10 @@ def main(cfg: DictConfig) -> None:
                 f"_seed{config.run.seed}"
             )
         ).resolve()
+        if config.checkpointing.directory is not None:
+            ckpt_dir = (
+                Path(get_original_cwd()) / config.checkpointing.directory
+            ).resolve()
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         with build_checkpoint_manager(config, ckpt_dir) as ckpt_mgr:
             start_iter, rng_key, hours, frames = restore(ckpt_mgr, model, optimizer, rng_key)
@@ -383,6 +398,10 @@ def main(cfg: DictConfig) -> None:
                             "search/root_gamma": train_metrics.search_root_gamma.mean().item(),
                             "search/root_downstream_eval_count": train_metrics.search_root_downstream_eval_count.mean().item(),
                             "search/root_q_concentration": train_metrics.search_root_q_concentration.mean().item(),
+                            "data/value_mask_fraction": train_metrics.data_value_mask_fraction.mean().item(),
+                            "data/pass_fraction": train_metrics.data_pass_fraction.mean().item(),
+                            "data/terminations_per_row": train_metrics.data_terminations_per_row.mean().item(),
+                            "data/psk_termination_fraction": train_metrics.data_psk_termination_fraction.mean().item(),
                             "train/iter_seconds": iter_seconds,
                             "train/frames_per_second": frames_this_iter
                             / max(iter_seconds, 1e-12),
@@ -392,6 +411,29 @@ def main(cfg: DictConfig) -> None:
                     )
                     logger.log(iteration, dict_to_log, pbar=pbar, prefix="", pbar_filter=r"loss|avg_R")
                     maybe_save(ckpt_mgr, iteration, model, optimizer, rng_key, config, hours, frames)
+                    raw_snapshot_dir = os.environ.get("SCACCHI_RAW_SNAPSHOT_DIR")
+                    if (
+                        raw_snapshot_dir
+                        and jax.process_index() == 0
+                        and (
+                            iteration % config.checkpointing.save_interval_steps == 0
+                            or iteration == config.run.max_num_iters - 1
+                        )
+                    ):
+                        # Plain pickle snapshot from process 0 only: orbax
+                        # multihost saves deadlock on pod-local disks.
+                        import pickle
+
+                        snap_dir = Path(raw_snapshot_dir)
+                        snap_dir.mkdir(parents=True, exist_ok=True)
+                        # Pure nested dict of numpy arrays: portable across
+                        # flax/python versions, unlike pickled nnx State.
+                        snap_state = jax.device_get(
+                            nnx.to_pure_dict(nnx.state(model))
+                        )
+                        snap_path = snap_dir / f"model_{iteration:06d}.pkl"
+                        with open(snap_path, "wb") as f:
+                            pickle.dump(snap_state, f)
             finally:
                 if profile_trace_active:
                     jax.profiler.stop_trace()

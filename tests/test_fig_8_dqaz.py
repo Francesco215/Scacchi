@@ -22,6 +22,7 @@ from scacchi.types import (
     ModelConfig,
     Network,
     SearchConfig,
+    SearchKind,
 )
 
 
@@ -103,7 +104,10 @@ def test_zero_tree_size_has_custom_plot_position():
 
 def test_stochastic_mcts_evaluate_uses_generic_eval_loop_smoke():
     env = pgx.make("tic_tac_toe")
-    search = SearchConfig(gumbel=GumbelSearchConfig(num_simulations=1))
+    search = SearchConfig(
+        kind=SearchKind.gumbel,
+        gumbel=GumbelSearchConfig(num_simulations=1),
+    )
     config = Config(
         model=ModelConfig(
             network=Network.boardlaw,

@@ -229,3 +229,4 @@ __marimo__/
 wandb
 artifacts/
 *.tar.gz
+vendor/

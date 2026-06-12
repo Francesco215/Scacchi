@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+ eopod kill-tpu --force
+
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   echo "Run this script with bash, not source: bash ${BASH_SOURCE[0]} ..." >&2
   return 2
@@ -271,12 +273,17 @@ if [[ "${SYNC}" == "1" ]]; then
   esac
 fi
 
+REMOTE_PYTHONPATH="${REPO_DIR}"
+if [[ -n "${SCACCHI_REMOTE_PYTHONPATH_PREFIX:-}" ]]; then
+  REMOTE_PYTHONPATH="${SCACCHI_REMOTE_PYTHONPATH_PREFIX}:${REMOTE_PYTHONPATH}"
+fi
 REMOTE_ENV=(
-  "PYTHONPATH=${REPO_DIR}"
+  "PYTHONPATH=${REMOTE_PYTHONPATH}"
   "JAX_PLATFORMS=tpu,cpu"
   "TPU_RUNTIME_METRICS_PORTS=${TPU_RUNTIME_METRICS_PORTS}"
 )
 for name in \
+  SCACCHI_RAW_SNAPSHOT_DIR \
   SCACCHI_PROFILE_DIR \
   SCACCHI_PROFILE_START_ITER \
   SCACCHI_PROFILE_NUM_ITERS \

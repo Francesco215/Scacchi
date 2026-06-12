@@ -27,6 +27,7 @@ from scacchi.types import (
     Network,
     SearchConfig,
     SearchConstantsConfig,
+    SearchKind,
     SelfplayConfig,
     TrainingConfig,
     TrainingLossConfig,
@@ -57,6 +58,7 @@ def _loss_config(
         model=ModelConfig(network=Network.boardlaw_dirichlet),
         selfplay=SelfplayConfig(max_num_steps=max_num_steps),
         search=SearchConfig(
+            kind=SearchKind.gumbel,
             gumbel=GumbelSearchConfig(
                 constants=SearchConstantsConfig(
                     categorical_epsilon=categorical_epsilon,

@@ -99,9 +99,38 @@ def train_minibatches(
     return metrics
 
 
+def _with_data_stats(
+    metrics: TrainMetrics,
+    data: TrainingSamples,
+    num_actions: int,
+) -> TrainMetrics:
+    terminated = data.terminated
+    value_mask = jnp.cumsum(terminated[:, ::-1], axis=1)[:, ::-1] >= 1
+    dtype = metrics.policy_loss.dtype
+    pass_action = num_actions - 1
+    num_terminations = jnp.sum(terminated.astype(dtype))
+    psk_terminated = (
+        jnp.zeros_like(terminated)
+        if data.psk_terminated is None
+        else data.psk_terminated
+    )
+    psk_fraction = jnp.sum(psk_terminated.astype(dtype)) / jnp.maximum(
+        num_terminations, 1.0
+    )
+    return metrics._replace(
+        data_value_mask_fraction=jnp.mean(value_mask.astype(dtype)),
+        data_pass_fraction=jnp.mean((data.played_action == pass_action).astype(dtype)),
+        data_terminations_per_row=jnp.mean(
+            jnp.sum(terminated.astype(dtype), axis=1)
+        ),
+        data_psk_termination_fraction=psk_fraction,
+    )
+
+
 def make_training_iteration(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     selfplay = make_selfplay(env, config, parallel=parallel)
+    num_actions = int(env.num_actions)
     compute_input_for_lossfn = make_compute_input_for_lossfn(config, parallel=parallel)
 
     @nnx.jit
@@ -120,7 +149,8 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
             parallel,
         )
         metrics = train_minibatches(model, optimizer, minibatches, config, parallel)
-        return _with_search_diagnostics(metrics, data)
+        metrics = _with_search_diagnostics(metrics, data)
+        return _with_data_stats(metrics, data, num_actions)
 
     def training_iteration(
         model: nnx.Module,

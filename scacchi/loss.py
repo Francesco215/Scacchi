@@ -98,6 +98,10 @@ class TrainMetrics(NamedTuple):
     search_root_gamma: Float[Array, "*batch"]
     search_root_downstream_eval_count: Float[Array, "*batch"]
     search_root_q_concentration: Float[Array, "*batch"]
+    data_value_mask_fraction: Float[Array, "*batch"]
+    data_pass_fraction: Float[Array, "*batch"]
+    data_terminations_per_row: Float[Array, "*batch"]
+    data_psk_termination_fraction: Float[Array, "*batch"]
 
 def _num_outcomes_for_config(config: Any) -> int:
     num_outcomes = config.env.num_outcomes
@@ -191,6 +195,8 @@ def make_compute_input_for_lossfn(
         loss_mask_mode = config.training.losses.loss_mask_mode
         if loss_mask_mode == "value":
             policy_loss_mask = value_mask
+            value_loss_mask = value_mask
+        elif loss_mask_mode == "pgx":
             value_loss_mask = value_mask
         elif loss_mask_mode != "search":
             raise ValueError(f"unknown loss_mask_mode: {loss_mask_mode!r}")
@@ -468,7 +474,25 @@ def _zero_train_metrics_like(reference: jax.Array, **values: jax.Array) -> Train
     return TrainMetrics(**fields)
 
 
-def _compute_losses(logits: jax.Array, value: jax.Array, data: Sample) -> tuple[jax.Array, jax.Array]:
+def _compute_losses(
+    logits: jax.Array,
+    value: jax.Array,
+    data: Sample,
+    config=None,
+) -> tuple[jax.Array, jax.Array]:
+    loss_mask_mode = (
+        None if config is None else config.training.losses.loss_mask_mode
+    )
+    if loss_mask_mode == "pgx":
+        # Exact replica of pgx examples/alphazero/train.py loss_fn: policy CE
+        # over the full softmax (illegal actions included) on every frame;
+        # value l2 multiplied by the completed-game mask, averaged over all
+        # frames (not a masked mean).
+        policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt)
+        policy_loss = jnp.mean(policy_loss)
+        value_loss = optax.l2_loss(value, data.value_tgt)
+        value_loss = jnp.mean(value_loss * data.value_mask)
+        return policy_loss, value_loss
     policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
     value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
     policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt, where=data.policy_mask)
@@ -677,7 +701,7 @@ def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
         output = model(data.obs, train=True)
         if len(output) == 2:
             logits, value = output
-            policy_loss, value_loss = _compute_losses(logits, value, data)
+            policy_loss, value_loss = _compute_losses(logits, value, data, config)
             metrics = _zero_train_metrics_like(
                 policy_loss,
                 policy_loss=policy_loss,

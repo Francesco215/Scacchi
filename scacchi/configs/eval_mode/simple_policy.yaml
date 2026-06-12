@@ -1,0 +1,15 @@
+# @package _global_
+# Policy-only evaluation, matching the lightweight PGX AlphaZero debug eval:
+# both players act directly from masked policy logits and skip tree search.
+
+eval:
+  player_action_commitment_type: posterior_sample
+  baseline_action_commitment_type: posterior_sample
+  player_search:
+    kind: policy
+    policy:
+      temperature: 1.0
+  baseline_search:
+    kind: policy
+    policy:
+      temperature: 1.0

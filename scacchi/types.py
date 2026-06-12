@@ -45,6 +45,9 @@ class QDirKLReduction(StrEnum):
 class LossMaskMode(StrEnum):
     search = "search"
     value = "value"
+    # Replicate pgx examples/alphazero/train.py exactly: policy CE unmasked
+    # (softmax over all actions, all frames), value loss mean(l2 * value_mask).
+    pgx = "pgx"
 
 
 class PolicyTargetMode(StrEnum):
@@ -56,6 +59,7 @@ class EvalBaseline(StrEnum):
     checkpoint = "checkpoint"
     pgx = "pgx"
     none = "none"
+    random = "random"
 
 
 def _require_ge(name: str, value: int | None, minimum: int) -> None:
@@ -209,28 +213,21 @@ class SearchConfig:
     kind: SearchKind = SearchKind.gumbel
     policy: PolicySearchConfig = field(default_factory=PolicySearchConfig)
     gumbel: GumbelSearchConfig = field(default_factory=GumbelSearchConfig)
-    dirichlet_thompson: DirichletThompsonSearchConfig = field(
-        default_factory=DirichletThompsonSearchConfig
-    )
+    dirichlet_thompson: DirichletThompsonSearchConfig = field(default_factory=DirichletThompsonSearchConfig)
     dqaz: DQAZSearchConfig = field(default_factory=DQAZSearchConfig)
 
-    def active(self) -> (
-        PolicySearchConfig
-        | GumbelSearchConfig
-        | DirichletThompsonSearchConfig
-        | DQAZSearchConfig
-    ):
-        return cast(
-            PolicySearchConfig
-            | GumbelSearchConfig
-            | DirichletThompsonSearchConfig
-            | DQAZSearchConfig,
-            getattr(self, str(self.kind)),
-        )
+    def active(self) -> (PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig | DQAZSearchConfig):
+        return cast(PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig | DQAZSearchConfig, getattr(self, str(self.kind)))
 
     def active_constants(self) -> SearchConstantsConfig:
         active = self.active()
         return getattr(active, "constants", SearchConstantsConfig())
+
+    def value(self, name: str, default: Any) -> Any:
+        return getattr(self.active(), name, default)
+
+    def constant(self, name: str, default: Any) -> Any:
+        return getattr(self.active_constants(), name, default)
 
 
 @dataclass
@@ -348,6 +345,7 @@ class LoggingConfig:
 class CheckpointingConfig:
     max_to_keep: int | None = 3
     save_interval_steps: int = 50
+    directory: str | None = None
 
     def __post_init__(self) -> None:
         _require_ge("checkpointing.max_to_keep", self.max_to_keep, 0)

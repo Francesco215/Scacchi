@@ -114,7 +114,10 @@ def test_scalar_gumbel_search_preserves_batch_sharding_without_collectives():
     search = make_search(
         _ToySearchEnv(),
         _toy_scalar_evaluator,
-        GumbelSearchConfig(num_simulations=2),
+        SearchConfig(
+            kind=SearchKind.gumbel,
+            gumbel=GumbelSearchConfig(num_simulations=2),
+        ),
     )
 
     def run(env_state, rng_key):
@@ -289,7 +292,10 @@ def test_play_dispatches_training_mode():
 
 def test_make_selfplay_delegates_to_play_training_smoke():
     env = pgx.make("tic_tac_toe")
-    search = SearchConfig(gumbel=GumbelSearchConfig(num_simulations=1))
+    search = SearchConfig(
+        kind=SearchKind.gumbel,
+        gumbel=GumbelSearchConfig(num_simulations=1),
+    )
     config = Config(
         env=EnvConfig(id="tic_tac_toe", num_outcomes=3),
         model=ModelConfig(
@@ -340,7 +346,10 @@ def test_batch_parallel_selfplay_lowers_without_search_collectives():
         selfplay=SelfplayConfig(
             batch_size=batch_size,
             max_num_steps=1,
-            search=SearchConfig(gumbel=GumbelSearchConfig(num_simulations=1)),
+            search=SearchConfig(
+                kind=SearchKind.gumbel,
+                gumbel=GumbelSearchConfig(num_simulations=1),
+            ),
             action_commitment_type=ActionCommitmentType.posterior_argmax,
         ),
     )

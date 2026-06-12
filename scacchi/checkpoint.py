@@ -75,8 +75,27 @@ def _checkpoint_manager_options(
     save_interval_steps: int = 1,
     save_on_steps: tuple[int, ...] | None = None,
     read_only: bool = False,
+    primary_only: bool = False,
 ) -> ocp.CheckpointManagerOptions:
     is_multihost = jax.process_count() > 1
+    if primary_only and is_multihost:
+        # Pod workers have private local disks, so cross-host barriers can
+        # never complete: process 0 saves alone, with no collective calls.
+        # The caller must pre-create the directory and give every other
+        # process a NoOpCheckpointManager.
+        return ocp.CheckpointManagerOptions(
+            max_to_keep=max_to_keep,
+            save_interval_steps=save_interval_steps,
+            save_on_steps=save_on_steps,
+            single_host_load_and_broadcast=False,
+            enable_async_checkpointing=True,
+            multiprocessing_options=ocp.options.MultiprocessingOptions(
+                primary_host=0,
+                active_processes={0},
+            ),
+            create=False,
+            read_only=read_only,
+        )
     return ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         save_interval_steps=save_interval_steps,
@@ -97,9 +116,16 @@ def build_checkpoint_manager(
         max_to_keep=config.checkpointing.max_to_keep,
         save_interval_steps=config.checkpointing.save_interval_steps,
         save_on_steps=(config.run.max_num_iters - 1,),
+        primary_only=True,
     )
     item_names = ("model", "optimizer", "rngs", "meta")
     if config.checkpointing.max_to_keep == 0:
+        return NoOpCheckpointManager(ckpt_dir)
+    if jax.process_count() > 1 and jax.process_index() != 0:
+        # Pod workers have private local disks: only process 0 saves (its
+        # manager uses active_processes={0}); the rest must not construct a
+        # real manager or orbax raises on the subset barrier. Note multihost
+        # RESUME from these checkpoints requires shared storage.
         return NoOpCheckpointManager(ckpt_dir)
     return ocp.CheckpointManager(ckpt_dir, options=options, item_names=item_names)
 

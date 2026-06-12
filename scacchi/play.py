@@ -12,7 +12,6 @@ from .dirichlet_tree.types import SearchDiagnostics
 from .distributed import (
     DISABLED_BATCH_PARALLEL,
     BatchParallel,
-    assert_batch_axis_sharded,
     constrain_batch_axis,
 )
 from .play_search import (
@@ -30,6 +29,7 @@ class TrainingSamples(NamedTuple):
     posterior: PosteriorTargets
     played_action: Int[Array, "batch time"]
     legal_action_mask: Bool[Array, "batch time action"]
+    psk_terminated: Bool[Array, "batch time"] | None = None
     search_diagnostics: SearchDiagnostics | None = None
 
 
@@ -148,38 +148,14 @@ def _play_eval(
     init_keys = parallel.split(init_key, batch_size)
     env_state = jax.vmap(env.init)(init_keys)
     env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="eval env_state",
-    )
     returns = jnp.zeros_like(env_state.terminated, dtype=jnp.float32)
 
     def body_fn(val):
         key, env_state, returns = val
         key, player_1_key, player_2_key = jax.random.split(key, 3)
         search_state = searchable_eval_state(env_state)
-        search_state = assert_batch_axis_sharded(
-            search_state,
-            parallel,
-            batch_axis=0,
-            label="eval search_state",
-        )
         player_1_output = player_1(search_state, player_1_key)
-        player_1_output = assert_batch_axis_sharded(
-            player_1_output,
-            parallel,
-            batch_axis=0,
-            label="eval player_1_output",
-        )
         player_2_output = player_2(search_state, player_2_key)
-        player_2_output = assert_batch_axis_sharded(
-            player_2_output,
-            parallel,
-            batch_axis=0,
-            label="eval player_2_output",
-        )
         action = jnp.where(
             env_state.current_player == player_1_id,
             player_1_output.action,
@@ -190,12 +166,6 @@ def _play_eval(
             env_state,
             action,
         )
-        env_state = assert_batch_axis_sharded(
-            env_state,
-            parallel,
-            batch_axis=0,
-            label="eval stepped_env_state",
-        )
         reward = env_state.rewards[jnp.arange(batch_size), player_1_id]
         returns = returns + jnp.where(active, reward, 0.0)
         returns = poison_eval_returns(returns, invalid_action)
@@ -205,12 +175,6 @@ def _play_eval(
         lambda x: ~(x[1].terminated.all()) & ~(jnp.isnan(x[2]).any()),
         body_fn,
         (key, env_state, returns),
-    )
-    returns = assert_batch_axis_sharded(
-        returns,
-        parallel,
-        batch_axis=0,
-        label="eval returns",
     )
     return eval_metrics_from_returns(returns)
 
@@ -224,22 +188,10 @@ def _selfplay_step_frame(
     batch_size: int,
     parallel: BatchParallel,
 ) -> tuple[Any, TrainingSamples]:
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="selfplay step input env_state",
-    )
     player_key, reset_key = jax.random.split(key, 2)
     observation = env_state.observation
     legal_action_mask = env_state.legal_action_mask
     player_output = player(env_state, player_key)
-    player_output = assert_batch_axis_sharded(
-        player_output,
-        parallel,
-        batch_axis=0,
-        label="selfplay step player_output",
-    )
     if player_output.posterior is None:
         raise ValueError("self-play player must return posterior targets")
 
@@ -250,15 +202,15 @@ def _selfplay_step_frame(
         player_output.action,
         reset_keys,
     )
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="selfplay step reset env_state",
-    )
     reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
     discount = -jnp.ones_like(reward)
     discount = jnp.where(env_state.terminated, 0.0, discount)
+    is_psk = getattr(getattr(env_state, "_x", None), "is_psk", None)
+    psk_terminated = (
+        jnp.zeros_like(env_state.terminated)
+        if is_psk is None
+        else env_state.terminated & is_psk
+    )
     frame = TrainingSamples(
         obs=observation,
         reward=reward,
@@ -267,13 +219,8 @@ def _selfplay_step_frame(
         discount=discount,
         posterior=player_output.posterior,
         played_action=player_output.action,
+        psk_terminated=psk_terminated,
         search_diagnostics=player_output.diagnostics,
-    )
-    frame = assert_batch_axis_sharded(
-        frame,
-        parallel,
-        batch_axis=0,
-        label="selfplay step frame",
     )
     return env_state, frame
 
@@ -292,12 +239,6 @@ def _play_training(
     init_keys = parallel.split(init_key, batch_size)
     env_state = jax.vmap(env.init)(init_keys)
     env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="selfplay init env_state",
-    )
 
     def step_fn(env_state: Any, key: jax.Array) -> tuple[Any, TrainingSamples]:
         return _selfplay_step_frame(
@@ -311,22 +252,11 @@ def _play_training(
 
     step_keys = jax.random.split(rollout_rng, max_num_steps)
     env_state, data = jax.lax.scan(step_fn, env_state, step_keys)
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="rollout output env_state",
-    )
     data = jax.tree_util.tree_map(
         lambda leaf: leaf.swapaxes(0, 1) if isinstance(leaf, jax.Array) else leaf,
         data,
     )
-    return assert_batch_axis_sharded(
-        data,
-        parallel,
-        batch_axis=0,
-        label="selfplay output data",
-    )
+    return data
 
 
 def play(

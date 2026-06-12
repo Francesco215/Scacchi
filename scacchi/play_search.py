@@ -151,6 +151,20 @@ class _DQAZBackupInputs(NamedTuple):
     leaf_players: np.ndarray
 
 
+class _DirichletRootContext(NamedTuple):
+    alpha_v: jax.Array
+    root: mctx.RootFnOutput
+    action_value_prior: jax.Array
+
+
+class _DirichletSearchBackendOutput(NamedTuple):
+    action_weights: jax.Array
+    action: jax.Array
+    q_evidence_sum: jax.Array
+    action_alpha_post: jax.Array
+    action_value_target_prior: jax.Array
+
+
 _NATIVE_TARGET_FIELD_NAMES = (
     "q_target_kind",
     "q_target_weight",
@@ -298,16 +312,8 @@ def make_dirichlet_recurrent_fn_from_constants(
     return recurrent_fn
 
 
-def _search_value(config: Any, name: str, default: Any) -> Any:
-    return getattr(config.search.active(), name, default)
-
-
-def _search_constant(config: Any, name: str, default: Any) -> Any:
-    return getattr(config.search.active_constants(), name, default)
-
-
 def _policy_target_samples(config: Any) -> int:
-    return int(_search_value(config, "policy_samples", _POSTERIOR_POLICY_TARGET_SAMPLES))
+    return int(config.search.value("policy_samples", _POSTERIOR_POLICY_TARGET_SAMPLES))
 
 
 def _search_kind(config: Any) -> SearchKind:
@@ -369,6 +375,7 @@ def legalize_action(
     action: jax.Array,
     legal_action_mask: jax.Array,
 ) -> jax.Array:
+    #TODO: remove this useless function. the rest of the code already avoids taking invalid actions.
     """Return `action` when legal, otherwise the first legal action in each row."""
 
     num_actions = legal_action_mask.shape[-1]
@@ -409,11 +416,7 @@ def make_player(search, action_committer):
     def player(env_state: pgx.State, rng_key: jax.Array) -> PlayerOutput:
         search_key, action_key = jax.random.split(rng_key)
         search_output = search(root_state=env_state, rng_key=search_key)
-        action = action_committer(
-            search_output.posterior,
-            env_state.legal_action_mask,
-            action_key,
-        )
+        action = action_committer(search_output.posterior, env_state.legal_action_mask, action_key)
         return PlayerOutput(
             action=action,
             posterior=search_output.posterior,
@@ -426,18 +429,13 @@ def make_player(search, action_committer):
 def make_search_player(
     env,
     model: Any,
-    search_cfg: SearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
+    search_cfg: SearchConfig,
     action_commitment_type: Any,
     *,
     q_loss_weight_mode: str = "policy",
 ):
     return make_player(
-        make_search(
-            env,
-            make_evaluator(model),
-            search_cfg,
-            q_loss_weight_mode=q_loss_weight_mode,
-        ),
+        make_search(env, make_evaluator(model), search_cfg, q_loss_weight_mode=q_loss_weight_mode),
         make_action_committer(str(action_commitment_type)),
     )
 
@@ -478,84 +476,116 @@ def _q_loss_weight_from_mode(
     raise ValueError(f"unknown q_loss_weight_mode: {mode!r}")
 
 
-def _run_dirichlet_search_output(
-    *,
+def _make_dirichlet_root_context(
     env_state: pgx.State,
     prediction: EvaluatorOutput,
-    recurrent_fn,
-    rng_key: jax.Array,
-    search_kind: SearchKind,
-    search_cfg: GumbelSearchConfig | DirichletThompsonSearchConfig,
-    q_loss_weight_mode: str,
-) -> SearchOutput:
+) -> _DirichletRootContext:
     alpha_v = _required_output(prediction.alpha_v, "alpha_v")
     alpha_q = _required_output(prediction.alpha_q, "alpha_q")
     root = _make_dirichlet_root(env_state, prediction.logits, alpha_v, alpha_q)
-    action_value_prior = alpha_q
+    return _DirichletRootContext(
+        alpha_v=alpha_v,
+        root=root,
+        action_value_prior=alpha_q,
+    )
 
-    search_key, posterior_key, _action_key = jax.random.split(rng_key, 3)
-    if search_kind == SearchKind.dirichlet_thompson:
-        if not isinstance(search_cfg, DirichletThompsonSearchConfig):
-            raise ValueError("Dirichlet Thompson search requires its active config")
-        policy_output = dirichlet_q_policy(
-            params=(),
-            rng_key=search_key,
-            root=root,
-            recurrent_fn=recurrent_fn,
-            action_value_prior=action_value_prior,
-            num_simulations=int(search_cfg.num_simulations),
-            invalid_actions=~env_state.legal_action_mask,
-            num_search_blocks=int(search_cfg.num_blocks),
-        )
-        q_evidence_sum = policy_output.q_evidence_sum
-        action_alpha_post = policy_output.alpha_search
-        action_value_target_prior = action_alpha_post - q_evidence_sum
-    elif search_kind == SearchKind.gumbel:
-        if not isinstance(search_cfg, GumbelSearchConfig):
-            raise ValueError("Gumbel search requires its active config")
-        policy_output = mctx.gumbel_muzero_policy(
-            params=(),
-            rng_key=search_key,
-            root=root,
-            recurrent_fn=recurrent_fn,
-            num_simulations=int(search_cfg.num_simulations),
-            invalid_actions=~env_state.legal_action_mask,
-            qtransform=_gumbel_qtransform(search_cfg),
-            gumbel_scale=float(search_cfg.gumbel_scale),
-        )
-        q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
-        action_value_target_prior = root_action_value_priors_from_tree(
-            policy_output.search_tree,
-            action_value_prior,
-        )
-        action_alpha_post = action_value_target_prior + q_evidence_sum
-    else:
-        raise RuntimeError(
-            f"{search_kind!r} search cannot run through the JAX model-search path. "
-            "Use the posterior-tree search entry point for DQAZ."
-        )
+
+def _run_dirichlet_thompson_backend(
+    *,
+    env_state: pgx.State,
+    root: mctx.RootFnOutput,
+    recurrent_fn,
+    search_key: jax.Array,
+    search_cfg: DirichletThompsonSearchConfig,
+    action_value_prior: jax.Array,
+) -> _DirichletSearchBackendOutput:
+    policy_output = dirichlet_q_policy(
+        params=(),
+        rng_key=search_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        action_value_prior=action_value_prior,
+        num_simulations=int(search_cfg.num_simulations),
+        invalid_actions=~env_state.legal_action_mask,
+        num_search_blocks=int(search_cfg.num_blocks),
+    )
+    q_evidence_sum = policy_output.q_evidence_sum
+    action_alpha_post = policy_output.alpha_search
+    return _DirichletSearchBackendOutput(
+        action_weights=cast(jax.Array, policy_output.action_weights),
+        action=cast(jax.Array, policy_output.action),
+        q_evidence_sum=q_evidence_sum,
+        action_alpha_post=action_alpha_post,
+        action_value_target_prior=action_alpha_post - q_evidence_sum,
+    )
+
+
+def _run_dirichlet_gumbel_backend(
+    *,
+    env_state: pgx.State,
+    root: mctx.RootFnOutput,
+    recurrent_fn,
+    search_key: jax.Array,
+    search_cfg: GumbelSearchConfig,
+    action_value_prior: jax.Array,
+) -> _DirichletSearchBackendOutput:
+    policy_output = mctx.gumbel_muzero_policy(
+        params=(),
+        rng_key=search_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=int(search_cfg.num_simulations),
+        invalid_actions=~env_state.legal_action_mask,
+        qtransform=mctx.qtransform_completed_by_mix_value,
+        gumbel_scale=float(search_cfg.gumbel_scale),
+    )
+    q_evidence_sum = q_evidence_sum_from_tree(policy_output.search_tree)
+    action_value_target_prior = root_action_value_priors_from_tree(
+        policy_output.search_tree,
+        action_value_prior,
+    )
+    return _DirichletSearchBackendOutput(
+        action_weights=cast(jax.Array, policy_output.action_weights),
+        action=cast(jax.Array, policy_output.action),
+        q_evidence_sum=q_evidence_sum,
+        action_alpha_post=action_value_target_prior + q_evidence_sum,
+        action_value_target_prior=action_value_target_prior,
+    )
+
+
+def _dirichlet_search_output_from_backend(
+    *,
+    alpha_v: jax.Array,
+    backend_output: _DirichletSearchBackendOutput,
+    legal_action_mask: jax.Array,
+    posterior_key: jax.Array,
+    search_cfg: GumbelSearchConfig | DirichletThompsonSearchConfig,
+    use_search_weights_as_policy_target: bool,
+    q_loss_weight_mode: str,
+) -> SearchOutput:
+    q_evidence_sum = backend_output.q_evidence_sum
 
     policy_samples = int(
         getattr(search_cfg, "policy_samples", _POSTERIOR_POLICY_TARGET_SAMPLES)
     )
     if policy_samples == 0:
-        posterior_policy_target = cast(jax.Array, policy_output.action_weights)
+        posterior_policy_target = backend_output.action_weights
     else:
         chunk_size = search_cfg.policy_sample_chunk_size
         posterior_policy_target = posterior_best_policy_target(
             posterior_key,
-            action_alpha_post,
-            env_state.legal_action_mask,
+            backend_output.action_alpha_post,
+            legal_action_mask,
             policy_samples,
             chunk_size=policy_samples if chunk_size is None else int(chunk_size),
         )
-    if search_kind == SearchKind.gumbel:
-        policy_target = cast(jax.Array, policy_output.action_weights)
+    if use_search_weights_as_policy_target:
+        policy_target = backend_output.action_weights
     else:
         policy_target = posterior_policy_target
     beta_Q_target, beta_V_target = posterior_targets(
         alpha_v,
-        action_value_target_prior,
+        backend_output.action_value_target_prior,
         q_evidence_sum,
         posterior_policy_target,
     )
@@ -573,7 +603,82 @@ def _run_dirichlet_search_output(
                     q_evidence_sum,
                     posterior_policy_target,
                 ),
-                search_action=cast(jax.Array, policy_output.action),
+                search_action=backend_output.action,
+            ),
+        ),
+    )
+
+
+def _run_dirichlet_backend_search_output(
+    *,
+    env_state: pgx.State,
+    prediction: EvaluatorOutput,
+    recurrent_fn,
+    rng_key: jax.Array,
+    search_cfg: GumbelSearchConfig | DirichletThompsonSearchConfig,
+    run_backend: Callable[..., _DirichletSearchBackendOutput],
+    use_search_weights_as_policy_target: bool,
+    q_loss_weight_mode: str,
+) -> SearchOutput:
+    root_context = _make_dirichlet_root_context(env_state, prediction)
+    search_key, posterior_key, _action_key = jax.random.split(rng_key, 3)
+    backend_output = run_backend(
+        env_state=env_state,
+        root=root_context.root,
+        recurrent_fn=recurrent_fn,
+        search_key=search_key,
+        search_cfg=search_cfg,
+        action_value_prior=root_context.action_value_prior,
+    )
+    return _dirichlet_search_output_from_backend(
+        alpha_v=root_context.alpha_v,
+        backend_output=backend_output,
+        legal_action_mask=env_state.legal_action_mask,
+        posterior_key=posterior_key,
+        search_cfg=search_cfg,
+        use_search_weights_as_policy_target=use_search_weights_as_policy_target,
+        q_loss_weight_mode=q_loss_weight_mode,
+    )
+
+
+def _run_scalar_gumbel_search_output(
+    *,
+    env_state: pgx.State,
+    prediction: EvaluatorOutput,
+    recurrent_fn,
+    rng_key: jax.Array,
+    search_cfg: GumbelSearchConfig,
+) -> SearchOutput:
+    value = _required_output(prediction.value, "value")
+    root = mctx.RootFnOutput(
+        prior_logits=prediction.logits,
+        value=value,
+        embedding=env_state,
+    )
+    policy_output = mctx.gumbel_muzero_policy(
+        params=(),
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=int(search_cfg.num_simulations),
+        invalid_actions=~env_state.legal_action_mask,
+        qtransform=mctx.qtransform_completed_by_mix_value,
+        gumbel_scale=float(search_cfg.gumbel_scale),
+    )
+    policy_target = cast(jax.Array, policy_output.action_weights)
+    search_action = cast(jax.Array, policy_output.action)
+    return SearchOutput(
+        posterior=PosteriorTargets(
+            prediction=PosteriorPrediction(
+                policy=policy_target,
+                value=value,
+            ),
+            metadata=TargetMetadata(
+                mask=_search_loss_mask(policy_target),
+                search_action=legalize_action(
+                    search_action,
+                    env_state.legal_action_mask,
+                ),
             ),
         ),
     )
@@ -585,152 +690,132 @@ def _run_policy_search_output(
     prediction: EvaluatorOutput,
     search_cfg: PolicySearchConfig,
 ) -> SearchOutput:
-    policy = _masked_policy(
-        prediction.logits,
-        env_state.legal_action_mask,
-        temperature=float(search_cfg.temperature),
-    )
-    search_action = posterior_best_action(policy, env_state.legal_action_mask)
+    masked_logits = _masked_logits(prediction.logits, env_state.legal_action_mask)
+    policy = jax.nn.softmax(masked_logits / float(search_cfg.temperature), axis=-1)
+    has_legal_action = jnp.any(env_state.legal_action_mask, axis=-1, keepdims=True)
+    policy =  jnp.where(has_legal_action, policy, jnp.zeros_like(policy))
+    search_action = posterior_best_action(policy, env_state.legal_action_mask) #TODO: check if you should simply sample
+    
     return SearchOutput(
         posterior=PosteriorTargets(
-            prediction=PosteriorPrediction(
-                policy=policy,
-                value=prediction.value,
-                alpha_v=prediction.alpha_v,
-                alpha_q=prediction.alpha_q,
-            ),
-            metadata=TargetMetadata(
-                mask=_search_loss_mask(policy),
-                search_action=legalize_action(
-                    search_action,
-                    env_state.legal_action_mask,
-                ),
-            ),
+            prediction=PosteriorPrediction(policy, prediction.value, prediction.alpha_v, prediction.alpha_q),
+            metadata=TargetMetadata(mask=_search_loss_mask(policy), search_action=legalize_action(search_action, env_state.legal_action_mask)),
         ),
     )
 
 
-def _active_jax_search_config(
-    search_cfg: (
-        SearchConfig
-        | PolicySearchConfig
-        | GumbelSearchConfig
-        | DirichletThompsonSearchConfig
-    ),
-) -> tuple[
-    SearchKind,
-    PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
-]:
-    if isinstance(search_cfg, SearchConfig):
-        if search_cfg.kind == SearchKind.dqaz:
-            raise RuntimeError(
-                "DQAZ remains on the posterior-tree compatibility path."
-            )
-        active = search_cfg.active()
-        if not isinstance(
-            active,
-            (PolicySearchConfig, GumbelSearchConfig, DirichletThompsonSearchConfig),
-        ):
-            raise RuntimeError(
-                "JAX search requires a policy, Gumbel, or Dirichlet config."
-            )
-        return search_cfg.kind, active
-    if isinstance(search_cfg, PolicySearchConfig):
-        return SearchKind.policy, search_cfg
-    if isinstance(search_cfg, GumbelSearchConfig):
-        return SearchKind.gumbel, search_cfg
-    return SearchKind.dirichlet_thompson, search_cfg
-
-
-def make_search(
+def _make_policy_search(
     env,
     evaluator: Callable[[jax.Array], EvaluatorOutput],
-    search_cfg: (
-        SearchConfig
-        | PolicySearchConfig
-        | GumbelSearchConfig
-        | DirichletThompsonSearchConfig
-    ),
-    *,
-    q_loss_weight_mode: str = "policy",
+    search_cfg: PolicySearchConfig,
+    *args, **kwargs,
 ) -> Callable[..., SearchOutput]:
-    search_kind, active_search_cfg = _active_jax_search_config(search_cfg)
-    if search_kind == SearchKind.policy:
-        if not isinstance(active_search_cfg, PolicySearchConfig):
-            raise ValueError("policy search requires PolicySearchConfig")
+    def search(*, root_state: pgx.State, rng_key: jax.Array) -> SearchOutput:
+        del rng_key
+        prediction = evaluator(root_state.observation)
+        return _run_policy_search_output(
+            env_state=root_state,
+            prediction=prediction,
+            search_cfg=search_cfg,
+        )
 
-        def search(*, root_state: pgx.State, rng_key: jax.Array) -> SearchOutput:
-            del rng_key
-            prediction = evaluator(root_state.observation)
-            return _run_policy_search_output(
-                env_state=root_state,
-                prediction=prediction,
-                search_cfg=active_search_cfg,
-            )
+    return search
 
-        return search
 
+def _make_gumbel_search(
+    env,
+    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    search_cfg: GumbelSearchConfig,
+    *,
+    q_loss_weight_mode: str,
+) -> Callable[..., SearchOutput]:
     scalar_recurrent_fn = make_recurrent_fn(env, evaluator)
-    dirichlet_recurrent_fn = make_dirichlet_recurrent_fn_from_constants(
-        env,
-        evaluator,
-        active_search_cfg.constants,
-    )
+    dirichlet_recurrent_fn = make_dirichlet_recurrent_fn_from_constants(env, evaluator, search_cfg.constants)
 
     def search(*, root_state: pgx.State, rng_key: jax.Array) -> SearchOutput:
         prediction = evaluator(root_state.observation)
         if prediction.alpha_q is None:
-            if search_kind != SearchKind.gumbel:
-                raise ValueError(
-                    f"{search_kind!r} search requires a Dirichlet evaluator."
-                )
-            if not isinstance(active_search_cfg, GumbelSearchConfig):
-                raise ValueError("scalar Gumbel search requires Gumbel config")
-            value = _required_output(prediction.value, "value")
-            root = mctx.RootFnOutput(
-                prior_logits=prediction.logits,
-                value=value,
-                embedding=root_state,
-            )
-            policy_output = mctx.gumbel_muzero_policy(
-                params=(),
-                rng_key=rng_key,
-                root=root,
+            return _run_scalar_gumbel_search_output(
+                env_state=root_state,
+                prediction=prediction,
                 recurrent_fn=scalar_recurrent_fn,
-                num_simulations=int(active_search_cfg.num_simulations),
-                invalid_actions=~root_state.legal_action_mask,
-                qtransform=_gumbel_qtransform(active_search_cfg),
-                gumbel_scale=float(active_search_cfg.gumbel_scale),
+                rng_key=rng_key,
+                search_cfg=search_cfg,
             )
-            policy_target = cast(jax.Array, policy_output.action_weights)
-            search_action = cast(jax.Array, policy_output.action)
-            return SearchOutput(
-                posterior=PosteriorTargets(
-                    prediction=PosteriorPrediction(
-                        policy=policy_target,
-                        value=value,
-                    ),
-                    metadata=TargetMetadata(
-                        mask=_search_loss_mask(policy_target),
-                        search_action=legalize_action(
-                            search_action,
-                            root_state.legal_action_mask,
-                        ),
-                    ),
-                ),
-            )
-        return _run_dirichlet_search_output(
+        return _run_dirichlet_backend_search_output(
             env_state=root_state,
             prediction=prediction,
             recurrent_fn=dirichlet_recurrent_fn,
             rng_key=rng_key,
-            search_kind=search_kind,
-            search_cfg=active_search_cfg,
+            search_cfg=search_cfg,
+            run_backend=_run_dirichlet_gumbel_backend,
+            use_search_weights_as_policy_target=isinstance(search_cfg, GumbelSearchConfig),
             q_loss_weight_mode=q_loss_weight_mode,
         )
 
     return search
 
+
+def _make_dirichlet_thompson_search(
+    env,
+    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    search_cfg: DirichletThompsonSearchConfig,
+    *,
+    q_loss_weight_mode: str,
+) -> Callable[..., SearchOutput]:
+    recurrent_fn = make_dirichlet_recurrent_fn_from_constants(
+        env,
+        evaluator,
+        search_cfg.constants,
+    )
+
+    def search(*, root_state: pgx.State, rng_key: jax.Array) -> SearchOutput:
+        prediction = evaluator(root_state.observation)
+        if prediction.alpha_q is None:
+            raise ValueError(
+                f"{SearchKind.dirichlet_thompson!r} search requires a Dirichlet "
+                "evaluator."
+            )
+        return _run_dirichlet_backend_search_output(
+            env_state=root_state,
+            prediction=prediction,
+            recurrent_fn=recurrent_fn,
+            rng_key=rng_key,
+            search_cfg=search_cfg,
+            run_backend=_run_dirichlet_thompson_backend,
+            use_search_weights_as_policy_target=isinstance(
+                search_cfg,
+                GumbelSearchConfig,
+            ),
+            q_loss_weight_mode=q_loss_weight_mode,
+        )
+
+    return search
+
+
+def make_search(
+    env,
+    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    search_cfg: SearchConfig,
+    *,
+    q_loss_weight_mode: str = "policy",
+) -> Callable[..., SearchOutput]:
+    
+    active_search_cfg, _make_search_function = {
+        SearchKind.policy: (search_cfg.policy, _make_policy_search),
+        SearchKind.gumbel: (search_cfg.gumbel, _make_gumbel_search),
+        SearchKind.dirichlet_thompson: (search_cfg.dirichlet_thompson, _make_dirichlet_thompson_search),
+    }[search_cfg.kind]
+    
+    return _make_search_function(env, evaluator, active_search_cfg, q_loss_weight_mode=q_loss_weight_mode)  # ty:ignore[invalid-argument-type]
+
+
+# 
+# 
+# 
+# 
+# 
+# --------------------
 
 def _run_posterior_tree_search_step(
     *,
@@ -1111,18 +1196,17 @@ def _run_dqaz_posterior_tree_search(
         dqaz.SearchConfig(
             action_size=action_size,
             observation_shape=tuple(root_observations.shape[1:]),
-            simulations_per_root=int(_search_value(config, "num_simulations", 1)),
+            simulations_per_root=int(config.search.value("num_simulations", 1)),
             posterior_best_samples=_policy_target_samples(config),
             kappa_n=float(
-                _search_value(
-                    config,
+                config.search.value(
                     "state_posterior_kappa_n",
                     _DQAZ_STATE_POSTERIOR_KAPPA_N,
                 )
             ),
             seed=seed,
-            debug=bool(_search_value(config, "debug", getattr(config, "debug", False))),
-            max_pending_requests_per_root=int(_search_value(config, "inflight_limit", 1)),
+            debug=bool(config.search.value("debug", getattr(config, "debug", False))),
+            max_pending_requests_per_root=int(config.search.value("inflight_limit", 1)),
         )
     )
     root_offsets, root_actions, root_q = _compact_valid_actions_and_q_from_mask_np(
@@ -1163,9 +1247,9 @@ def _run_dqaz_posterior_tree_search(
     profile_shapes: dict[tuple[int, int, int, int], int] = {}
 
     eval_batch_size = _eval_batch_size(config, batch_size)
-    pad_to_eval_batch = bool(_search_value(config, "pad_to_eval_batch", False))
+    pad_to_eval_batch = bool(config.search.value("pad_to_eval_batch", False))
     pad_to = eval_batch_size if pad_to_eval_batch else None
-    use_jax_backup = bool(_search_value(config, "jax_backup", True))
+    use_jax_backup = bool(config.search.value("jax_backup", True))
     jax_backup_step = 0
     while not engine.is_done(tree_ids):
         start = time.perf_counter() if profile_search else 0.0
@@ -1254,13 +1338,12 @@ def _run_dqaz_posterior_tree_search(
             np.asarray(child_rewards[:active_size], dtype=np.float32),
             current_players,
             epsilon=float(
-                _search_value(
-                    config,
+                config.search.value(
                     "epsilon_terminal",
                     _DQAZ_EPSILON_TERMINAL,
                 )
             ),
-            kappa=float(_search_constant(config, "kappa_terminal", 8.0)),
+            kappa=float(config.search.constant("kappa_terminal", 8.0)),
         )
         if profile_search:
             profile_times["terminal_alpha"] += time.perf_counter() - start
@@ -1291,7 +1374,7 @@ def _run_dqaz_posterior_tree_search(
                     backup_batch,
                     root_batch_size=batch_size,
                     eval_batch_size=eval_batch_size,
-                    num_simulations=int(_search_value(config, "num_simulations", 1)),
+                    num_simulations=int(config.search.value("num_simulations", 1)),
                 )
                 if profile_search:
                     profile_times["pad_backup"] += time.perf_counter() - start
@@ -1320,8 +1403,7 @@ def _run_dqaz_posterior_tree_search(
                     jnp.asarray(backup_inputs.leaf_alpha, dtype=jnp.float32),
                     jnp.asarray(backup_inputs.leaf_players, dtype=jnp.int32),
                     float(
-                        _search_value(
-                            config,
+                        config.search.value(
                             "state_posterior_kappa_n",
                             _DQAZ_STATE_POSTERIOR_KAPPA_N,
                         )
@@ -1793,7 +1875,7 @@ def _select_active_states(
 
 
 def _eval_batch_size(config: Any, num_trees: int) -> int:
-    configured = _search_value(config, "eval_batch_size", None)
+    configured = config.search.value("eval_batch_size", None)
     if configured is None:
         return max(1, num_trees)
     return max(1, int(configured))
