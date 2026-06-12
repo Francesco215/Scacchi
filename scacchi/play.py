@@ -133,7 +133,7 @@ def eval_metrics_from_returns(returns: Float[Array, "batch"]) -> EvalMetrics:
     )
 
 
-def _play_eval(
+def play_eval(
     env: Any,
     player_1: Player,
     player_2: Player,
@@ -225,7 +225,7 @@ def _selfplay_step_frame(
     return env_state, frame
 
 
-def _play_training(
+def play_training(
     env: Any,
     player: Player,
     rng_key: jax.Array,
@@ -241,18 +241,11 @@ def _play_training(
     env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
 
     def step_fn(env_state: Any, key: jax.Array) -> tuple[Any, TrainingSamples]:
-        return _selfplay_step_frame(
-            env,
-            player,
-            env_state,
-            key,
-            batch_size=batch_size,
-            parallel=parallel,
-        )
+        return _selfplay_step_frame(env, player, env_state, key, batch_size=batch_size, parallel=parallel)
 
     step_keys = jax.random.split(rollout_rng, max_num_steps)
     env_state, data = jax.lax.scan(step_fn, env_state, step_keys)
-    data = jax.tree_util.tree_map(
+    data = jax.tree_util.tree_map( #exchanges the batch axis with the step axis
         lambda leaf: leaf.swapaxes(0, 1) if isinstance(leaf, jax.Array) else leaf,
         data,
     )
@@ -276,65 +269,10 @@ def play(
             raise ValueError("training play requires identical self-play players")
         if max_num_steps is None:
             raise ValueError("training play requires max_num_steps")
-        return _play_training(
-            env,
-            player_1,
-            rng_key,
-            batch_size=batch_size,
-            max_num_steps=max_num_steps,
-            parallel=parallel,
-        )
+        return play_training(env, player_1, rng_key, batch_size=batch_size, max_num_steps=max_num_steps, parallel=parallel)
     if mode == "eval":
-        return _play_eval(
-            env,
-            player_1,
-            player_2,
-            rng_key,
-            batch_size=batch_size,
-            player_1_id=player_1_id,
-            parallel=parallel,
-        )
+        return play_eval(env, player_1, player_2, rng_key, batch_size=batch_size, player_1_id=player_1_id, parallel=parallel)
     raise ValueError(f"unknown play mode: {mode!r}")
-
-
-def play_training(
-    env: Any,
-    player: Player,
-    rng_key: jax.Array,
-    *,
-    batch_size: int,
-    max_num_steps: int,
-    parallel: BatchParallel | None = None,
-) -> TrainingSamples:
-    return _play_training(
-        env,
-        player,
-        rng_key,
-        batch_size=batch_size,
-        max_num_steps=max_num_steps,
-        parallel=parallel,
-    )
-
-
-def play_eval(
-    env: Any,
-    player_1: Player,
-    player_2: Player,
-    rng_key: jax.Array,
-    *,
-    batch_size: int,
-    player_1_id: int = 0,
-    parallel: BatchParallel | None = None,
-) -> EvalMetrics:
-    return _play_eval(
-        env,
-        player_1,
-        player_2,
-        rng_key,
-        batch_size=batch_size,
-        player_1_id=player_1_id,
-        parallel=parallel,
-    )
 
 
 def make_selfplay(env, config, parallel: BatchParallel | None = None):
