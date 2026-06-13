@@ -41,7 +41,7 @@ training:
     value_outcome_weight: 0.0
     q_outcome_weight: 0.0
     policy_target_mode: search
-    loss_mask_mode: value
+    loss_mask_mode: pgx
 
 eval:
   interval: 1

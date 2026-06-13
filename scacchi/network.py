@@ -61,9 +61,9 @@ def policy_value_from_output(output):
 
 class BlockV1(nnx.Module):
     def __init__(self, num_channels: int, *, dtype=jnp.float32, rngs: nnx.Rngs):
-        self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         self.bn1 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
-        self.conv2 = nnx.Conv(num_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv2 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         self.bn2 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
     def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
@@ -79,9 +79,9 @@ class BlockV1(nnx.Module):
 class BlockV2(nnx.Module):
     def __init__(self, num_channels: int, *, dtype=jnp.float32, rngs: nnx.Rngs):
         self.bn1 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
-        self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         self.bn2 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
-        self.conv2 = nnx.Conv(num_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv2 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
 
     def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
         residual = x
@@ -115,7 +115,7 @@ class AZNet(nnx.Module):
         self.resnet_v2 = resnet_v2
         self.dtype = dtype
 
-        self.conv = nnx.Conv(input_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv = nnx.Conv(input_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         if not resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
@@ -125,7 +125,7 @@ class AZNet(nnx.Module):
         if resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
-        self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.policy_bn = nnx.BatchNorm(2, momentum=0.9, dtype=dtype, rngs=rngs)
         self.policy_linear = nnx.Linear(
             height * width * 2,
@@ -136,7 +136,7 @@ class AZNet(nnx.Module):
             rngs=rngs,
         )
 
-        self.value_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.value_conv = nnx.Conv(num_channels, 1, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.value_bn = nnx.BatchNorm(1, momentum=0.9, dtype=dtype, rngs=rngs)
         self.value_linear = nnx.Linear(height * width, num_channels, dtype=dtype, rngs=rngs)
         self.value_out = nnx.Linear(num_channels, 1, dtype=dtype, rngs=rngs)
@@ -200,7 +200,7 @@ class AZDirichletNet(nnx.Module):
         self.dtype = dtype
         self.dirichlet_concentration_clip = dirichlet_concentration_clip
 
-        self.conv = nnx.Conv(input_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv = nnx.Conv(input_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         if not resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
@@ -210,7 +210,7 @@ class AZDirichletNet(nnx.Module):
         if resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
-        self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.policy_bn = nnx.BatchNorm(2, momentum=0.9, dtype=dtype, rngs=rngs)
         self.policy_linear = nnx.Linear(
             height * width * 2,
@@ -221,7 +221,7 @@ class AZDirichletNet(nnx.Module):
             rngs=rngs,
         )
 
-        self.value_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.value_conv = nnx.Conv(num_channels, 1, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.value_bn = nnx.BatchNorm(1, momentum=0.9, dtype=dtype, rngs=rngs)
         self.value_linear = nnx.Linear(height * width, num_channels, dtype=dtype, rngs=rngs)
         self.value_dir_out = nnx.Linear(
@@ -244,7 +244,7 @@ class AZDirichletNet(nnx.Module):
             rngs=rngs,
         )
 
-        self.q_dir_conv = nnx.Conv(num_channels, num_outcomes, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.q_dir_conv = nnx.Conv(num_channels, num_outcomes, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.q_dir_bn = nnx.BatchNorm(num_outcomes, momentum=0.9, dtype=dtype, rngs=rngs)
         self.q_dir_linear = nnx.Linear(
             height * width * num_outcomes,
@@ -254,7 +254,7 @@ class AZDirichletNet(nnx.Module):
             bias_init=jax.nn.initializers.zeros,
             rngs=rngs,
         )
-        self.q_conc_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.q_conc_conv = nnx.Conv(num_channels, 1, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.q_conc_bn = nnx.BatchNorm(1, momentum=0.9, dtype=dtype, rngs=rngs)
         self.q_conc_linear = nnx.Linear(
             height * width,

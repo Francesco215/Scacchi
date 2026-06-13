@@ -35,11 +35,14 @@ def make_minibatches(
         num_updates = min(num_updates, max_updates_per_iter)
     local_train_rows = num_updates * local_training_batch_size
 
-    local_keys = parallel.split(rng_key, device_count)
+    if device_count == 1:
+        local_keys = rng_key[None, :]
+    else:
+        local_keys = parallel.split(rng_key, device_count)
     local_row_ixs = jax.vmap(lambda key: jax.random.permutation(key, jnp.arange(local_rows))[:local_train_rows])(local_keys)
 
     def local_shuffle(x: jax.Array) -> jax.Array:
-        x = rearrange(x, "(d b) t ... -> d (b t) ...", d=device_count, b=local_batch_size)
+        x = rearrange(x, "(d b) t ... -> d (t b) ...", d=device_count, b=local_batch_size)
         x = jax.vmap(lambda local_x, ixs: local_x[ixs])(x, local_row_ixs)
         x = rearrange(x, "d (u b) ... -> u (d b) ...", u=num_updates, b=local_training_batch_size)
         return x
