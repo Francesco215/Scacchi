@@ -292,6 +292,14 @@ def main(cfg: DictConfig) -> None:
             profile_stop_iter = profile_start_iter + profile_num_iters
             profile_create_perfetto = _env_flag("SCACCHI_PROFILE_PERFETTO")
             profile_trace_active = False
+            if jax.process_index() == 0:
+                print(
+                    "Training loop starting: "
+                    f"start_iter={start_iter}, "
+                    f"max_num_iters={config.run.max_num_iters}, "
+                    f"eval_interval={config.eval.interval}",
+                    flush=True,
+                )
             pbar = tqdm(range(start_iter, config.run.max_num_iters), desc="training", dynamic_ncols=True, total=config.run.max_num_iters, initial=start_iter, disable=jax.process_index() != 0)
             pbar.refresh()
             try:
@@ -302,6 +310,8 @@ def main(cfg: DictConfig) -> None:
                         iteration == config.run.max_num_iters - 1
                         or iteration % config.eval.interval == 0
                     ):
+                        if jax.process_index() == 0:
+                            print(f"Iteration {iteration}: evaluation starting", flush=True)
                         with parallel.mesh_context():
                             returns = evaluate(eval_key, model)
                         dict_to_log.update(returns_metrics("eval/vs_baseline", returns))

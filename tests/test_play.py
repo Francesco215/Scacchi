@@ -185,6 +185,43 @@ def test_policy_search_uses_masked_logits_without_tree_search():
     assert jnp.array_equal(output.action, jnp.array([1, 2], dtype=jnp.int32))
 
 
+def test_policy_search_action_samples_batched_policy_rows():
+    batch_size = 64
+    num_actions = 3
+    env_state = _ToySearchState(
+        observation=jnp.zeros((batch_size, 1), dtype=jnp.float32),
+        legal_action_mask=jnp.ones((batch_size, num_actions), dtype=jnp.bool_),
+        current_player=jnp.zeros((batch_size,), dtype=jnp.int32),
+        rewards=jnp.zeros((batch_size, 2), dtype=jnp.float32),
+        terminated=jnp.zeros((batch_size,), dtype=jnp.bool_),
+    )
+
+    def logits_only_model(obs: jax.Array) -> jax.Array:
+        return jnp.zeros((obs.shape[0], num_actions), dtype=jnp.float32)
+
+    key = jax.random.PRNGKey(0)
+    player = make_search_player(
+        _ToySearchEnv(),
+        logits_only_model,
+        SearchConfig(
+            kind=SearchKind.policy,
+            policy=PolicySearchConfig(temperature=1.0),
+        ),
+        ActionCommitmentType.search_action,
+    )
+
+    output = player(env_state, key)
+    assert output.posterior is not None
+    expected = posterior_sample_action(
+        key,
+        output.posterior.prediction.policy,
+        env_state.legal_action_mask,
+    )
+
+    assert jnp.array_equal(output.action, expected)
+    assert jnp.any(output.action != 0)
+
+
 def test_commit_action_samples_posterior_target():
     key = jax.random.PRNGKey(0)
     action_weights = jnp.array(

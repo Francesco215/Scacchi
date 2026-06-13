@@ -51,13 +51,60 @@ class BatchParallel:
 DISABLED_BATCH_PARALLEL = BatchParallel(enabled=False)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return None
+    return int(value)
+
+
+def _env_local_device_ids(name: str) -> list[int] | None:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return None
+    return [int(part.strip()) for part in value.split(",") if part.strip()]
+
+
 def initialize_distributed() -> None:
+    if _env_bool("SCACCHI_DISABLE_DISTRIBUTED"):
+        return
     platforms = os.environ.get("JAX_PLATFORMS")
     if platforms is not None and "tpu" not in {platform.strip() for platform in platforms.split(",")}:
         return
     if not any(Path("/dev").glob("accel*")):
         return
     if jax.distributed.is_initialized():
+        return
+    coordinator_address = os.environ.get("SCACCHI_JAX_COORDINATOR_ADDRESS")
+    num_processes = _env_int("SCACCHI_JAX_NUM_PROCESSES")
+    process_id = _env_int("SCACCHI_JAX_PROCESS_ID")
+    local_device_ids = _env_local_device_ids("SCACCHI_JAX_LOCAL_DEVICE_IDS")
+    initialization_timeout = _env_int("SCACCHI_JAX_INITIALIZATION_TIMEOUT") or 300
+    coordinator_bind_address = os.environ.get("SCACCHI_JAX_COORDINATOR_BIND_ADDRESS")
+
+    explicit_args = (coordinator_address, num_processes, process_id)
+    if any(value is not None for value in explicit_args):
+        if any(value is None for value in explicit_args):
+            raise ValueError(
+                "SCACCHI_JAX_COORDINATOR_ADDRESS, SCACCHI_JAX_NUM_PROCESSES, "
+                "and SCACCHI_JAX_PROCESS_ID must be set together."
+            )
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=num_processes,
+            process_id=process_id,
+            local_device_ids=local_device_ids,
+            cluster_detection_method="deactivate",
+            initialization_timeout=initialization_timeout,
+            coordinator_bind_address=coordinator_bind_address,
+        )
         return
     jax.distributed.initialize()
 

@@ -689,14 +689,16 @@ def _run_policy_search_output(
     *,
     env_state: pgx.State,
     prediction: EvaluatorOutput,
+    rng_key: jax.Array,
     search_cfg: PolicySearchConfig,
 ) -> SearchOutput:
     masked_logits = _masked_logits(prediction.logits, env_state.legal_action_mask)
     policy = jax.nn.softmax(masked_logits / float(search_cfg.temperature), axis=-1)
     has_legal_action = jnp.any(env_state.legal_action_mask, axis=-1, keepdims=True)
-    policy =  jnp.where(has_legal_action, policy, jnp.zeros_like(policy))
-    search_action = posterior_best_action(policy, env_state.legal_action_mask) #TODO: check if you should simply sample
-    
+    policy = jnp.where(has_legal_action, policy, jnp.zeros_like(policy))
+    # TODO: this search action should just be the action committed by the player. it shoudln't even be here in the first place
+    search_action = posterior_sample_action(rng_key, policy, env_state.legal_action_mask)
+
     return SearchOutput(
         posterior=PosteriorTargets(
             prediction=PosteriorPrediction(policy, prediction.value, prediction.alpha_v, prediction.alpha_q),
@@ -712,11 +714,11 @@ def _make_policy_search(
     *args, **kwargs,
 ) -> Callable[..., SearchOutput]:
     def search(*, root_state: pgx.State, rng_key: jax.Array) -> SearchOutput:
-        del rng_key
         prediction = evaluator(root_state.observation)
         return _run_policy_search_output(
             env_state=root_state,
             prediction=prediction,
+            rng_key=rng_key,
             search_cfg=search_cfg,
         )
 

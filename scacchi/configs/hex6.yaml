@@ -54,10 +54,22 @@ eval:
   interval: 5
   batch_size: 512
   baseline: checkpoint
-  baseline_search:
-    kind: gumbel
-    gumbel:
+  player_search:
+    kind: dirichlet_thompson
+    dirichlet_thompson:
       num_simulations: 4
+      num_blocks: 8
+      constants:
+        kappa_leaf: 1.0
+        kappa_terminal: 8.0
+  baseline_search:
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 4
+      num_blocks: 8
+      constants:
+        kappa_leaf: 1.0
+        kappa_terminal: 8.0
 
 logging:
   interval: 1
