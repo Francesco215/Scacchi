@@ -186,7 +186,6 @@ def _selfplay_step_frame(
     key: jax.Array,
     *,
     batch_size: int,
-    parallel: BatchParallel,
 ) -> tuple[Any, TrainingSamples]:
     player_key, reset_key = jax.random.split(key, 2)
     observation = env_state.observation
@@ -196,7 +195,7 @@ def _selfplay_step_frame(
         raise ValueError("self-play player must return posterior targets")
 
     actor = env_state.current_player
-    reset_keys = parallel.split(reset_key, batch_size)
+    reset_keys = jax.random.split(reset_key, batch_size)
     env_state = jax.vmap(auto_reset(env.step, env.init))(
         env_state,
         player_output.action,
@@ -236,12 +235,18 @@ def play_training(
 ) -> TrainingSamples:
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     rollout_rng, init_key = jax.random.split(rng_key)
-    init_keys = parallel.split(init_key, batch_size)
+    init_keys = jax.random.split(init_key, batch_size)
     env_state = jax.vmap(env.init)(init_keys)
     env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
 
     def step_fn(env_state: Any, key: jax.Array) -> tuple[Any, TrainingSamples]:
-        return _selfplay_step_frame(env, player, env_state, key, batch_size=batch_size, parallel=parallel)
+        return _selfplay_step_frame(
+            env,
+            player,
+            env_state,
+            key,
+            batch_size=batch_size,
+        )
 
     step_keys = jax.random.split(rollout_rng, max_num_steps)
     env_state, data = jax.lax.scan(step_fn, env_state, step_keys)
@@ -251,6 +256,42 @@ def play_training(
     )
     return data
 
+
+def make_single_device_selfplay(
+    env,
+    config,
+    parallel: BatchParallel | None = None,
+):
+    """Return the single-device PGX-style self-play function.
+
+    This maps to the body of pgx/examples/alphazero/train.py::selfplay after
+    removing pmap's leading device axis.  The returned function still emits
+    Scacchi's richer TrainingSamples container with batch/time axes.
+    """
+
+    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
+
+    def training_player(model: nnx.Module):
+        return make_search_player(
+            env,
+            model,
+            config.selfplay.search,
+            config.selfplay.action_commitment_type,
+            q_loss_weight_mode=str(config.training.losses.q_loss_weight_mode),
+        )
+
+    @nnx.jit
+    def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
+        return play_training(
+            env,
+            training_player(model),
+            rng_key,
+            batch_size=int(config.selfplay.batch_size),
+            max_num_steps=int(config.selfplay.max_num_steps),
+            parallel=parallel,
+        )
+
+    return selfplay
 
 def play(
     env: Any,
@@ -269,7 +310,14 @@ def play(
             raise ValueError("training play requires identical self-play players")
         if max_num_steps is None:
             raise ValueError("training play requires max_num_steps")
-        return play_training(env, player_1, rng_key, batch_size=batch_size, max_num_steps=max_num_steps, parallel=parallel)
+        return play_training(
+            env,
+            player_1,
+            rng_key,
+            batch_size=batch_size,
+            max_num_steps=max_num_steps,
+            parallel=parallel,
+        )
     if mode == "eval":
         return play_eval(env, player_1, player_2, rng_key, batch_size=batch_size, player_1_id=player_1_id, parallel=parallel)
     raise ValueError(f"unknown play mode: {mode!r}")
@@ -277,6 +325,9 @@ def play(
 
 def make_selfplay(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
+
+    if not parallel.enabled or parallel.device_count == 1:
+        return make_single_device_selfplay(env, config, parallel)
 
     def training_player(model: nnx.Module):
         return make_search_player(
@@ -288,60 +339,46 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
         )
 
     # TODO: this part is super ugly but it works. Let's think on how to remove it safely
-    if parallel.enabled:
-        if parallel.mesh is None:
-            raise RuntimeError("batch-parallel self-play requires a mesh.")
-        if int(config.selfplay.batch_size) % parallel.device_count != 0:
-            raise ValueError(
-                "selfplay.batch_size must be divisible by the batch-parallel "
-                f"device count ({parallel.device_count})."
-            )
-        local_batch_size = int(config.selfplay.batch_size) // parallel.device_count
-        if local_batch_size < 1:
-            raise ValueError(
-                "selfplay.batch_size must be at least the batch-parallel device count."
-            )
-
-        # MCTX uses dynamic gathers/scatters over its leading batch dimension.
-        # If it sees a globally sharded [batch, ...] array, XLA inserts
-        # cross-device collectives inside the search loop. shard_map gives each
-        # device a local [local_batch, ...] search problem and stitches the
-        # resulting samples back into a global batch-sharded pytree.
-        @_local_search_shard_map(
-            mesh=parallel.mesh,
-            in_specs=(PartitionSpec(), PartitionSpec(parallel.axis_name, None)),
-            out_specs=PartitionSpec(parallel.axis_name),
+    if parallel.mesh is None:
+        raise RuntimeError("batch-parallel self-play requires a mesh.")
+    if int(config.selfplay.batch_size) % parallel.device_count != 0:
+        raise ValueError(
+            "selfplay.batch_size must be divisible by the batch-parallel "
+            f"device count ({parallel.device_count})."
         )
-        def local_selfplay(
-            model: nnx.Module,
-            device_rng_keys: jax.Array,
-        ) -> TrainingSamples:
-            rng_key = device_rng_keys[0]
-            return play_training(
-                env,
-                training_player(model),
-                rng_key,
-                batch_size=local_batch_size,
-                max_num_steps=int(config.selfplay.max_num_steps),
-                parallel=DISABLED_BATCH_PARALLEL,
-            )
+    local_batch_size = int(config.selfplay.batch_size) // parallel.device_count
+    if local_batch_size < 1:
+        raise ValueError(
+            "selfplay.batch_size must be at least the batch-parallel device count."
+        )
 
-        @nnx.jit
-        def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
-            device_rng_keys = jax.random.split(rng_key, parallel.device_count)
-            return local_selfplay(model, device_rng_keys)
-
-        return selfplay
-
-    @nnx.jit
-    def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
+    # MCTX uses dynamic gathers/scatters over its leading batch dimension.
+    # If it sees a globally sharded [batch, ...] array, XLA inserts
+    # cross-device collectives inside the search loop. shard_map gives each
+    # device a local [local_batch, ...] search problem and stitches the
+    # resulting samples back into a global batch-sharded pytree.
+    @_local_search_shard_map(
+        mesh=parallel.mesh,
+        in_specs=(PartitionSpec(), PartitionSpec(parallel.axis_name, None)),
+        out_specs=PartitionSpec(parallel.axis_name),
+    )
+    def local_selfplay(
+        model: nnx.Module,
+        device_rng_keys: jax.Array,
+    ) -> TrainingSamples:
+        rng_key = device_rng_keys[0]
         return play_training(
             env,
             training_player(model),
             rng_key,
-            batch_size=int(config.selfplay.batch_size),
+            batch_size=local_batch_size,
             max_num_steps=int(config.selfplay.max_num_steps),
-            parallel=parallel,
+            parallel=DISABLED_BATCH_PARALLEL,
         )
+
+    @nnx.jit
+    def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
+        device_rng_keys = jax.random.split(rng_key, parallel.device_count)
+        return local_selfplay(model, device_rng_keys)
 
     return selfplay

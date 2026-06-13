@@ -414,7 +414,8 @@ def make_action_committer(action_commitment_type: str):
 
 def make_player(search, action_committer):
     def player(env_state: pgx.State, rng_key: jax.Array) -> PlayerOutput:
-        search_key, action_key = jax.random.split(rng_key)
+        search_key = rng_key
+        _, action_key = jax.random.split(rng_key)
         search_output = search(root_state=env_state, rng_key=search_key)
         action = action_committer(search_output.posterior, env_state.legal_action_mask, action_key)
         return PlayerOutput(
