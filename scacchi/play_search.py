@@ -37,6 +37,7 @@ from .dirichlet_tree.types import SearchDiagnostics, TreeTrainingData
 from .dqaz_jax_backup import BackupArrays, apply_batched_backup_block
 from .network import policy_value_from_output
 from .types import (
+    ActionCommitmentType,
     DirichletThompsonSearchConfig,
     GumbelSearchConfig,
     PolicySearchConfig,
@@ -321,6 +322,11 @@ def _search_kind(config: Any) -> SearchKind:
 
 
 def _selfplay_action_source(config: Any) -> str:
+    action_commitment_type = config.selfplay.action_commitment_type
+    assert action_commitment_type == "posterior_sample", (
+        "action_commitment_type must be 'posterior_sample' for training, "
+        f"got {action_commitment_type}"
+    )
     return str(config.selfplay.action_commitment_type)
 
 
@@ -431,7 +437,7 @@ def make_search_player(
     env,
     model: Any,
     search_cfg: SearchConfig,
-    action_commitment_type: Any,
+    action_commitment_type: ActionCommitmentType,
     *,
     q_loss_weight_mode: str = "policy",
 ):
@@ -507,6 +513,7 @@ def _run_dirichlet_thompson_backend(
         recurrent_fn=recurrent_fn,
         action_value_prior=action_value_prior,
         num_simulations=int(search_cfg.num_simulations),
+        max_depth=int(search_cfg.max_depth),
         invalid_actions=~env_state.legal_action_mask,
         num_search_blocks=int(search_cfg.num_blocks),
     )

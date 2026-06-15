@@ -34,6 +34,7 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.selfplay.action_commitment_type == "posterior_sample"
     assert config.selfplay.search.kind == "dirichlet_thompson"
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 4
+    assert config.selfplay.search.dirichlet_thompson.max_depth == 4
     assert config.selfplay.search.dirichlet_thompson.num_blocks == 4
     assert config.selfplay.search.dirichlet_thompson.policy_samples == 1
     assert config.selfplay.search.dirichlet_thompson.policy_sample_chunk_size == 1
@@ -43,6 +44,7 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.eval.baseline_search.kind == "dirichlet_thompson"
     assert config.search.kind == "dirichlet_thompson"
     assert config.search.dirichlet_thompson.num_simulations == 4
+    assert config.search.dirichlet_thompson.max_depth == 4
     assert config.search.dirichlet_thompson.num_blocks == 4
     assert config.search.dirichlet_thompson.policy_samples == 1
     assert config.search.dirichlet_thompson.policy_sample_chunk_size == 1
@@ -225,6 +227,28 @@ def test_legacy_top_level_search_populates_play_mode_search_configs():
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 7
     assert config.eval.player_search.dirichlet_thompson.num_simulations == 7
     assert config.eval.baseline_search.dirichlet_thompson.num_simulations == 7
+    assert config.selfplay.search.dirichlet_thompson.max_depth == 7
+    assert config.eval.player_search.dirichlet_thompson.max_depth == 7
+    assert config.eval.baseline_search.dirichlet_thompson.max_depth == 7
+
+
+def test_dirichlet_thompson_search_accepts_explicit_max_depth():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {
+                "kind": "dirichlet_thompson",
+                "dirichlet_thompson": {
+                    "num_simulations": 7,
+                    "max_depth": 3,
+                },
+            },
+        }
+    )
+
+    assert config.search.dirichlet_thompson.max_depth == 3
+    assert config.selfplay.search.dirichlet_thompson.max_depth == 3
+    assert config.eval.player_search.dirichlet_thompson.max_depth == 3
 
 
 def test_nested_selfplay_search_populates_top_level_compatibility_alias():

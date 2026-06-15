@@ -248,6 +248,12 @@ class AZDirichletNet(nnx.Module):
         self.q_dir_bn = nnx.BatchNorm(num_outcomes, momentum=0.9, dtype=dtype, rngs=rngs)
         self.q_dir_linear = nnx.Linear(
             height * width * num_outcomes,
+            num_channels,
+            dtype=dtype,
+            rngs=rngs,
+        )
+        self.q_dir_out = nnx.Linear(
+            num_channels,
             num_actions * num_outcomes,
             dtype=dtype,
             kernel_init=jax.nn.initializers.zeros,
@@ -258,6 +264,12 @@ class AZDirichletNet(nnx.Module):
         self.q_conc_bn = nnx.BatchNorm(1, momentum=0.9, dtype=dtype, rngs=rngs)
         self.q_conc_linear = nnx.Linear(
             height * width,
+            num_channels,
+            dtype=dtype,
+            rngs=rngs,
+        )
+        self.q_conc_out = nnx.Linear(
+            num_channels,
             num_actions,
             dtype=dtype,
             kernel_init=jax.nn.initializers.zeros,
@@ -307,7 +319,9 @@ class AZDirichletNet(nnx.Module):
         q_mean_logits = self.q_dir_bn(q_mean_logits, use_running_average=not train)
         q_mean_logits = jax.nn.relu(q_mean_logits)
         q_mean_logits = q_mean_logits.reshape((q_mean_logits.shape[0], -1))
-        q_mean_logits = self.q_dir_linear(q_mean_logits).reshape(
+        q_mean_logits = self.q_dir_linear(q_mean_logits)
+        q_mean_logits = jax.nn.relu(q_mean_logits)
+        q_mean_logits = self.q_dir_out(q_mean_logits).reshape(
             (x.shape[0], self.num_actions, self.num_outcomes)
         )
 
@@ -316,6 +330,8 @@ class AZDirichletNet(nnx.Module):
         q_concentration_logit = jax.nn.relu(q_concentration_logit)
         q_concentration_logit = q_concentration_logit.reshape((q_concentration_logit.shape[0], -1))
         q_concentration_logit = self.q_conc_linear(q_concentration_logit)
+        q_concentration_logit = jax.nn.relu(q_concentration_logit)
+        q_concentration_logit = self.q_conc_out(q_concentration_logit)
         alpha_q = dirichlet_from_logits(
             q_mean_logits,
             q_concentration_logit,

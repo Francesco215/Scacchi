@@ -106,6 +106,22 @@ def test_az_dirichlet_net_shapes_and_unit_alphas():
     assert jnp.allclose(alpha_q, jnp.ones_like(alpha_q))
 
 
+def test_az_dirichlet_q_heads_use_az_style_flattened_board_hidden_layer():
+    model = AZDirichletNet(
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        num_outcomes=3,
+        num_channels=8,
+        num_blocks=1,
+        rngs=nnx.Rngs(0),
+    )
+
+    assert model.q_dir_linear.kernel[...].shape == (3 * 3 * 3, 8)
+    assert model.q_dir_out.kernel[...].shape == (8, 10 * 3)
+    assert model.q_conc_linear.kernel[...].shape == (3 * 3, 8)
+    assert model.q_conc_out.kernel[...].shape == (8, 10)
+
+
 def test_build_model_supports_az_dirichlet_for_go_wdl3():
     config = Config(
         env=EnvConfig(id="go", board_size=8, num_outcomes=None),

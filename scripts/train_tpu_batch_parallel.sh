@@ -19,12 +19,14 @@ SYNC_EVAL_CHECKPOINTS="${SCACCHI_SYNC_EVAL_CHECKPOINTS:-auto}"
 DRY_RUN="${SCACCHI_DRY_RUN:-0}"
 TPU_RUNTIME_METRICS_PORTS="${TPU_RUNTIME_METRICS_PORTS:-8431,8432,8433,8434}"
 CLEAR_TPU_LOCKFILE="${SCACCHI_CLEAR_TPU_LOCKFILE:-1}"
+KILL_TPU_ON_INTERRUPT="${SCACCHI_KILL_TPU_ON_INTERRUPT:-1}"
 
 archive=""
 file_list=""
 delete_list=""
 eval_checkpoint_archive=""
 launch_script=""
+remote_training_active=0
 
 cleanup() {
   [[ -n "${archive}" ]] && rm -f "${archive}"
@@ -553,6 +555,47 @@ else
   exit 1
 fi
 
+kill_tpu_workers_on_interrupt() {
+  local worker
+
+  if [[ "${KILL_TPU_ON_INTERRUPT}" != "1" ]]; then
+    return 0
+  fi
+
+  if [[ "${TPU_WORKERS}" == "all" ]]; then
+    echo "Interrupt received; killing TPU processes on all workers." >&2
+    "${EOPOD}" kill-tpu --force --worker all || true
+    return 0
+  fi
+
+  echo "Interrupt received; killing TPU processes on workers ${TPU_WORKER_LIST_CSV}." >&2
+  for worker in "${TPU_WORKER_LIST[@]}"; do
+    "${EOPOD}" kill-tpu --force --worker "${worker}" || true
+  done
+}
+
+handle_interrupt() {
+  local signal="${1:-INT}"
+  local status=130
+
+  if [[ "${signal}" == "TERM" ]]; then
+    status=143
+  fi
+
+  trap - INT TERM
+  set +e
+  if [[ "${remote_training_active}" == "1" ]]; then
+    kill_tpu_workers_on_interrupt
+  else
+    echo "Interrupted." >&2
+  fi
+  cleanup
+  exit "${status}"
+}
+
+trap 'handle_interrupt INT' INT
+trap 'handle_interrupt TERM' TERM
+
 remote_status_wrapper() {
   local command="$1"
 
@@ -778,7 +821,15 @@ if [[ "${CLEAR_TPU_LOCKFILE}" == "1" ]]; then
 fi
 
 # In this eopod version, --retry is implemented as the total attempt count.
+remote_training_active=1
+set +e
 run_eopod_stream "${REMOTE_CMD}"
+remote_training_status=$?
+set -e
+remote_training_active=0
+if [[ "${remote_training_status}" -ne 0 ]]; then
+  exit "${remote_training_status}"
+fi
 
 if [[ -n "${SCACCHI_PROFILE_DIR:-}" ]]; then
   echo "Profile traces were written under ${SCACCHI_PROFILE_DIR} on the selected TPU workers."

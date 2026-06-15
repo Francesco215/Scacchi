@@ -157,6 +157,7 @@ class GumbelSearchConfig:
 @dataclass
 class DirichletThompsonSearchConfig:
     num_simulations: int = 32
+    max_depth: int | None = None
     num_blocks: int = 1
     policy_samples: int = 32
     policy_sample_chunk_size: int | None = 32
@@ -168,6 +169,9 @@ class DirichletThompsonSearchConfig:
             self.num_simulations,
             0,
         )
+        if self.max_depth is None:
+            self.max_depth = self.num_simulations
+        _require_ge("search.dirichlet_thompson.max_depth", self.max_depth, 0)
         _require_ge("search.dirichlet_thompson.num_blocks", self.num_blocks, 1)
         _require_ge("search.dirichlet_thompson.policy_samples", self.policy_samples, 0)
         _require_ge(
@@ -439,6 +443,24 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
     elif isinstance(eval_cfg, DictConfig) and "player_search" in eval_cfg:
         if "baseline_search" not in eval_cfg:
             eval_cfg["baseline_search"] = copy_node(eval_cfg["player_search"])
+
+    def default_dirichlet_max_depth(search: Any) -> None:
+        if not isinstance(search, DictConfig):
+            return
+        dirichlet_cfg = search.get("dirichlet_thompson")
+        if not isinstance(dirichlet_cfg, DictConfig):
+            return
+        if "num_simulations" in dirichlet_cfg and (
+            "max_depth" not in dirichlet_cfg or dirichlet_cfg.get("max_depth") is None
+        ):
+            dirichlet_cfg["max_depth"] = dirichlet_cfg["num_simulations"]
+
+    default_dirichlet_max_depth(aliased.get("search"))
+    if isinstance(selfplay, DictConfig):
+        default_dirichlet_max_depth(selfplay.get("search"))
+    if isinstance(eval_cfg, DictConfig):
+        default_dirichlet_max_depth(eval_cfg.get("player_search"))
+        default_dirichlet_max_depth(eval_cfg.get("baseline_search"))
     return aliased
 
 
