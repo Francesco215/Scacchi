@@ -216,7 +216,7 @@ def _dirichlet_q_search_block(
     params: base.Params,
     rng_key: chex.PRNGKey,
     root: base.RootFnOutput,
-    recurrent_fn: base.RecurrentFn,
+    expand_fn: base.RecurrentFn,
     *,
     action_value_prior: jax.Array,
     explored_action_mask: jax.Array,
@@ -238,7 +238,7 @@ def _dirichlet_q_search_block(
         params=params,
         rng_key=rng_key,
         root=root,
-        recurrent_fn=recurrent_fn,
+        recurrent_fn=expand_fn,
         root_action_selection_fn=dirichlet_root_action_selection,
         interior_action_selection_fn=policy_prior_interior_action_selection,
         num_simulations=num_simulations,
@@ -274,7 +274,7 @@ def dirichlet_q_policy(
     params: base.Params,
     rng_key: chex.PRNGKey,
     root: base.RootFnOutput,
-    recurrent_fn: base.RecurrentFn,
+    expand_fn: base.RecurrentFn,
     *,
     action_value_prior: jax.Array | None = None,
     action_alpha_prior: jax.Array | None = None,
@@ -295,7 +295,7 @@ def dirichlet_q_policy(
     if num_simulations < 0:
         raise ValueError(f"num_simulations must be >= 0, got {num_simulations}")
     if num_simulations == 0:
-        del params, root, recurrent_fn, max_depth, loop_fn
+        del params, root, expand_fn, max_depth, loop_fn
         q_evidence_total = jnp.zeros_like(action_value_prior)
         alpha_search = action_value_prior
         sampled_outcome = jax.random.dirichlet(rng_key, alpha_search)
@@ -324,7 +324,7 @@ def dirichlet_q_policy(
             params=params,
             rng_key=block_key,
             root=root,
-            recurrent_fn=recurrent_fn,
+            expand_fn=expand_fn,
             action_value_prior=alpha_base,
             explored_action_mask=explored_action_mask,
             num_simulations=num_simulations,

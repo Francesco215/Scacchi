@@ -81,7 +81,7 @@ def _toy_root(num_actions: int = 2):
     )
 
 
-def _toy_recurrent_fn(_, rng_key, action, embedding: NodeEmbedding):
+def _toy_expand_fn(_, rng_key, action, embedding: NodeEmbedding):
     del rng_key
     batch_size = action.shape[0]
     win_prob = jnp.where(action == 0, 0.75, 0.25).astype(jnp.float32)
@@ -268,7 +268,7 @@ def test_repeated_search_blocks_aggregate_evidence_and_carry_posterior():
         params=(),
         rng_key=block_keys[0],
         root=root,
-        recurrent_fn=_toy_recurrent_fn,
+        expand_fn=_toy_expand_fn,
         action_value_prior=action_value_prior,
         explored_action_mask=jnp.zeros(action_value_prior.shape[:-1], dtype=bool),
         num_simulations=1,
@@ -278,7 +278,7 @@ def test_repeated_search_blocks_aggregate_evidence_and_carry_posterior():
         params=(),
         rng_key=block_keys[1],
         root=root,
-        recurrent_fn=_toy_recurrent_fn,
+        expand_fn=_toy_expand_fn,
         action_value_prior=block_1.alpha_search,
         explored_action_mask=block_1.explored_action_mask,
         num_simulations=1,
@@ -289,7 +289,7 @@ def test_repeated_search_blocks_aggregate_evidence_and_carry_posterior():
         params=(),
         rng_key=rng_key,
         root=root,
-        recurrent_fn=_toy_recurrent_fn,
+        expand_fn=_toy_expand_fn,
         action_value_prior=action_value_prior,
         num_simulations=1,
         invalid_actions=invalid_actions,
@@ -312,7 +312,7 @@ def test_single_search_block_matches_one_block_policy():
         params=(),
         rng_key=rng_key,
         root=root,
-        recurrent_fn=_toy_recurrent_fn,
+        expand_fn=_toy_expand_fn,
         action_value_prior=action_value_prior,
         explored_action_mask=jnp.zeros(action_value_prior.shape[:-1], dtype=bool),
         num_simulations=2,
@@ -322,7 +322,7 @@ def test_single_search_block_matches_one_block_policy():
         params=(),
         rng_key=rng_key,
         root=root,
-        recurrent_fn=_toy_recurrent_fn,
+        expand_fn=_toy_expand_fn,
         action_value_prior=action_value_prior,
         num_simulations=2,
         invalid_actions=invalid_actions,
@@ -348,7 +348,7 @@ def test_zero_simulation_policy_uses_q_prior_without_search_tree():
         params=(),
         rng_key=rng_key,
         root=root,
-        recurrent_fn=_toy_recurrent_fn,
+        expand_fn=_toy_expand_fn,
         action_value_prior=action_value_prior,
         num_simulations=0,
         invalid_actions=invalid_actions,

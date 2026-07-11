@@ -227,8 +227,8 @@ def _masked_policy(
     return jnp.where(has_legal_action, policy, jnp.zeros_like(policy))
 
 
-def make_recurrent_fn(env, evaluator: Callable[[jax.Array], EvaluatorOutput]):
-    def recurrent_fn(_, rng_key: jax.Array, action: jax.Array, env_state: pgx.State):
+def make_expand_fn(env, evaluator: Callable[[jax.Array], EvaluatorOutput]):
+    def expand_fn(_, rng_key: jax.Array, action: jax.Array, env_state: pgx.State):
         del rng_key
 
         current_player = env_state.current_player
@@ -250,10 +250,10 @@ def make_recurrent_fn(env, evaluator: Callable[[jax.Array], EvaluatorOutput]):
         )
         return fn_output, env_state
 
-    return recurrent_fn
+    return expand_fn
 
 
-def make_dirichlet_recurrent_fn_from_constants(
+def make_dirichlet_expand_fn_from_constants(
     env,
     evaluator: Callable[[jax.Array], EvaluatorOutput],
     constants: SearchConstantsConfig,
@@ -261,7 +261,7 @@ def make_dirichlet_recurrent_fn_from_constants(
     kappa_terminal = float(constants.kappa_terminal)
     kappa_leaf = float(constants.kappa_leaf)
 
-    def recurrent_fn(_, rng_key: jax.Array, action: jax.Array, embedding: NodeEmbedding):
+    def expand_fn(_, rng_key: jax.Array, action: jax.Array, embedding: NodeEmbedding):
         del rng_key
 
         current_player = embedding.state.current_player
@@ -310,7 +310,7 @@ def make_dirichlet_recurrent_fn_from_constants(
         )
         return fn_output, next_embedding
 
-    return recurrent_fn
+    return expand_fn
 
 
 def _policy_target_samples(config: Any) -> int:
@@ -501,7 +501,7 @@ def _run_dirichlet_thompson_backend(
     *,
     env_state: pgx.State,
     root: mctx.RootFnOutput,
-    recurrent_fn,
+    expand_fn,
     search_key: jax.Array,
     search_cfg: DirichletThompsonSearchConfig,
     action_value_prior: jax.Array,
@@ -510,7 +510,7 @@ def _run_dirichlet_thompson_backend(
         params=(),
         rng_key=search_key,
         root=root,
-        recurrent_fn=recurrent_fn,
+        expand_fn=expand_fn,
         action_value_prior=action_value_prior,
         num_simulations=int(search_cfg.num_simulations),
         max_depth=int(search_cfg.max_depth),
@@ -532,7 +532,7 @@ def _run_dirichlet_gumbel_backend(
     *,
     env_state: pgx.State,
     root: mctx.RootFnOutput,
-    recurrent_fn,
+    expand_fn,
     search_key: jax.Array,
     search_cfg: GumbelSearchConfig,
     action_value_prior: jax.Array,
@@ -541,7 +541,7 @@ def _run_dirichlet_gumbel_backend(
         params=(),
         rng_key=search_key,
         root=root,
-        recurrent_fn=recurrent_fn,
+        recurrent_fn=expand_fn,
         num_simulations=int(search_cfg.num_simulations),
         invalid_actions=~env_state.legal_action_mask,
         qtransform=mctx.qtransform_completed_by_mix_value,
@@ -621,7 +621,7 @@ def _run_dirichlet_backend_search_output(
     *,
     env_state: pgx.State,
     prediction: EvaluatorOutput,
-    recurrent_fn,
+    expand_fn,
     rng_key: jax.Array,
     search_cfg: GumbelSearchConfig | DirichletThompsonSearchConfig,
     run_backend: Callable[..., _DirichletSearchBackendOutput],
@@ -633,7 +633,7 @@ def _run_dirichlet_backend_search_output(
     backend_output = run_backend(
         env_state=env_state,
         root=root_context.root,
-        recurrent_fn=recurrent_fn,
+        expand_fn=expand_fn,
         search_key=search_key,
         search_cfg=search_cfg,
         action_value_prior=root_context.action_value_prior,
@@ -653,7 +653,7 @@ def _run_scalar_gumbel_search_output(
     *,
     env_state: pgx.State,
     prediction: EvaluatorOutput,
-    recurrent_fn,
+    expand_fn,
     rng_key: jax.Array,
     search_cfg: GumbelSearchConfig,
 ) -> SearchOutput:
@@ -667,7 +667,7 @@ def _run_scalar_gumbel_search_output(
         params=(),
         rng_key=rng_key,
         root=root,
-        recurrent_fn=recurrent_fn,
+        recurrent_fn=expand_fn,
         num_simulations=int(search_cfg.num_simulations),
         invalid_actions=~env_state.legal_action_mask,
         qtransform=mctx.qtransform_completed_by_mix_value,
@@ -739,8 +739,12 @@ def _make_gumbel_search(
     *,
     q_loss_weight_mode: str,
 ) -> Callable[..., SearchOutput]:
-    scalar_recurrent_fn = make_recurrent_fn(env, evaluator)
-    dirichlet_recurrent_fn = make_dirichlet_recurrent_fn_from_constants(env, evaluator, search_cfg.constants)
+    scalar_expand_fn = make_expand_fn(env, evaluator)
+    dirichlet_expand_fn = make_dirichlet_expand_fn_from_constants(
+        env,
+        evaluator,
+        search_cfg.constants,
+    )
 
     def search(*, root_state: pgx.State, rng_key: jax.Array) -> SearchOutput:
         prediction = evaluator(root_state.observation)
@@ -748,14 +752,14 @@ def _make_gumbel_search(
             return _run_scalar_gumbel_search_output(
                 env_state=root_state,
                 prediction=prediction,
-                recurrent_fn=scalar_recurrent_fn,
+                expand_fn=scalar_expand_fn,
                 rng_key=rng_key,
                 search_cfg=search_cfg,
             )
         return _run_dirichlet_backend_search_output(
             env_state=root_state,
             prediction=prediction,
-            recurrent_fn=dirichlet_recurrent_fn,
+            expand_fn=dirichlet_expand_fn,
             rng_key=rng_key,
             search_cfg=search_cfg,
             run_backend=_run_dirichlet_gumbel_backend,
@@ -773,7 +777,7 @@ def _make_dirichlet_thompson_search(
     *,
     q_loss_weight_mode: str,
 ) -> Callable[..., SearchOutput]:
-    recurrent_fn = make_dirichlet_recurrent_fn_from_constants(
+    expand_fn = make_dirichlet_expand_fn_from_constants(
         env,
         evaluator,
         search_cfg.constants,
@@ -789,7 +793,7 @@ def _make_dirichlet_thompson_search(
         return _run_dirichlet_backend_search_output(
             env_state=root_state,
             prediction=prediction,
-            recurrent_fn=recurrent_fn,
+            expand_fn=expand_fn,
             rng_key=rng_key,
             search_cfg=search_cfg,
             run_backend=_run_dirichlet_thompson_backend,
