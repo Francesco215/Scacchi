@@ -37,13 +37,12 @@ from .types import (
 
 _POSTERIOR_POLICY_TARGET_SAMPLES = 32
 
-
 class EvaluatorOutput(NamedTuple):
     logits: Float[Array, "*batch action"]
     value: Float[Array, "*batch"] | None = None
     alpha_v: Float[Array, "*batch outcome"] | None = None
     alpha_q: Float[Array, "*batch action outcome"] | None = None
-
+Evaluator = Callable[[jax.Array], EvaluatorOutput]
 
 class PosteriorPrediction(NamedTuple):
     policy: Float[Array, "*batch action"]
@@ -103,7 +102,7 @@ def evaluator_output_from_model_output(model_output: Any) -> EvaluatorOutput:
     )
 
 
-def make_evaluator(model: Any) -> Callable[[jax.Array], EvaluatorOutput]:
+def make_evaluator(model: Any) -> Evaluator:
     def evaluator(obs: jax.Array) -> EvaluatorOutput:
         if isinstance(model, nnx.Module):
             return evaluator_output_from_model_output(model(obs, train=False))
@@ -135,7 +134,7 @@ def _masked_policy(
     return jnp.where(has_legal_action, policy, jnp.zeros_like(policy))
 
 
-def make_expand_fn(env, evaluator: Callable[[jax.Array], EvaluatorOutput]):
+def make_expand_fn(env, evaluator: Evaluator):
     def expand_fn(_, rng_key: jax.Array, action: jax.Array, env_state: pgx.State):
         del rng_key
 
@@ -163,7 +162,7 @@ def make_expand_fn(env, evaluator: Callable[[jax.Array], EvaluatorOutput]):
 
 def make_dirichlet_expand_fn_from_constants(
     env,
-    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    evaluator: Evaluator,
     constants: SearchConstantsConfig,
 ):
     kappa_terminal = float(constants.kappa_terminal)
@@ -572,7 +571,7 @@ def _run_policy_search_output(
 
 def _make_policy_search(
     env,
-    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    evaluator: Evaluator,
     search_cfg: PolicySearchConfig,
     *args, **kwargs,
 ) -> Callable[..., SearchOutput]:
@@ -590,7 +589,7 @@ def _make_policy_search(
 
 def _make_gumbel_search(
     env,
-    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    evaluator: Evaluator,
     search_cfg: GumbelSearchConfig,
     *,
     q_loss_weight_mode: str,
@@ -628,7 +627,7 @@ def _make_gumbel_search(
 
 def _make_dirichlet_thompson_search(
     env,
-    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    evaluator: Evaluator,
     search_cfg: DirichletThompsonSearchConfig,
     *,
     q_loss_weight_mode: str,
@@ -665,7 +664,7 @@ def _make_dirichlet_thompson_search(
 
 def make_search(
     env,
-    evaluator: Callable[[jax.Array], EvaluatorOutput],
+    evaluator: Evaluator,
     search_cfg: SearchConfig,
     *,
     q_loss_weight_mode: str = "policy",

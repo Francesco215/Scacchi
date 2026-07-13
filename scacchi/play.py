@@ -75,11 +75,7 @@ def play_eval(
         key, player_1_key, player_2_key = jax.random.split(key, 3)
         player_1_output = player_1(env_state, player_1_key)
         player_2_output = player_2(env_state, player_2_key)
-        action = jnp.where(
-            env_state.current_player == player_1_id,
-            player_1_output.action,
-            player_2_output.action,
-        )
+        action = jnp.where(env_state.current_player == player_1_id, player_1_output.action, player_2_output.action)
         env_state = jax.vmap(env.step)(env_state, action)
         reward = env_state.rewards[jnp.arange(batch_size), player_1_id]
         returns = returns + reward
@@ -110,11 +106,7 @@ def _selfplay_step_frame(
 
     actor = env_state.current_player
     reset_keys = jax.random.split(reset_key, batch_size)
-    env_state = jax.vmap(auto_reset(env.step, env.init))(
-        env_state,
-        player_output.action,
-        reset_keys,
-    )
+    env_state = jax.vmap(auto_reset(env.step, env.init))(env_state, player_output.action, reset_keys)
     reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
     discount = -jnp.ones_like(reward)
     discount = jnp.where(env_state.terminated, 0.0, discount)
@@ -187,14 +179,7 @@ def play(
             raise ValueError("training play requires identical self-play players")
         if max_num_steps is None:
             raise ValueError("training play requires max_num_steps")
-        return play_training(
-            env,
-            player_1,
-            rng_key,
-            batch_size=batch_size,
-            max_num_steps=max_num_steps,
-            parallel=parallel,
-        )
+        return play_training(env, player_1, rng_key, batch_size=batch_size, max_num_steps=max_num_steps, parallel=parallel)
     if mode == "eval":
         return play_eval(env, player_1, player_2, rng_key, batch_size=batch_size, player_1_id=player_1_id, parallel=parallel)
     raise ValueError(f"unknown play mode: {mode!r}")
