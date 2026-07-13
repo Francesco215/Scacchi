@@ -18,7 +18,6 @@ from scacchi.play_search import (
     PosteriorTargets,
     TargetMetadata,
     commit_action,
-    legalize_action,
     make_search,
     make_search_player,
 )
@@ -246,14 +245,7 @@ def test_commit_action_samples_posterior_target():
     assert not jnp.array_equal(played_action, search_action)
 
 
-@pytest.mark.parametrize(
-    ("legal_action_mask", "expected"),
-    [
-        (jnp.array([[True, True, True]]), jnp.array([2], dtype=jnp.int32)),
-        (jnp.array([[False, True, False]]), jnp.array([1], dtype=jnp.int32)),
-    ],
-)
-def test_commit_action_can_use_search_action(legal_action_mask, expected):
+def test_commit_action_can_use_search_action():
     action_weights = jnp.array([[0.0, 1.0, 0.0]])
     search_action = jnp.array([2], dtype=jnp.int32)
 
@@ -261,26 +253,11 @@ def test_commit_action_can_use_search_action(legal_action_mask, expected):
         "search_action",
         jax.random.PRNGKey(0),
         action_weights,
-        legal_action_mask,
+        jnp.ones_like(action_weights, dtype=jnp.bool_),
         search_action,
     )
 
-    assert jnp.array_equal(played_action, expected)
-
-
-def test_legalize_action_handles_out_of_bounds_and_terminal_rows():
-    legal_action_mask = jnp.array(
-        [
-            [False, True, False],
-            [False, False, True],
-            [False, False, False],
-        ]
-    )
-    action = jnp.array([-1, 9, 2], dtype=jnp.int32)
-
-    played_action = legalize_action(action, legal_action_mask)
-
-    assert jnp.array_equal(played_action, jnp.array([1, 2, 0], dtype=jnp.int32))
+    assert jnp.array_equal(played_action, search_action)
 
 
 def test_commit_action_rejects_removed_posterior_best_alias():

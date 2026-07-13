@@ -60,67 +60,6 @@ def _local_search_shard_map(**kwargs):
     return nnx.shard_map(**kwargs)
 
 
-def _replace_legal_action_mask(
-    env_state: Any,
-    legal_action_mask: Bool[Array, "*batch action"],
-) -> Any:
-    if hasattr(env_state, "replace"):
-        return env_state.replace(legal_action_mask=legal_action_mask)
-    if hasattr(env_state, "_replace"):
-        return env_state._replace(legal_action_mask=legal_action_mask)
-    raise TypeError("env_state must support replacing legal_action_mask")
-
-
-def searchable_eval_state(env_state: Any):
-    """Give completed eval rows a dummy legal action; their moves are discarded."""
-
-    dummy_legal_action_mask = (
-        jnp.zeros_like(env_state.legal_action_mask)
-        .at[..., 0]
-        .set(True)
-    )
-    legal_action_mask = jnp.where(
-        env_state.terminated[..., None],
-        dummy_legal_action_mask,
-        env_state.legal_action_mask,
-    )
-    return _replace_legal_action_mask(env_state, legal_action_mask)
-
-
-def step_active_eval_rows(
-    env: Any,
-    env_state: Any,
-    action: Int[Array, "batch"],
-) -> tuple[Any, Bool[Array, "batch"], Bool[Array, ""]]:
-    active = ~env_state.terminated
-    action = jnp.asarray(action, dtype=jnp.int32)
-    num_actions = env_state.legal_action_mask.shape[-1]
-    in_bounds = (0 <= action) & (action < num_actions)
-    safe_action = jnp.clip(action, 0, num_actions - 1)
-    selected_is_legal = jnp.take_along_axis(
-        env_state.legal_action_mask,
-        safe_action[..., None],
-        axis=-1,
-    )[..., 0]
-    invalid_action = jnp.any(active & ~(in_bounds & selected_is_legal))
-
-    def step_one(state, row_action, row_active):
-        def step_state(state):
-            return env.step(state, row_action)
-
-        should_step = row_active & ~invalid_action
-        return jax.lax.cond(should_step, step_state, lambda state: state, state)
-
-    return jax.vmap(step_one)(env_state, action, active), active, invalid_action
-
-
-def poison_eval_returns(
-    returns: Float[Array, "batch"],
-    invalid_action: Bool[Array, ""],
-) -> Float[Array, "batch"]:
-    return jnp.where(invalid_action, jnp.full_like(returns, jnp.nan), returns)
-
-
 def eval_metrics_from_returns(returns: Float[Array, "batch"]) -> EvalMetrics:
     return EvalMetrics(
         returns=returns,
@@ -151,26 +90,20 @@ def play_eval(
     def body_fn(val):
         key, env_state, returns = val
         key, player_1_key, player_2_key = jax.random.split(key, 3)
-        search_state = searchable_eval_state(env_state)
-        player_1_output = player_1(search_state, player_1_key)
-        player_2_output = player_2(search_state, player_2_key)
+        player_1_output = player_1(env_state, player_1_key)
+        player_2_output = player_2(env_state, player_2_key)
         action = jnp.where(
             env_state.current_player == player_1_id,
             player_1_output.action,
             player_2_output.action,
         )
-        env_state, active, invalid_action = step_active_eval_rows(
-            env,
-            env_state,
-            action,
-        )
+        env_state = jax.vmap(env.step)(env_state, action)
         reward = env_state.rewards[jnp.arange(batch_size), player_1_id]
-        returns = returns + jnp.where(active, reward, 0.0)
-        returns = poison_eval_returns(returns, invalid_action)
+        returns = returns + reward
         return key, env_state, returns
 
     _, _, returns = nnx.while_loop(
-        lambda x: ~(x[1].terminated.all()) & ~(jnp.isnan(x[2]).any()),
+        lambda x: ~x[1].terminated.all(),
         body_fn,
         (key, env_state, returns),
     )

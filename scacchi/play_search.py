@@ -252,29 +252,7 @@ def commit_action(
         raise ValueError(
             f"unknown action_commitment_type: {action_commitment_type!r}"
         )
-    return legalize_action(selected, legal_action_mask)
-
-
-def legalize_action(
-    action: jax.Array,
-    legal_action_mask: jax.Array,
-) -> jax.Array:
-    #TODO: remove this useless function. the rest of the code already avoids taking invalid actions.
-    """Return `action` when legal, otherwise the first legal action in each row."""
-
-    num_actions = legal_action_mask.shape[-1]
-    first_legal = jnp.argmax(legal_action_mask, axis=-1).astype(jnp.int32)
-    has_legal_action = jnp.any(legal_action_mask, axis=-1)
-    action = jnp.asarray(action, dtype=jnp.int32)
-    in_bounds = (0 <= action) & (action < num_actions)
-    safe_action = jnp.clip(action, 0, num_actions - 1)
-    selected_is_legal = jnp.take_along_axis(
-        legal_action_mask,
-        safe_action[..., None],
-        axis=-1,
-    )[..., 0]
-    selected = jnp.where(in_bounds & selected_is_legal, action, first_legal)
-    return jnp.where(has_legal_action, selected, jnp.zeros_like(selected))
+    return selected
 
 
 def make_action_committer(action_commitment_type: str):
@@ -560,10 +538,7 @@ def _run_scalar_gumbel_search_output(
             ),
             metadata=TargetMetadata(
                 mask=_search_loss_mask(policy_target),
-                search_action=legalize_action(
-                    search_action,
-                    env_state.legal_action_mask,
-                ),
+                search_action=search_action,
             ),
         ),
     )
@@ -576,17 +551,21 @@ def _run_policy_search_output(
     rng_key: jax.Array,
     search_cfg: PolicySearchConfig,
 ) -> SearchOutput:
-    masked_logits = _masked_logits(prediction.logits, env_state.legal_action_mask)
-    policy = jax.nn.softmax(masked_logits / float(search_cfg.temperature), axis=-1)
-    has_legal_action = jnp.any(env_state.legal_action_mask, axis=-1, keepdims=True)
-    policy = jnp.where(has_legal_action, policy, jnp.zeros_like(policy))
+    policy = _masked_policy(
+        prediction.logits,
+        env_state.legal_action_mask,
+        temperature=float(search_cfg.temperature),
+    )
     # TODO: this search action should just be the action committed by the player. it shoudln't even be here in the first place
     search_action = posterior_sample_action(rng_key, policy, env_state.legal_action_mask)
 
     return SearchOutput(
         posterior=PosteriorTargets(
             prediction=PosteriorPrediction(policy, prediction.value, prediction.alpha_v, prediction.alpha_q),
-            metadata=TargetMetadata(mask=_search_loss_mask(policy), search_action=legalize_action(search_action, env_state.legal_action_mask)),
+            metadata=TargetMetadata(
+                mask=_search_loss_mask(policy),
+                search_action=search_action,
+            ),
         ),
     )
 

@@ -12,9 +12,6 @@ from scacchi.play import (
     EvalMetrics,
     play,
     play_eval,
-    poison_eval_returns,
-    searchable_eval_state,
-    step_active_eval_rows,
 )
 from scacchi.play_search import PlayerOutput
 from scacchi.types import (
@@ -74,94 +71,6 @@ def losing_player(env_state: ToyState, key: jax.Array) -> PlayerOutput:
         action=jnp.zeros_like(env_state.current_player, dtype=jnp.int32),
         posterior=None,
     )
-
-
-def test_searchable_eval_state_adds_dummy_legal_action_only_for_terminal_rows():
-    state = ToyState(
-        observation=jnp.zeros((2, 1), dtype=jnp.float32),
-        legal_action_mask=jnp.array(
-            [
-                [False, True, False],
-                [False, False, False],
-            ]
-        ),
-        current_player=jnp.zeros((2,), dtype=jnp.int32),
-        terminated=jnp.array([False, True]),
-        rewards=jnp.zeros((2, 2), dtype=jnp.float32),
-    )
-
-    search_state = searchable_eval_state(state)
-
-    assert jnp.array_equal(
-        search_state.legal_action_mask,
-        jnp.array(
-            [
-                [False, True, False],
-                [True, False, False],
-            ]
-        ),
-    )
-
-
-def test_step_active_eval_rows_reports_invalid_actions_and_skips_step():
-    state = ToyState(
-        observation=jnp.array([[0.0], [5.0]], dtype=jnp.float32),
-        legal_action_mask=jnp.array(
-            [
-                [False, True, False],
-                [False, False, False],
-            ]
-        ),
-        current_player=jnp.zeros((2,), dtype=jnp.int32),
-        terminated=jnp.array([False, True]),
-        rewards=jnp.array([[0.0, 0.0], [7.0, -7.0]], dtype=jnp.float32),
-    )
-
-    next_state, active, invalid_action = step_active_eval_rows(
-        ToyEnv(),
-        state,
-        jnp.array([2, 2], dtype=jnp.int32),
-    )
-
-    assert jnp.array_equal(active, jnp.array([True, False]))
-    assert bool(invalid_action)
-    assert jnp.array_equal(next_state.terminated, jnp.array([False, True]))
-    assert jnp.array_equal(next_state.observation, jnp.array([[0.0], [5.0]]))
-    assert jnp.array_equal(
-        next_state.rewards,
-        jnp.array([[0.0, 0.0], [7.0, -7.0]], dtype=jnp.float32),
-    )
-
-
-def test_step_active_eval_rows_ignores_invalid_terminal_row_actions():
-    state = ToyState(
-        observation=jnp.array([[0.0], [5.0]], dtype=jnp.float32),
-        legal_action_mask=jnp.array(
-            [
-                [False, True, False],
-                [False, False, False],
-            ]
-        ),
-        current_player=jnp.zeros((2,), dtype=jnp.int32),
-        terminated=jnp.array([False, True]),
-        rewards=jnp.array([[0.0, 0.0], [7.0, -7.0]], dtype=jnp.float32),
-    )
-
-    next_state, active, invalid_action = step_active_eval_rows(
-        ToyEnv(),
-        state,
-        jnp.array([1, 99], dtype=jnp.int32),
-    )
-
-    assert jnp.array_equal(active, jnp.array([True, False]))
-    assert not bool(invalid_action)
-    assert jnp.array_equal(next_state.observation, jnp.array([[1.0], [5.0]]))
-
-
-def test_poison_eval_returns_makes_all_returns_nan_after_invalid_action():
-    returns = poison_eval_returns(jnp.array([1.0, -1.0]), jnp.array(True))
-
-    assert jnp.isnan(returns).all()
 
 
 def test_play_eval_runs_two_player_loop_until_all_rows_done():

@@ -225,15 +225,6 @@ def _dirichlet_q_search_block(
     max_depth: int | None = None,
     loop_fn=jax.lax.fori_loop,
 ) -> DirichletQSearchOutput:
-    root = base.RootFnOutput(
-        prior_logits=jnp.where(
-            invalid_actions,
-            jnp.finfo(root.prior_logits.dtype).min,
-            root.prior_logits,
-        ),
-        value=root.value,
-        embedding=root.embedding,
-    )
     search_tree = mctx_search.search(
         params=params,
         rng_key=rng_key,
