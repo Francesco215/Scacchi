@@ -72,7 +72,6 @@ def _toy_root(num_actions: int = 2):
         evidence_weight=jnp.zeros((1,), dtype=jnp.float32),
         root_action=jnp.full((1,), NO_PARENT),
         depth_parity=jnp.zeros((1,), dtype=jnp.int32),
-        alpha_Q_prior=jnp.ones((1, num_actions, 2)),
     )
     return mctx.RootFnOutput(
         prior_logits=jnp.zeros((1, num_actions)),
@@ -96,7 +95,6 @@ def _toy_expand_fn(_, rng_key, action, embedding: NodeEmbedding):
         evidence_weight=evidence_weight,
         root_action=root_action,
         depth_parity=depth_parity,
-        alpha_Q_prior=embedding.alpha_Q_prior,
     )
     return (
         mctx.RecurrentFnOutput(
@@ -118,7 +116,6 @@ def test_root_thompson_selector_matches_dirichlet_utility_draw():
         evidence_weight=jnp.array([0.0, 2.0, 3.0]),
         root_action=jnp.array([NO_PARENT, 0, 1]),
         depth_parity=jnp.array([0, 0, 1]),
-        alpha_Q_prior=jnp.zeros((3, 3, 2)),
     )
     tree = _fake_unbatched_tree(
         embedding,
@@ -146,7 +143,6 @@ def test_root_thompson_selector_masks_invalid_high_utility_action():
         evidence_weight=jnp.array([0.0]),
         root_action=jnp.array([NO_PARENT]),
         depth_parity=jnp.array([0]),
-        alpha_Q_prior=jnp.zeros((1, 3, 2)),
     )
     tree = _fake_unbatched_tree(
         embedding,
@@ -173,7 +169,6 @@ def test_root_action_prior_uses_child_v_only_after_action_is_explored():
         evidence_weight=jnp.zeros((1, 3)),
         root_action=jnp.array([[NO_PARENT, 0, 1]]),
         depth_parity=jnp.array([[0, 1, 1]]),
-        alpha_Q_prior=jnp.zeros((1, 3, 2, 2)),
     )
     tree = _FakeTree(
         embeddings=embedding,
@@ -195,7 +190,6 @@ def test_root_action_prior_keeps_carried_posterior_for_previously_explored_actio
         evidence_weight=jnp.zeros((1, 2)),
         root_action=jnp.array([[NO_PARENT, 0]]),
         depth_parity=jnp.array([[0, 1]]),
-        alpha_Q_prior=jnp.zeros((1, 2, 2, 2)),
     )
     tree = _FakeTree(
         embeddings=embedding,
@@ -227,7 +221,6 @@ def test_batched_and_unbatched_root_evidence_sums_agree_on_toy_tree():
         evidence_weight=jnp.array([[0.0, 2.0, 3.0], [0.0, 5.0, 7.0]]),
         root_action=jnp.array([[NO_PARENT, 0, 2], [NO_PARENT, 1, 1]]),
         depth_parity=jnp.array([[0, 0, 1], [0, 1, 0]]),
-        alpha_Q_prior=jnp.zeros((2, 3, 3, 2)),
     )
     node_visits = jnp.array([[1, 1, 1], [1, 1, 1]])
     tree = _fake_tree(embedding, node_visits, num_actions=3)
@@ -242,7 +235,6 @@ def test_batched_and_unbatched_root_evidence_sums_agree_on_toy_tree():
             evidence_weight=embedding.evidence_weight[batch_index],
             root_action=embedding.root_action[batch_index],
             depth_parity=embedding.depth_parity[batch_index],
-            alpha_Q_prior=embedding.alpha_Q_prior[batch_index],
         )
         unbatched.append(
             _q_evidence_sum_from_unbatched_tree(
@@ -265,7 +257,6 @@ def test_repeated_search_blocks_aggregate_evidence_and_carry_posterior():
     invalid_actions = jnp.array([[False, False]])
 
     block_1 = _dirichlet_q_search_block(
-        params=(),
         rng_key=block_keys[0],
         root=root,
         expand_fn=_toy_expand_fn,
@@ -275,7 +266,6 @@ def test_repeated_search_blocks_aggregate_evidence_and_carry_posterior():
         invalid_actions=invalid_actions,
     )
     block_2 = _dirichlet_q_search_block(
-        params=(),
         rng_key=block_keys[1],
         root=root,
         expand_fn=_toy_expand_fn,
@@ -286,7 +276,6 @@ def test_repeated_search_blocks_aggregate_evidence_and_carry_posterior():
     )
 
     repeated = dirichlet_q_policy(
-        params=(),
         rng_key=rng_key,
         root=root,
         expand_fn=_toy_expand_fn,
@@ -299,7 +288,6 @@ def test_repeated_search_blocks_aggregate_evidence_and_carry_posterior():
     expected_evidence = block_1.q_evidence_sum + block_2.q_evidence_sum
     assert jnp.allclose(repeated.q_evidence_sum, expected_evidence)
     assert jnp.allclose(repeated.alpha_search, block_2.alpha_search)
-    assert repeated.search_tree is None
 
 
 def test_single_search_block_matches_one_block_policy():
@@ -309,7 +297,6 @@ def test_single_search_block_matches_one_block_policy():
     invalid_actions = jnp.array([[False, False]])
 
     block = _dirichlet_q_search_block(
-        params=(),
         rng_key=rng_key,
         root=root,
         expand_fn=_toy_expand_fn,
@@ -319,7 +306,6 @@ def test_single_search_block_matches_one_block_policy():
         invalid_actions=invalid_actions,
     )
     policy = dirichlet_q_policy(
-        params=(),
         rng_key=rng_key,
         root=root,
         expand_fn=_toy_expand_fn,
@@ -345,7 +331,6 @@ def test_zero_simulation_policy_uses_q_prior_without_search_tree():
     invalid_actions = jnp.array([[False, False, True]])
 
     policy = dirichlet_q_policy(
-        params=(),
         rng_key=rng_key,
         root=root,
         expand_fn=_toy_expand_fn,
@@ -354,7 +339,6 @@ def test_zero_simulation_policy_uses_q_prior_without_search_tree():
         invalid_actions=invalid_actions,
     )
 
-    assert policy.search_tree is None
     assert jnp.allclose(policy.q_evidence_sum, jnp.zeros_like(action_value_prior))
     assert jnp.allclose(policy.alpha_search, action_value_prior)
     assert not bool(policy.explored_action_mask.any())
@@ -373,7 +357,6 @@ def test_q_evidence_routes_by_root_action_and_aligns_parity():
         evidence_weight=jnp.array([[0.0, 2.0, 3.0, 5.0]]),
         root_action=jnp.array([[NO_PARENT, 0, 2, 0]]),
         depth_parity=jnp.array([[0, 0, 1, 1]]),
-        alpha_Q_prior=jnp.zeros((1, 4, 3, 2)),
     )
     tree = _fake_tree(embedding, jnp.array([[1, 1, 1, 1]]), num_actions=3)
 
@@ -402,7 +385,6 @@ def test_terminal_child_outcome_scatters_back_to_root_perspective():
         evidence_weight=jnp.array([[0.0, 8.0]]),
         root_action=jnp.array([[NO_PARENT, 1]]),
         depth_parity=jnp.array([[0, 1]]),
-        alpha_Q_prior=jnp.zeros((1, 2, 2, 2)),
     )
     tree = _fake_tree(embedding, jnp.array([[1, 1]]), num_actions=2)
 

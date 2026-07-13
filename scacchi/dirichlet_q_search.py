@@ -9,6 +9,8 @@ from mctx._src import action_selection
 from mctx._src import base
 from mctx._src import search as mctx_search
 
+from .types import DirichletThompsonSearchConfig, SearchConstantsConfig
+
 
 NO_PARENT = -1
 
@@ -20,7 +22,13 @@ class NodeEmbedding(NamedTuple):
     evidence_weight: jax.Array
     root_action: jax.Array
     depth_parity: jax.Array
-    alpha_Q_prior: jax.Array
+
+
+def _required_output(value: jax.Array | None, name: str) -> jax.Array:
+    #TODO: completely remove this function. every time it's used is pure slop
+    if value is None:
+        raise ValueError(f"evaluator output is missing {name}")
+    return value
 
 
 def flip_outcome(outcome_dist: jax.Array) -> jax.Array:
@@ -44,6 +52,45 @@ def terminal_outcome_from_reward(reward: jax.Array, num_outcomes: int) -> jax.Ar
     else:
         raise ValueError(f"unsupported outcome count: {num_outcomes}")
     return jax.nn.one_hot(outcome_index, num_outcomes, dtype=reward.dtype)
+
+
+def make_dirichlet_expand_fn_from_constants(
+    env,
+    evaluator,
+    constants: SearchConstantsConfig,
+):
+    kappa_terminal = float(constants.kappa_terminal)
+    kappa_leaf = float(constants.kappa_leaf)
+
+    def expand_fn(_, rng_key: jax.Array, action: jax.Array, embedding: NodeEmbedding):
+        del rng_key
+
+        current_player = embedding.state.current_player
+        env_state = jax.vmap(env.step)(embedding.state, action)
+        prediction = evaluator(env_state.observation)
+        logits = mask_invalid_scores(prediction.logits, env_state.legal_action_mask)
+
+        reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), current_player]
+        nonterminal_outcome = outcome_mean(prediction.alpha_v) # do we need it?
+        terminal_parent_outcome = terminal_outcome_from_reward(reward, prediction.alpha_v.shape[-1])
+        terminal_child_outcome = flip_outcome(terminal_parent_outcome)
+        
+        outcome_dist = jnp.where(env_state.terminated[..., None], terminal_child_outcome, nonterminal_outcome)
+        evidence_weight = jnp.where(env_state.terminated, jnp.asarray(kappa_terminal, dtype=outcome_dist.dtype), jnp.asarray(kappa_leaf, dtype=outcome_dist.dtype))
+        root_action = jnp.where(embedding.root_action == NO_PARENT, action, embedding.root_action)
+        depth_parity = 1 - embedding.depth_parity
+
+        value = outcome_utility(outcome_dist)
+        value = jnp.where(env_state.terminated, 0.0, value)
+        discount = -jnp.ones_like(value)
+        discount = jnp.where(env_state.terminated, 0.0, discount)
+
+        # TODO: check if it's possible to remove some data, or if we should use less info
+        next_embedding = NodeEmbedding(env_state,outcome_dist,prediction.alpha_v,evidence_weight,root_action,depth_parity)
+        fn_output = base.RecurrentFnOutput(reward=reward,discount=discount,prior_logits=logits,value=value)
+        return fn_output, next_embedding
+
+    return expand_fn
 
 
 def mask_invalid_scores(scores: jax.Array, legal_action_mask: jax.Array) -> jax.Array:
@@ -83,19 +130,45 @@ class DirichletRootExtraData:
     action_value_prior: jax.Array
     explored_action_mask: jax.Array
 
-    @property
-    def action_alpha_prior(self) -> jax.Array:
-        return self.action_value_prior
-
 
 @chex.dataclass(frozen=True)
 class DirichletQSearchOutput:
     action: chex.Array
     action_weights: chex.Array
-    search_tree: Any
     q_evidence_sum: jax.Array
     alpha_search: jax.Array
     explored_action_mask: jax.Array
+
+
+class DirichletThompsonSearchResult(NamedTuple):
+    action: jax.Array
+    policy_target: jax.Array
+    alpha_v_target: jax.Array
+    alpha_q_target: jax.Array
+    q_loss_weight: jax.Array
+
+
+def make_dirichlet_root(
+    env_state: Any,
+    logits: jax.Array,
+    alpha_v: jax.Array,
+    alpha_q: jax.Array,
+) -> base.RootFnOutput:
+    root_outcome = outcome_mean(alpha_v)
+    value = outcome_utility(root_outcome)
+    root_embedding = NodeEmbedding(
+        state=env_state,
+        outcome_dist=root_outcome,
+        alpha_V_prior=alpha_v,
+        evidence_weight=jnp.zeros_like(value),
+        root_action=jnp.full_like(env_state.current_player, NO_PARENT),
+        depth_parity=jnp.zeros_like(env_state.current_player),
+    )
+    return base.RootFnOutput(
+        prior_logits=logits,
+        value=value,
+        embedding=root_embedding,
+    )
 
 
 def _q_evidence_sum_from_unbatched_tree(tree: Any) -> jax.Array:
@@ -213,7 +286,6 @@ def policy_prior_interior_action_selection(
 
 
 def _dirichlet_q_search_block(
-    params: base.Params,
     rng_key: chex.PRNGKey,
     root: base.RootFnOutput,
     expand_fn: base.RecurrentFn,
@@ -226,7 +298,7 @@ def _dirichlet_q_search_block(
     loop_fn=jax.lax.fori_loop,
 ) -> DirichletQSearchOutput:
     search_tree = mctx_search.search(
-        params=params,
+        params=(),
         rng_key=rng_key,
         root=root,
         recurrent_fn=expand_fn,
@@ -254,7 +326,6 @@ def _dirichlet_q_search_block(
     return DirichletQSearchOutput(
         action=action,
         action_weights=search_tree.summary().visit_probs,
-        search_tree=search_tree,
         q_evidence_sum=q_evidence,
         alpha_search=alpha_post,
         explored_action_mask=explored_actions,
@@ -262,13 +333,11 @@ def _dirichlet_q_search_block(
 
 
 def dirichlet_q_policy(
-    params: base.Params,
     rng_key: chex.PRNGKey,
     root: base.RootFnOutput,
     expand_fn: base.RecurrentFn,
     *,
-    action_value_prior: jax.Array | None = None,
-    action_alpha_prior: jax.Array | None = None,
+    action_value_prior: jax.Array,
     num_simulations: int,
     invalid_actions: chex.Array,
     num_search_blocks: int = 1,
@@ -277,16 +346,10 @@ def dirichlet_q_policy(
 ) -> DirichletQSearchOutput:
     if num_search_blocks < 1:
         raise ValueError(f"num_search_blocks must be >= 1, got {num_search_blocks}")
-    if action_value_prior is None:
-        if action_alpha_prior is None:
-            raise ValueError("action_value_prior is required")
-        action_value_prior = action_alpha_prior
-    elif action_alpha_prior is not None:
-        raise ValueError("pass only one of action_value_prior or action_alpha_prior")
     if num_simulations < 0:
         raise ValueError(f"num_simulations must be >= 0, got {num_simulations}")
     if num_simulations == 0:
-        del params, root, expand_fn, max_depth, loop_fn
+        del root, expand_fn, max_depth, loop_fn
         q_evidence_total = jnp.zeros_like(action_value_prior)
         alpha_search = action_value_prior
         sampled_outcome = jax.random.dirichlet(rng_key, alpha_search)
@@ -300,7 +363,6 @@ def dirichlet_q_policy(
         return DirichletQSearchOutput(
             action=action,
             action_weights=action_weights,
-            search_tree=None,
             q_evidence_sum=q_evidence_total,
             alpha_search=alpha_search,
             explored_action_mask=jnp.zeros(action_value_prior.shape[:-1], dtype=bool),
@@ -312,7 +374,6 @@ def dirichlet_q_policy(
     def block_body(carry, block_key):
         alpha_base, explored_action_mask, q_evidence_total, _ = carry
         block_output = _dirichlet_q_search_block(
-            params=params,
             rng_key=block_key,
             root=root,
             expand_fn=expand_fn,
@@ -333,8 +394,21 @@ def dirichlet_q_policy(
 
     zero_q_evidence = jnp.zeros_like(action_value_prior)
     zero_action_weights = jnp.zeros_like(root.prior_logits)
-    ( alpha_search, explored_action_mask, q_evidence_total, action_weights), _ = jax.lax.scan(
-        block_body,(action_value_prior, initial_explored_action_mask, zero_q_evidence, zero_action_weights),block_keys,
+    initial_carry = (
+        action_value_prior,
+        initial_explored_action_mask,
+        zero_q_evidence,
+        zero_action_weights,
+    )
+    (
+        alpha_search,
+        explored_action_mask,
+        q_evidence_total,
+        action_weights,
+    ), _ = jax.lax.scan(
+        block_body,
+        initial_carry,
+        block_keys,
     )
 
     score = outcome_utility(outcome_mean(alpha_search))
@@ -342,7 +416,6 @@ def dirichlet_q_policy(
     return DirichletQSearchOutput(
         action=action,
         action_weights=action_weights,
-        search_tree=None,
         q_evidence_sum=q_evidence_total,
         alpha_search=alpha_search,
         explored_action_mask=explored_action_mask,
@@ -445,3 +518,72 @@ def posterior_targets(
     v_evidence_sum = jnp.sum(policy_target[..., None] * q_evidence_sum, axis=-2)
     beta_V_target = alpha_V_prior + v_evidence_sum
     return beta_Q_target, beta_V_target
+
+
+def q_loss_weight_from_mode(
+    mode: str,
+    q_evidence_sum: jax.Array,
+    posterior_policy_target: jax.Array,
+) -> jax.Array:
+    if mode == "evidence_mass":
+        return jnp.sum(q_evidence_sum, axis=-1) + jnp.zeros_like(
+            posterior_policy_target
+        )
+    if mode == "policy":
+        return posterior_policy_target
+    raise ValueError(f"unknown q_loss_weight_mode: {mode!r}")
+
+
+def dirichlet_thompson_search(
+    *,
+    env_state: Any,
+    logits: jax.Array,
+    alpha_v_prior: jax.Array,
+    alpha_q_prior: jax.Array,
+    expand_fn: base.RecurrentFn,
+    rng_key: chex.PRNGKey,
+    search_cfg: DirichletThompsonSearchConfig,
+    q_loss_weight_mode: str,
+) -> DirichletThompsonSearchResult:
+    """Run Thompson MCTS and produce its policy and Dirichlet targets."""
+    root = make_dirichlet_root(env_state, logits, alpha_v_prior, alpha_q_prior)
+    search_key, posterior_key, _ = jax.random.split(rng_key, 3)
+    search_output = dirichlet_q_policy(
+        rng_key=search_key,
+        root=root,
+        expand_fn=expand_fn,
+        action_value_prior=alpha_q_prior,
+        num_simulations=int(search_cfg.num_simulations),
+        max_depth=search_cfg.max_depth,
+        invalid_actions=~env_state.legal_action_mask,
+        num_search_blocks=int(search_cfg.num_blocks),
+    )
+
+    policy_samples = int(search_cfg.policy_samples)
+    if policy_samples == 0:
+        policy_target = jnp.asarray(search_output.action_weights)
+    else:
+        chunk_size = search_cfg.policy_sample_chunk_size
+        policy_target = posterior_best_policy_target(
+            posterior_key,
+            search_output.alpha_search,
+            env_state.legal_action_mask,
+            policy_samples,
+            chunk_size=policy_samples if chunk_size is None else int(chunk_size),
+        )
+
+    v_evidence_sum = jnp.sum(
+        policy_target[..., None] * search_output.q_evidence_sum,
+        axis=-2,
+    )
+    return DirichletThompsonSearchResult(
+        action=jnp.asarray(search_output.action),
+        policy_target=policy_target,
+        alpha_v_target=alpha_v_prior + v_evidence_sum,
+        alpha_q_target=search_output.alpha_search,
+        q_loss_weight=q_loss_weight_from_mode(
+            q_loss_weight_mode,
+            search_output.q_evidence_sum,
+            policy_target,
+        ),
+    )

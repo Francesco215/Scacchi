@@ -1,3 +1,4 @@
+import chex
 from typing import Any, Callable, Literal, NamedTuple
 
 from flax import nnx
@@ -39,7 +40,7 @@ class EvalMetrics(NamedTuple):
     lose_rate: Float[Array, ""]
 
 
-Player = Callable[[Any, jax.Array], PlayerOutput]
+Player = Callable[[Any, chex.PRNGKey], PlayerOutput]
 PlayMode = Literal["training", "eval"]
 
 
