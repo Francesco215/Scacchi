@@ -1,4 +1,3 @@
-import inspect
 from typing import Any, Callable, Literal, NamedTuple
 
 from flax import nnx
@@ -12,6 +11,7 @@ from .distributed import (
     DISABLED_BATCH_PARALLEL,
     BatchParallel,
     constrain_batch_axis,
+    local_shard_map,
 )
 from .play_search import (
     PlayerOutput,
@@ -41,23 +41,6 @@ class EvalMetrics(NamedTuple):
 
 Player = Callable[[Any, jax.Array], PlayerOutput]
 PlayMode = Literal["training", "eval"]
-
-
-def _local_search_shard_map(**kwargs):
-    """Build an nnx.shard_map for local per-device search.
-
-    MCTX's local search body has varying scalar carry values inside while loops.
-    The shard-map checker is useful for proving manual axis types, but here it
-    rejects a valid local-only search before lowering. Newer JAX names the
-    checker toggle `check_vma`; older versions used `check_rep`.
-    """
-
-    parameters = inspect.signature(nnx.shard_map).parameters
-    if "check_vma" in parameters:
-        return nnx.shard_map(**kwargs, check_vma=False)
-    if "check_rep" in parameters:
-        return nnx.shard_map(**kwargs, check_rep=False)
-    return nnx.shard_map(**kwargs)
 
 
 def eval_metrics_from_returns(returns: Float[Array, "batch"]) -> EvalMetrics:
@@ -187,42 +170,6 @@ def play_training(
     return data
 
 
-def make_single_device_selfplay(
-    env,
-    config,
-    parallel: BatchParallel | None = None,
-):
-    """Return the single-device PGX-style self-play function.
-
-    This maps to the body of pgx/examples/alphazero/train.py::selfplay after
-    removing pmap's leading device axis.  The returned function still emits
-    Scacchi's richer TrainingSamples container with batch/time axes.
-    """
-
-    parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
-
-    def training_player(model: nnx.Module):
-        return make_search_player(
-            env,
-            model,
-            config.selfplay.search,
-            config.selfplay.action_commitment_type,
-            q_loss_weight_mode=str(config.training.losses.q_loss_weight_mode),
-        )
-
-    @nnx.jit
-    def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
-        return play_training(
-            env,
-            training_player(model),
-            rng_key,
-            batch_size=int(config.selfplay.batch_size),
-            max_num_steps=int(config.selfplay.max_num_steps),
-            parallel=parallel,
-        )
-
-    return selfplay
-
 def play(
     env: Any,
     player_1: Player,
@@ -256,9 +203,6 @@ def play(
 def make_selfplay(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
 
-    if not parallel.enabled or parallel.device_count == 1:
-        return make_single_device_selfplay(env, config, parallel)
-
     def training_player(model: nnx.Module):
         return make_search_player(
             env,
@@ -268,27 +212,17 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             q_loss_weight_mode=str(config.training.losses.q_loss_weight_mode),
         )
 
-    # TODO: this part is super ugly but it works. Let's think on how to remove it safely
-    if parallel.mesh is None:
-        raise RuntimeError("batch-parallel self-play requires a mesh.")
-    if int(config.selfplay.batch_size) % parallel.device_count != 0:
-        raise ValueError(
-            "selfplay.batch_size must be divisible by the batch-parallel "
-            f"device count ({parallel.device_count})."
-        )
-    local_batch_size = int(config.selfplay.batch_size) // parallel.device_count
-    if local_batch_size < 1:
+    local_batch_size = parallel.local_batch_size(int(config.selfplay.batch_size))
+    if local_batch_size == 0:
         raise ValueError(
             "selfplay.batch_size must be at least the batch-parallel device count."
         )
 
-    # MCTX uses dynamic gathers/scatters over its leading batch dimension.
-    # If it sees a globally sharded [batch, ...] array, XLA inserts
-    # cross-device collectives inside the search loop. shard_map gives each
-    # device a local [local_batch, ...] search problem and stitches the
-    # resulting samples back into a global batch-sharded pytree.
-    @_local_search_shard_map(
-        mesh=parallel.mesh,
+    # Search always receives a device-local batch.  This avoids collectives in
+    # MCTX's dynamic gather/scatter loops, and keeps local and multi-device
+    # execution on precisely the same JAX path.
+    @local_shard_map(
+        mesh=parallel.execution_mesh(),
         in_specs=(PartitionSpec(), PartitionSpec(parallel.axis_name, None)),
         out_specs=PartitionSpec(parallel.axis_name),
     )

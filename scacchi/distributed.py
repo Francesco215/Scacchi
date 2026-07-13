@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from flax import nnx
 import jax
 from jax import numpy as jnp
 import numpy as np
@@ -40,6 +42,33 @@ class BatchParallel:
         axes[batch_axis] = self.axis_name
         return NamedSharding(self.mesh, PartitionSpec(*axes))
 
+    def execution_mesh(self) -> Mesh:
+        """Return a mesh for code that runs one independent local batch per device.
+
+        A disabled ``BatchParallel`` still uses a one-device mesh here.  This
+        lets callers keep a single SPMD program for both local and distributed
+        execution, without turning ordinary batch tensors into sharded ones.
+        """
+
+        if self.enabled and self.mesh is not None:
+            return self.mesh
+        return jax.make_mesh(
+            (1,),
+            (self.axis_name,),
+            axis_types=(AxisType.Auto,),
+            devices=jax.devices()[:1],
+        )
+
+    def local_batch_size(self, batch_size: int) -> int:
+        """Validate and return the portion of a batch owned by one device."""
+
+        if batch_size % self.device_count != 0:
+            raise ValueError(
+                "batch size must be divisible by the batch-parallel device "
+                f"count ({self.device_count})."
+            )
+        return batch_size // self.device_count
+
     def split(self, rng_key: jax.Array, num:int) -> jax.Array:
         ids = jnp.arange(num, dtype=jnp.uint32)
         sharding = self.sharding_for(ndim=1)
@@ -49,6 +78,23 @@ class BatchParallel:
         return keys
 
 DISABLED_BATCH_PARALLEL = BatchParallel(enabled=False)
+
+
+def local_shard_map(**kwargs):
+    """Build an NNX shard map for independent per-device computations.
+
+    Some local control-flow carries are not manually axis-typed.  They are
+    valid because the mapped computation never communicates across devices,
+    but JAX's optional shard-map checker rejects them before lowering.  The
+    option was renamed from ``check_rep`` to ``check_vma`` across JAX versions.
+    """
+
+    parameters = inspect.signature(nnx.shard_map).parameters
+    if "check_vma" in parameters:
+        return nnx.shard_map(**kwargs, check_vma=False)
+    if "check_rep" in parameters:
+        return nnx.shard_map(**kwargs, check_rep=False)
+    return nnx.shard_map(**kwargs)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

@@ -23,7 +23,7 @@ def make_minibatches(
     samples = assert_batch_axis_sharded(samples, parallel, batch_axis=0, label="minibatch samples")
     batch_size = samples.obs.shape[0]
     num_steps = samples.obs.shape[1]
-    device_count = parallel.device_count if parallel.enabled else 1
+    device_count = parallel.device_count
     assert batch_size % device_count == 0, f"batch_size={batch_size} must be divisible by device_count={device_count}."
     assert training_batch_size % device_count == 0, f"training_batch_size={training_batch_size} must be divisible by device_count={device_count}."
 
@@ -35,10 +35,7 @@ def make_minibatches(
         num_updates = min(num_updates, max_updates_per_iter)
     local_train_rows = num_updates * local_training_batch_size
 
-    if device_count == 1:
-        local_keys = rng_key[None, :]
-    else:
-        local_keys = parallel.split(rng_key, device_count)
+    local_keys = parallel.split(rng_key, device_count)
     local_row_ixs = jax.vmap(lambda key: jax.random.permutation(key, jnp.arange(local_rows))[:local_train_rows])(local_keys)
 
     def local_shuffle(x: jax.Array) -> jax.Array:
