@@ -1,8 +1,9 @@
 # Dirichlet-Q AlphaZero: Math Reference
 
-Implementation note: the active Dirichlet-Q search is implemented in JAX on
-top of MCTX. Visited-node evidence is aligned to the root player's perspective,
-grouped by the first root action, and added to that action's Dirichlet prior.
+Implementation note: the active Dirichlet-Q search is implemented in JAX by
+the lightweight `scacchi.dirichlet_mctx` backend. Each simulation's evidence is
+aligned to the root player's perspective, grouped by its first root action, and
+added to that action's Dirichlet prior during backup.
 
 ## 1. Big picture
 
@@ -25,8 +26,8 @@ $$
 $$
 
 Search evaluates actions and accumulates WDL evidence by the first root action.
-For policy improvement and Q-target construction, each action uses the
-next-state value Dirichlet as its prior, aligned back to the root player's
+Once an action is explored, policy improvement and Q-target construction use
+the next-state value Dirichlet as its prior, aligned back to the root player's
 perspective:
 
 $$
@@ -39,11 +40,12 @@ $$
 s_a = \textrm{Step}(s,a).
 $$
 
-The action posterior used for the search-improved policy and Q target is
+Until then, the action uses the Q-head Dirichlet as its fallback. The action
+posterior used for the search-improved policy and Q target is therefore
 
 $$
 \alpha_a^{\mathrm{post}}(s)=
-\alpha_a^{\mathrm{child}}(s)+E_Q(s,a),
+\alpha_{\mathrm{base}}(s,a;\mathrm{tree})+E_Q(s,a),
 $$
 
 The policy target after search is the posterior probability that each action is optimal:
@@ -724,10 +726,8 @@ $$
 a \in \mathcal{A}(s).
 $$
 
-In the current MCTX implementation, search traversal itself may use MCTX's
-root selection rule, but the posterior used for policy targets is reconstructed
-from the accumulated root-action evidence and the mixed Q-fallback/value-prior
-base described above.
+The implementation updates this posterior directly during each simulation's
+backup. It does not reconstruct Dirichlet evidence from a scalar-MCTS tree.
 
 ---
 
@@ -735,16 +735,17 @@ base described above.
 
 After search, define the search-improved policy as the posterior probability that each action is optimal under utility.
 
-The posterior used here is the child-value-prior posterior:
+The posterior used here has the mixed base defined in Section 7:
 
 $$
 \alpha_b^{(T)}=
-\alpha_{\theta^-}^{V \rightarrow Q}(s,b)+
+\alpha_{\mathrm{base}}(s,b;\mathrm{tree})+
 E_Q(s,b),
 $$
 
 where $E_Q(s,b)$ is the accumulated root-player-perspective evidence for
-action $b$.
+action $b$. Thus explored actions use their aligned child-value prior and
+unexplored actions retain their Q-head fallback.
 
 For each legal action $a$:
 
@@ -1476,7 +1477,8 @@ $$
 \textrm{softmax}(r_\theta).
 $$
 
-There is no additive $\alpha_{\mathrm{base}}$ and no smoothing term.
+There is no additional fixed Dirichlet base prior or smoothing term beyond the
+network-predicted mixed Q/value base described above.
 
 ---
 

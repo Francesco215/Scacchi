@@ -1,5 +1,3 @@
-from fsspec.implementations.http import ex
-from functools import partial
 from typing import Any, Callable, NamedTuple, cast
 
 import chex
@@ -10,8 +8,9 @@ from jaxtyping import Array, Bool, Float, Int
 import mctx
 import pgx
 
+from . import dirichlet_mctx
 from .dirichlet_q_search import (
-    dirichlet_thompson_search,
+    adapt_dirichlet_expand_fn_to_mctx,
     make_dirichlet_expand_fn_from_constants,
     make_dirichlet_root,
     outcome_mean,
@@ -155,7 +154,7 @@ def _run_dirichlet_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutp
     """
     alpha_v = _required_output(prediction.alpha_v, "alpha_v")
     alpha_q = _required_output(prediction.alpha_q, "alpha_q")
-    root = make_dirichlet_root(env_state, prediction.logits, alpha_v, alpha_q)
+    root = make_dirichlet_root(env_state, prediction.logits, alpha_v)
     search_key, posterior_key = jax.random.split(rng_key)
     search_output = mctx.gumbel_muzero_policy(
         params=(),
@@ -227,34 +226,85 @@ def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput,
     return SearchOutput(PosteriorTargets(prediction=posterior_prediction, metadata=metadata))
 
 
+def _run_dirichlet_thompson_search(
+    env_state: pgx.State,
+    prediction: EvaluatorOutput,
+    expand_fn,
+    rng_key: jax.Array,
+    search_cfg: DirichletThompsonSearchConfig,
+    q_loss_weight_mode: str,
+) -> SearchOutput:
+    """Run the MCTX-shaped Dirichlet Thompson backend."""
+
+    alpha_v = _required_output(prediction.alpha_v, "alpha_v")
+    alpha_q = _required_output(prediction.alpha_q, "alpha_q")
+    root = dirichlet_mctx.RootFnOutput(
+        prior_logits=prediction.logits,
+        value=alpha_v,
+        action_values=alpha_q,
+        embedding=env_state,
+        terminal=env_state.terminated,
+        to_play=env_state.current_player,
+    )
+    policy_output = dirichlet_mctx.dirichlet_thompson_policy(
+        params=(),
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=expand_fn,
+        num_simulations=int(search_cfg.num_simulations),
+        invalid_actions=~env_state.legal_action_mask,
+        posterior_update=dirichlet_mctx.update_posterior,
+        max_depth=search_cfg.max_depth,
+        num_search_blocks=int(search_cfg.num_blocks),
+        policy_samples=int(search_cfg.policy_samples),
+        policy_sample_chunk_size=search_cfg.policy_sample_chunk_size,
+    )
+    policy_target = policy_output.action_weights
+    search_action = policy_output.action
+    tree = policy_output.search_tree
+    q_evidence_sum = tree.posterior.evidence
+    beta_Q_target, beta_V_target = posterior_targets(
+        alpha_v,
+        tree.posterior.base,
+        q_evidence_sum,
+        policy_target,
+    )
+    posterior_prediction = PosteriorPrediction(
+        policy=policy_target,
+        alpha_v=beta_V_target,
+        alpha_q=beta_Q_target,
+    )
+    metadata = TargetMetadata(
+        mask=_search_loss_mask(policy_target),
+        q_weight=q_loss_weight_from_mode(
+            q_loss_weight_mode,
+            q_evidence_sum,
+            policy_target,
+        ),
+        search_action=search_action,
+    )
+    return SearchOutput(
+        PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
+    )
+
+
 def _make_dirichlet_thompson_search(env, evaluator: Evaluator, search_cfg: DirichletThompsonSearchConfig, q_loss_weight_mode: str) -> Search:
-    expand_fn = make_dirichlet_expand_fn_from_constants(env, evaluator, search_cfg.constants)
+    expand_fn = make_dirichlet_expand_fn_from_constants(
+        env,
+        evaluator,
+        search_cfg.constants,
+    )
 
     def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
         prediction = evaluator(root_state.observation)
-        alpha_v = _required_output(prediction.alpha_v, "alpha_v")
-        alpha_q = _required_output(prediction.alpha_q, "alpha_q")
-        result = dirichlet_thompson_search(
-            env_state=root_state,
-            logits=prediction.logits,
-            alpha_v_prior=alpha_v,
-            alpha_q_prior=alpha_q,
-            expand_fn=expand_fn,
-            rng_key=rng_key,
-            search_cfg=search_cfg,
-            q_loss_weight_mode=q_loss_weight_mode,
+        return _run_dirichlet_thompson_search(
+            root_state,
+            prediction,
+            expand_fn,
+            rng_key,
+            search_cfg,
+            q_loss_weight_mode,
         )
-        prediction = PosteriorPrediction(
-            policy=result.policy_target,
-            alpha_v=result.alpha_v_target,
-            alpha_q=result.alpha_q_target,
-        )
-        metadata = TargetMetadata(
-            mask=_search_loss_mask(result.policy_target),
-            q_weight=result.q_loss_weight,
-            search_action=result.action,
-        )
-        return SearchOutput(PosteriorTargets(prediction=prediction, metadata=metadata))
 
     return search
 
@@ -263,9 +313,16 @@ def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfi
     def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
         prediction = evaluator(root_state.observation)
         policy = _masked_policy(prediction.logits, root_state.legal_action_mask, temperature=float(search_cfg.temperature))
-        
+        search_action = posterior_sample_action(
+            rng_key,
+            policy,
+            root_state.legal_action_mask,
+        )
         prediction = PosteriorPrediction(policy, prediction.value, prediction.alpha_v, prediction.alpha_q)
-        metadata = TargetMetadata(mask=_search_loss_mask(policy))
+        metadata = TargetMetadata(
+            mask=_search_loss_mask(policy),
+            search_action=search_action,
+        )
         return SearchOutput(PosteriorTargets(prediction=prediction, metadata=metadata))
 
     return search
@@ -273,7 +330,14 @@ def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfi
 
 def _make_gumbel_search(env, evaluator: Evaluator, search_cfg: GumbelSearchConfig, q_loss_weight_mode: str) -> Search:
     scalar_expand_fn = make_gumbel_expand_fn(env, evaluator)
-    dirichlet_expand_fn = make_dirichlet_expand_fn_from_constants(env,evaluator,search_cfg.constants)
+    shared_dirichlet_expand_fn = make_dirichlet_expand_fn_from_constants(
+        env,
+        evaluator,
+        search_cfg.constants,
+    )
+    dirichlet_expand_fn = adapt_dirichlet_expand_fn_to_mctx(
+        shared_dirichlet_expand_fn
+    )
 
     def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
         prediction = evaluator(root_state.observation)
@@ -314,6 +378,26 @@ def make_action_committer(action_commitment_type: str):
         raise ValueError(f"unknown action_commitment_type: {action_commitment_type!r}")
 
     return action_committer
+
+
+def commit_action(
+    action_commitment_type: str,
+    rng_key: jax.Array,
+    policy: jax.Array,
+    legal_action_mask: jax.Array,
+    search_action: jax.Array | None = None,
+) -> jax.Array:
+    """Compatibility boundary for committing an already-computed policy."""
+
+    posterior = PosteriorTargets(
+        prediction=PosteriorPrediction(policy=policy),
+        metadata=TargetMetadata(search_action=search_action),
+    )
+    return make_action_committer(action_commitment_type)(
+        posterior,
+        legal_action_mask,
+        rng_key,
+    )
 
 
 def make_search_player(env, model: Any, search_cfg: SearchConfig, action_commitment_type: ActionCommitmentType, q_loss_weight_mode: str = "policy"):

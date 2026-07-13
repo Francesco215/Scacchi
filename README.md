@@ -19,8 +19,9 @@ Search refines these WDL beliefs by accumulating evidence in the tree. The
 search-improved policy target is the posterior probability that each action is
 optimal, and the value/Q heads are trained toward posterior Dirichlet targets.
 
-The search implementation and posterior-target helpers live in
-`scacchi/dirichlet_q_search.py`.
+The Thompson tree-search backend lives in `scacchi/dirichlet_mctx/`;
+`scacchi/dirichlet_q_search.py` contains the shared leaf expansion,
+posterior-target helpers, and the small adapter used by Dirichlet-Gumbel MCTX.
 
 ## Codebase Structure
 
@@ -32,6 +33,7 @@ The search implementation and posterior-target helpers live in
 - `scacchi/play.py`: training and evaluation play loops.
 - `scacchi/play_search.py`: evaluator, search, player, and action commitment
   boundaries.
+- `scacchi/dirichlet_mctx/`: lightweight MCTX-shaped Dirichlet Thompson search.
 - `scacchi/pipeline.py`: replay/minibatch handling and per-iteration training.
 - `scacchi/loss.py`: policy, scalar value, Dirichlet KL, and outcome losses.
 - `scacchi/dirichlet_tree/`: categorical target metadata helpers.

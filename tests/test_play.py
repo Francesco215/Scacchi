@@ -179,6 +179,35 @@ def test_scalar_gumbel_search_preserves_batch_sharding_without_collectives():
     assert metadata.search_action.shape == (batch_size,)
 
 
+def test_dirichlet_gumbel_search_uses_shared_expand_adapter():
+    env_state = _toy_dirichlet_state()
+    search = make_search(
+        _ToySearchEnv(),
+        _toy_dirichlet_evaluator,
+        SearchConfig(
+            kind=SearchKind.gumbel,
+            gumbel=GumbelSearchConfig(
+                num_simulations=2,
+                policy_sample_chunk_size=2,
+            ),
+        ),
+    )
+
+    output = search(env_state, jax.random.PRNGKey(5))
+
+    prediction = output.posterior.prediction
+    metadata = output.posterior.metadata
+    assert metadata is not None
+    assert prediction.alpha_v is not None
+    assert prediction.alpha_q is not None
+    assert metadata.q_weight is not None
+    assert metadata.search_action is not None
+    assert prediction.policy.shape == env_state.legal_action_mask.shape
+    assert prediction.alpha_v.shape == (2, 2)
+    assert prediction.alpha_q.shape == (2, 3, 2)
+    assert jnp.all(prediction.policy[~env_state.legal_action_mask] == 0.0)
+
+
 def test_dirichlet_thompson_prior_only_search_preserves_rng_and_targets():
     env_state = _toy_dirichlet_state()
     search = make_search(
@@ -337,8 +366,9 @@ def test_policy_search_action_samples_batched_policy_rows():
 
     output = player(env_state, key)
     assert output.posterior is not None
+    search_key, _ = jax.random.split(key)
     expected = posterior_sample_action(
-        key,
+        search_key,
         output.posterior.prediction.policy,
         env_state.legal_action_mask,
     )

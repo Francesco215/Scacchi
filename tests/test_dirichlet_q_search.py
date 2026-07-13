@@ -1,407 +1,558 @@
-from types import SimpleNamespace
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
-import mctx
 
+from scacchi import dirichlet_mctx
 from scacchi.dirichlet_q_search import (
-    DirichletRootExtraData,
     NO_PARENT,
     NodeEmbedding,
-    _dirichlet_q_search_block,
-    _q_evidence_sum_from_unbatched_tree,
-    dirichlet_q_policy,
-    dirichlet_root_action_selection,
-    flip_outcome,
-    outcome_utility,
+    adapt_dirichlet_expand_fn_to_mctx,
+    make_dirichlet_expand_fn_from_constants,
     posterior_best_action,
     posterior_best_policy_target,
     posterior_sample_action,
     posterior_targets,
-    q_evidence_sum_from_tree,
-    root_action_value_priors_from_tree,
+    q_loss_weight_from_mode,
     terminal_outcome_from_reward,
 )
+from scacchi.types import SearchConstantsConfig
 
 
-class _FakeTree(SimpleNamespace):
-    @property
-    def num_actions(self):
-        return self.children_index.shape[-1]
-
-
-def _fake_tree(embedding: NodeEmbedding, node_visits: jax.Array, num_actions: int):
-    return _FakeTree(
-        embeddings=embedding,
-        node_visits=node_visits,
-        children_index=jnp.zeros((*node_visits.shape, num_actions), dtype=jnp.int32),
-    )
-
-
-def _fake_unbatched_tree(
-    embedding: NodeEmbedding,
-    node_visits: jax.Array,
-    num_actions: int,
+def _root(
+    action_values: jax.Array,
     *,
-    action_value_prior: jax.Array | None = None,
-    root_invalid_actions: jax.Array | None = None,
-    children_index: jax.Array | None = None,
+    prior_logits: jax.Array | None = None,
+    value: jax.Array | None = None,
+    to_play: int = 0,
+    terminal: bool = False,
+) -> dirichlet_mctx.RootFnOutput:
+    action_values = jnp.asarray(action_values, dtype=jnp.float32)
+    if action_values.ndim == 2:
+        action_values = action_values[None, ...]
+    batch_size, num_actions, num_outcomes = action_values.shape
+    if prior_logits is None:
+        prior_logits = jnp.zeros((batch_size, num_actions), dtype=jnp.float32)
+    if value is None:
+        value = jnp.ones((batch_size, num_outcomes), dtype=jnp.float32)
+    return dirichlet_mctx.RootFnOutput(
+        prior_logits=jnp.asarray(prior_logits, dtype=jnp.float32),
+        value=jnp.asarray(value, dtype=jnp.float32),
+        action_values=action_values,
+        embedding=jnp.zeros((batch_size,), dtype=jnp.int32),
+        terminal=jnp.full((batch_size,), terminal, dtype=jnp.bool_),
+        to_play=jnp.full((batch_size,), to_play, dtype=jnp.int32),
+    )
+
+
+def _constant_recurrent_fn(
+    *,
+    num_actions: int,
+    value: tuple[float, ...],
+    outcome: tuple[float, ...],
+    evidence_weight: float,
+    to_play: int,
+    terminal: bool = False,
+    prior_logits: tuple[float, ...] | None = None,
 ):
-    if action_value_prior is None:
-        action_value_prior = jnp.ones((num_actions, embedding.outcome_dist.shape[-1]))
-    if root_invalid_actions is None:
-        root_invalid_actions = jnp.zeros((num_actions,), dtype=bool)
-    if children_index is None:
-        children_index = jnp.full((node_visits.shape[0], num_actions), NO_PARENT, dtype=jnp.int32)
-    return _FakeTree(
-        embeddings=embedding,
-        node_visits=node_visits,
-        children_index=children_index,
-        extra_data=DirichletRootExtraData(
-            action_value_prior=action_value_prior,
-            explored_action_mask=jnp.zeros((num_actions,), dtype=bool),
+    if prior_logits is None:
+        prior_logits = (0.0,) * num_actions
+
+    def recurrent_fn(_, rng_key, action, depth):
+        del rng_key
+        batch_size = action.shape[0]
+        step = dirichlet_mctx.RecurrentFnOutput(
+            prior_logits=jnp.broadcast_to(
+                jnp.asarray(prior_logits, dtype=jnp.float32),
+                (batch_size, num_actions),
+            ),
+            value=jnp.broadcast_to(
+                jnp.asarray(value, dtype=jnp.float32),
+                (batch_size, len(value)),
+            ),
+            outcome=jnp.broadcast_to(
+                jnp.asarray(outcome, dtype=jnp.float32),
+                (batch_size, len(outcome)),
+            ),
+            evidence_weight=jnp.full(
+                (batch_size,), evidence_weight, dtype=jnp.float32
+            ),
+            terminal=jnp.full((batch_size,), terminal, dtype=jnp.bool_),
+            to_play=jnp.full((batch_size,), to_play, dtype=jnp.int32),
+        )
+        return step, depth + 1
+
+    return recurrent_fn
+
+
+def _policy(
+    root: dirichlet_mctx.RootFnOutput,
+    recurrent_fn,
+    *,
+    rng_key: jax.Array = jax.random.PRNGKey(0),
+    num_simulations: int,
+    invalid_actions: jax.Array | None = None,
+    max_depth: int | None = None,
+    num_search_blocks: int = 1,
+    policy_samples: int = 0,
+):
+    if invalid_actions is None:
+        invalid_actions = jnp.zeros_like(root.prior_logits, dtype=bool)
+    return dirichlet_mctx.dirichlet_thompson_policy(
+        params=(),
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=num_simulations,
+        invalid_actions=invalid_actions,
+        max_depth=max_depth,
+        num_search_blocks=num_search_blocks,
+        policy_samples=policy_samples,
+    )
+
+
+class _ExpandState(NamedTuple):
+    observation: jax.Array
+    legal_action_mask: jax.Array
+    current_player: jax.Array
+    rewards: jax.Array
+    terminated: jax.Array
+
+
+class _ExpandEnv:
+    def step(self, state: _ExpandState, action: jax.Array) -> _ExpandState:
+        del action
+        return _ExpandState(
+            observation=state.observation + 1.0,
+            legal_action_mask=state.legal_action_mask,
+            current_player=1 - state.current_player,
+            rewards=state.rewards,
+            terminated=state.terminated,
+        )
+
+
+class _ExpandPrediction(NamedTuple):
+    logits: jax.Array
+    alpha_v: jax.Array
+
+
+def _expand_evaluator(observation: jax.Array) -> _ExpandPrediction:
+    batch_size = observation.shape[0]
+    return _ExpandPrediction(
+        logits=jnp.zeros((batch_size, 2), dtype=jnp.float32),
+        alpha_v=jnp.broadcast_to(
+            jnp.array([2.0, 6.0], dtype=jnp.float32),
+            (batch_size, 2),
         ),
-        root_invalid_actions=root_invalid_actions,
     )
 
 
-def _toy_root(num_actions: int = 2):
-    root_embedding = NodeEmbedding(
-        state=jnp.zeros((1,), dtype=jnp.int32),
-        outcome_dist=jnp.full((1, 2), 0.5),
-        alpha_V_prior=jnp.full((1, 2), 1.0),
-        evidence_weight=jnp.zeros((1,), dtype=jnp.float32),
-        root_action=jnp.full((1,), NO_PARENT),
-        depth_parity=jnp.zeros((1,), dtype=jnp.int32),
+def test_shared_expand_fn_drives_thompson_and_mctx_adapter():
+    root_state = _ExpandState(
+        observation=jnp.zeros((1, 1), dtype=jnp.float32),
+        legal_action_mask=jnp.array([[True, True]]),
+        current_player=jnp.array([0], dtype=jnp.int32),
+        rewards=jnp.zeros((1, 2), dtype=jnp.float32),
+        terminated=jnp.array([False]),
     )
-    return mctx.RootFnOutput(
-        prior_logits=jnp.zeros((1, num_actions)),
-        value=jnp.zeros((1,)),
-        embedding=root_embedding,
+    expand_fn = make_dirichlet_expand_fn_from_constants(
+        _ExpandEnv(),
+        _expand_evaluator,
+        SearchConstantsConfig(kappa_leaf=2.0, kappa_terminal=8.0),
     )
+    action = jnp.array([0], dtype=jnp.int32)
+    step, child_state = expand_fn((), jax.random.PRNGKey(1), action, root_state)
 
-
-def _toy_expand_fn(_, rng_key, action, embedding: NodeEmbedding):
-    del rng_key
-    batch_size = action.shape[0]
-    win_prob = jnp.where(action == 0, 0.75, 0.25).astype(jnp.float32)
-    outcome_dist = jnp.stack([1.0 - win_prob, win_prob], axis=-1)
-    evidence_weight = jnp.ones((batch_size,), dtype=jnp.float32)
-    root_action = jnp.where(embedding.root_action == NO_PARENT, action, embedding.root_action)
-    depth_parity = 1 - embedding.depth_parity
-    next_embedding = NodeEmbedding(
-        state=embedding.state + 1,
-        outcome_dist=outcome_dist,
-        alpha_V_prior=1.0 + outcome_dist,
-        evidence_weight=evidence_weight,
-        root_action=root_action,
-        depth_parity=depth_parity,
-    )
-    return (
-        mctx.RecurrentFnOutput(
-            reward=jnp.zeros((batch_size,)),
-            discount=jnp.zeros((batch_size,)),
-            prior_logits=jnp.zeros((batch_size, 2)),
-            value=outcome_utility(outcome_dist),
-        ),
-        next_embedding,
-    )
-
-
-def test_root_thompson_selector_matches_dirichlet_utility_draw():
-    action_value_prior = jnp.array([[2.0, 1.0], [1.0, 3.0], [3.0, 1.0]])
     embedding = NodeEmbedding(
-        state=None,
-        outcome_dist=jnp.array([[0.5, 0.5], [0.1, 0.9], [0.8, 0.2]]),
-        alpha_V_prior=jnp.ones((3, 2)),
-        evidence_weight=jnp.array([0.0, 2.0, 3.0]),
-        root_action=jnp.array([NO_PARENT, 0, 1]),
-        depth_parity=jnp.array([0, 0, 1]),
-    )
-    tree = _fake_unbatched_tree(
-        embedding,
-        jnp.array([1, 1, 1]),
-        num_actions=3,
-        action_value_prior=action_value_prior,
-    )
-    rng_key = jax.random.PRNGKey(7)
-    alpha_post = action_value_prior + _q_evidence_sum_from_unbatched_tree(tree)
-    phi = jax.random.dirichlet(rng_key, alpha_post)
-    expected = jnp.argmax(outcome_utility(phi), axis=-1)
-
-    action = dirichlet_root_action_selection(rng_key, tree, 0)
-
-    assert int(action) == int(expected)
-
-
-def test_root_thompson_selector_masks_invalid_high_utility_action():
-    action_value_prior = jnp.array([[1000.0, 1.0], [1.0, 1000.0], [500.0, 1.0]])
-    root_invalid_actions = jnp.array([False, True, False])
-    embedding = NodeEmbedding(
-        state=None,
+        state=root_state,
         outcome_dist=jnp.array([[0.5, 0.5]]),
         alpha_V_prior=jnp.ones((1, 2)),
-        evidence_weight=jnp.array([0.0]),
-        root_action=jnp.array([NO_PARENT]),
-        depth_parity=jnp.array([0]),
+        evidence_weight=jnp.zeros((1,)),
+        root_action=jnp.array([NO_PARENT], dtype=jnp.int32),
+        root_player=root_state.current_player,
     )
-    tree = _fake_unbatched_tree(
+    mctx_step, mctx_child = adapt_dirichlet_expand_fn_to_mctx(expand_fn)(
+        (),
+        jax.random.PRNGKey(1),
+        action,
         embedding,
-        jnp.array([1]),
-        num_actions=3,
-        action_value_prior=action_value_prior,
-        root_invalid_actions=root_invalid_actions,
     )
+    assert all(
+        bool(jnp.array_equal(actual, expected))
+        for actual, expected in zip(
+            jax.tree.leaves(mctx_child.state),
+            jax.tree.leaves(child_state),
+            strict=True,
+        )
+    )
+    assert jnp.array_equal(mctx_child.alpha_V_prior, step.value)
+    assert jnp.array_equal(mctx_child.outcome_dist, step.outcome)
+    assert jnp.array_equal(mctx_step.prior_logits, step.prior_logits)
+    assert jnp.allclose(mctx_step.value, dirichlet_mctx.outcome_utility(step.outcome))
+
+    root = dirichlet_mctx.RootFnOutput(
+        prior_logits=jnp.zeros((1, 2)),
+        value=jnp.ones((1, 2)),
+        action_values=jnp.array([[[9.0, 1.0], [1.0, 9.0]]]),
+        embedding=root_state,
+        terminal=root_state.terminated,
+        to_play=root_state.current_player,
+    )
+    output = _policy(
+        root,
+        expand_fn,
+        num_simulations=1,
+        invalid_actions=jnp.array([[False, True]]),
+    )
+    assert jnp.allclose(
+        output.search_tree.posterior.base[0, 0],
+        jnp.array([6.0, 2.0]),
+    )
+    assert jnp.allclose(
+        output.search_tree.posterior.evidence[0, 0],
+        jnp.array([1.5, 0.5]),
+    )
+
+
+def test_root_thompson_selector_matches_draw_and_masks_invalid_action():
+    action_values = jnp.array(
+        [[[1000.0, 1.0], [1.0, 1000.0], [500.0, 1.0]]],
+        dtype=jnp.float32,
+    )
+    invalid_actions = jnp.array([[False, True, False]])
+    tree = dirichlet_mctx.instantiate_tree_from_root(
+        _root(action_values),
+        num_simulations=0,
+        root_invalid_actions=invalid_actions,
+    )
+    unbatched_tree = jax.tree.map(lambda leaf: leaf[0], tree)
     rng_key = jax.random.PRNGKey(0)
-    scores = outcome_utility(jax.random.dirichlet(rng_key, action_value_prior))
-    expected = jnp.argmax(jnp.where(root_invalid_actions, -jnp.inf, scores), axis=-1)
+    scores = dirichlet_mctx.outcome_utility(
+        jax.random.dirichlet(rng_key, action_values[0])
+    )
+    expected = jnp.argmax(
+        jnp.where(invalid_actions[0], -jnp.inf, scores)
+    ).astype(jnp.int32)
 
-    action = dirichlet_root_action_selection(rng_key, tree, 0)
+    action = dirichlet_mctx.thompson_root_action_selection(
+        rng_key,
+        unbatched_tree,
+        jnp.asarray(0, dtype=jnp.int32),
+    )
 
-    assert int(jnp.argmax(scores, axis=-1)) == 1
+    assert int(jnp.argmax(scores)) == 1
     assert int(action) == int(expected)
+    assert not bool(invalid_actions[0, action])
 
 
-def test_root_action_prior_uses_child_v_only_after_action_is_explored():
-    embedding = NodeEmbedding(
-        state=None,
-        outcome_dist=jnp.full((1, 3, 2), 0.5),
-        alpha_V_prior=jnp.array([[[9.0, 9.0], [3.0, 1.0], [7.0, 5.0]]]),
-        evidence_weight=jnp.zeros((1, 3)),
-        root_action=jnp.array([[NO_PARENT, 0, 1]]),
-        depth_parity=jnp.array([[0, 1, 1]]),
-    )
-    tree = _FakeTree(
-        embeddings=embedding,
-        node_visits=jnp.array([[1, 1, 0]]),
-        children_index=jnp.array([[[1, NO_PARENT], [NO_PARENT, NO_PARENT], [NO_PARENT, NO_PARENT]]]),
-    )
-    action_value_prior = jnp.array([[[1.0, 10.0], [2.0, 20.0]]])
-
-    mixed_prior = root_action_value_priors_from_tree(tree, action_value_prior)
-
-    assert jnp.allclose(mixed_prior, jnp.array([[[1.0, 3.0], [2.0, 20.0]]]))
-
-
-def test_root_action_prior_keeps_carried_posterior_for_previously_explored_action():
-    embedding = NodeEmbedding(
-        state=None,
-        outcome_dist=jnp.full((1, 2, 2), 0.5),
-        alpha_V_prior=jnp.array([[[9.0, 9.0], [3.0, 1.0]]]),
-        evidence_weight=jnp.zeros((1, 2)),
-        root_action=jnp.array([[NO_PARENT, 0]]),
-        depth_parity=jnp.array([[0, 1]]),
-    )
-    tree = _FakeTree(
-        embeddings=embedding,
-        node_visits=jnp.array([[1, 1]]),
-        children_index=jnp.array([[[1, NO_PARENT], [NO_PARENT, NO_PARENT]]]),
-    )
-    carried_posterior = jnp.array([[[5.0, 6.0], [2.0, 20.0]]])
-    explored_action_mask = jnp.array([[True, False]])
-
-    mixed_prior = root_action_value_priors_from_tree(
-        tree,
-        carried_posterior,
-        explored_action_mask,
+def test_first_root_child_replaces_q_fallback_and_adds_aligned_evidence():
+    root = _root([[9.0, 1.0], [1.0, 9.0]], to_play=0)
+    recurrent_fn = _constant_recurrent_fn(
+        num_actions=2,
+        value=(2.0, 6.0),
+        outcome=(0.25, 0.75),
+        evidence_weight=4.0,
+        to_play=1,
     )
 
-    assert jnp.allclose(mixed_prior, carried_posterior)
-
-
-def test_batched_and_unbatched_root_evidence_sums_agree_on_toy_tree():
-    embedding = NodeEmbedding(
-        state=None,
-        outcome_dist=jnp.array(
-            [
-                [[0.5, 0.5], [0.2, 0.8], [0.7, 0.3]],
-                [[0.5, 0.5], [0.1, 0.9], [0.4, 0.6]],
-            ]
-        ),
-        alpha_V_prior=jnp.ones((2, 3, 2)),
-        evidence_weight=jnp.array([[0.0, 2.0, 3.0], [0.0, 5.0, 7.0]]),
-        root_action=jnp.array([[NO_PARENT, 0, 2], [NO_PARENT, 1, 1]]),
-        depth_parity=jnp.array([[0, 0, 1], [0, 1, 0]]),
+    output = _policy(
+        root,
+        recurrent_fn,
+        num_simulations=1,
+        invalid_actions=jnp.array([[False, True]]),
+        max_depth=4,
     )
-    node_visits = jnp.array([[1, 1, 1], [1, 1, 1]])
-    tree = _fake_tree(embedding, node_visits, num_actions=3)
 
-    batched = q_evidence_sum_from_tree(tree)
-    unbatched = []
-    for batch_index in range(2):
-        unbatched_embedding = NodeEmbedding(
-            state=None,
-            outcome_dist=embedding.outcome_dist[batch_index],
-            alpha_V_prior=embedding.alpha_V_prior[batch_index],
-            evidence_weight=embedding.evidence_weight[batch_index],
-            root_action=embedding.root_action[batch_index],
-            depth_parity=embedding.depth_parity[batch_index],
+    tree = output.search_tree
+    expected_base = jnp.array([[[6.0, 2.0], [1.0, 9.0]]])
+    expected_evidence = jnp.array([[[3.0, 1.0], [0.0, 0.0]]])
+    assert jnp.allclose(tree.posterior.base, expected_base)
+    assert jnp.allclose(tree.posterior.evidence, expected_evidence)
+    assert jnp.allclose(tree.posterior.alpha, expected_base + expected_evidence)
+    assert jnp.array_equal(tree.posterior.explored, jnp.array([[True, False]]))
+    assert jnp.array_equal(tree.summary().visit_counts, jnp.array([[1.0, 0.0]]))
+    assert int(tree.children_index[0, 0, 0]) == 1
+
+
+def test_repeated_depth_cutoff_counts_every_simulation_without_new_nodes():
+    root = _root([[1.0, 1.0]], to_play=0)
+    recurrent_fn = _constant_recurrent_fn(
+        num_actions=1,
+        value=(3.0, 1.0),
+        outcome=(0.25, 0.75),
+        evidence_weight=2.0,
+        to_play=0,
+    )
+
+    output = _policy(
+        root,
+        recurrent_fn,
+        num_simulations=4,
+        max_depth=1,
+    )
+
+    tree = output.search_tree
+    assert jnp.array_equal(tree.summary().visit_counts, jnp.array([[4.0]]))
+    assert jnp.allclose(tree.posterior.base, jnp.array([[[3.0, 1.0]]]))
+    assert jnp.allclose(tree.posterior.evidence, jnp.array([[[2.0, 6.0]]]))
+    assert int(tree.children_index[0, 0, 0]) == 1
+    assert jnp.array_equal(
+        tree.parents[0],
+        jnp.array([-1, 0, -1, -1, -1], dtype=jnp.int32),
+    )
+
+
+def test_terminal_child_has_no_descendants_and_repeats_terminal_evidence():
+    root = _root([[1.0, 1.0], [1.0, 1.0]], to_play=0)
+    recurrent_fn = _constant_recurrent_fn(
+        num_actions=2,
+        value=(4.0, 2.0),
+        outcome=(1.0, 0.0),
+        evidence_weight=8.0,
+        to_play=1,
+        terminal=True,
+        prior_logits=(-jnp.inf, -jnp.inf),
+    )
+
+    output = _policy(
+        root,
+        recurrent_fn,
+        num_simulations=3,
+        invalid_actions=jnp.array([[True, False]]),
+        max_depth=6,
+    )
+
+    tree = output.search_tree
+    assert int(tree.children_index[0, 0, 1]) == 1
+    assert bool(tree.node_terminal[0, 1])
+    assert bool(jnp.all(tree.children_index[0, 1] == tree.UNVISITED))
+    assert jnp.array_equal(
+        tree.parents[0],
+        jnp.array([-1, 0, -1, -1], dtype=jnp.int32),
+    )
+    assert jnp.array_equal(tree.summary().visit_counts, jnp.array([[0.0, 3.0]]))
+    assert jnp.allclose(
+        tree.posterior.evidence,
+        jnp.array([[[0.0, 0.0], [0.0, 24.0]]]),
+    )
+    assert jnp.allclose(
+        tree.posterior.base,
+        jnp.array([[[1.0, 1.0], [2.0, 4.0]]]),
+    )
+
+
+def test_depth_evidence_uses_node_players_and_routes_to_first_root_action():
+    root = _root(
+        [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+        to_play=0,
+    )
+
+    def recurrent_fn(_, rng_key, action, depth):
+        del rng_key
+        batch_size = action.shape[0]
+        next_depth = depth + 1
+        first = next_depth == 1
+        value = jnp.where(
+            first[:, None],
+            jnp.array([[2.0, 5.0]]),
+            jnp.array([[7.0, 3.0]]),
         )
-        unbatched.append(
-            _q_evidence_sum_from_unbatched_tree(
-                _fake_unbatched_tree(
-                    unbatched_embedding,
-                    node_visits[batch_index],
-                    num_actions=3,
-                )
-            )
+        outcome = jnp.where(
+            first[:, None],
+            jnp.array([[0.2, 0.8]]),
+            jnp.array([[0.1, 0.9]]),
+        )
+        step = dirichlet_mctx.RecurrentFnOutput(
+            prior_logits=jnp.broadcast_to(
+                jnp.array([-jnp.inf, 0.0, -jnp.inf]),
+                (batch_size, 3),
+            ),
+            value=value,
+            outcome=outcome,
+            evidence_weight=jnp.where(first, 1.0, 2.0),
+            terminal=jnp.zeros((batch_size,), dtype=bool),
+            # Both descendants have player 1. At depth two the evidence still
+            # needs one flip, so a simple depth-parity rule would be wrong.
+            to_play=jnp.ones((batch_size,), dtype=jnp.int32),
+        )
+        return step, next_depth
+
+    output = _policy(
+        root,
+        recurrent_fn,
+        num_simulations=2,
+        invalid_actions=jnp.array([[True, True, False]]),
+        max_depth=2,
+    )
+
+    tree = output.search_tree
+    expected_evidence = jnp.array(
+        [[[0.0, 0.0], [0.0, 0.0], [2.6, 0.4]]]
+    )
+    assert jnp.allclose(tree.posterior.evidence, expected_evidence)
+    assert jnp.allclose(tree.posterior.base[0, 2], jnp.array([5.0, 2.0]))
+    assert jnp.array_equal(tree.summary().visit_counts, jnp.array([[0.0, 0.0, 2.0]]))
+    root_child = tree.children_index[0, 0, 2]
+    assert int(root_child) == 1
+    assert int(tree.children_index[0, root_child, 1]) == 2
+    assert int(tree.children_visits[0, root_child, 1]) == 1
+
+
+def test_search_blocks_carry_posterior_but_rebuild_block_topology():
+    root = _root([[1.0, 1.0]], to_play=0)
+    recurrent_fn = _constant_recurrent_fn(
+        num_actions=1,
+        value=(4.0, 1.0),
+        outcome=(0.6, 0.4),
+        evidence_weight=2.0,
+        to_play=0,
+    )
+
+    output = _policy(
+        root,
+        recurrent_fn,
+        rng_key=jax.random.PRNGKey(11),
+        num_simulations=1,
+        max_depth=1,
+        num_search_blocks=3,
+    )
+
+    tree = output.search_tree
+    assert jnp.allclose(tree.posterior.base, jnp.array([[[4.0, 1.0]]]))
+    assert jnp.allclose(tree.posterior.evidence, jnp.array([[[3.6, 2.4]]]))
+    assert jnp.array_equal(tree.posterior.explored, jnp.array([[True]]))
+    # Tree topology and visit counts describe the final block; its posterior
+    # carries evidence from all three blocks.
+    assert jnp.array_equal(tree.summary().visit_counts, jnp.array([[1.0]]))
+    assert int(tree.children_index[0, 0, 0]) == 1
+
+
+def test_policy_accepts_custom_posterior_update_rule():
+    root = _root([[1.0, 1.0]])
+    expand_fn = _constant_recurrent_fn(
+        num_actions=1,
+        value=(2.0, 2.0),
+        outcome=(0.25, 0.75),
+        evidence_weight=1.0,
+        to_play=0,
+    )
+
+    def triple_evidence(posterior, **update):
+        return dirichlet_mctx.update_posterior(
+            posterior,
+            **{
+                **update,
+                "evidence_weight": 3.0 * update["evidence_weight"],
+            },
         )
 
-    assert jnp.allclose(batched, jnp.stack(unbatched))
-
-
-def test_repeated_search_blocks_aggregate_evidence_and_carry_posterior():
-    rng_key = jax.random.PRNGKey(11)
-    block_keys = jax.random.split(rng_key, 2)
-    root = _toy_root()
-    action_value_prior = jnp.full((1, 2, 2), 2.0)
-    invalid_actions = jnp.array([[False, False]])
-
-    block_1 = _dirichlet_q_search_block(
-        rng_key=block_keys[0],
+    output = dirichlet_mctx.dirichlet_thompson_policy(
+        params=(),
+        rng_key=jax.random.PRNGKey(4),
         root=root,
-        expand_fn=_toy_expand_fn,
-        action_value_prior=action_value_prior,
-        explored_action_mask=jnp.zeros(action_value_prior.shape[:-1], dtype=bool),
+        recurrent_fn=expand_fn,
         num_simulations=1,
-        invalid_actions=invalid_actions,
-    )
-    block_2 = _dirichlet_q_search_block(
-        rng_key=block_keys[1],
-        root=root,
-        expand_fn=_toy_expand_fn,
-        action_value_prior=block_1.alpha_search,
-        explored_action_mask=block_1.explored_action_mask,
-        num_simulations=1,
-        invalid_actions=invalid_actions,
+        invalid_actions=jnp.array([[False]]),
+        posterior_update=triple_evidence,
+        policy_samples=0,
     )
 
-    repeated = dirichlet_q_policy(
-        rng_key=rng_key,
-        root=root,
-        expand_fn=_toy_expand_fn,
-        action_value_prior=action_value_prior,
-        num_simulations=1,
-        invalid_actions=invalid_actions,
-        num_search_blocks=2,
+    assert jnp.allclose(
+        output.search_tree.posterior.evidence,
+        jnp.array([[[0.75, 2.25]]]),
     )
 
-    expected_evidence = block_1.q_evidence_sum + block_2.q_evidence_sum
-    assert jnp.allclose(repeated.q_evidence_sum, expected_evidence)
-    assert jnp.allclose(repeated.alpha_search, block_2.alpha_search)
 
-
-def test_single_search_block_matches_one_block_policy():
-    rng_key = jax.random.PRNGKey(3)
-    root = _toy_root()
-    action_value_prior = jnp.full((1, 2, 2), 2.0)
-    invalid_actions = jnp.array([[False, False]])
-
-    block = _dirichlet_q_search_block(
-        rng_key=rng_key,
-        root=root,
-        expand_fn=_toy_expand_fn,
-        action_value_prior=action_value_prior,
-        explored_action_mask=jnp.zeros(action_value_prior.shape[:-1], dtype=bool),
-        num_simulations=2,
-        invalid_actions=invalid_actions,
-    )
-    policy = dirichlet_q_policy(
-        rng_key=rng_key,
-        root=root,
-        expand_fn=_toy_expand_fn,
-        action_value_prior=action_value_prior,
-        num_simulations=2,
-        invalid_actions=invalid_actions,
-        num_search_blocks=1,
-    )
-
-    assert jnp.array_equal(policy.action, block.action)
-    assert jnp.allclose(policy.action_weights, block.action_weights)
-    assert jnp.allclose(policy.q_evidence_sum, block.q_evidence_sum)
-    assert jnp.allclose(policy.alpha_search, block.alpha_search)
-
-
-def test_zero_simulation_policy_uses_q_prior_without_search_tree():
+def test_zero_simulation_policy_samples_q_prior_without_tree_updates():
     rng_key = jax.random.PRNGKey(17)
-    root = _toy_root(num_actions=3)
-    action_value_prior = jnp.array(
+    action_values = jnp.array(
         [[[1.0, 4.0], [4.0, 1.0], [2.0, 2.0]]],
         dtype=jnp.float32,
     )
     invalid_actions = jnp.array([[False, False, True]])
+    root = _root(action_values)
+    recurrent_fn = _constant_recurrent_fn(
+        num_actions=3,
+        value=(1.0, 1.0),
+        outcome=(0.5, 0.5),
+        evidence_weight=1.0,
+        to_play=1,
+    )
+    search_key, _, _ = jax.random.split(rng_key, 3)
+    sampled = jax.random.dirichlet(search_key, action_values)
+    expected_action = dirichlet_mctx.masked_argmax(
+        dirichlet_mctx.outcome_utility(sampled),
+        invalid_actions,
+    )
 
-    policy = dirichlet_q_policy(
+    output = _policy(
+        root,
+        recurrent_fn,
         rng_key=rng_key,
-        root=root,
-        expand_fn=_toy_expand_fn,
-        action_value_prior=action_value_prior,
         num_simulations=0,
         invalid_actions=invalid_actions,
     )
 
-    assert jnp.allclose(policy.q_evidence_sum, jnp.zeros_like(action_value_prior))
-    assert jnp.allclose(policy.alpha_search, action_value_prior)
-    assert not bool(policy.explored_action_mask.any())
-    assert policy.action.shape == (1,)
-    action_weights = jnp.asarray(policy.action_weights)
-    assert action_weights.shape == (1, 3)
-    assert float(action_weights[0, 2]) == 0.0
-    assert float(action_weights.sum()) == 1.0
-
-
-def test_q_evidence_routes_by_root_action_and_aligns_parity():
-    embedding = NodeEmbedding(
-        state=None,
-        outcome_dist=jnp.array([[[0.5, 0.5], [0.2, 0.8], [0.7, 0.3], [0.1, 0.9]]]),
-        alpha_V_prior=jnp.ones((1, 4, 2)),
-        evidence_weight=jnp.array([[0.0, 2.0, 3.0, 5.0]]),
-        root_action=jnp.array([[NO_PARENT, 0, 2, 0]]),
-        depth_parity=jnp.array([[0, 0, 1, 1]]),
+    tree = output.search_tree
+    assert jnp.array_equal(output.action, expected_action)
+    assert jnp.array_equal(
+        output.action_weights,
+        jax.nn.one_hot(expected_action, 3, dtype=action_values.dtype),
     )
-    tree = _fake_tree(embedding, jnp.array([[1, 1, 1, 1]]), num_actions=3)
+    assert jnp.array_equal(tree.posterior.base, action_values)
+    assert jnp.array_equal(tree.posterior.evidence, jnp.zeros_like(action_values))
+    assert not bool(tree.posterior.explored.any())
+    assert bool(jnp.all(tree.children_index == tree.UNVISITED))
 
-    evidence_sum = q_evidence_sum_from_tree(tree)
 
-    expected = jnp.array(
-        [
+def test_dirichlet_policy_jits_with_heterogeneous_root_masks():
+    root = _root(
+        jnp.array(
             [
-                2.0 * jnp.array([0.2, 0.8]) + 5.0 * jnp.array([0.9, 0.1]),
-                jnp.array([0.0, 0.0]),
-                3.0 * jnp.array([0.3, 0.7]),
+                [[2.0, 1.0], [1.0, 2.0]],
+                [[1.0, 3.0], [3.0, 1.0]],
             ]
-        ]
+        )
     )
-    assert evidence_sum.shape == (1, 3, 2)
-    assert jnp.allclose(evidence_sum, expected)
-
-
-def test_terminal_child_outcome_scatters_back_to_root_perspective():
-    terminal_parent = terminal_outcome_from_reward(jnp.array([1.0]), 2)
-    terminal_child = flip_outcome(terminal_parent)
-    embedding = NodeEmbedding(
-        state=None,
-        outcome_dist=jnp.array([[[0.5, 0.5], terminal_child[0]]]),
-        alpha_V_prior=jnp.ones((1, 2, 2)),
-        evidence_weight=jnp.array([[0.0, 8.0]]),
-        root_action=jnp.array([[NO_PARENT, 1]]),
-        depth_parity=jnp.array([[0, 1]]),
+    recurrent_fn = _constant_recurrent_fn(
+        num_actions=2,
+        value=(2.0, 4.0),
+        outcome=(0.25, 0.75),
+        evidence_weight=1.0,
+        to_play=1,
     )
-    tree = _fake_tree(embedding, jnp.array([[1, 1]]), num_actions=2)
+    invalid_actions = jnp.array([[False, True], [True, False]])
 
-    evidence_sum = q_evidence_sum_from_tree(tree)
+    @jax.jit
+    def run(root_output, rng_key):
+        return _policy(
+            root_output,
+            recurrent_fn,
+            rng_key=rng_key,
+            num_simulations=2,
+            invalid_actions=invalid_actions,
+            max_depth=2,
+            policy_samples=4,
+        )
 
-    assert jnp.allclose(terminal_parent, jnp.array([[0.0, 1.0]]))
-    assert jnp.allclose(terminal_child, jnp.array([[1.0, 0.0]]))
-    assert jnp.allclose(evidence_sum[0, 1], jnp.array([0.0, 8.0]))
+    with jax.debug_key_reuse(True):
+        output = run(root, jax.random.key(9))
+    assert jnp.array_equal(output.action, jnp.array([0, 1], dtype=jnp.int32))
+    assert jnp.allclose(output.action_weights.sum(axis=-1), 1.0)
+    assert jnp.all(output.action_weights[invalid_actions] == 0.0)
+    assert jnp.array_equal(
+        output.search_tree.summary().visit_counts,
+        jnp.array([[2.0, 0.0], [0.0, 2.0]]),
+    )
 
 
 def test_posterior_best_policy_target_masks_invalid_actions():
-    alpha_Q_post = jnp.array([[[1.0, 2.0], [1.0, 1000.0], [2.0, 1.0]]])
+    alpha_q_post = jnp.array([[[1.0, 2.0], [1.0, 1000.0], [2.0, 1.0]]])
     legal_action_mask = jnp.array([[True, False, True]])
 
     policy_target = posterior_best_policy_target(
         jax.random.PRNGKey(0),
-        alpha_Q_post,
+        alpha_q_post,
         legal_action_mask,
         num_samples=128,
     )
@@ -412,7 +563,7 @@ def test_posterior_best_policy_target_masks_invalid_actions():
 
 
 def test_posterior_best_policy_target_chunk_size_matches_full_chunk():
-    alpha_Q_post = jnp.array(
+    alpha_q_post = jnp.array(
         [
             [[1.0, 2.0], [5.0, 1.0], [2.0, 2.0]],
             [[3.0, 1.0], [1.0, 4.0], [2.0, 1.0]],
@@ -428,14 +579,14 @@ def test_posterior_best_policy_target_chunk_size_matches_full_chunk():
 
     full_chunk = posterior_best_policy_target(
         key,
-        alpha_Q_post,
+        alpha_q_post,
         legal_action_mask,
         num_samples=7,
         chunk_size=7,
     )
     chunked = posterior_best_policy_target(
         key,
-        alpha_Q_post,
+        alpha_q_post,
         legal_action_mask,
         num_samples=7,
         chunk_size=3,
@@ -444,42 +595,68 @@ def test_posterior_best_policy_target_chunk_size_matches_full_chunk():
     assert jnp.allclose(chunked, full_chunk)
 
 
-def test_posterior_best_action_is_argmax_policy_target_and_masks_invalid():
-    policy_target = jnp.array([[0.2, 0.7, 0.1], [0.6, 0.4, 0.0]])
-    legal_action_mask = jnp.array([[True, False, True], [True, True, False]])
-
-    action = posterior_best_action(policy_target, legal_action_mask)
-
-    assert jnp.array_equal(action, jnp.array([0, 0], dtype=jnp.int32))
-
-
-def test_posterior_sample_action_samples_policy_target_and_masks_invalid():
-    policy_target = jnp.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+def test_posterior_action_helpers_respect_legal_mask():
+    policy_target = jnp.array([[0.2, 0.7, 0.1], [1.0, 0.0, 0.0]])
     legal_action_mask = jnp.array([[True, False, True], [False, True, False]])
 
-    action = posterior_sample_action(
+    best = posterior_best_action(policy_target, legal_action_mask)
+    sampled = posterior_sample_action(
         jax.random.PRNGKey(0),
         policy_target,
         legal_action_mask,
     )
 
-    assert bool(legal_action_mask[0, action[0]])
-    assert int(action[1]) == 1
+    assert jnp.array_equal(best, jnp.array([0, 1], dtype=jnp.int32))
+    assert bool(jnp.all(legal_action_mask[jnp.arange(2), sampled]))
 
 
-def test_posterior_targets_add_q_evidence_to_action_value_prior_and_weight_value_evidence():
-    alpha_V_prior = jnp.array([[1.0, 1.0]])
-    action_value_prior = jnp.array([[[1.0, 2.0], [2.0, 1.0], [1.0, 2.0]]])
-    q_evidence_sum = jnp.array([[[2.0, 0.0], [0.0, 0.0], [0.5, 1.5]]])
+def test_posterior_targets_add_q_evidence_and_policy_weight_value_evidence():
+    alpha_v_prior = jnp.array([[1.0, 1.0]])
+    action_value_prior = jnp.array(
+        [[[1.0, 2.0], [2.0, 1.0], [1.0, 2.0]]]
+    )
+    q_evidence_sum = jnp.array(
+        [[[2.0, 0.0], [0.0, 0.0], [0.5, 1.5]]]
+    )
     policy_target = jnp.array([[0.25, 0.0, 0.75]])
 
-    beta_Q_target, beta_V_target = posterior_targets(
-        alpha_V_prior,
+    beta_q_target, beta_v_target = posterior_targets(
+        alpha_v_prior,
         action_value_prior,
         q_evidence_sum,
         policy_target,
     )
 
-    assert jnp.allclose(beta_Q_target, action_value_prior + q_evidence_sum)
-    expected_v_evidence = 0.25 * jnp.array([2.0, 0.0]) + 0.75 * jnp.array([0.5, 1.5])
-    assert jnp.allclose(beta_V_target, alpha_V_prior + expected_v_evidence)
+    expected_v_evidence = (
+        0.25 * jnp.array([2.0, 0.0])
+        + 0.75 * jnp.array([0.5, 1.5])
+    )
+    assert jnp.allclose(beta_q_target, action_value_prior + q_evidence_sum)
+    assert jnp.allclose(beta_v_target, alpha_v_prior + expected_v_evidence)
+
+
+def test_q_loss_weights_support_policy_and_evidence_mass_modes():
+    evidence = jnp.array([[[2.0, 0.0], [0.5, 1.5], [0.0, 0.0]]])
+    policy = jnp.array([[0.25, 0.75, 0.0]])
+
+    assert jnp.array_equal(
+        q_loss_weight_from_mode("policy", evidence, policy),
+        policy,
+    )
+    assert jnp.allclose(
+        q_loss_weight_from_mode("evidence_mass", evidence, policy),
+        jnp.array([[2.0, 2.0, 0.0]]),
+    )
+
+
+def test_terminal_reward_maps_two_and_three_outcome_spaces():
+    reward = jnp.array([-1.0, 0.0, 1.0])
+
+    assert jnp.array_equal(
+        terminal_outcome_from_reward(reward, 3),
+        jnp.eye(3, dtype=reward.dtype),
+    )
+    assert jnp.array_equal(
+        terminal_outcome_from_reward(jnp.array([-1.0, 1.0]), 2),
+        jnp.eye(2, dtype=reward.dtype),
+    )
