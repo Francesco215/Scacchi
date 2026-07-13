@@ -108,12 +108,7 @@ def mask_logits(logits: jax.Array, legal_action_mask: jax.Array) -> jax.Array:
     return jnp.where(legal_action_mask, logits, jnp.finfo(logits.dtype).min)
 
 
-def _masked_policy(
-    logits: jax.Array,
-    legal_action_mask: jax.Array,
-    *,
-    temperature: float,
-) -> jax.Array:
+def _masked_policy(logits: jax.Array, legal_action_mask: jax.Array, *, temperature: float) -> jax.Array:
     policy = jax.nn.softmax(mask_logits(logits, legal_action_mask) / temperature, axis=-1)
     return jnp.where(jnp.any(legal_action_mask, axis=-1, keepdims=True), policy, 0.0)
 
@@ -143,14 +138,7 @@ def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
     return jnp.sum(action_weights, axis=-1) > 0
 
 
-def _run_dirichlet_gumbel_search(
-    env_state: pgx.State,
-    prediction: EvaluatorOutput,
-    expand_fn,
-    rng_key: jax.Array,
-    search_cfg: GumbelSearchConfig,
-    q_loss_weight_mode: str,
-) -> SearchOutput:
+def _run_dirichlet_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_loss_weight_mode: str) -> SearchOutput:
     """Run scalar Gumbel MuZero search against a Dirichlet-output network.
 
     MCTX consumes policy logits and scalar values, so the Dirichlet value head
@@ -168,7 +156,7 @@ def _run_dirichlet_gumbel_search(
     alpha_v = _required_output(prediction.alpha_v, "alpha_v")
     alpha_q = _required_output(prediction.alpha_q, "alpha_q")
     root = make_dirichlet_root(env_state, prediction.logits, alpha_v, alpha_q)
-    search_key, posterior_key, _ = jax.random.split(rng_key, 3)
+    search_key, posterior_key = jax.random.split(rng_key)
     search_output = mctx.gumbel_muzero_policy(
         params=(),
         rng_key=search_key,
@@ -219,20 +207,9 @@ def _run_dirichlet_gumbel_search(
     return SearchOutput(PosteriorTargets(prediction=posterior_prediction, metadata=metadata))
 
 
-def _run_scalar_gumbel_search(
-    env_state: pgx.State,
-    prediction: EvaluatorOutput,
-    expand_fn,
-    rng_key: jax.Array,
-    search_cfg: GumbelSearchConfig,
-    q_loss_weight_mode: str,  # does nothing. just for compatibility
-) -> SearchOutput:
+def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_loss_weight_mode: str) -> SearchOutput:
     value = _required_output(prediction.value, "value")
-    root = mctx.RootFnOutput(
-        prior_logits=prediction.logits,
-        value=value,
-        embedding=env_state,
-    )
+    root = mctx.RootFnOutput(prior_logits=prediction.logits, value=value, embedding=env_state)
     policy_output = mctx.gumbel_muzero_policy(
         params=(),
         rng_key=rng_key,
@@ -250,13 +227,7 @@ def _run_scalar_gumbel_search(
     return SearchOutput(PosteriorTargets(prediction=posterior_prediction, metadata=metadata))
 
 
-def _make_dirichlet_thompson_search(
-    env,
-    evaluator: Evaluator,
-    search_cfg: DirichletThompsonSearchConfig,
-    *,
-    q_loss_weight_mode: str,
-) -> Search:
+def _make_dirichlet_thompson_search(env, evaluator: Evaluator, search_cfg: DirichletThompsonSearchConfig, q_loss_weight_mode: str) -> Search:
     expand_fn = make_dirichlet_expand_fn_from_constants(env, evaluator, search_cfg.constants)
 
     def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
@@ -288,12 +259,7 @@ def _make_dirichlet_thompson_search(
     return search
 
 
-def _make_policy_search(
-    env,
-    evaluator: Evaluator,
-    search_cfg: PolicySearchConfig,
-    *args, **kwargs,
-) -> Search:
+def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfig, *args, **kwargs) -> Search:
     def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
         prediction = evaluator(root_state.observation)
         policy = _masked_policy(prediction.logits, root_state.legal_action_mask, temperature=float(search_cfg.temperature))
@@ -320,13 +286,7 @@ def _make_gumbel_search(env, evaluator: Evaluator, search_cfg: GumbelSearchConfi
     return search
 
     
-def make_search(
-    env,
-    evaluator: Evaluator,
-    search_cfg: SearchConfig,
-    *,
-    q_loss_weight_mode: str = "policy",
-) -> Search:
+def make_search(env, evaluator: Evaluator, search_cfg: SearchConfig, q_loss_weight_mode: str = "policy") -> Search:
     
     active_search_cfg, _make_search_function = {
         SearchKind.policy: (search_cfg.policy, _make_policy_search),
@@ -334,15 +294,11 @@ def make_search(
         SearchKind.dirichlet_thompson: (search_cfg.dirichlet_thompson, _make_dirichlet_thompson_search),
     }[search_cfg.kind]
     
-    return _make_search_function(env, evaluator, active_search_cfg, q_loss_weight_mode=q_loss_weight_mode)  # ty:ignore[invalid-argument-type]
+    return _make_search_function(env, evaluator, active_search_cfg, q_loss_weight_mode)  # ty:ignore[invalid-argument-type]
 
 
 def make_action_committer(action_commitment_type: str):
-    def action_committer(
-        posterior: PosteriorTargets,
-        legal_action_mask: jax.Array,
-        rng_key: jax.Array,
-    ) -> jax.Array:
+    def action_committer(posterior: PosteriorTargets, legal_action_mask: jax.Array, rng_key: jax.Array) -> jax.Array:
         metadata = posterior.metadata
         search_action = None if metadata is None else metadata.search_action
         policy = posterior.prediction.policy
@@ -360,18 +316,14 @@ def make_action_committer(action_commitment_type: str):
     return action_committer
 
 
-def make_player(search, action_committer):
+def make_search_player(env, model: Any, search_cfg: SearchConfig, action_commitment_type: ActionCommitmentType, q_loss_weight_mode: str = "policy"):
+    search = make_search(env, make_evaluator(model), search_cfg, q_loss_weight_mode)
+    action_committer = make_action_committer(str(action_commitment_type))
+
     def player(env_state: pgx.State, rng_key: jax.Array) -> PlayerOutput:
-        search_key = rng_key
-        _, action_key = jax.random.split(rng_key)
-        search_output = search(root_state=env_state, rng_key=search_key)
+        search_key, action_key = jax.random.split(rng_key)
+        search_output = search(env_state, search_key)
         action = action_committer(search_output.posterior, env_state.legal_action_mask, action_key)
         return PlayerOutput(action=action, posterior=search_output.posterior)
 
     return player
-
-
-def make_search_player(env, model: Any, search_cfg: SearchConfig, action_commitment_type: ActionCommitmentType, *, q_loss_weight_mode: str = "policy"):
-    search = make_search(env, make_evaluator(model), search_cfg, q_loss_weight_mode=q_loss_weight_mode)
-    action_commiter = make_action_committer(str(action_commitment_type))
-    return make_player(search, action_commiter)
