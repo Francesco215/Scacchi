@@ -1,3 +1,4 @@
+from fsspec.implementations.http import ex
 from functools import partial
 from typing import Any, Callable, NamedTuple, cast
 
@@ -142,48 +143,7 @@ def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
     return jnp.sum(action_weights, axis=-1) > 0
 
 
-def make_action_committer(action_commitment_type: str):
-    def action_committer(
-        posterior: PosteriorTargets,
-        legal_action_mask: jax.Array,
-        rng_key: jax.Array,
-    ) -> jax.Array:
-        metadata = posterior.metadata
-        search_action = None if metadata is None else metadata.search_action
-        policy = posterior.prediction.policy
-        
-        if action_commitment_type == "posterior_argmax":
-            return posterior_best_action(policy, legal_action_mask)
-        elif action_commitment_type == "posterior_sample":
-            return posterior_sample_action(rng_key, policy, legal_action_mask)
-        elif action_commitment_type == "search_action":
-            if search_action is None:
-                raise ValueError("search_action commitment requires a backend action")
-            return search_action
-        raise ValueError(f"unknown action_commitment_type: {action_commitment_type!r}")
-
-    return action_committer
-
-
-def make_player(search, action_committer):
-    def player(env_state: pgx.State, rng_key: jax.Array) -> PlayerOutput:
-        search_key = rng_key
-        _, action_key = jax.random.split(rng_key)
-        search_output = search(root_state=env_state, rng_key=search_key)
-        action = action_committer(search_output.posterior, env_state.legal_action_mask, action_key)
-        return PlayerOutput(action=action, posterior=search_output.posterior)
-
-    return player
-
-
-def make_search_player(env, model: Any, search_cfg: SearchConfig, action_commitment_type: ActionCommitmentType, *, q_loss_weight_mode: str = "policy"):
-    search = make_search(env, make_evaluator(model), search_cfg, q_loss_weight_mode=q_loss_weight_mode)
-    action_commiter = make_action_committer(str(action_commitment_type))
-    return make_player(search, action_commiter)
-
-
-def _run_dirichlet_gumbel_search_output(
-    *,
+def _run_dirichlet_gumbel_search(
     env_state: pgx.State,
     prediction: EvaluatorOutput,
     expand_fn,
@@ -259,13 +219,13 @@ def _run_dirichlet_gumbel_search_output(
     return SearchOutput(PosteriorTargets(prediction=posterior_prediction, metadata=metadata))
 
 
-def _run_scalar_gumbel_search_output(
-    *,
+def _run_scalar_gumbel_search(
     env_state: pgx.State,
     prediction: EvaluatorOutput,
     expand_fn,
     rng_key: jax.Array,
     search_cfg: GumbelSearchConfig,
+    q_loss_weight_mode: str,  # does nothing. just for compatibility
 ) -> SearchOutput:
     value = _required_output(prediction.value, "value")
     root = mctx.RootFnOutput(
@@ -288,55 +248,6 @@ def _run_scalar_gumbel_search_output(
     posterior_prediction = PosteriorPrediction(policy=policy_target, value=value)
     metadata = TargetMetadata(mask=_search_loss_mask(policy_target), search_action=search_action)
     return SearchOutput(PosteriorTargets(prediction=posterior_prediction, metadata=metadata))
-
-
-def _make_policy_search(
-    env,
-    evaluator: Evaluator,
-    search_cfg: PolicySearchConfig,
-    *args, **kwargs,
-) -> Search:
-    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
-        prediction = evaluator(root_state.observation)
-        policy = _masked_policy(prediction.logits, root_state.legal_action_mask, temperature=float(search_cfg.temperature))
-        
-        prediction = PosteriorPrediction(policy, prediction.value, prediction.alpha_v, prediction.alpha_q)
-        metadata = TargetMetadata(mask=_search_loss_mask(policy))
-        return SearchOutput(PosteriorTargets(prediction=prediction, metadata=metadata))
-
-    return search
-
-
-def _make_gumbel_search(
-    env,
-    evaluator: Evaluator,
-    search_cfg: GumbelSearchConfig,
-    *,
-    q_loss_weight_mode: str,
-) -> Search:
-    scalar_expand_fn = make_gumbel_expand_fn(env, evaluator)
-    dirichlet_expand_fn = make_dirichlet_expand_fn_from_constants(env,evaluator,search_cfg.constants)
-
-    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
-        prediction = evaluator(root_state.observation)
-        if prediction.alpha_q is None:
-            return _run_scalar_gumbel_search_output(
-                env_state=root_state,
-                prediction=prediction,
-                expand_fn=scalar_expand_fn,
-                rng_key=rng_key,
-                search_cfg=search_cfg,
-            )
-        return _run_dirichlet_gumbel_search_output(
-            env_state=root_state,
-            prediction=prediction,
-            expand_fn=dirichlet_expand_fn,
-            rng_key=rng_key,
-            search_cfg=search_cfg,
-            q_loss_weight_mode=q_loss_weight_mode,
-        )
-
-    return search
 
 
 def _make_dirichlet_thompson_search(
@@ -377,6 +288,38 @@ def _make_dirichlet_thompson_search(
     return search
 
 
+def _make_policy_search(
+    env,
+    evaluator: Evaluator,
+    search_cfg: PolicySearchConfig,
+    *args, **kwargs,
+) -> Search:
+    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
+        prediction = evaluator(root_state.observation)
+        policy = _masked_policy(prediction.logits, root_state.legal_action_mask, temperature=float(search_cfg.temperature))
+        
+        prediction = PosteriorPrediction(policy, prediction.value, prediction.alpha_v, prediction.alpha_q)
+        metadata = TargetMetadata(mask=_search_loss_mask(policy))
+        return SearchOutput(PosteriorTargets(prediction=prediction, metadata=metadata))
+
+    return search
+
+
+def _make_gumbel_search(env, evaluator: Evaluator, search_cfg: GumbelSearchConfig, q_loss_weight_mode: str) -> Search:
+    scalar_expand_fn = make_gumbel_expand_fn(env, evaluator)
+    dirichlet_expand_fn = make_dirichlet_expand_fn_from_constants(env,evaluator,search_cfg.constants)
+
+    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
+        prediction = evaluator(root_state.observation)
+        is_dirichlet = prediction.alpha_q is not None
+        search_fn = _run_dirichlet_gumbel_search if is_dirichlet else _run_scalar_gumbel_search
+        expand_fn = dirichlet_expand_fn if is_dirichlet else scalar_expand_fn
+
+        return search_fn(root_state,prediction,expand_fn,rng_key,search_cfg,q_loss_weight_mode)
+
+    return search
+
+    
 def make_search(
     env,
     evaluator: Evaluator,
@@ -392,3 +335,43 @@ def make_search(
     }[search_cfg.kind]
     
     return _make_search_function(env, evaluator, active_search_cfg, q_loss_weight_mode=q_loss_weight_mode)  # ty:ignore[invalid-argument-type]
+
+
+def make_action_committer(action_commitment_type: str):
+    def action_committer(
+        posterior: PosteriorTargets,
+        legal_action_mask: jax.Array,
+        rng_key: jax.Array,
+    ) -> jax.Array:
+        metadata = posterior.metadata
+        search_action = None if metadata is None else metadata.search_action
+        policy = posterior.prediction.policy
+        
+        if action_commitment_type == "posterior_argmax":
+            return posterior_best_action(policy, legal_action_mask)
+        elif action_commitment_type == "posterior_sample":
+            return posterior_sample_action(rng_key, policy, legal_action_mask)
+        elif action_commitment_type == "search_action":
+            if search_action is None:
+                raise ValueError("search_action commitment requires a backend action")
+            return search_action
+        raise ValueError(f"unknown action_commitment_type: {action_commitment_type!r}")
+
+    return action_committer
+
+
+def make_player(search, action_committer):
+    def player(env_state: pgx.State, rng_key: jax.Array) -> PlayerOutput:
+        search_key = rng_key
+        _, action_key = jax.random.split(rng_key)
+        search_output = search(root_state=env_state, rng_key=search_key)
+        action = action_committer(search_output.posterior, env_state.legal_action_mask, action_key)
+        return PlayerOutput(action=action, posterior=search_output.posterior)
+
+    return player
+
+
+def make_search_player(env, model: Any, search_cfg: SearchConfig, action_commitment_type: ActionCommitmentType, *, q_loss_weight_mode: str = "policy"):
+    search = make_search(env, make_evaluator(model), search_cfg, q_loss_weight_mode=q_loss_weight_mode)
+    action_commiter = make_action_committer(str(action_commitment_type))
+    return make_player(search, action_commiter)
