@@ -1,46 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.scipy.special import gammaln
 
 
-TARGET_PAD = np.int8(0)
-TARGET_DIRICHLET = np.int8(1)
-TARGET_CATEGORICAL = np.int8(2)
-
-OUTCOME_LOSS = np.int8(0)
-OUTCOME_DRAW = np.int8(1)
-OUTCOME_WIN = np.int8(2)
-NO_OUTCOME = np.int8(-1)
-NO_DISTANCE = np.int32(-1)
-INF_DISTANCE = np.int32(2**30)
-
-
-@dataclass(frozen=True, slots=True)
-class NativeTarget:
-    kind: int
-    alpha: np.ndarray | None = None
-    outcome: int = int(NO_OUTCOME)
-    distance: int = int(NO_DISTANCE)
-    weight: float = 1.0
-
-
-def dirichlet_target(alpha: np.ndarray) -> NativeTarget:
-    return NativeTarget(kind=int(TARGET_DIRICHLET), alpha=_positive(alpha))
-
-
-def categorical_target(outcome: int, distance: int) -> NativeTarget:
-    return NativeTarget(
-        kind=int(TARGET_CATEGORICAL),
-        alpha=None,
-        outcome=int(outcome),
-        distance=int(distance),
-    )
+TARGET_PAD = 0
+TARGET_DIRICHLET = 1
+TARGET_CATEGORICAL = 2
+NO_OUTCOME = -1
+NO_DISTANCE = -1
 
 
 def _full_like_input_sharding(source: jax.Array, value: Any, dtype: Any) -> jax.Array:
@@ -75,126 +46,6 @@ def native_fields_from_beta(beta_q: Any, beta_v: Any) -> dict[str, jax.Array]:
     }
 
 
-def align_outcome(outcome: int, source_player: int, target_player: int) -> int:
-    outcome = int(outcome)
-    if outcome < 0 or int(source_player) == int(target_player):
-        return outcome
-    if outcome == int(OUTCOME_LOSS):
-        return int(OUTCOME_WIN)
-    if outcome == int(OUTCOME_WIN):
-        return int(OUTCOME_LOSS)
-    return int(OUTCOME_DRAW)
-
-
-def flip_outcome_index(outcome: int) -> int:
-    return align_outcome(outcome, 0, 1)
-
-
-def outcome_utility_index(outcome: int | np.ndarray) -> np.ndarray:
-    outcome_arr = np.asarray(outcome)
-    return np.where(
-        outcome_arr == int(OUTCOME_WIN),
-        1.0,
-        np.where(outcome_arr == int(OUTCOME_LOSS), -1.0, 0.0),
-    )
-
-
-def categorical_utility_np(outcome: int | np.ndarray, num_outcomes: int) -> np.ndarray:
-    outcome_arr = np.asarray(outcome)
-    return np.where(
-        outcome_arr == int(num_outcomes) - 1,
-        1.0,
-        np.where(outcome_arr == 0, -1.0, 0.0),
-    )
-
-
-def categorical_proxy_np(
-    outcome: int,
-    num_outcomes: int,
-    *,
-    epsilon: float = 1e-6,
-) -> np.ndarray:
-    proxy = np.full((int(num_outcomes),), float(epsilon), dtype=np.float32)
-    if 0 <= int(outcome) < int(num_outcomes):
-        proxy[int(outcome)] = np.float32(
-            1.0 - (float(num_outcomes) - 1.0) * float(epsilon)
-        )
-    return _positive(proxy)
-
-
-def native_policy_target_np(
-    rng: np.random.Generator,
-    alpha: np.ndarray,
-    legal_action_mask: np.ndarray,
-    target_kind: np.ndarray | None,
-    target_outcome: np.ndarray | None,
-    num_samples: int,
-) -> np.ndarray:
-    alpha = _positive(alpha)
-    legal = np.asarray(legal_action_mask, dtype=bool)
-    target = np.zeros((alpha.shape[-2],), dtype=np.float32)
-    legal_actions = np.flatnonzero(legal)
-    if legal_actions.size == 0:
-        return target
-    if int(num_samples) <= 0:
-        raise ValueError(f"num_samples must be positive, got {num_samples}")
-
-    if target_kind is None:
-        target_kind = np.full((alpha.shape[-2],), int(TARGET_DIRICHLET), dtype=np.int8)
-    if target_outcome is None:
-        target_outcome = np.full((alpha.shape[-2],), int(NO_OUTCOME), dtype=np.int8)
-    kind = np.asarray(target_kind)
-    outcome = np.asarray(target_outcome)
-    hits = np.zeros((legal_actions.size,), dtype=np.float32)
-    for _ in range(int(num_samples)):
-        utilities = np.empty((legal_actions.size,), dtype=np.float32)
-        for ix, action in enumerate(legal_actions):
-            if int(kind[int(action)]) == int(TARGET_CATEGORICAL):
-                utilities[ix] = float(categorical_utility_np(int(outcome[int(action)]), alpha.shape[-1]))
-            else:
-                phi = rng.dirichlet(alpha[int(action)])
-                utilities[ix] = float(phi[-1] - phi[0])
-        hits[int(np.argmax(utilities))] += 1.0
-    target[legal_actions] = hits / float(num_samples)
-    target_sum = float(np.sum(target))
-    if target_sum <= 0.0:
-        target[legal_actions] = 1.0 / float(legal_actions.size)
-    else:
-        target /= target_sum
-    return target
-
-
-def sample_native_utility(
-    rng: np.random.Generator,
-    alpha: np.ndarray,
-    kind: np.ndarray | int,
-    outcome: np.ndarray | int,
-) -> np.ndarray:
-    alpha = _positive(alpha)
-    kind_arr = np.asarray(kind)
-    outcome_arr = np.asarray(outcome)
-    if kind_arr.shape == ():
-        if int(kind_arr) == int(TARGET_CATEGORICAL):
-            return np.asarray(
-                categorical_utility_np(int(outcome_arr), alpha.shape[-1]),
-                dtype=np.float32,
-            )
-        phi = rng.dirichlet(alpha)
-        return np.asarray(phi[-1] - phi[0], dtype=np.float32)
-
-    flat_alpha = alpha.reshape((-1, alpha.shape[-1]))
-    flat_kind = kind_arr.reshape((-1,))
-    flat_outcome = outcome_arr.reshape((-1,))
-    utility = np.empty((flat_kind.shape[0],), dtype=np.float32)
-    for ix, target_kind in enumerate(flat_kind):
-        if int(target_kind) == int(TARGET_CATEGORICAL):
-            utility[ix] = float(categorical_utility_np(int(flat_outcome[ix]), alpha.shape[-1]))
-        else:
-            phi = rng.dirichlet(flat_alpha[ix])
-            utility[ix] = float(phi[-1] - phi[0])
-    return utility.reshape(kind_arr.shape)
-
-
 def categorical_point(
     outcome: jax.Array,
     num_outcomes: int,
@@ -227,7 +78,3 @@ def dirichlet_nll_at_categorical(
         + jnp.sum(gammaln(alpha), axis=-1)
         - jnp.sum((alpha - 1.0) * jnp.log(point), axis=-1)
     )
-
-
-def _positive(alpha: np.ndarray) -> np.ndarray:
-    return np.maximum(np.asarray(alpha, dtype=np.float32), np.float32(1e-6))

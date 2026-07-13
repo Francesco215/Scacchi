@@ -309,7 +309,6 @@ def test_play_dispatches_training_mode():
                     mask=jnp.any(env_state.legal_action_mask, axis=-1),
                 ),
             ),
-            diagnostics=None,
         )
 
     training = play(

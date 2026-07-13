@@ -19,10 +19,8 @@ Search refines these WDL beliefs by accumulating evidence in the tree. The
 search-improved policy target is the posterior probability that each action is
 optimal, and the value/Q heads are trained toward posterior Dirichlet targets.
 
-For the detailed search-side algorithm, see
-[`latex/algorithms.tex`](latex/algorithms.tex). That file defines the
-posterior tree, leaf evaluation boundary, backup rules, batched CPU/GPU search
-driver, policy target export, and tree-derived training targets.
+The search implementation and posterior-target helpers live in
+`scacchi/dirichlet_q_search.py`.
 
 ## Codebase Structure
 
@@ -36,13 +34,11 @@ driver, policy target export, and tree-derived training targets.
   boundaries.
 - `scacchi/pipeline.py`: replay/minibatch handling and per-iteration training.
 - `scacchi/loss.py`: policy, scalar value, Dirichlet KL, and outcome losses.
-- `scacchi/dirichlet_tree/`: compatibility helpers for native categorical
-  target metadata and shared training-output containers.
+- `scacchi/dirichlet_tree/`: categorical target metadata helpers.
 - `scacchi/configs/`: Hydra YAML configs, currently centered on Hex.
 - `scripts/`: benchmarks, sweeps, and plotting utilities.
-- `tests/`: unit tests for config validation, losses, network behavior, search,
-  and posterior-tree utilities.
-- `latex/`: detailed algorithm reference material.
+- `tests/`: unit tests for config validation, losses, network behavior, and
+  search utilities.
 
 ## Common Commands
 

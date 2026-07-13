@@ -8,6 +8,45 @@ from scacchi import checkpoint
 from scacchi.types import CheckpointingConfig, Config, RunConfig
 
 
+def test_legacy_flat_checkpoint_config_loads_for_solved_baselines() -> None:
+    config = checkpoint._load_checkpoint_config(
+        {
+            "env_id": "hex",
+            "board_size": 5,
+            "seed": 0,
+            "max_num_iters": 300,
+            "network": "boardlaw",
+            "num_channels": 512,
+            "num_layers": 8,
+            "resnet_v2": True,
+            "selfplay_batch_size": 1024,
+            "num_simulations": 32,
+            "max_num_steps": 256,
+            "training_batch_size": 4096,
+            "learning_rate": 1e-3,
+            "log_interval": 1,
+            "eval_interval": 0,
+            "eval_batch_size": 64,
+            "wandb_enabled": True,
+            "wandb_project": "scacchi-az",
+            "ckpt_max_to_keep": 3,
+            "ckpt_save_interval_steps": 50,
+            # Removed MoHex fields in the real baseline metadata are ignored.
+            "mohex_max_memory": 207108864,
+        }
+    )
+
+    assert config.env.id == "hex"
+    assert config.env.board_size == 5
+    assert config.model.network == "boardlaw"
+    assert config.model.num_channels == 512
+    assert config.model.num_layers == 8
+    assert config.selfplay.search.kind == "gumbel"
+    assert config.selfplay.search.gumbel.num_simulations == 32
+    assert config.eval.interval == 0
+    assert config.eval.batch_size == 64
+
+
 def test_rng_key_checkpoint_value_is_host_numpy_array() -> None:
     rng_key = jax.random.PRNGKey(7)
 

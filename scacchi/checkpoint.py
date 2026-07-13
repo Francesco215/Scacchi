@@ -147,6 +147,64 @@ def _rng_key_from_checkpoint_value(value: Any, template: jax.Array) -> jax.Array
     return jnp.asarray(value, dtype=template.dtype)
 
 
+def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
+    """Load current or pre-nested-schema checkpoint metadata.
+
+    The solved Hex baselines were produced before runtime configuration was
+    split into nested sections.  Keep that compatibility local to checkpoint
+    loading so flat user configs remain an error.
+    """
+    if "model" in raw or "env" in raw or "run" in raw:
+        return load_config(OmegaConf.create(raw))
+
+    legacy_sections: dict[str, dict[str, Any]] = {
+        "run": {
+            "seed": raw.get("seed", 0),
+            "max_num_iters": raw.get("max_num_iters", 400),
+        },
+        "env": {
+            "id": raw.get("env_id", "go_9x9"),
+            "board_size": raw.get("board_size"),
+        },
+        "model": {
+            "network": raw.get("network", "aznet"),
+            "num_channels": raw.get("num_channels", 128),
+            "num_layers": raw.get("num_layers", 6),
+            "resnet_v2": raw.get("resnet_v2", True),
+        },
+        "selfplay": {
+            "batch_size": raw.get("selfplay_batch_size", 1024),
+            "max_num_steps": raw.get("max_num_steps", 256),
+            "search": {
+                "kind": "gumbel",
+                "gumbel": {
+                    "num_simulations": raw.get("num_simulations", 32),
+                },
+            },
+        },
+        "training": {
+            "batch_size": raw.get("training_batch_size", 4096),
+            "learning_rate": raw.get("learning_rate", 0.001),
+        },
+        "eval": {
+            "interval": raw.get("eval_interval", 5),
+            "batch_size": raw.get("eval_batch_size", 16),
+        },
+        "logging": {
+            "interval": raw.get("log_interval", 1),
+            "wandb": {
+                "enabled": raw.get("wandb_enabled", True),
+                "project": raw.get("wandb_project", "scacchi-az"),
+            },
+        },
+        "checkpointing": {
+            "max_to_keep": raw.get("ckpt_max_to_keep", 3),
+            "save_interval_steps": raw.get("ckpt_save_interval_steps", 50),
+        },
+    }
+    return load_config(OmegaConf.create(legacy_sections))
+
+
 def maybe_save(
     manager: ocp.CheckpointManager,
     step: int,
@@ -225,7 +283,7 @@ def from_pretrained(
         meta_restored = manager.restore(
             step, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
         )
-        config = load_config(OmegaConf.create(meta_restored["meta"]["config"]))
+        config = _load_checkpoint_config(meta_restored["meta"]["config"])
         model = build_model(
             config,
             num_actions=env.num_actions,

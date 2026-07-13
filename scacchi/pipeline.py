@@ -50,37 +50,6 @@ def make_minibatches(
     return minibatches
 
 
-def _mean_or_zero(value: jax.Array | None, dtype) -> jax.Array:
-    if value is None:
-        return jnp.asarray(0.0, dtype=dtype)
-    return jnp.asarray(jnp.mean(value), dtype=dtype)
-
-
-def _with_search_diagnostics(
-    metrics: TrainMetrics,
-    data: TrainingSamples,
-) -> TrainMetrics:
-    diagnostics = data.search_diagnostics
-    if diagnostics is None:
-        return metrics
-    dtype = metrics.policy_loss.dtype
-    return metrics._replace(
-        search_path_depth_mean=_mean_or_zero(diagnostics.path_depth_mean, dtype),
-        search_path_depth_p50=_mean_or_zero(diagnostics.path_depth_p50, dtype),
-        search_path_depth_p90=_mean_or_zero(diagnostics.path_depth_p90, dtype),
-        search_path_depth_max=_mean_or_zero(diagnostics.path_depth_max, dtype),
-        search_expanded_nodes=_mean_or_zero(diagnostics.expanded_nodes, dtype),
-        search_terminal_fraction=_mean_or_zero(diagnostics.terminal_fraction, dtype),
-        search_root_policy_entropy=_mean_or_zero(diagnostics.root_policy_entropy, dtype),
-        search_root_gamma=_mean_or_zero(diagnostics.root_gamma, dtype),
-        search_root_downstream_eval_count=_mean_or_zero(
-            diagnostics.root_downstream_eval_count,
-            dtype,
-        ),
-        search_root_q_concentration=_mean_or_zero(diagnostics.root_q_concentration, dtype),
-    )
-
-
 def train_minibatches(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
@@ -152,7 +121,6 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
             parallel,
         )
         metrics = train_minibatches(model, optimizer, minibatches, config, parallel)
-        metrics = _with_search_diagnostics(metrics, data)
         return _with_data_stats(metrics, data, num_actions)
 
     def training_iteration(

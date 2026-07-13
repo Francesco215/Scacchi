@@ -65,7 +65,6 @@ def winning_player(env_state: ToyState, key: jax.Array) -> PlayerOutput:
     return PlayerOutput(
         action=jnp.ones_like(env_state.current_player, dtype=jnp.int32),
         posterior=None,
-        diagnostics=None,
     )
 
 
@@ -74,7 +73,6 @@ def losing_player(env_state: ToyState, key: jax.Array) -> PlayerOutput:
     return PlayerOutput(
         action=jnp.zeros_like(env_state.current_player, dtype=jnp.int32),
         posterior=None,
-        diagnostics=None,
     )
 
 

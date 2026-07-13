@@ -58,23 +58,6 @@ class _NativeTargetFields(NamedTuple):
 
 _NATIVE_TARGET_FIELD_NAMES = _NativeTargetFields._fields
 
-_TREE_TO_SAMPLE_FIELDS = {
-    "obs": "obs",
-    "policy_tgt": "action_weights",
-    "value_tgt": "value_tgt",
-    "played_action": "played_action",
-    "policy_mask": "legal_action_mask",
-    "value_mask": "value_loss_mask",
-    "beta_Q_target": "beta_Q_target",
-    "beta_V_target": "beta_V_target",
-    "q_loss_weight": "q_loss_weight",
-    "policy_loss_mask": "policy_loss_mask",
-    "value_loss_mask": "value_loss_mask",
-    "search_loss_mask": "search_loss_mask",
-    "outcome_mask": "outcome_mask",
-}
-
-
 class TrainMetrics(NamedTuple):
     policy_loss: Float[Array, "*batch"]
     value_loss: Float[Array, "*batch"]
@@ -88,16 +71,6 @@ class TrainMetrics(NamedTuple):
     alpha_V_concentration: Float[Array, "*batch"]
     alpha_Q_concentration: Float[Array, "*batch"]
     q_loss_weight_mean: Float[Array, "*batch"]
-    search_path_depth_mean: Float[Array, "*batch"]
-    search_path_depth_p50: Float[Array, "*batch"]
-    search_path_depth_p90: Float[Array, "*batch"]
-    search_path_depth_max: Float[Array, "*batch"]
-    search_expanded_nodes: Float[Array, "*batch"]
-    search_terminal_fraction: Float[Array, "*batch"]
-    search_root_policy_entropy: Float[Array, "*batch"]
-    search_root_gamma: Float[Array, "*batch"]
-    search_root_downstream_eval_count: Float[Array, "*batch"]
-    search_root_q_concentration: Float[Array, "*batch"]
     data_value_mask_fraction: Float[Array, "*batch"]
     data_pass_fraction: Float[Array, "*batch"]
     data_terminations_per_row: Float[Array, "*batch"]
@@ -208,9 +181,7 @@ def make_compute_input_for_lossfn(
             )
             policy_loss_mask = legal_policy_mask & value_mask & (value_tgt > 0)
 
-        native_target_values = {
-            field: metadata_value(field) for field in _NATIVE_TARGET_FIELD_NAMES
-        }
+        native_target_values = dict.fromkeys(_NATIVE_TARGET_FIELD_NAMES)
 
         terminal_edge_targets = config.training.losses.terminal_edge_targets
         terminal_parent_targets = config.training.losses.terminal_parent_targets
@@ -340,22 +311,7 @@ def make_compute_input_for_lossfn(
         native_fields = _native_target_fields(sample)
         native_fields = assert_batch_axis_sharded(native_fields, parallel, batch_axis=0, label="loss native_fields final")
         sample = _with_native_defaults(sample, native_fields)
-        sample = assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="loss sample after native defaults")
-        tree_data = metadata_value("tree_data")
-        if tree_data is None:
-            return sample
-
-        tree = tree_data
-        tree_native_defaults = native_fields_from_beta(
-            tree.beta_Q_target,
-            tree.beta_V_target,
-        )
-        tree_native_defaults = assert_batch_axis_sharded(tree_native_defaults, parallel, batch_axis=0, label="loss tree native_defaults")
-        sample = _concat_sample_rows(
-            sample._replace(value_mask=sample.value_loss_mask),
-            _tree_as_sample(tree, tree_native_defaults),
-        )
-        return assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="loss sample after tree concat")
+        return assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="loss sample after native defaults")
 
     return compute_loss_input
 
@@ -432,40 +388,6 @@ def _with_native_defaults(
     if native_fields is None:
         native_fields = _native_target_fields(sample)
     return sample._replace(**native_fields._asdict())
-
-
-def _tree_as_sample(tree: Any, native_defaults: dict[str, jax.Array]) -> Sample:
-    fields = {
-        sample_field: getattr(tree, tree_field)
-        for sample_field, tree_field in _TREE_TO_SAMPLE_FIELDS.items()
-    }
-    fields.update(
-        _native_fields_from_values(
-            _native_target_values(tree),
-            native_defaults,
-        )._asdict()
-    )
-    return Sample(**fields)
-
-
-def _flatten_rows_like(reference: jax.Array, value: jax.Array) -> jax.Array:
-    keep_feature_ndim = reference.ndim - 2
-    feature_shape = value.shape[-keep_feature_ndim:] if keep_feature_ndim else ()
-    return value.reshape((value.shape[0], -1, *feature_shape))
-
-
-def _concat_sample_rows(root: Sample, tree: Sample) -> Sample:
-    return jax.tree_util.tree_map(
-        lambda root_leaf, tree_leaf: jnp.concatenate(
-            [
-                _flatten_rows_like(root_leaf, root_leaf),
-                _flatten_rows_like(root_leaf, tree_leaf),
-            ],
-            axis=1,
-        ),
-        root,
-        tree,
-    )
 
 
 def _zero_train_metrics_like(reference: jax.Array, **values: jax.Array) -> TrainMetrics:

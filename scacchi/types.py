@@ -29,7 +29,6 @@ class SearchKind(StrEnum):
     policy = "policy"
     gumbel = "gumbel"
     dirichlet_thompson = "dirichlet_thompson"
-    dqaz = "dqaz"
 
 
 class QLossWeightMode(StrEnum):
@@ -182,46 +181,17 @@ class DirichletThompsonSearchConfig:
 
 
 @dataclass
-class DQAZSearchConfig:
-    num_simulations: int = 32
-    policy_samples: int = 32
-    inflight_limit: int = 1
-    state_posterior_kappa_n: float = 9.0
-    eval_batch_size: int | None = None
-    pad_to_eval_batch: bool = False
-    jax_backup: bool = True
-    debug: bool = False
-    epsilon_terminal: float = 1e-3
-    constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
-
-    def __post_init__(self) -> None:
-        _require_ge("search.dqaz.num_simulations", self.num_simulations, 1)
-        _require_ge("search.dqaz.policy_samples", self.policy_samples, 1)
-        _require_ge("search.dqaz.inflight_limit", self.inflight_limit, 1)
-        _require_gt(
-            "search.dqaz.state_posterior_kappa_n",
-            self.state_posterior_kappa_n,
-            0.0,
-        )
-        _require_ge("search.dqaz.eval_batch_size", self.eval_batch_size, 1)
-        _require_range(
-            "search.dqaz.epsilon_terminal",
-            self.epsilon_terminal,
-            lower=0.0,
-            upper=0.5,
-        )
-
-
-@dataclass
 class SearchConfig:
     kind: SearchKind = SearchKind.gumbel
     policy: PolicySearchConfig = field(default_factory=PolicySearchConfig)
     gumbel: GumbelSearchConfig = field(default_factory=GumbelSearchConfig)
     dirichlet_thompson: DirichletThompsonSearchConfig = field(default_factory=DirichletThompsonSearchConfig)
-    dqaz: DQAZSearchConfig = field(default_factory=DQAZSearchConfig)
 
-    def active(self) -> (PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig | DQAZSearchConfig):
-        return cast(PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig | DQAZSearchConfig, getattr(self, str(self.kind)))
+    def active(self) -> PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig:
+        return cast(
+            PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
+            getattr(self, str(self.kind)),
+        )
 
     def active_constants(self) -> SearchConstantsConfig:
         active = self.active()
@@ -394,7 +364,7 @@ class TrainConfig:
             ("selfplay.search", self.selfplay.search),
             ("eval.player_search", self.eval.player_search),
         ):
-            if search.kind in {SearchKind.dirichlet_thompson, SearchKind.dqaz}:
+            if search.kind == SearchKind.dirichlet_thompson:
                 assert self.model.network in dirichlet_networks, (
                     f"{name}.kind={search.kind!r} requires "
                     "model.network='aznet_dirichlet' or "

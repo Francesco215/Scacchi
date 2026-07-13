@@ -5,7 +5,6 @@ import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
 from scacchi.distributed import BatchParallel, assert_batch_axis_sharded
-from scacchi.dirichlet_tree.types import TreeTrainingData
 from scacchi.dirichlet_tree.native import TARGET_CATEGORICAL, dirichlet_nll_at_categorical
 from scacchi.dirichlet_tree.native import native_fields_from_beta
 from scacchi.loss import (
@@ -99,16 +98,7 @@ def _training_samples(
     beta_V_target,
     q_loss_weight,
     discount,
-    tree_data=None,
     search_loss_mask=None,
-    q_target_kind=None,
-    q_target_weight=None,
-    q_target_outcome=None,
-    q_target_distance=None,
-    v_target_kind=None,
-    v_target_weight=None,
-    v_target_outcome=None,
-    v_target_distance=None,
 ) -> TrainingSamples:
     return TrainingSamples(
         obs=obs,
@@ -124,15 +114,6 @@ def _training_samples(
             metadata=TargetMetadata(
                 mask=search_loss_mask,
                 q_weight=q_loss_weight,
-                tree_data=tree_data,
-                q_target_kind=q_target_kind,
-                q_target_weight=q_target_weight,
-                q_target_outcome=q_target_outcome,
-                q_target_distance=q_target_distance,
-                v_target_kind=v_target_kind,
-                v_target_weight=v_target_weight,
-                v_target_outcome=v_target_outcome,
-                v_target_distance=v_target_distance,
             ),
         ),
         played_action=played_action,
@@ -304,44 +285,6 @@ def test_compute_loss_input_preserves_sample_batch_sharding():
         sample = compute(data)
     sample = assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="computed sample")
     assert sample.q_target_weight.shape == (batch_size, 2, 3)
-
-
-def test_compute_loss_input_appends_tree_rows_with_separate_loss_masks():
-    tree_data = TreeTrainingData(
-        obs=jnp.array([[[10.0], [20.0]]]),
-        action_weights=jnp.array([[[1.0, 0.0], [0.0, 0.0]]]),
-        played_action=jnp.array([[0, 0]]),
-        legal_action_mask=jnp.array([[[True, False], [False, False]]]),
-        beta_Q_target=jnp.ones((1, 2, 2, 2)),
-        beta_V_target=jnp.ones((1, 2, 2)),
-        q_loss_weight=jnp.array([[[1.0, 0.0], [0.0, 0.0]]]),
-        value_tgt=jnp.array([[0.5, 1.0]]),
-        policy_loss_mask=jnp.array([[True, False]]),
-        value_loss_mask=jnp.array([[True, True]]),
-        search_loss_mask=jnp.array([[True, False]]),
-        outcome_mask=jnp.array([[False, True]]),
-    )
-    data = _training_samples(
-        obs=jnp.array([[[1.0]]]),
-        reward=jnp.array([[1.0]]),
-        terminated=jnp.array([[True]]),
-        action_weights=jnp.array([[[0.0, 1.0]]]),
-        played_action=jnp.array([[1]]),
-        legal_action_mask=jnp.array([[[True, True]]]),
-        beta_Q_target=jnp.ones((1, 1, 2, 2)),
-        beta_V_target=jnp.ones((1, 1, 2)),
-        q_loss_weight=jnp.zeros((1, 1, 2)),
-        discount=jnp.zeros((1, 1)),
-        tree_data=tree_data,
-    )
-    config = _loss_config(max_num_steps=1)
-
-    sample = make_compute_input_for_lossfn(config)(data)
-
-    assert sample.obs.shape == (1, 3, 1)
-    assert jnp.array_equal(sample.policy_loss_mask, jnp.array([[True, True, False]]))
-    assert jnp.array_equal(sample.value_loss_mask, jnp.array([[True, True, True]]))
-    assert jnp.array_equal(sample.outcome_mask, jnp.array([[True, False, True]]))
 
 
 def test_compute_loss_input_trains_root_search_targets_before_terminal_result():

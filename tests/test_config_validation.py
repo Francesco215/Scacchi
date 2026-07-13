@@ -512,16 +512,6 @@ def test_policy_target_mode_must_be_known():
         )
 
 
-def test_posterior_tree_policy_is_not_part_of_training_config():
-    with pytest.raises(ValidationError, match="posterior_tree"):
-        _config(
-            {
-                "model": {"network": "boardlaw_dirichlet"},
-                "search": {"kind": "posterior_tree"},
-            }
-        )
-
-
 def test_eval_baseline_none_requires_eval_disabled():
     with pytest.raises(ValueError, match="eval.baseline=none"):
         _config({"eval": {"baseline": "none", "interval": 1}})

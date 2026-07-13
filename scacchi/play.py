@@ -8,7 +8,6 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 from pgx.experimental import auto_reset
 
-from .dirichlet_tree.types import SearchDiagnostics
 from .distributed import (
     DISABLED_BATCH_PARALLEL,
     BatchParallel,
@@ -30,7 +29,6 @@ class TrainingSamples(NamedTuple):
     played_action: Int[Array, "batch time"]
     legal_action_mask: Bool[Array, "batch time action"]
     psk_terminated: Bool[Array, "batch time"] | None = None
-    search_diagnostics: SearchDiagnostics | None = None
 
 
 class EvalMetrics(NamedTuple):
@@ -219,7 +217,6 @@ def _selfplay_step_frame(
         posterior=player_output.posterior,
         played_action=player_output.action,
         psk_terminated=psk_terminated,
-        search_diagnostics=player_output.diagnostics,
     )
     return env_state, frame
 
