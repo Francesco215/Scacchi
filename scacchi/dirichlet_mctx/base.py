@@ -18,12 +18,14 @@ class RecurrentFnOutput:
     """Evaluation returned after taking one tree edge.
 
     All outcome distributions use the perspective of ``to_play``.
-    ``value`` is the child state's Dirichlet value prior, while ``outcome``
-    and ``evidence_weight`` form the evidence item added by this simulation.
+    ``value`` is the child state's Dirichlet value prior and
+    ``action_values`` contains its action-value priors.  ``outcome`` and
+    ``evidence_weight`` form the evidence item added by this simulation.
     """
 
     prior_logits: jax.Array
     value: jax.Array
+    action_values: jax.Array
     outcome: jax.Array
     evidence_weight: jax.Array
     terminal: jax.Array
@@ -64,9 +66,6 @@ class PolicyOutput(Generic[T]):
     search_tree: T
 
 
-RootActionSelectionFn = Callable[[chex.PRNGKey, Any, jax.Array], jax.Array]
-InteriorActionSelectionFn = Callable[
-    [chex.PRNGKey, Any, jax.Array, jax.Array], jax.Array
-]
+ActionSelectionFn = Callable[[chex.PRNGKey, Any, jax.Array], jax.Array]
 PosteriorUpdateFn = Callable[..., Any]
 LoopFn = Callable[[int, int, Callable[[Any, Any], Any], Any], Any]

@@ -18,7 +18,7 @@ model:
   resnet_v2: true
 
 selfplay:
-  batch_size: 16384
+  batch_size: 4096
   max_num_steps: 64
   action_commitment_type: posterior_argmax
   search:
@@ -53,7 +53,6 @@ training:
 eval:
   interval: 5
   batch_size: 512
-  baseline: checkpoint
   player_search:
     kind: dirichlet_thompson
     dirichlet_thompson:
@@ -62,14 +61,11 @@ eval:
       constants:
         kappa_leaf: 1.0
         kappa_terminal: 8.0
+  baseline: checkpoint
   baseline_search:
-    kind: dirichlet_thompson
-    dirichlet_thompson:
+    kind: gumbel
+    gumbel:
       num_simulations: 4
-      num_blocks: 8
-      constants:
-        kappa_leaf: 1.0
-        kappa_terminal: 8.0
 
 logging:
   interval: 1

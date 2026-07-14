@@ -39,32 +39,16 @@ def masked_argmax(scores: jax.Array, invalid_actions: jax.Array) -> jax.Array:
     )
 
 
-def thompson_root_action_selection(
+def thompson_action_selection(
     rng_key: chex.PRNGKey,
     tree: Tree,
     node_index: chex.Array,
 ) -> jax.Array:
-    del node_index
-    sampled_outcome = jax.random.dirichlet(rng_key, tree.posterior.alpha)
+    """Sample the selected node's action posteriors and choose their best."""
+
+    alpha = tree.action_posteriors.alpha[node_index]
+    sampled_outcome = jax.random.dirichlet(rng_key, alpha)
     return masked_argmax(
         outcome_utility(sampled_outcome),
-        tree.root_invalid_actions,
+        tree.invalid_actions[node_index],
     )
-
-
-def policy_prior_interior_action_selection(
-    rng_key: chex.PRNGKey,
-    tree: Tree,
-    node_index: chex.Array,
-    depth: chex.Array,
-) -> jax.Array:
-    del rng_key, depth
-    logits = tree.children_prior_logits[node_index]
-    valid = jnp.isfinite(logits)
-    finite_logits = jnp.where(valid, logits, jnp.finfo(logits.dtype).min)
-    prior_probs = jax.nn.softmax(finite_logits)
-    visit_counts = tree.children_visits[node_index]
-    visit_frequency = visit_counts / (1 + jnp.sum(visit_counts, keepdims=True))
-    scores = jnp.where(valid, prior_probs - visit_frequency, -jnp.inf)
-    return jnp.argmax(scores, axis=-1).astype(jnp.int32)
-

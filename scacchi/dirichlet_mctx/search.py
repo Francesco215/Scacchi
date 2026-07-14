@@ -134,21 +134,13 @@ def simulate(
     def body_fn(state: _SimulationState) -> _SimulationState:
         node_index = state.next_node_index
         next_key, selection_key = jax.random.split(state.rng_key)
-        action = interior_action_selection_fn(
-            selection_key,
-            tree,
-            node_index,
-            state.depth,
-        )
+        action = interior_action_selection_fn(selection_key, tree, node_index, state.depth)
         child_index = tree.children_index[node_index, action]
         visited = child_index != Tree.UNVISITED
         safe_child = jnp.where(visited, child_index, Tree.ROOT_INDEX)
         depth = state.depth + 1
-        continuing = (
-            visited
-            & ~tree.node_terminal[safe_child]
-            & (depth < max_depth)
-        )
+        continuing = visited & ~tree.node_terminal[safe_child] & (depth < max_depth)
+        
         return _SimulationState(
             rng_key=next_key,
             node_index=node_index,
@@ -179,71 +171,25 @@ def simulate(
     )
 
 
-def expand(
-    params: base.Params,
-    rng_key: chex.PRNGKey,
-    tree: Tree,
-    recurrent_fn: base.RecurrentFn,
-    simulation: Simulation,
-    next_node_index: jax.Array,
-) -> tuple[Tree, base.RecurrentFnOutput]:
+def expand(params: base.Params, rng_key: chex.PRNGKey, tree: Tree, recurrent_fn: base.RecurrentFn, simulation: Simulation, next_node_index: jax.Array) -> tuple[Tree, base.RecurrentFnOutput]:
     """Evaluate the selected edges and update node/topology storage."""
 
     batch = jnp.arange(tree.parents.shape[0])
     parent_index = jnp.where(simulation.active, simulation.parent_index, 0)
     action = jnp.where(simulation.active, simulation.action, 0)
-    embedding = jax.tree.map(
-        lambda value: value[batch, parent_index],
-        tree.embeddings,
-    )
+    embedding = jax.tree.map(lambda value: value[batch, parent_index], tree.embeddings)
     step, child_embedding = recurrent_fn(params, rng_key, action, embedding)
 
     tree = replace(
         tree,
-        parents=_set_node(
-            tree.parents,
-            next_node_index,
-            parent_index,
-            simulation.active,
-        ),
-        action_from_parent=_set_node(
-            tree.action_from_parent,
-            next_node_index,
-            action,
-            simulation.active,
-        ),
-        children_index=_set_edge(
-            tree.children_index,
-            parent_index,
-            action,
-            next_node_index,
-            simulation.active,
-        ),
-        children_prior_logits=_set_node(
-            tree.children_prior_logits,
-            next_node_index,
-            step.prior_logits,
-            simulation.active,
-        ),
-        node_to_play=_set_node(
-            tree.node_to_play,
-            next_node_index,
-            step.to_play,
-            simulation.active,
-        ),
-        node_terminal=_set_node(
-            tree.node_terminal,
-            next_node_index,
-            step.terminal,
-            simulation.active,
-        ),
+        parents=_set_node(tree.parents, next_node_index, parent_index, simulation.active),
+        action_from_parent=_set_node(tree.action_from_parent, next_node_index, action, simulation.active),
+        children_index=_set_edge(tree.children_index, parent_index, action, next_node_index, simulation.active),
+        children_prior_logits=_set_node(tree.children_prior_logits, next_node_index, step.prior_logits, simulation.active),
+        node_to_play=_set_node(tree.node_to_play, next_node_index, step.to_play, simulation.active),
+        node_terminal=_set_node(tree.node_terminal, next_node_index, step.terminal, simulation.active),
         embeddings=jax.tree.map(
-            lambda table, value: _set_node(
-                table,
-                next_node_index,
-                value,
-                simulation.active,
-            ),
+            lambda table, value: _set_node(table, next_node_index, value, simulation.active),
             tree.embeddings,
             child_embedding,
         ),
@@ -377,14 +323,7 @@ def search(
             new_node,
             jnp.where(simulation.active, child, Tree.ROOT_INDEX),
         )
-        tree, step = expand(
-            params,
-            expand_key,
-            tree,
-            recurrent_fn,
-            simulation,
-            next_node,
-        )
+        tree, step = expand(params, expand_key, tree, recurrent_fn, simulation, next_node)
         tree = backward(tree, simulation, next_node, step, posterior_update)
         return key, tree
 

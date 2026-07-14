@@ -25,7 +25,7 @@ model:
   rezero_kernel_init: orthogonal
 
 selfplay:
-  batch_size: 16_384
+  batch_size: 4096
   max_num_steps: 64
   action_commitment_type: posterior_sample
   search:
@@ -38,7 +38,7 @@ selfplay:
         kappa_terminal: 8.0
 
 training:
-  batch_size: 8192
+  batch_size: 2048
   learning_rate: 1e-3
   grad_clip_norm: 1.0
 
@@ -73,13 +73,10 @@ eval:
         kappa_leaf: 1.0
         kappa_terminal: 8.0
   baseline_search:
-    kind: dirichlet_thompson
-    dirichlet_thompson:
+    # The solved checkpoint has scalar policy/value heads, not Dirichlet heads.
+    kind: gumbel
+    gumbel:
       num_simulations: 4
-      num_blocks: 8
-      constants:
-        kappa_leaf: 1.0
-        kappa_terminal: 8.0
 
 logging:
   interval: 1

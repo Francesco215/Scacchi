@@ -1,35 +1,40 @@
-"""Conjugate posterior updates for root actions."""
+"""Default node-local posterior update for Dirichlet Thompson search."""
 
 from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
 
-from .tree import Posterior
+from .action_selection import align_outcome
+from .tree import Posterior, PosteriorUpdateContext
 
 
 def update_posterior(
-    posterior: Posterior,
-    *,
-    action: jax.Array,
-    action_value_prior: jax.Array,
-    has_action_value_prior: jax.Array,
-    evidence: jax.Array,
-    evidence_weight: jax.Array,
-    active: jax.Array,
+    context: PosteriorUpdateContext,
 ) -> Posterior:
-    """Replace a first-explored Q fallback and add one evidence item.
+    """Apply the current incremental evidence rule to one path node.
 
-    Inputs are batched and already aligned to the root player's perspective.
-    This is the Dirichlet-search analogue of an MCTX ``qtransform``: callers
-    may supply another function with this signature to change update policy
-    without changing traversal or tree storage.
+    The richer context is intentional: callers can replace this function with
+    a rule that recomputes the node from all child embeddings or child
+    posteriors without changing traversal or backup.  This default preserves
+    the existing behavior: replace the selected Q fallback with the evaluated
+    child's V prior on first exploration, then add the backed-up leaf evidence.
     """
 
+    posterior = context.node.posterior
+    action = context.action
+    active = context.active
     batch = jnp.arange(posterior.base.shape[0])
     old_base = posterior.base[batch, action]
     old_explored = posterior.explored[batch, action]
-    replace_base = active & has_action_value_prior & ~old_explored
+    child_value = context.children.nodes.value[batch, action]
+    child_player = context.children.nodes.to_play[batch, action]
+    action_value_prior = align_outcome(
+        child_value,
+        child_player,
+        context.node.to_play,
+    )
+    replace_base = active & context.is_leaf_edge & ~old_explored
     selected_base = jnp.where(
         replace_base[..., None],
         action_value_prior,
@@ -39,7 +44,7 @@ def update_posterior(
 
     weighted_evidence = jnp.where(
         active[..., None],
-        evidence_weight[..., None] * evidence,
+        context.evidence_weight[..., None] * context.outcome,
         0.0,
     )
     evidence_sum = posterior.evidence.at[batch, action].add(weighted_evidence)
