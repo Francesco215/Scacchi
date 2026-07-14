@@ -19,13 +19,17 @@ class RecurrentFnOutput:
 
     All outcome distributions use the perspective of ``to_play``.
     ``value`` is the child state's Dirichlet value prior and
-    ``action_values`` contains its action-value priors.  ``outcome`` and
-    ``evidence_weight`` form the evidence item added by this simulation.
+    ``action_values`` contains its action-value priors. ``leaf_value`` is the
+    full Dirichlet message used when this expansion ends a simulation: the
+    value prior for a new non-terminal leaf, or a concentrated outcome for a
+    terminal leaf. ``outcome`` and ``evidence_weight`` remain available to the
+    Dirichlet-Gumbel adapter.
     """
 
     prior_logits: jax.Array
     value: jax.Array
     action_values: jax.Array
+    leaf_value: jax.Array
     outcome: jax.Array
     evidence_weight: jax.Array
     terminal: jax.Array
@@ -67,5 +71,5 @@ class PolicyOutput(Generic[T]):
 
 
 ActionSelectionFn = Callable[[chex.PRNGKey, Any, jax.Array], jax.Array]
-PosteriorUpdateFn = Callable[..., Any]
+PosteriorUpdateFn = Callable[[chex.PRNGKey, Any], Any]
 LoopFn = Callable[[int, int, Callable[[Any, Any], Any], Any], Any]

@@ -99,6 +99,18 @@ def _selfplay_step_frame(
     batch_size: int,
 ) -> tuple[Any, TrainingSamples]:
     player_key, reset_key = jax.random.split(key, 2)
+
+    # ``pgx.experimental.auto_reset`` returns a freshly initialized position
+    # after a game ends, but deliberately carries the previous transition's
+    # terminal flags and rewards for one frame.  Those fields belong to the
+    # transition we already recorded; passing them into search makes every raw
+    # ``env.step`` in a recurrent/expand function a terminal no-op.  Clear the
+    # transition marker before asking the player to analyse the fresh board.
+    env_state = env_state.replace(
+        terminated=jnp.zeros_like(env_state.terminated),
+        truncated=jnp.zeros_like(env_state.truncated),
+        rewards=jnp.zeros_like(env_state.rewards),
+    )
     observation = env_state.observation
     legal_action_mask = env_state.legal_action_mask
     player_output = player(env_state, player_key)

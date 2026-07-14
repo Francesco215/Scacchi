@@ -262,13 +262,13 @@ def _run_dirichlet_thompson_search(
     policy_target = policy_output.action_weights
     search_action = policy_output.action
     tree = policy_output.search_tree
-    q_evidence_sum = tree.posterior.evidence
-    beta_Q_target, beta_V_target = posterior_targets(
-        alpha_v,
-        tree.posterior.base,
-        q_evidence_sum,
-        policy_target,
-    )
+    summary = tree.summary()
+    # These are the actual replacement-style B/cache posteriors exposed by
+    # the north-star implementation.  R remains structural metadata; changing
+    # concentration here would train a different posterior than search uses.
+    beta_Q_target = summary.alpha
+    beta_V_target = summary.value_alpha
+    q_search_count = summary.visit_counts[..., None]
     posterior_prediction = PosteriorPrediction(
         policy=policy_target,
         alpha_v=beta_V_target,
@@ -278,7 +278,7 @@ def _run_dirichlet_thompson_search(
         mask=_search_loss_mask(policy_target),
         q_weight=q_loss_weight_from_mode(
             q_loss_weight_mode,
-            q_evidence_sum,
+            q_search_count,
             policy_target,
         ),
         search_action=search_action,

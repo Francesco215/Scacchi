@@ -34,7 +34,7 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.selfplay.action_commitment_type == "posterior_sample"
     assert config.selfplay.search.kind == "dirichlet_thompson"
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 4
-    assert config.selfplay.search.dirichlet_thompson.max_depth == 4
+    assert config.selfplay.search.dirichlet_thompson.max_depth == 16
     assert config.selfplay.search.dirichlet_thompson.num_blocks == 4
     assert config.selfplay.search.dirichlet_thompson.policy_samples == 1
     assert config.selfplay.search.dirichlet_thompson.policy_sample_chunk_size == 1
@@ -44,7 +44,7 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.eval.baseline_search.kind == "dirichlet_thompson"
     assert config.search.kind == "dirichlet_thompson"
     assert config.search.dirichlet_thompson.num_simulations == 4
-    assert config.search.dirichlet_thompson.max_depth == 4
+    assert config.search.dirichlet_thompson.max_depth == 16
     assert config.search.dirichlet_thompson.num_blocks == 4
     assert config.search.dirichlet_thompson.policy_samples == 1
     assert config.search.dirichlet_thompson.policy_sample_chunk_size == 1
@@ -114,6 +114,37 @@ def test_simple_policy_eval_fragment_overrides_eval_search_only():
     assert config.eval.baseline_search.policy.temperature == 1.0
     assert config.eval.player_action_commitment_type == "posterior_sample"
     assert config.eval.baseline_action_commitment_type == "posterior_sample"
+
+
+def test_hex5_uses_corrected_dirichlet_search_recipe():
+    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex5.yaml"
+    config = load_config(OmegaConf.load(cfg_path))
+
+    assert config.selfplay.search.dirichlet_thompson.num_simulations == 4
+    assert config.selfplay.search.dirichlet_thompson.num_blocks == 4
+    assert config.selfplay.search.dirichlet_thompson.max_depth == 16
+    assert config.selfplay.search.dirichlet_thompson.policy_samples == 32
+    assert (
+        config.selfplay.search.dirichlet_thompson.constants.kappa_terminal
+        == 80.0
+    )
+    assert (
+        config.selfplay.search.dirichlet_thompson.constants.categorical_epsilon
+        == 0.01
+    )
+    assert config.eval.player_search.dirichlet_thompson.num_blocks == 8
+    assert config.eval.player_search.dirichlet_thompson.max_depth == 32
+    assert config.model.compute_dtype == "bfloat16"
+    assert config.training.batch_size == 2048
+    assert config.training.learning_rate == 2e-3
+    assert config.training.losses.q_dir_kl_weight == 1.0
+    assert config.training.losses.q_outcome_weight == 0.25
+    assert (
+        config.checkpointing.directory
+        == "checkpoints/hex5_dirichlet_fresh_pi_seed9101_v1"
+    )
+    assert config.checkpointing.max_to_keep == 1
+    assert config.checkpointing.save_interval_steps == 10
 
 
 def test_policy_search_temperature_must_be_positive():
@@ -369,6 +400,39 @@ def test_dirichlet_thompson_simulations_must_be_non_negative():
                 },
             }
         )
+
+
+def test_dirichlet_thompson_positive_search_rejects_zero_max_depth():
+    with pytest.raises(ValueError, match="search.dirichlet_thompson.max_depth"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "num_simulations": 1,
+                        "max_depth": 0,
+                    },
+                },
+            }
+        )
+
+
+def test_dirichlet_thompson_zero_search_allows_zero_max_depth():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {
+                "kind": "dirichlet_thompson",
+                "dirichlet_thompson": {
+                    "num_simulations": 0,
+                    "max_depth": 0,
+                },
+            },
+        }
+    )
+
+    assert config.search.dirichlet_thompson.max_depth == 0
 
 
 def test_dirichlet_thompson_allows_zero_policy_samples_for_search_policy_targets():

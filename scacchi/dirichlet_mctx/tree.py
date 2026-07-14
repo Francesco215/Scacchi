@@ -1,4 +1,4 @@
-"""The minimal batched tree needed by Dirichlet Thompson search."""
+"""Fixed-capacity data for Dirichlet Thompson tree search."""
 
 from __future__ import annotations
 
@@ -10,99 +10,112 @@ import jax.numpy as jnp
 
 
 @chex.dataclass(frozen=True)
-class Posterior:
-    """Action posterior split into its base prior and search evidence.
+class NodePosterior:
+    """Search state repaired for one node or stored for every node.
 
-    The leading dimensions are deliberately generic.  Stored tree posteriors
-    have shape ``[B, N, A, O]``; a node view has shape ``[B, A, O]``.
+    ``action_alpha`` is the edge message ``B`` from the Tic-Tac-Toe model and
+    contains the Q fallback until ``action_count`` becomes positive.
+    ``action_count`` is the structural edge count ``R``; because every direct
+    or child message has positive ``R``, it also represents the demo's ``m``
+    bit without a duplicate boolean table. ``value_alpha`` is the cached state
+    posterior. Leading dimensions are generic: the tree adds ``[B, N]`` and a
+    gathered node adds only ``[B]``.
     """
 
-    base: jax.Array
-    evidence: jax.Array
-    explored: jax.Array
+    action_alpha: jax.Array
+    action_count: jax.Array
+    value_alpha: jax.Array
 
-    @property
-    def alpha(self) -> jax.Array:
-        return self.base + self.evidence
+
+@chex.dataclass(frozen=True)
+class NodeView:
+    """The current node passed to a configurable posterior repair rule."""
+
+    index: jax.Array
+    embedding: Any
+    value_prior: jax.Array
+    to_play: jax.Array
+    terminal: jax.Array
+    invalid_actions: jax.Array
+    posterior: NodePosterior
+
+
+@chex.dataclass(frozen=True)
+class ChildrenView:
+    """Action-indexed child summaries needed to repair their parent.
+
+    ``embedding_table`` is left ungathered so large game states are not copied
+    across the full action axis. A custom rule that truly needs them can gather
+    ``embedding_table[batch, index]`` using ``visited`` and safe indices.
+    """
+
+    index: jax.Array
+    visited: jax.Array
+    embedding_table: Any
+    value_prior: jax.Array
+    value_alpha: jax.Array
+    count: jax.Array
+    to_play: jax.Array
+    terminal: jax.Array
+
+
+@chex.dataclass(frozen=True)
+class LeafView:
+    """The selected leaf edge evaluated by the current simulation.
+
+    ``active`` is true only for the deepest path node.  It is false for every
+    ancestor, allowing the same posterior-update callback to own both the
+    direct leaf message and all child-to-parent repairs.
+    """
+
+    action: jax.Array
+    value_alpha: jax.Array
+    to_play: jax.Array
+    active: jax.Array
+
+
+@chex.dataclass(frozen=True)
+class PosteriorUpdateContext:
+    """Per-node input to ``PosteriorUpdateFn`` during bottom-up backup.
+
+    Every invocation has the same node, children, and selected-leaf contract.
+    The callback is responsible for the deepest direct ``B/m/R`` write as well
+    as child repairs, so replacing it replaces the complete backward rule.
+    Ancestors observe the freshly repaired value posterior of every child.
+    """
+
+    node: NodeView
+    children: ChildrenView
+    leaf: LeafView
+    active: jax.Array
 
 
 @chex.dataclass(frozen=True)
 class SearchSummary:
     visit_counts: jax.Array
-    visit_probs: jax.Array
     alpha: jax.Array
-    evidence: jax.Array
-    explored: jax.Array
-
-
-@chex.dataclass(frozen=True)
-class NodeView:
-    """A gathered node, suitable for a configurable posterior update."""
-
-    index: jax.Array
-    embedding: Any
-    value: jax.Array
-    outcome: jax.Array
-    evidence_weight: jax.Array
-    to_play: jax.Array
-    terminal: jax.Array
-    invalid_actions: jax.Array
-    visit_counts: jax.Array
-    posterior: Posterior
-
-
-@chex.dataclass(frozen=True)
-class ChildrenView:
-    """All action-indexed children of a node.
-
-    Unvisited entries contain safe placeholder data and must be ignored using
-    ``visited``.  Keeping the action axis intact makes update rules easy to
-    express with ordinary JAX array operations.
-    """
-
-    nodes: NodeView
-    visited: jax.Array
-
-
-@chex.dataclass(frozen=True)
-class PosteriorUpdateContext:
-    """Everything a node-local posterior rule may inspect during backup.
-
-    ``outcome`` is the current simulation's leaf outcome, already aligned to
-    ``node.to_play``.  Children are presented after any deeper path node has
-    been updated, so a rule may derive a parent from child posteriors.
-    """
-
-    node: NodeView
-    children: ChildrenView
-    action: jax.Array
-    outcome: jax.Array
-    evidence_weight: jax.Array
-    is_leaf_edge: jax.Array
-    active: jax.Array
+    value_alpha: jax.Array
 
 
 @chex.dataclass(frozen=True)
 class Tree:
-    """Fixed-capacity state of a batch of Thompson-search trees.
+    """A small JAX tree specialized for Dirichlet message passing.
 
-    Unlike MCTX's scalar-value tree, this stores no rewards, discounts, or
-    running scalar value means.  Each live node owns an action posterior, so
-    the same Thompson rule can select actions at the root and in the interior.
-    Node evaluation data is retained to make posterior backup replaceable.
+    The topology is MCTX-like, but the statistics mirror the Tic-Tac-Toe
+    implementation: every edge has ``(B, R)`` (with ``m == (R > 0)``) and every
+    node caches a full value Dirichlet. ``node_n_down`` caches the edge-count
+    reduction so gathering child summaries stays linear in the action count.
+    The posterior rule repairs these data bottom-up.
     """
 
     parents: jax.Array  # [B, N]
-    action_from_parent: jax.Array  # [B, N]
     children_index: jax.Array  # [B, N, A]
-    children_visits: jax.Array  # [B, N, A]
     node_to_play: jax.Array  # [B, N]
     node_terminal: jax.Array  # [B, N]
-    node_values: jax.Array  # [B, N, O]
-    node_outcomes: jax.Array  # [B, N, O]
-    node_evidence_weights: jax.Array  # [B, N]
+    node_value_priors: jax.Array  # [B, N, O]
+    node_n_down: jax.Array  # [B, N]
     invalid_actions: jax.Array  # [B, N, A]
-    action_posteriors: Posterior  # [B, N, A, O], [B, N, A]
+    posterior: NodePosterior
     embeddings: Any  # pytree with leaves [B, N, ...]
 
     ROOT_INDEX: ClassVar[int] = 0
@@ -118,35 +131,44 @@ class Tree:
         return self.children_index.shape[1] - 1
 
     @property
-    def root_posterior(self) -> Posterior:
-        return Posterior(
-            base=self.action_posteriors.base[..., self.ROOT_INDEX, :, :],
-            evidence=self.action_posteriors.evidence[..., self.ROOT_INDEX, :, :],
-            explored=self.action_posteriors.explored[..., self.ROOT_INDEX, :],
+    def root_posterior(self) -> NodePosterior:
+        return NodePosterior(
+            action_alpha=self.posterior.action_alpha[:, self.ROOT_INDEX],
+            action_count=self.posterior.action_count[:, self.ROOT_INDEX],
+            value_alpha=self.posterior.value_alpha[:, self.ROOT_INDEX],
         )
 
     @property
     def root_invalid_actions(self) -> jax.Array:
-        return self.invalid_actions[..., self.ROOT_INDEX, :]
+        return self.invalid_actions[:, self.ROOT_INDEX]
 
     def summary(self) -> SearchSummary:
         posterior = self.root_posterior
-        visit_counts = self.children_visits[:, self.ROOT_INDEX].astype(
-            posterior.base.dtype
+        visit_counts = posterior.action_count.astype(posterior.action_alpha.dtype)
+        child_index = self.children_index[:, self.ROOT_INDEX]
+        visited = child_index != self.UNVISITED
+        safe_child = jnp.where(visited, child_index, self.ROOT_INDEX)
+        batch = jnp.arange(self.parents.shape[0])[:, None]
+        child_prior = self.node_value_priors[batch, safe_child]
+        child_player = self.node_to_play[batch, safe_child]
+        root_player = self.node_to_play[:, self.ROOT_INDEX, None]
+        child_prior = jnp.where(
+            (child_player == root_player)[..., None],
+            child_prior,
+            child_prior[..., ::-1],
         )
-        total = jnp.sum(visit_counts, axis=-1, keepdims=True)
-        legal = ~self.root_invalid_actions
-        legal_count = jnp.sum(legal, axis=-1, keepdims=True)
-        fallback = legal.astype(visit_counts.dtype) / jnp.maximum(legal_count, 1)
-        visit_probs = jnp.where(
-            total > 0,
-            visit_counts / jnp.maximum(total, 1),
+        fallback = jnp.where(
+            visited[..., None],
+            child_prior,
+            posterior.action_alpha,
+        )
+        alpha = jnp.where(
+            (posterior.action_count > 0)[..., None],
+            posterior.action_alpha,
             fallback,
         )
         return SearchSummary(
             visit_counts=visit_counts,
-            visit_probs=visit_probs,
-            alpha=posterior.alpha,
-            evidence=posterior.evidence,
-            explored=posterior.explored,
+            alpha=alpha,
+            value_alpha=posterior.value_alpha,
         )

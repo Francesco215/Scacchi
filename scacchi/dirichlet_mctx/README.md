@@ -26,18 +26,46 @@ policy_output = dirichlet_mctx.dirichlet_thompson_policy(
 The module map is also parallel to MCTX:
 
 - `base.py`: root, expansion, and policy-output contracts.
-- `tree.py`: fixed-capacity `Tree`, root `Posterior`, and summary types.
-- `action_selection.py`: root Thompson and interior policy-prior selection.
-- `search.py`: `simulate -> expand -> backward`.
+- `tree.py`: fixed-capacity `Tree`, node posterior, and update-view types.
+- `action_selection.py`: one node-local Thompson selector used everywhere.
+- `search.py`: `simulate -> expand -> bottom-up repair`.
 - `policies.py`: the public `dirichlet_thompson_policy` wrapper.
-- `posterior_updates.py`: the replace-prior-plus-evidence Bayesian update.
+- `posterior_updates.py`: the replaceable node-posterior repair rule.
 
-The tree stores only topology, edge visits, policy priors, state embeddings,
-player/terminal metadata, and the root posterior.  Scalar-MCTS rewards,
-discounts, value averages, and duplicate visit tables are intentionally absent.
-Evidence is added once per simulation during backup, already aligned to the
-root player's perspective.
+The stored search state follows `tictactoe-demo/app.js`. Every edge owns a full
+Dirichlet message `B` and downstream count `R`. The demo's message-present bit
+is exactly `R > 0`, so the tree does not duplicate it. Every node also caches a
+searched value Dirichlet. Thompson selection reads `B` when `R > 0`, an
+expanded child's value prior otherwise, and the node's Q-head prior as the
+final fallback.
+
+Backward contains no posterior formula. At every path node it gathers a
+`NodeView`, a `ChildrenView`, and a `LeafView`, calls
+`posterior_update(rng_key, context)`, stores the returned `NodePosterior`, and
+repeats toward the root. `LeafView.active` is true only at the deepest node, so
+the same callback owns the direct leaf message and every child-to-parent
+repair. A replacement rule can inspect the current embedding and all child
+summaries—or lazily gather child embeddings—without changing traversal.
+
+The default update recomputes `pi_search` from a fresh population over the
+node's current, post-repair action alphas. Its production sampler is an
+explicit fixed-work Wilson--Hilferty approximation to a Dirichlet draw: this
+avoids the rejection-loop stalls caused by tiny terminal components while
+keeping the sampling rule identical at traversal, node repair, and the public
+root. It does not use visits, an independent Gaussian-utility rule, or a
+historical policy average. Structural `R` affects only `n_down`, the
+prior/search mixing weight, and child propagation.
+
+The backend returns the raw app-style caches. Scacchi trains Q toward the root
+effective action alphas and V toward the root value cache; `R` is not added to
+either concentration.
+
+Static mathematical choices belong to the update callable rather than the
+tree. For example, callers can pass
+`functools.partial(update_posterior, kappa_n=4, policy_samples=128)` or a wholly
+different `(rng_key, context) -> NodePosterior` function. Every configured
+update uses the same complete leaf/node/children backup path.
 
 The simulate/expand/backward organization is derived from DeepMind's MCTX,
 which is distributed under the Apache License 2.0; the stored state and backup
-semantics here are specialized for Dirichlet evidence.
+semantics here are specialized for Dirichlet message passing.

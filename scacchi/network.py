@@ -23,24 +23,69 @@ def _dtype_from_name(name: str):
 
 
 def _unit_dirichlet_concentration_logit(num_outcomes: int) -> float:
-    """Logit whose squared softplus gives total concentration num_outcomes."""
+    """Logit whose squared-softplus transform totals ``num_outcomes``."""
     return math.log(math.expm1(math.sqrt(num_outcomes)))
+
+
+_DIRICHLET_INITIAL_EXCESS_CONCENTRATION = 0.1
+
+
+def _smooth_dirichlet_concentration_logit(
+    concentration_floor: float,
+    concentration_clip: float | None,
+    *,
+    initial_excess: float = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION,
+) -> float:
+    """Initialize the bounded concentration just above its dumb-prior floor."""
+
+    if initial_excess <= 0:
+        raise ValueError(f"initial_excess must be > 0, got {initial_excess}")
+    if concentration_clip is None:
+        return math.log(math.expm1(initial_excess))
+    concentration_range = concentration_clip - concentration_floor
+    if concentration_range <= initial_excess:
+        raise ValueError(
+            "dirichlet_concentration_clip must exceed the dumb-prior floor "
+            f"by more than {initial_excess}; got floor={concentration_floor}, "
+            f"clip={concentration_clip}"
+        )
+    fraction = initial_excess / concentration_range
+    return math.log(fraction / (1.0 - fraction))
 
 
 def dirichlet_from_logits(
     mean_logits: jax.Array,
     concentration_logit: jax.Array,
     *,
+    concentration_floor: float | None = None,
     concentration_clip: float | None = None,
 ) -> jax.Array:
     mean_logits = mean_logits.astype(jnp.float32)
     concentration_logit = concentration_logit.astype(jnp.float32)
-    concentration = jax.nn.softplus(concentration_logit)**2
-    if concentration_clip is not None:
-        concentration = jnp.minimum(
-            concentration,
-            jnp.asarray(concentration_clip, dtype=concentration.dtype),
-        )
+    if concentration_floor is None:
+        concentration = jax.nn.softplus(concentration_logit) ** 2
+        if concentration_clip is not None:
+            concentration = jnp.minimum(
+                concentration,
+                jnp.asarray(concentration_clip, dtype=concentration.dtype),
+            )
+    else:
+        floor = jnp.asarray(concentration_floor, dtype=concentration_logit.dtype)
+        if concentration_clip is None:
+            concentration = floor + jax.nn.softplus(concentration_logit)
+        else:
+            if concentration_clip <= concentration_floor:
+                raise ValueError(
+                    "concentration_clip must be greater than concentration_floor; "
+                    f"got floor={concentration_floor}, clip={concentration_clip}"
+                )
+            concentration_range = jnp.asarray(
+                concentration_clip - concentration_floor,
+                dtype=concentration_logit.dtype,
+            )
+            concentration = floor + concentration_range * jax.nn.sigmoid(
+                concentration_logit
+            )
     return concentration[..., None] * jax.nn.softmax(mean_logits, axis=-1)
 
 
@@ -451,6 +496,10 @@ class BoardlawDirichletNet(nnx.Module):
         self.width = width
         self.depth = depth
         self.dtype = dtype
+        concentration_floor = float(num_outcomes)
+        self.dirichlet_concentration_floor = (
+            None if legacy_dirichlet_head_init else concentration_floor
+        )
         self.dirichlet_concentration_clip = dirichlet_concentration_clip
 
         input_dim = math.prod(observation_shape)
@@ -481,7 +530,10 @@ class BoardlawDirichletNet(nnx.Module):
                 rngs=rngs,
             )
             concentration_bias_init = jax.nn.initializers.constant(
-                _unit_dirichlet_concentration_logit(num_outcomes)
+                _smooth_dirichlet_concentration_logit(
+                    concentration_floor,
+                    self.dirichlet_concentration_clip,
+                )
             )
             self.value_conc_head = nnx.Linear(
                 width,
@@ -523,6 +575,7 @@ class BoardlawDirichletNet(nnx.Module):
         alpha_v = dirichlet_from_logits(
             value_mean_logits,
             value_concentration_logit,
+            concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
 
@@ -533,6 +586,7 @@ class BoardlawDirichletNet(nnx.Module):
         alpha_q = dirichlet_from_logits(
             q_mean_logits,
             q_concentration_logit,
+            concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
         return logits.astype(jnp.float32), alpha_v, alpha_q

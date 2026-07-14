@@ -34,6 +34,47 @@ def test_dirichlet_from_logits_uses_squared_softplus_concentration():
     assert jnp.allclose(outcome_mean(alpha), jnp.array([[0.5, 0.5]]))
 
 
+def test_dirichlet_from_logits_smoothly_approaches_dumb_prior_floor():
+    mean_logits = jnp.array([[0.0, 0.0, 0.0]])
+    concentration_logit = jnp.array([-10.0])
+
+    concentration = lambda logit: jnp.sum(
+        dirichlet_from_logits(
+            mean_logits,
+            logit,
+            concentration_floor=3.0,
+            concentration_clip=8.0,
+        )
+    )
+    total = concentration(concentration_logit)
+    gradient = jax.grad(concentration)(concentration_logit)
+
+    assert 3.0 < total < 3.001
+    assert gradient[0] > 0.0
+
+
+def test_bounded_dirichlet_concentration_has_gradients_away_from_both_limits():
+    mean_logits = jnp.zeros((1, 3))
+
+    def concentration(logit):
+        return jnp.sum(
+            dirichlet_from_logits(
+                mean_logits,
+                logit,
+                concentration_floor=3.0,
+                concentration_clip=8.0,
+            )
+        )
+
+    low = jnp.array([-8.0])
+    high = jnp.array([8.0])
+
+    assert 3.0 < concentration(low) < 8.0
+    assert 3.0 < concentration(high) < 8.0
+    assert jax.grad(concentration)(low)[0] > 0.0
+    assert jax.grad(concentration)(high)[0] > 0.0
+
+
 def test_dirichlet_from_logits_clips_total_concentration():
     mean_logits = jnp.array([[0.0, 0.0, 0.0]])
     concentration_logit = jnp.array([100.0])
@@ -66,7 +107,7 @@ def test_boardlaw_dirichlet_net_shapes_and_positive_alphas():
     assert jnp.allclose(outcome_mean(alpha_q).sum(axis=-1), 1.0)
 
 
-def test_boardlaw_dirichlet_heads_initialize_to_uniform_policy_and_unit_alphas():
+def test_boardlaw_dirichlet_heads_initialize_near_uniform_dumb_prior():
     model = BoardlawDirichletNet(
         num_actions=10,
         observation_shape=(3, 3, 4),
@@ -81,8 +122,9 @@ def test_boardlaw_dirichlet_heads_initialize_to_uniform_policy_and_unit_alphas()
 
     assert jnp.allclose(logits, jnp.zeros_like(logits))
     assert jnp.allclose(jax.nn.softmax(logits, axis=-1), jnp.full_like(logits, 0.1))
-    assert jnp.allclose(alpha_v, jnp.ones_like(alpha_v))
-    assert jnp.allclose(alpha_q, jnp.ones_like(alpha_q))
+    expected_alpha = (3.0 + 0.1) / 3.0
+    assert jnp.allclose(alpha_v, jnp.full_like(alpha_v, expected_alpha))
+    assert jnp.allclose(alpha_q, jnp.full_like(alpha_q, expected_alpha))
 
 
 def test_az_dirichlet_net_shapes_and_unit_alphas():

@@ -61,6 +61,7 @@ def make_dirichlet_expand_fn_from_constants(
 
     kappa_terminal = float(constants.kappa_terminal)
     kappa_leaf = float(constants.kappa_leaf)
+    categorical_epsilon = float(constants.categorical_epsilon)
 
     def expand_fn(_, rng_key: jax.Array, action: jax.Array, env_state: Any):
         del rng_key
@@ -68,6 +69,7 @@ def make_dirichlet_expand_fn_from_constants(
         child_state = jax.vmap(env.step)(env_state, action)
         prediction = evaluator(child_state.observation)
         alpha_v = _required_output(prediction.alpha_v, "alpha_v")
+        alpha_q = _required_output(prediction.alpha_q, "alpha_q")
         logits = mask_invalid_scores(
             prediction.logits,
             child_state.legal_action_mask,
@@ -96,9 +98,20 @@ def make_dirichlet_expand_fn_from_constants(
             jnp.asarray(kappa_terminal, dtype=outcome.dtype),
             jnp.asarray(kappa_leaf, dtype=outcome.dtype),
         )
+        terminal_alpha = (
+            jnp.asarray(categorical_epsilon, dtype=outcome.dtype)
+            + jnp.asarray(kappa_terminal, dtype=outcome.dtype) * outcome
+        )
+        leaf_value = jnp.where(
+            child_state.terminated[..., None],
+            terminal_alpha,
+            alpha_v,
+        )
         step = dirichlet_mctx.RecurrentFnOutput(
             prior_logits=logits,
             value=alpha_v,
+            action_values=alpha_q,
+            leaf_value=leaf_value,
             outcome=outcome,
             evidence_weight=evidence_weight,
             terminal=child_state.terminated,

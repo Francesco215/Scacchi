@@ -2,36 +2,60 @@
 
 from .action_selection import (
     align_outcome,
+    effective_action_alpha,
     flip_outcome,
     masked_argmax,
     outcome_mean,
     outcome_utility,
-    policy_prior_interior_action_selection,
-    thompson_root_action_selection,
+    root_action_alpha,
+    sample_dirichlet,
+    thompson_action_selection,
+    thompson_policy,
+    thompson_sample,
 )
 from .base import PolicyOutput, RecurrentFnOutput, RootFnOutput
 from .policies import dirichlet_thompson_policy, posterior_best_policy_target
-from .posterior_updates import update_posterior
+from .posterior_updates import (
+    mix_value_prior,
+    update_posterior,
+)
 from .search import instantiate_tree_from_root, search
-from .tree import Posterior, SearchSummary, Tree
+from .tree import (
+    ChildrenView,
+    LeafView,
+    NodePosterior,
+    NodeView,
+    PosteriorUpdateContext,
+    SearchSummary,
+    Tree,
+)
 
 __all__ = [
     "PolicyOutput",
-    "Posterior",
+    "ChildrenView",
+    "LeafView",
+    "NodePosterior",
+    "NodeView",
+    "PosteriorUpdateContext",
     "RecurrentFnOutput",
     "RootFnOutput",
     "SearchSummary",
     "Tree",
     "align_outcome",
     "dirichlet_thompson_policy",
+    "effective_action_alpha",
     "flip_outcome",
     "instantiate_tree_from_root",
     "masked_argmax",
+    "mix_value_prior",
     "outcome_mean",
     "outcome_utility",
-    "policy_prior_interior_action_selection",
     "posterior_best_policy_target",
+    "root_action_alpha",
+    "sample_dirichlet",
     "search",
-    "thompson_root_action_selection",
+    "thompson_action_selection",
+    "thompson_policy",
+    "thompson_sample",
     "update_posterior",
 ]

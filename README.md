@@ -15,7 +15,7 @@ predicts:
   value,
 - an action Dirichlet-Q head for uncertainty over each legal move's WDL value.
 
-Search refines these WDL beliefs by accumulating evidence in the tree. The
+Search refines these WDL beliefs by passing Dirichlet messages through the tree. The
 search-improved policy target is the posterior probability that each action is
 optimal, and the value/Q heads are trained toward posterior Dirichlet targets.
 

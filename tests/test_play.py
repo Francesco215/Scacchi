@@ -7,6 +7,7 @@ import pgx
 import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
+from scacchi import dirichlet_mctx
 from scacchi.dirichlet_q_search import outcome_utility, posterior_sample_action
 from scacchi.distributed import BatchParallel, assert_batch_axis_sharded
 from scacchi.network import BoardlawNet
@@ -227,8 +228,11 @@ def test_dirichlet_thompson_prior_only_search_preserves_rng_and_targets():
 
     root_prediction = _toy_dirichlet_evaluator(env_state.observation)
     assert root_prediction.alpha_q is not None
-    search_key, _, _ = jax.random.split(rng_key, 3)
-    sampled_outcome = jax.random.dirichlet(search_key, root_prediction.alpha_q)
+    _, policy_key = jax.random.split(rng_key)
+    sampled_outcome = dirichlet_mctx.sample_dirichlet(
+        policy_key,
+        root_prediction.alpha_q,
+    )
     scores = jnp.where(
         env_state.legal_action_mask,
         outcome_utility(sampled_outcome),
@@ -457,6 +461,48 @@ def test_play_dispatches_training_mode():
     assert isinstance(training, TrainingSamples)
     assert training.obs.shape[:2] == (2, 1)
     assert training.posterior.prediction.policy.shape == (2, 1, env.num_actions)
+
+
+def test_selfplay_clears_auto_reset_transition_marker_before_player_search():
+    env = pgx.make("tic_tac_toe")
+
+    def player(env_state, key: jax.Array) -> PlayerOutput:
+        del key
+        policy = env_state.legal_action_mask.astype(jnp.float32)
+        policy = policy / jnp.sum(policy, axis=-1, keepdims=True)
+        return PlayerOutput(
+            action=jnp.argmax(env_state.legal_action_mask, axis=-1).astype(jnp.int32),
+            posterior=PosteriorTargets(
+                prediction=PosteriorPrediction(
+                    policy=policy,
+                    # Surface exactly what a search root receives.  The
+                    # transition ending game one is recorded separately in
+                    # TrainingSamples.terminated; game two's fresh root must
+                    # not still look terminal to its player.
+                    value=env_state.terminated.astype(jnp.float32),
+                ),
+                metadata=TargetMetadata(
+                    mask=jnp.any(env_state.legal_action_mask, axis=-1),
+                ),
+            ),
+        )
+
+    training = play(
+        env,
+        player,
+        player,
+        jax.random.PRNGKey(7),
+        mode="training",
+        batch_size=1,
+        max_num_steps=8,
+    )
+
+    # First-legal Tic-Tac-Toe finishes within the rollout, proving an
+    # auto-reset occurred.  Nonetheless every player/search invocation sees a
+    # clean, playable root, including the first move of the next game.
+    assert bool(training.terminated.any())
+    assert training.posterior.prediction.value is not None
+    assert not bool(training.posterior.prediction.value.any())
 
 
 def test_make_selfplay_delegates_to_play_training_smoke():

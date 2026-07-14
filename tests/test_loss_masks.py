@@ -1,19 +1,27 @@
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import optax
 import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
+from omegaconf import OmegaConf
 
 from scacchi.distributed import BatchParallel, assert_batch_axis_sharded
-from scacchi.dirichlet_tree.native import TARGET_CATEGORICAL, dirichlet_nll_at_categorical
+from scacchi.dirichlet_q_search import terminal_outcome_from_reward
+from scacchi.dirichlet_tree.native import (
+    TARGET_CATEGORICAL,
+    TARGET_DIRICHLET,
+    dirichlet_nll_at_categorical,
+)
 from scacchi.dirichlet_tree.native import native_fields_from_beta
 from scacchi.loss import (
     DIRICHLET_KL_LOSS_CUTOFF,
     Sample,
     _compute_dirichlet_losses,
     _compute_losses,
-    _masked_mean,
     _dirichlet_kl,
+    _masked_mean,
     make_compute_input_for_lossfn,
 )
 from scacchi.pipeline import make_minibatches
@@ -30,6 +38,7 @@ from scacchi.types import (
     SelfplayConfig,
     TrainingConfig,
     TrainingLossConfig,
+    load_config,
 )
 
 
@@ -751,6 +760,69 @@ def test_dirichlet_kl_losses_ignore_huge_and_nonfinite_terms():
     assert not bool(jnp.isfinite(raw_q_kl[0, 2]))
     assert jnp.allclose(metrics.value_dir_kl_loss, 0.0, atol=1e-6)
     assert jnp.allclose(metrics.q_dir_kl_loss, 0.0, atol=1e-6)
+
+
+def test_hex5_terminal_dirichlet_target_survives_loss_cutoff():
+    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex5.yaml"
+    config = load_config(OmegaConf.load(cfg_path))
+    constants = config.selfplay.search.active_constants()
+    terminal_outcome = terminal_outcome_from_reward(
+        jnp.asarray(1.0, dtype=jnp.float32),
+        num_outcomes=3,
+    )
+    terminal_alpha = (
+        jnp.asarray(constants.categorical_epsilon, dtype=jnp.float32)
+        + jnp.asarray(constants.kappa_terminal, dtype=jnp.float32)
+        * terminal_outcome
+    )
+    source = _training_samples(
+        obs=jnp.zeros((1, 1, 1)),
+        reward=jnp.ones((1, 1)),
+        terminated=jnp.ones((1, 1), dtype=jnp.bool_),
+        action_weights=jnp.ones((1, 1, 1)),
+        played_action=jnp.zeros((1, 1), dtype=jnp.int32),
+        legal_action_mask=jnp.ones((1, 1, 1), dtype=jnp.bool_),
+        beta_Q_target=terminal_alpha[None, None, None, :],
+        beta_V_target=jnp.ones((1, 1, 3)),
+        q_loss_weight=jnp.ones((1, 1, 1)),
+        discount=jnp.zeros((1, 1)),
+        search_loss_mask=jnp.ones((1, 1), dtype=jnp.bool_),
+    )
+    data = make_compute_input_for_lossfn(config)(source)
+    logits = jnp.zeros((1, 1, 1))
+    alpha_v = jnp.ones((1, 1, 3))
+    alpha_q = jnp.ones((1, 1, 1, 3))
+
+    raw_q_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
+    total_loss, metrics = _compute_dirichlet_losses(
+        logits,
+        alpha_v,
+        alpha_q,
+        data,
+        config,
+    )
+    alpha_q_grad = jax.grad(
+        lambda candidate: _compute_dirichlet_losses(
+            logits,
+            alpha_v,
+            candidate,
+            data,
+            config,
+        )[0]
+    )(alpha_q)
+
+    assert data.q_target_kind[0, 0, 0] == int(TARGET_DIRICHLET)
+    assert raw_q_kl[0, 0, 0] > 0.0
+    assert raw_q_kl[0, 0, 0] < DIRICHLET_KL_LOSS_CUTOFF, (
+        f"hex5 categorical_epsilon={constants.categorical_epsilon} produces "
+        f"terminal KL={float(raw_q_kl[0, 0, 0])}"
+    )
+    assert bool(jnp.isfinite(metrics.q_dir_kl_loss))
+    assert metrics.q_dir_kl_loss > 0.0
+    assert bool(jnp.isfinite(total_loss))
+    assert total_loss > 0.0
+    assert bool(jnp.all(jnp.isfinite(alpha_q_grad)))
+    assert jnp.linalg.norm(alpha_q_grad) > 0.0
 
 
 def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():

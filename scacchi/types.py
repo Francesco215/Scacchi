@@ -168,10 +168,18 @@ class DirichletThompsonSearchConfig:
             self.num_simulations,
             0,
         )
-        if self.max_depth is None:
-            self.max_depth = self.num_simulations
-        _require_ge("search.dirichlet_thompson.max_depth", self.max_depth, 0)
         _require_ge("search.dirichlet_thompson.num_blocks", self.num_blocks, 1)
+        if self.max_depth is None:
+            # Blocks are a compatibility spelling for one persistent search
+            # budget.  An implicit depth limit must therefore use the complete
+            # budget, not the size of the old reset-per-block tree.
+            self.max_depth = self.num_simulations * self.num_blocks
+        minimum_depth = 1 if self.num_simulations > 0 else 0
+        _require_ge(
+            "search.dirichlet_thompson.max_depth",
+            self.max_depth,
+            minimum_depth,
+        )
         _require_ge("search.dirichlet_thompson.policy_samples", self.policy_samples, 0)
         _require_ge(
             "search.dirichlet_thompson.policy_sample_chunk_size",
@@ -423,7 +431,10 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
         if "num_simulations" in dirichlet_cfg and (
             "max_depth" not in dirichlet_cfg or dirichlet_cfg.get("max_depth") is None
         ):
-            dirichlet_cfg["max_depth"] = dirichlet_cfg["num_simulations"]
+            dirichlet_cfg["max_depth"] = (
+                dirichlet_cfg["num_simulations"]
+                * dirichlet_cfg.get("num_blocks", 1)
+            )
 
     default_dirichlet_max_depth(aliased.get("search"))
     if isinstance(selfplay, DictConfig):
