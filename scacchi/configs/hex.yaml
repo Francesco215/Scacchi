@@ -25,8 +25,7 @@ selfplay:
     kind: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
 
     dirichlet_thompson:
-      num_simulations: 32  # Search simulations per root.
-      num_blocks: 8  # Dirichlet Thompson search blocks.
+      num_simulations: 256  # Persistent-tree simulations per root.
 
       constants:
         kappa_leaf: 1.0  # Nonterminal evidence mass used by Dirichlet-Q search.

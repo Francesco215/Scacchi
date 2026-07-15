@@ -21,8 +21,7 @@ selfplay:
     kind: dirichlet_thompson
 
     dirichlet_thompson:
-      num_simulations: 4
-      num_blocks: 4
+      num_simulations: 16
       policy_samples: 1
       policy_sample_chunk_size: 1
 

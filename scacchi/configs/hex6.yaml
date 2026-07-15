@@ -1,10 +1,9 @@
-# Best completed 6x6 non-Gumbel Boardlaw-Dirichlet recipe from notebook.md.
-# Mirrors W&B run ohn3i1n9 / hex6_dqthompson_outcome1_best_seed9103_16k64_ps64.
-# This is dirichlet_thompson, not the removed Python wavefront backend.
+# From-scratch Hex6 speedrun.  Every trial must use a unique empty checkpoint
+# directory: warm starts and continuation runs do not count.
 
 run:
   seed: 9103
-  max_num_iters: 150
+  max_num_iters: 200
 
 env:
   id: hex
@@ -15,53 +14,63 @@ model:
   network: boardlaw_dirichlet
   num_channels: 128
   num_layers: 8
+  compute_dtype: bfloat16
   resnet_v2: true
 
 selfplay:
   batch_size: 4096
   max_num_steps: 64
+  # The app.js player commits the argmax of posteriorBestPolicy.  Traversal
+  # itself remains one Thompson draw from every action posterior.
   action_commitment_type: posterior_argmax
   search:
     kind: dirichlet_thompson
-
     dirichlet_thompson:
-      num_simulations: 4
-      num_blocks: 8
-
+      num_simulations: 32
+      # Same posterior-best estimator as app.js, with a smaller population as
+      # the speed/variance trade-off for this first controlled speedrun.
+      policy_samples: 32
+      policy_sample_chunk_size: 32
       constants:
         kappa_leaf: 1.0
-        kappa_terminal: 8.0
+        kappa_terminal: 80.0
+        categorical_epsilon: 0.01
 
 training:
   batch_size: 1024
   learning_rate: 1e-3
   grad_clip_norm: 1.0
-
   losses:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
     q_dir_kl_weight: 1.0
     value_outcome_weight: 1.0
-    q_outcome_weight: 0.25
-    terminal_edge_targets: false
-    terminal_parent_targets: false
+    q_outcome_weight: 1.0
+    q_loss_weight_mode: evidence_mass
+    q_dir_kl_reduction: masked_mean
+    loss_mask_mode: value
+    terminal_edge_targets: true
+    terminal_parent_targets: true
     policy_target_mode: search
-
   regularization:
     dirichlet_concentration_clip: 8.0
 
 eval:
   interval: 5
   batch_size: 512
+  baseline: checkpoint
+  player_action_commitment_type: posterior_argmax
+  baseline_action_commitment_type: posterior_argmax
   player_search:
     kind: dirichlet_thompson
     dirichlet_thompson:
-      num_simulations: 4
-      num_blocks: 8
+      num_simulations: 32
+      policy_samples: 32
+      policy_sample_chunk_size: 32
       constants:
         kappa_leaf: 1.0
-        kappa_terminal: 8.0
-  baseline: checkpoint
+        kappa_terminal: 80.0
+        categorical_epsilon: 0.01
   baseline_search:
     kind: gumbel
     gumbel:
@@ -74,5 +83,6 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 0
-  save_interval_steps: 50
+  max_to_keep: 1
+  save_interval_steps: 10
+  directory: checkpoints/hex6_speedrun_scratch_seed9103_v1

@@ -1,40 +1,38 @@
-# From-scratch Hex8 calibrated-posterior trial with reference loss balance.
+# From-scratch Hex7 calibrated-posterior trial.
 #
-# v13 proved that C64 plus mean-KL learns quickly, reaching 0.217 over fresh
-# games at step 320, but its unit-weight outcome losses then overfit the
-# self-play distribution and competitive strength collapsed to 0.128 by step
-# 420.  Mean-KL already supervises V/Q posterior means, so restore the solved
-# reference's auxiliary outcome weights (V=0.25, Q=0.1).  All search budgets
-# remain at the reference's true total of 32 simulations and the app.js
-# 32-draw node-local repair.  This unique directory is never resumed from an
-# earlier trial.
+# The p32/e64 v2 checkpoint learned strong posterior means: when evaluated at
+# the evidence scale learned by the fixed reference (C ~= 64), it scored 0.584
+# over 4,096 official games versus i5wif2l3's final 0.577 rolling score.  Keep
+# that efficient/diverse self-play recipe, use C64 in both training and eval,
+# and train posterior means independently of fixed evidence mass.  This avoids
+# both an eval-only calibration and the concentration-collapse failure of the
+# earlier full-Dirichlet hard-floor trial.
 
 run:
   seed: 0
-  max_num_iters: 800
+  max_num_iters: 650
 
 env:
   id: hex
-  board_size: 8
+  board_size: 7
   num_outcomes: 2
 
 model:
   network: boardlaw_dirichlet
-  num_channels: 1024
+  num_channels: 256
   num_layers: 8
   compute_dtype: bfloat16
   resnet_v2: true
   dirichlet_concentration_floor: 64.0
-  rezero_kernel_init: orthogonal
 
 selfplay:
   batch_size: 4096
   max_num_steps: 64
-  action_commitment_type: posterior_sample
+  action_commitment_type: posterior_argmax
   search:
     kind: dirichlet_thompson
     dirichlet_thompson:
-      num_simulations: 32
+      num_simulations: 64
       policy_samples: 32
       posterior_policy_samples: 32
       policy_sample_chunk_size: 32
@@ -51,8 +49,8 @@ training:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 0.25
-    q_outcome_weight: 0.1
+    value_outcome_weight: 1.0
+    q_outcome_weight: 1.0
     q_loss_weight_mode: evidence_mass
     q_dir_kl_reduction: masked_mean
     dirichlet_loss_mode: mean
@@ -65,15 +63,15 @@ training:
 
 eval:
   interval: 5
-  batch_size: 512
+  batch_size: 1024
   baseline: checkpoint
   player_action_commitment_type: posterior_argmax
   baseline_action_commitment_type: search_action
   player_search:
     kind: dirichlet_thompson
     dirichlet_thompson:
-      num_simulations: 32
-      policy_samples: 32
+      num_simulations: 128
+      policy_samples: 256
       posterior_policy_samples: 32
       policy_sample_chunk_size: 32
       constants:
@@ -83,7 +81,7 @@ eval:
   baseline_search:
     kind: gumbel
     gumbel:
-      num_simulations: 4
+      num_simulations: 32
 
 logging:
   interval: 1
@@ -92,6 +90,6 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 3
+  max_to_keep: 1
   save_interval_steps: 10
-  directory: checkpoints/hex8_speedrun_scratch_seed0_v14
+  directory: checkpoints/hex7_speedrun_scratch_seed0_v4

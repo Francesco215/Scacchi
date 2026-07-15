@@ -26,8 +26,7 @@ selfplay:
     kind: dirichlet_thompson
 
     dirichlet_thompson:
-      num_simulations: 4
-      num_blocks: 4
+      num_simulations: 16
       # Final root policy population. Internal repair draws its own fresh
       # population from each node's just-updated edge posteriors.
       policy_samples: 32
@@ -66,8 +65,7 @@ eval:
   player_search:
     kind: dirichlet_thompson
     dirichlet_thompson:
-      num_simulations: 4
-      num_blocks: 8
+      num_simulations: 32
       policy_samples: 32
       constants:
         kappa_leaf: 1.0
