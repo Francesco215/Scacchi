@@ -11,6 +11,7 @@ from .dirichlet_tree.native import (
     TARGET_PAD,
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
+    categorical_point,
     dirichlet_nll_at_categorical,
     native_fields_from_beta,
 )
@@ -480,6 +481,25 @@ def _dirichlet_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
     )
 
 
+def _dirichlet_mean_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
+    """Categorical KL between two Dirichlet means, independent of mass."""
+
+    dtype = jnp.result_type(beta, alpha, jnp.float32)
+    eps = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
+    beta = jnp.maximum(beta.astype(dtype), eps)
+    alpha = jnp.maximum(alpha.astype(dtype), eps)
+    target = jax.lax.stop_gradient(beta / jnp.sum(beta, axis=-1, keepdims=True))
+    prediction = alpha / jnp.sum(alpha, axis=-1, keepdims=True)
+    return jnp.sum(
+        target
+        * (
+            jnp.log(jnp.maximum(target, eps))
+            - jnp.log(jnp.maximum(prediction, eps))
+        ),
+        axis=-1,
+    )
+
+
 def _native_dirichlet_loss(
     beta: jax.Array,
     alpha: jax.Array,
@@ -487,13 +507,30 @@ def _native_dirichlet_loss(
     target_outcome: jax.Array,
     target_weight: jax.Array,
     categorical_epsilon: float,
+    loss_mode: str,
 ) -> jax.Array:
     target_kind = jnp.asarray(target_kind)
     target_outcome = jnp.asarray(target_outcome)
     target_weight = jnp.asarray(target_weight, dtype=alpha.dtype)
     clipped_outcome = jnp.clip(target_outcome, 0, alpha.shape[-1] - 1)
-    dir_loss = _dirichlet_kl(beta, alpha)
-    cat_loss = dirichlet_nll_at_categorical(alpha, clipped_outcome, categorical_epsilon)
+    if loss_mode == "full":
+        dir_loss = _dirichlet_kl(beta, alpha)
+        cat_loss = dirichlet_nll_at_categorical(
+            alpha,
+            clipped_outcome,
+            categorical_epsilon,
+        )
+    elif loss_mode == "mean":
+        dir_loss = _dirichlet_mean_kl(beta, alpha)
+        categorical_target = categorical_point(
+            clipped_outcome,
+            alpha.shape[-1],
+            categorical_epsilon,
+            dtype=alpha.dtype,
+        )
+        cat_loss = _dirichlet_mean_kl(categorical_target, alpha)
+    else:
+        raise ValueError(f"unknown dirichlet_loss_mode: {loss_mode!r}")
     loss = jnp.where(target_kind == int(TARGET_CATEGORICAL), cat_loss, dir_loss)
     loss = jnp.where(target_kind == int(TARGET_PAD), 0.0, loss)
     loss = jnp.where(
@@ -525,6 +562,7 @@ def _compute_dirichlet_losses(
     categorical_epsilon = float(
         config.selfplay.search.active_constants().categorical_epsilon
     )
+    dirichlet_loss_mode = str(config.training.losses.dirichlet_loss_mode)
     value_dir_kl = _native_dirichlet_loss(
         data.beta_V_target,
         alpha_v,
@@ -532,6 +570,7 @@ def _compute_dirichlet_losses(
         native_fields.v_target_outcome,
         native_fields.v_target_weight,
         categorical_epsilon,
+        dirichlet_loss_mode,
     )
     value_dir_kl_loss = _bounded_masked_mean(value_dir_kl, value_loss_mask)
 
@@ -542,6 +581,7 @@ def _compute_dirichlet_losses(
         native_fields.q_target_outcome,
         native_fields.q_target_weight,
         categorical_epsilon,
+        dirichlet_loss_mode,
     )
     q_row_mask = (
         value_loss_mask

@@ -16,6 +16,8 @@ from .action_selection import (
 from .base import PolicyOutput, RecurrentFnOutput, RootFnOutput
 from .policies import dirichlet_thompson_policy, posterior_best_policy_target
 from .posterior_updates import (
+    DEFAULT_POLICY_SAMPLE_CHUNK_SIZE,
+    DEFAULT_POLICY_SAMPLES,
     mix_value_prior,
     update_posterior,
 )
@@ -33,6 +35,8 @@ from .tree import (
 __all__ = [
     "PolicyOutput",
     "ChildrenView",
+    "DEFAULT_POLICY_SAMPLE_CHUNK_SIZE",
+    "DEFAULT_POLICY_SAMPLES",
     "LeafView",
     "NodePosterior",
     "NodeView",

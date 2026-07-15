@@ -33,9 +33,8 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.selfplay.max_num_steps == 128
     assert config.selfplay.action_commitment_type == "posterior_sample"
     assert config.selfplay.search.kind == "dirichlet_thompson"
-    assert config.selfplay.search.dirichlet_thompson.num_simulations == 4
+    assert config.selfplay.search.dirichlet_thompson.num_simulations == 16
     assert config.selfplay.search.dirichlet_thompson.max_depth == 16
-    assert config.selfplay.search.dirichlet_thompson.num_blocks == 4
     assert config.selfplay.search.dirichlet_thompson.policy_samples == 1
     assert config.selfplay.search.dirichlet_thompson.policy_sample_chunk_size == 1
     assert config.selfplay.search.dirichlet_thompson.constants.kappa_leaf == 1.0
@@ -43,9 +42,8 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.eval.player_search.kind == "dirichlet_thompson"
     assert config.eval.baseline_search.kind == "dirichlet_thompson"
     assert config.search.kind == "dirichlet_thompson"
-    assert config.search.dirichlet_thompson.num_simulations == 4
+    assert config.search.dirichlet_thompson.num_simulations == 16
     assert config.search.dirichlet_thompson.max_depth == 16
-    assert config.search.dirichlet_thompson.num_blocks == 4
     assert config.search.dirichlet_thompson.policy_samples == 1
     assert config.search.dirichlet_thompson.policy_sample_chunk_size == 1
     assert config.search.dirichlet_thompson.constants.kappa_leaf == 1.0
@@ -120,8 +118,7 @@ def test_hex5_uses_corrected_dirichlet_search_recipe():
     cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex5.yaml"
     config = load_config(OmegaConf.load(cfg_path))
 
-    assert config.selfplay.search.dirichlet_thompson.num_simulations == 4
-    assert config.selfplay.search.dirichlet_thompson.num_blocks == 4
+    assert config.selfplay.search.dirichlet_thompson.num_simulations == 16
     assert config.selfplay.search.dirichlet_thompson.max_depth == 16
     assert config.selfplay.search.dirichlet_thompson.policy_samples == 32
     assert (
@@ -132,7 +129,7 @@ def test_hex5_uses_corrected_dirichlet_search_recipe():
         config.selfplay.search.dirichlet_thompson.constants.categorical_epsilon
         == 0.01
     )
-    assert config.eval.player_search.dirichlet_thompson.num_blocks == 8
+    assert config.eval.player_search.dirichlet_thompson.num_simulations == 32
     assert config.eval.player_search.dirichlet_thompson.max_depth == 32
     assert config.model.compute_dtype == "bfloat16"
     assert config.training.batch_size == 2048
@@ -165,6 +162,7 @@ def test_policy_search_temperature_must_be_positive():
         ("hex", 32),
         ("hex5", 4),
         ("hex6", 4),
+        ("hex7", 32),
         ("hex8", 4),
     ],
 )
@@ -362,14 +360,25 @@ def test_dirichlet_network_allows_dirichlet_loss_weights():
     assert config.model.network == "boardlaw_dirichlet"
 
 
-def test_num_search_blocks_must_be_positive():
-    with pytest.raises(ValueError, match="search.dirichlet_thompson.num_blocks"):
+def test_dirichlet_mean_loss_mode_is_configurable():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "training": {"losses": {"dirichlet_loss_mode": "mean"}},
+        }
+    )
+
+    assert config.training.losses.dirichlet_loss_mode == "mean"
+
+
+def test_num_search_blocks_is_not_a_public_config_field():
+    with pytest.raises(ConfigKeyError, match="num_blocks"):
         _config(
             {
                 "model": {"network": "boardlaw_dirichlet"},
                 "search": {
                     "kind": "dirichlet_thompson",
-                    "dirichlet_thompson": {"num_blocks": 0},
+                    "dirichlet_thompson": {"num_blocks": 1},
                 },
             }
         )
@@ -457,6 +466,41 @@ def test_dirichlet_thompson_policy_samples_must_be_non_negative():
                 "search": {
                     "kind": "dirichlet_thompson",
                     "dirichlet_thompson": {"policy_samples": -1},
+                },
+            }
+        )
+
+
+def test_dirichlet_thompson_accepts_separate_posterior_policy_budget():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {
+                "kind": "dirichlet_thompson",
+                "dirichlet_thompson": {
+                    "policy_samples": 32,
+                    "posterior_policy_samples": 1,
+                },
+            },
+        }
+    )
+
+    search = config.search.dirichlet_thompson
+    assert search.policy_samples == 32
+    assert search.posterior_policy_samples == 1
+
+
+def test_dirichlet_thompson_posterior_policy_budget_must_be_positive():
+    with pytest.raises(
+        ValueError,
+        match="search.dirichlet_thompson.posterior_policy_samples",
+    ):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {"posterior_policy_samples": 0},
                 },
             }
         )

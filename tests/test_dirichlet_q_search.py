@@ -108,7 +108,6 @@ def _policy(
     num_simulations: int,
     invalid_actions: jax.Array | None = None,
     max_depth: int | None = None,
-    num_search_blocks: int = 1,
     policy_samples: int = 0,
 ):
     if invalid_actions is None:
@@ -121,7 +120,6 @@ def _policy(
         num_simulations=num_simulations,
         invalid_actions=invalid_actions,
         max_depth=max_depth,
-        num_search_blocks=num_search_blocks,
         policy_samples=policy_samples,
     )
 
@@ -525,7 +523,7 @@ def test_terminal_child_has_no_descendants_and_repeats_terminal_message():
     assert jnp.allclose(tree.root_posterior.value_alpha[0], expected_value)
 
 
-def test_default_max_depth_uses_block_multiplied_simulation_budget():
+def test_default_max_depth_uses_complete_simulation_budget():
     terminal_depth = 5
     config = load_config(
         OmegaConf.create(
@@ -534,9 +532,8 @@ def test_default_max_depth_uses_block_multiplied_simulation_budget():
                 "search": {
                     "kind": "dirichlet_thompson",
                     "dirichlet_thompson": {
-                        "num_simulations": 2,
+                        "num_simulations": 6,
                         "max_depth": None,
-                        "num_blocks": 3,
                         "policy_samples": 0,
                     },
                 }
@@ -586,14 +583,12 @@ def test_default_max_depth_uses_block_multiplied_simulation_budget():
         chain_recurrent_fn,
         num_simulations=search_cfg.num_simulations,
         max_depth=search_cfg.max_depth,
-        num_search_blocks=search_cfg.num_blocks,
     )
     tree = output.search_tree
 
-    assert terminal_depth > search_cfg.num_simulations
     assert bool(tree.node_terminal[0, terminal_depth]), (
         f"max_depth={search_cfg.max_depth} prevented "
-        f"{search_cfg.num_simulations * search_cfg.num_blocks} simulations "
+        f"{search_cfg.num_simulations} simulations "
         f"from reaching depth {terminal_depth}"
     )
     assert jnp.array_equal(
@@ -604,9 +599,7 @@ def test_default_max_depth_uses_block_multiplied_simulation_budget():
         tree.children_index[0, :terminal_depth, 0],
         jnp.arange(1, terminal_depth + 1, dtype=jnp.int32),
     )
-    assert tree.summary().visit_counts[0, 0] == (
-        search_cfg.num_simulations * search_cfg.num_blocks
-    )
+    assert tree.summary().visit_counts[0, 0] == search_cfg.num_simulations
 
 
 def test_terminal_root_does_not_search_even_if_actions_are_marked_legal():
@@ -697,7 +690,7 @@ def test_bottom_up_repair_uses_updated_child_cache_and_node_players():
     )
 
 
-def test_search_blocks_share_one_persistent_tree_and_posterior():
+def test_simulations_share_one_persistent_tree_and_posterior():
     root = _root([[1.0, 1.0]], to_play=0)
     recurrent_fn = _constant_recurrent_fn(
         num_actions=1,
@@ -711,15 +704,13 @@ def test_search_blocks_share_one_persistent_tree_and_posterior():
         root,
         recurrent_fn,
         rng_key=jax.random.PRNGKey(11),
-        num_simulations=1,
+        num_simulations=3,
         max_depth=1,
-        num_search_blocks=3,
     )
 
     tree = output.search_tree
     assert jnp.allclose(tree.summary().alpha, jnp.array([[[4.0, 1.0]]]))
     assert jnp.array_equal(tree.root_posterior.action_count > 0, jnp.array([[True]]))
-    # Blocks multiply the simulation budget without resetting topology/state.
     assert jnp.array_equal(tree.summary().visit_counts, jnp.array([[3.0]]))
     assert jnp.allclose(
         tree.root_posterior.value_alpha,

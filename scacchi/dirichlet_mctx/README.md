@@ -48,9 +48,13 @@ repair. A replacement rule can inspect the current embedding and all child
 summaries—or lazily gather child embeddings—without changing traversal.
 
 The default update recomputes `pi_search` from a fresh population over the
-node's current, post-repair action alphas. Its production sampler is an
-explicit fixed-work Wilson--Hilferty approximation to a Dirichlet draw: this
-avoids the rejection-loop stalls caused by tiny terminal components while
+node's current, post-repair action alphas. The internal population size is an
+estimator budget and may be smaller than the public root-policy population;
+even one draw is an unbiased estimate of the same posterior-best policy. Its
+production sampler is a
+bounded-work, vectorized Marsaglia--Tsang Dirichlet draw matching the demo's
+accept/reject mathematics. It evaluates a small proposal population in
+parallel so tiny terminal components do not stall nested search loops, while
 keeping the sampling rule identical at traversal, node repair, and the public
 root. It does not use visits, an independent Gaussian-utility rule, or a
 historical policy average. Structural `R` affects only `n_down`, the

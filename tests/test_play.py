@@ -264,10 +264,10 @@ def test_dirichlet_thompson_tree_search_builds_legal_targets():
         SearchConfig(
             kind=SearchKind.dirichlet_thompson,
             dirichlet_thompson=DirichletThompsonSearchConfig(
-                num_simulations=2,
+                num_simulations=4,
                 max_depth=2,
-                num_blocks=2,
                 policy_samples=8,
+                posterior_policy_samples=1,
                 policy_sample_chunk_size=2,
             ),
         ),

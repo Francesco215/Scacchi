@@ -41,6 +41,11 @@ class QDirKLReduction(StrEnum):
     masked_mean = "masked_mean"
 
 
+class DirichletLossMode(StrEnum):
+    full = "full"
+    mean = "mean"
+
+
 class LossMaskMode(StrEnum):
     search = "search"
     value = "value"
@@ -97,7 +102,21 @@ class ModelConfig:
     # TODO: remove the three config below and settle on some defaults in the code
     resnet_v2: bool = True
     legacy_dirichlet_head_init: bool = False
+    dirichlet_concentration_floor: float | None = None
+    dirichlet_initial_concentration: float | None = None
     rezero_kernel_init: RezeroKernelInit = RezeroKernelInit.variance_scaling
+
+    def __post_init__(self) -> None:
+        _require_gt(
+            "model.dirichlet_concentration_floor",
+            self.dirichlet_concentration_floor,
+            0.0,
+        )
+        _require_gt(
+            "model.dirichlet_initial_concentration",
+            self.dirichlet_initial_concentration,
+            0.0,
+        )
 
 
 
@@ -157,8 +176,12 @@ class GumbelSearchConfig:
 class DirichletThompsonSearchConfig:
     num_simulations: int = 32
     max_depth: int | None = None
-    num_blocks: int = 1
     policy_samples: int = 32
+    # Monte Carlo budget for pi_search inside each bottom-up node repair.
+    # None keeps the public root-policy budget.  A smaller value remains an
+    # unbiased Thompson estimate and avoids multiplying every path repair by
+    # the full root readout budget.
+    posterior_policy_samples: int | None = None
     policy_sample_chunk_size: int | None = 32
     constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
 
@@ -168,12 +191,8 @@ class DirichletThompsonSearchConfig:
             self.num_simulations,
             0,
         )
-        _require_ge("search.dirichlet_thompson.num_blocks", self.num_blocks, 1)
         if self.max_depth is None:
-            # Blocks are a compatibility spelling for one persistent search
-            # budget.  An implicit depth limit must therefore use the complete
-            # budget, not the size of the old reset-per-block tree.
-            self.max_depth = self.num_simulations * self.num_blocks
+            self.max_depth = self.num_simulations
         minimum_depth = 1 if self.num_simulations > 0 else 0
         _require_ge(
             "search.dirichlet_thompson.max_depth",
@@ -181,6 +200,11 @@ class DirichletThompsonSearchConfig:
             minimum_depth,
         )
         _require_ge("search.dirichlet_thompson.policy_samples", self.policy_samples, 0)
+        _require_ge(
+            "search.dirichlet_thompson.posterior_policy_samples",
+            self.posterior_policy_samples,
+            1,
+        )
         _require_ge(
             "search.dirichlet_thompson.policy_sample_chunk_size",
             self.policy_sample_chunk_size,
@@ -232,6 +256,10 @@ class TrainingLossConfig:
     q_outcome_weight: float = 0.0
     q_loss_weight_mode: QLossWeightMode = QLossWeightMode.policy
     q_dir_kl_reduction: QDirKLReduction = QDirKLReduction.weighted
+    # ``full`` trains both posterior mean and evidence mass. ``mean`` trains
+    # the same posterior WDL means while leaving concentration to the model
+    # prior, which is useful when evidence mass is a fixed search calibration.
+    dirichlet_loss_mode: DirichletLossMode = DirichletLossMode.full
     loss_mask_mode: LossMaskMode = LossMaskMode.search
     terminal_edge_targets: bool = False
     terminal_parent_targets: bool = False
@@ -347,17 +375,6 @@ class TrainConfig:
     checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
 
     def __post_init__(self) -> None:
-        default_search = SearchConfig()
-        if self.search == default_search:
-            self.search = self.selfplay.search
-        else:
-            if self.selfplay.search == default_search:
-                self.selfplay.search = self.search
-            if self.eval.player_search == default_search:
-                self.eval.player_search = self.search
-            if self.eval.baseline_search == default_search:
-                self.eval.baseline_search = self.search
-
         dirichlet_networks = {Network.aznet_dirichlet, Network.boardlaw_dirichlet}
         active_weights = self.training.losses.active_dirichlet_weights()
         if self.model.network not in dirichlet_networks and active_weights:
@@ -395,12 +412,12 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
 
     selfplay = aliased.get("selfplay")
     if selfplay is None:
-        selfplay = OmegaConf.create({})
-        aliased["selfplay"] = selfplay
+        aliased["selfplay"] = OmegaConf.create({})
+        selfplay = aliased["selfplay"]
     eval_cfg = aliased.get("eval")
     if eval_cfg is None:
-        eval_cfg = OmegaConf.create({})
-        aliased["eval"] = eval_cfg
+        aliased["eval"] = OmegaConf.create({})
+        eval_cfg = aliased["eval"]
 
     search_alias = aliased.get("search")
     if search_alias is None and isinstance(selfplay, DictConfig) and "search" in selfplay:
@@ -431,10 +448,7 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
         if "num_simulations" in dirichlet_cfg and (
             "max_depth" not in dirichlet_cfg or dirichlet_cfg.get("max_depth") is None
         ):
-            dirichlet_cfg["max_depth"] = (
-                dirichlet_cfg["num_simulations"]
-                * dirichlet_cfg.get("num_blocks", 1)
-            )
+            dirichlet_cfg["max_depth"] = dirichlet_cfg["num_simulations"]
 
     default_dirichlet_max_depth(aliased.get("search"))
     if isinstance(selfplay, DictConfig):

@@ -1,3 +1,4 @@
+import functools
 from typing import Any, Callable, NamedTuple, cast
 
 import chex
@@ -246,6 +247,26 @@ def _run_dirichlet_thompson_search(
         terminal=env_state.terminated,
         to_play=env_state.current_player,
     )
+    # The public root policy and each repaired node estimate the same
+    # posterior-best population.  Their Monte Carlo budgets may differ: one
+    # internal draw is still an unbiased app.js pi_search estimate, while the
+    # larger public population gives a lower-variance training/readout target.
+    # Binding the internal budget into the callback keeps the external search
+    # API lightweight and the complete backward rule replaceable.
+    posterior_policy_samples = (
+        int(search_cfg.policy_samples)
+        if search_cfg.posterior_policy_samples is None
+        else int(search_cfg.posterior_policy_samples)
+    )
+    posterior_update = functools.partial(
+        dirichlet_mctx.update_posterior,
+        policy_samples=max(1, posterior_policy_samples),
+        policy_sample_chunk_size=(
+            max(1, int(search_cfg.policy_sample_chunk_size))
+            if search_cfg.policy_sample_chunk_size is not None
+            else dirichlet_mctx.DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
+        ),
+    )
     policy_output = dirichlet_mctx.dirichlet_thompson_policy(
         params=(),
         rng_key=rng_key,
@@ -253,9 +274,8 @@ def _run_dirichlet_thompson_search(
         recurrent_fn=expand_fn,
         num_simulations=int(search_cfg.num_simulations),
         invalid_actions=~env_state.legal_action_mask,
-        posterior_update=dirichlet_mctx.update_posterior,
+        posterior_update=posterior_update,
         max_depth=search_cfg.max_depth,
-        num_search_blocks=int(search_cfg.num_blocks),
         policy_samples=int(search_cfg.policy_samples),
         policy_sample_chunk_size=search_cfg.policy_sample_chunk_size,
     )

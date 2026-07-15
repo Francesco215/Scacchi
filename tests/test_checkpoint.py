@@ -47,6 +47,27 @@ def test_legacy_flat_checkpoint_config_loads_for_solved_baselines() -> None:
     assert config.eval.batch_size == 64
 
 
+def test_nested_checkpoint_migrates_legacy_search_blocks_to_total_simulations() -> None:
+    config = checkpoint._load_checkpoint_config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "num_simulations": 4,
+                        "num_blocks": 16,
+                    },
+                }
+            },
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.num_simulations == 64
+    assert search.max_depth == 64
+
+
 def test_rng_key_checkpoint_value_is_host_numpy_array() -> None:
     rng_key = jax.random.PRNGKey(7)
 

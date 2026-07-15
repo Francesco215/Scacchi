@@ -9,6 +9,13 @@ import jax.numpy as jnp
 from .tree import Tree
 
 
+# Marsaglia--Tsang accepts a proposal with very high probability for every
+# shape >= 1. Four vectorized proposals reproduce exact-Dirichlet moments while
+# keeping the sampler affordable inside every node repair. The rare rejected
+# lane still has a finite, positive fallback below.
+_GAMMA_PROPOSALS = 4
+
+
 def flip_outcome(outcome: jax.Array) -> jax.Array:
     return outcome[..., ::-1]
 
@@ -43,14 +50,17 @@ def sample_dirichlet(
     rng_key: chex.PRNGKey,
     alpha: jax.Array,
 ) -> jax.Array:
-    """Draw a fixed-work approximation to a Dirichlet sample.
+    """Draw a bounded-work Marsaglia--Tsang Dirichlet sample.
 
-    ``jax.random.dirichlet`` uses a rejection-based gamma sampler.  Small
-    terminal components (for example ``0.01``) make that sampler prohibitively
-    slow when it is nested inside every bottom-up tree repair.  This uses the
-    Wilson--Hilferty gamma transform, with the exact shape-augmentation identity
-    below one and the exact exponential draw at shape one.  Normalizing in log
-    space keeps concentrated terminal messages finite.
+    The north-star implementation in ``tictactoe-demo/app.js`` samples each
+    gamma variate with Marsaglia--Tsang acceptance/rejection and applies the
+    exact shape-augmentation identity below one. A single uncorrected
+    Wilson--Hilferty proposal is measurably biased, especially when Thompson
+    selection takes an extreme over many actions. Here we evaluate a small
+    fixed population of proposals in parallel and take the first accepted one.
+    Only the vanishingly rare all-rejected lane uses the old transform as a
+    finite-work fallback. Normalizing in log space keeps concentrated terminal
+    messages finite.
 
     The same primitive is used for traversal, node-local posterior-best
     populations, and the public root population; there is still only one
@@ -61,16 +71,44 @@ def sample_dirichlet(
     alpha = alpha.astype(dtype)
     tiny = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
     alpha = jnp.maximum(alpha, tiny)
-    normal_key, augment_key, exponential_key = jax.random.split(rng_key, 3)
+    proposal_key, augment_key = jax.random.split(rng_key)
+    normal_key, accept_key = jax.random.split(proposal_key)
 
     augmented_shape = jnp.where(alpha < 1.0, alpha + 1.0, alpha)
     d = augmented_shape - jnp.asarray(1.0 / 3.0, dtype=dtype)
-    z = jax.random.normal(normal_key, alpha.shape, dtype=dtype)
-    base = jnp.maximum(
-        1.0 + z / jnp.sqrt(9.0 * d),
-        jnp.sqrt(tiny),
+    c = jax.lax.rsqrt(9.0 * d)
+    proposal_shape = (_GAMMA_PROPOSALS, *alpha.shape)
+    z = jax.random.normal(normal_key, proposal_shape, dtype=dtype)
+    base = 1.0 + c * z
+    positive = base > 0.0
+    cube = jnp.where(positive, base**3, 1.0)
+    accept_u = jax.random.uniform(
+        accept_key,
+        proposal_shape,
+        dtype=dtype,
+        minval=tiny,
+        maxval=1.0,
     )
-    log_gamma = jnp.log(d) + 3.0 * jnp.log(base)
+    accepted = positive & (
+        (accept_u < 1.0 - 0.0331 * z**4)
+        | (
+            jnp.log(accept_u)
+            < 0.5 * z**2 + d * (1.0 - cube + jnp.log(cube))
+        )
+    )
+    first_accepted = jnp.argmax(accepted, axis=0)
+    chosen_cube = jnp.take_along_axis(
+        cube,
+        first_accepted[None, ...],
+        axis=0,
+    )[0]
+    fallback_base = jnp.maximum(1.0 + c * z[0], jnp.sqrt(tiny))
+    chosen_cube = jnp.where(
+        jnp.any(accepted, axis=0),
+        chosen_cube,
+        fallback_base**3,
+    )
+    log_gamma = jnp.log(d) + jnp.log(chosen_cube)
 
     augment_u = jax.random.uniform(
         augment_key,
@@ -85,15 +123,6 @@ def sample_dirichlet(
         0.0,
     )
 
-    exponential_u = jax.random.uniform(
-        exponential_key,
-        alpha.shape,
-        dtype=dtype,
-        minval=tiny,
-        maxval=1.0,
-    )
-    log_exponential = jnp.log(jnp.maximum(-jnp.log(exponential_u), tiny))
-    log_gamma = jnp.where(alpha == 1.0, log_exponential, log_gamma)
     return jax.nn.softmax(log_gamma, axis=-1)
 
 

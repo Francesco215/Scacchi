@@ -32,7 +32,11 @@ from flax import nnx
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from scacchi.checkpoint import _suppress_orbax_logs, from_pretrained
+from scacchi.checkpoint import (
+    _load_checkpoint_config,
+    _suppress_orbax_logs,
+    from_pretrained,
+)
 from scacchi.envs import make_env
 from scacchi.evaluations import make_mcts_evaluate
 from scacchi.network import build_model
@@ -61,7 +65,7 @@ class LoadedCheckpoint:
 
 
 def _config_from_raw(raw: Any) -> Config:
-    return load_config(OmegaConf.create(raw))
+    return _load_checkpoint_config(raw)
 
 
 def _nonnegative_int_csv(value: str) -> tuple[int, ...]:
@@ -152,7 +156,6 @@ def _with_eval_settings(
     *,
     eval_batch_size: int,
     tree_size: int,
-    num_search_blocks: int,
 ) -> Config:
     search = config.eval.player_search
     eval_config = replace(config.eval, batch_size=eval_batch_size)
@@ -172,7 +175,7 @@ def _with_eval_settings(
             dirichlet_thompson=replace(
                 search.dirichlet_thompson,
                 num_simulations=tree_size,
-                num_blocks=num_search_blocks,
+                max_depth=tree_size,
             ),
         )
         return replace(
@@ -213,13 +216,11 @@ def score_to_elo(score: float, *, eps: float = 1e-3) -> float:
     return 400.0 * math.log10(clipped / (1.0 - clipped))
 
 
-def _result_key(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
+def _result_key(row: dict[str, Any]) -> tuple[int, int, int]:
     return (
         int(row["checkpoint_step"]),
         int(row["tree_size"]),
-        int(row["num_search_blocks"]),
         int(row["target_tree_size"]),
-        int(row["target_num_search_blocks"]),
     )
 
 
@@ -227,11 +228,10 @@ def _load_existing_results(
     path: Path,
     *,
     target_tree_size: int,
-    target_num_search_blocks: int,
-) -> dict[tuple[int, int, int, int, int], dict[str, Any]]:
+) -> dict[tuple[int, int, int], dict[str, Any]]:
     if not path.exists():
         return {}
-    results: dict[tuple[int, int, int, int, int], dict[str, Any]] = {}
+    results: dict[tuple[int, int, int], dict[str, Any]] = {}
     incompatible = 0
     with path.open() as f:
         for line in f:
@@ -240,7 +240,6 @@ def _load_existing_results(
             row = json.loads(line)
             if (
                 int(row.get("target_tree_size", -1)) != target_tree_size
-                or int(row.get("target_num_search_blocks", -1)) != target_num_search_blocks
             ):
                 incompatible += 1
                 continue
@@ -409,9 +408,7 @@ def _summarize_returns(
     *,
     checkpoint: LoadedCheckpoint,
     tree_size: int,
-    num_search_blocks: int,
     target_tree_size: int,
-    target_num_search_blocks: int,
     seed: int,
     elapsed_seconds: float,
 ) -> dict[str, Any]:
@@ -425,9 +422,7 @@ def _summarize_returns(
         "checkpoint_frames": checkpoint.frames,
         "checkpoint_hours": checkpoint.hours,
         "tree_size": int(tree_size),
-        "num_search_blocks": int(num_search_blocks),
         "target_tree_size": int(target_tree_size),
-        "target_num_search_blocks": int(target_num_search_blocks),
         "eval_games": int(returns.size),
         "seed": int(seed),
         "elapsed_seconds": float(elapsed_seconds),
@@ -462,7 +457,6 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     results = _load_existing_results(
         results_path,
         target_tree_size=args.target_tree_size,
-        target_num_search_blocks=args.target_num_search_blocks,
     )
 
     target_model = from_pretrained(str(target_dir), env, rngs=nnx.Rngs(args.seed))
@@ -475,9 +469,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             or (
                 step,
                 tree_size,
-                args.num_search_blocks,
                 args.target_tree_size,
-                args.target_num_search_blocks,
             )
             not in results
             for tree_size in args.tree_sizes
@@ -493,13 +485,11 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             base_config,
             eval_batch_size=args.eval_games,
             tree_size=tree_size,
-            num_search_blocks=args.num_search_blocks,
         )
         target_eval_config = _with_eval_settings(
             base_config,
             eval_batch_size=args.eval_games,
             tree_size=args.target_tree_size,
-            num_search_blocks=args.target_num_search_blocks,
         )
         evaluate = make_stochastic_mcts_evaluate(
             env,
@@ -511,9 +501,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
             key = (
                 step,
                 tree_size,
-                args.num_search_blocks,
                 args.target_tree_size,
-                args.target_num_search_blocks,
             )
             if key in results and not args.overwrite:
                 continue
@@ -528,9 +516,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 returns,
                 checkpoint=checkpoint,
                 tree_size=tree_size,
-                num_search_blocks=args.num_search_blocks,
                 target_tree_size=args.target_tree_size,
-                target_num_search_blocks=args.target_num_search_blocks,
                 seed=eval_seed,
                 elapsed_seconds=elapsed_seconds,
             )
@@ -549,9 +535,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "target_dir": str(target_dir),
                 "target_elo": 0,
                 "target_tree_size": args.target_tree_size,
-                "target_num_search_blocks": args.target_num_search_blocks,
                 "tree_sizes": list(args.tree_sizes),
-                "num_search_blocks": args.num_search_blocks,
                 "eval_games": args.eval_games,
                 "num_points": len(rows),
                 "pngs": ["fig_8.png", "fig_8_heatmap.png"],
@@ -572,34 +556,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tree-sizes", type=_nonnegative_int_csv, default=DEFAULT_TREE_SIZES)
     parser.add_argument("--eval-games", type=int, default=256)
     parser.add_argument(
-        "--num-search-blocks",
-        type=int,
-        default=1,
-        help="Use 1 so the plotted tree size equals num_simulations.",
-    )
-    parser.add_argument(
         "--target-tree-size",
         type=int,
         default=512,
         help="Fixed test-time tree size for the target model.",
-    )
-    parser.add_argument(
-        "--target-num-search-blocks",
-        type=int,
-        default=1,
-        help="Use 1 so the target tree size equals target num_simulations.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.eval_games <= 0:
         parser.error("--eval-games must be positive")
-    if args.num_search_blocks <= 0:
-        parser.error("--num-search-blocks must be positive")
     if args.target_tree_size <= 0:
         parser.error("--target-tree-size must be positive")
-    if args.target_num_search_blocks <= 0:
-        parser.error("--target-num-search-blocks must be positive")
     return args
 
 

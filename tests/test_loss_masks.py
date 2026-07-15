@@ -21,6 +21,7 @@ from scacchi.loss import (
     _compute_dirichlet_losses,
     _compute_losses,
     _dirichlet_kl,
+    _dirichlet_mean_kl,
     _masked_mean,
     make_compute_input_for_lossfn,
 )
@@ -58,6 +59,7 @@ def _loss_config(
     q_dir_kl_weight: float = 0.0,
     value_outcome_weight: float = 0.0,
     q_outcome_weight: float = 0.0,
+    dirichlet_loss_mode: str = "full",
     categorical_epsilon: float = 1e-4,
     terminal_edge_targets: bool = False,
     terminal_parent_targets: bool = False,
@@ -80,6 +82,7 @@ def _loss_config(
                 q_dir_kl_weight=q_dir_kl_weight,
                 value_outcome_weight=value_outcome_weight,
                 q_outcome_weight=q_outcome_weight,
+                dirichlet_loss_mode=dirichlet_loss_mode,
                 terminal_edge_targets=terminal_edge_targets,
                 terminal_parent_targets=terminal_parent_targets,
             ),
@@ -651,6 +654,50 @@ def test_dirichlet_kl_is_zero_for_identical_parameters_and_positive_otherwise():
 
     assert jnp.allclose(same, 0.0, atol=1e-6)
     assert different[0] > 0.0
+
+
+def test_dirichlet_mean_kl_ignores_concentration_but_preserves_mean_signal():
+    beta = jnp.array([[2.0, 8.0]])
+    same_mean = jnp.array([[20.0, 80.0]])
+    different_mean = jnp.array([[80.0, 20.0]])
+
+    assert jnp.allclose(_dirichlet_mean_kl(beta, same_mean), 0.0, atol=1e-6)
+    assert _dirichlet_mean_kl(beta, different_mean)[0] > 0.0
+
+
+def test_mean_dirichlet_loss_mode_does_not_penalize_fixed_evidence_mass():
+    data = Sample(
+        obs=jnp.zeros((1, 1)),
+        policy_tgt=jnp.array([[1.0, 0.0]]),
+        value_tgt=jnp.array([1.0]),
+        played_action=jnp.array([0]),
+        policy_mask=jnp.array([[True, True]]),
+        value_mask=jnp.array([True]),
+        beta_Q_target=jnp.array([[[2.0, 8.0], [8.0, 2.0]]]),
+        beta_V_target=jnp.array([[2.0, 8.0]]),
+        q_loss_weight=jnp.array([[1.0, 1.0]]),
+    )
+    logits = jnp.zeros((1, 2))
+    alpha_v = jnp.array([[20.0, 80.0]])
+    alpha_q = jnp.array([[[20.0, 80.0], [80.0, 20.0]]])
+    config = _loss_config(
+        policy_loss_weight=0.0,
+        value_dir_kl_weight=1.0,
+        q_dir_kl_weight=1.0,
+        dirichlet_loss_mode="mean",
+    )
+
+    total, metrics = _compute_dirichlet_losses(
+        logits,
+        alpha_v,
+        alpha_q,
+        data,
+        config,
+    )
+
+    assert jnp.allclose(metrics.value_dir_kl_loss, 0.0, atol=1e-6)
+    assert jnp.allclose(metrics.q_dir_kl_loss, 0.0, atol=1e-6)
+    assert jnp.allclose(total, 0.0, atol=1e-6)
 
 
 def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():

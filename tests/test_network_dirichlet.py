@@ -127,6 +127,48 @@ def test_boardlaw_dirichlet_heads_initialize_near_uniform_dumb_prior():
     assert jnp.allclose(alpha_q, jnp.full_like(alpha_q, expected_alpha))
 
 
+def test_boardlaw_dirichlet_heads_accept_trainable_initial_concentration():
+    model = BoardlawDirichletNet(
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        num_outcomes=2,
+        width=16,
+        depth=2,
+        dirichlet_concentration_clip=100.0,
+        dirichlet_initial_concentration=32.0,
+        rngs=nnx.Rngs(0),
+    )
+    obs = jnp.ones((4, 3, 3, 4))
+
+    _, alpha_v, alpha_q = model(obs, train=False)
+
+    assert jnp.allclose(jnp.sum(alpha_v, axis=-1), 32.0)
+    assert jnp.allclose(jnp.sum(alpha_q, axis=-1), 32.0)
+    assert jnp.allclose(outcome_mean(alpha_v), 0.5)
+    assert jnp.allclose(outcome_mean(alpha_q), 0.5)
+
+
+def test_boardlaw_dirichlet_heads_accept_configurable_concentration_floor():
+    model = BoardlawDirichletNet(
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        num_outcomes=2,
+        width=16,
+        depth=2,
+        dirichlet_concentration_clip=100.0,
+        dirichlet_concentration_floor=32.0,
+        rngs=nnx.Rngs(0),
+    )
+    obs = jnp.ones((4, 3, 3, 4))
+
+    _, alpha_v, alpha_q = model(obs, train=False)
+
+    assert jnp.allclose(jnp.sum(alpha_v, axis=-1), 32.1)
+    assert jnp.allclose(jnp.sum(alpha_q, axis=-1), 32.1)
+    assert jnp.allclose(outcome_mean(alpha_v), 0.5)
+    assert jnp.allclose(outcome_mean(alpha_q), 0.5)
+
+
 def test_az_dirichlet_net_shapes_and_unit_alphas():
     model = AZDirichletNet(
         num_actions=10,

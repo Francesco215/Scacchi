@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 from types import TracebackType
@@ -155,7 +156,33 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
     loading so flat user configs remain an error.
     """
     if "model" in raw or "env" in raw or "run" in raw:
-        return load_config(OmegaConf.create(raw))
+        # Checkpoints written by the reset-per-block API stored a per-block
+        # simulation count and a block count.  The replacement search owns one
+        # persistent tree, so migrate that historical product at this I/O
+        # boundary instead of retaining ``num_blocks`` in the public config.
+        migrated = copy.deepcopy(raw)
+
+        def migrate_search(search: Any) -> None:
+            if not isinstance(search, dict):
+                return
+            settings = search.get("dirichlet_thompson")
+            if not isinstance(settings, dict):
+                return
+            blocks = settings.pop("num_blocks", None)
+            if blocks is not None:
+                settings["num_simulations"] = int(
+                    settings.get("num_simulations", 32)
+                ) * int(blocks)
+
+        migrate_search(migrated.get("search"))
+        selfplay = migrated.get("selfplay")
+        if isinstance(selfplay, dict):
+            migrate_search(selfplay.get("search"))
+        eval_config = migrated.get("eval")
+        if isinstance(eval_config, dict):
+            migrate_search(eval_config.get("player_search"))
+            migrate_search(eval_config.get("baseline_search"))
+        return load_config(OmegaConf.create(migrated))
 
     legacy_sections: dict[str, dict[str, Any]] = {
         "run": {

@@ -488,6 +488,8 @@ class BoardlawDirichletNet(nnx.Module):
         dtype=jnp.float32,
         dirichlet_concentration_clip: float | None = 8.0,
         legacy_dirichlet_head_init: bool = False,
+        dirichlet_concentration_floor: float | None = None,
+        dirichlet_initial_concentration: float | None = None,
         rezero_kernel_init: str = "variance_scaling",
         rngs: nnx.Rngs,
     ):
@@ -496,11 +498,25 @@ class BoardlawDirichletNet(nnx.Module):
         self.width = width
         self.depth = depth
         self.dtype = dtype
-        concentration_floor = float(num_outcomes)
+        concentration_floor = (
+            float(num_outcomes)
+            if dirichlet_concentration_floor is None
+            else float(dirichlet_concentration_floor)
+        )
         self.dirichlet_concentration_floor = (
             None if legacy_dirichlet_head_init else concentration_floor
         )
         self.dirichlet_concentration_clip = dirichlet_concentration_clip
+        self.dirichlet_initial_concentration = dirichlet_initial_concentration
+
+        if legacy_dirichlet_head_init and (
+            dirichlet_concentration_floor is not None
+            or dirichlet_initial_concentration is not None
+        ):
+            raise ValueError(
+                "dirichlet concentration floor/initialization cannot be combined "
+                "with legacy_dirichlet_head_init"
+            )
 
         input_dim = math.prod(observation_shape)
         self.intake = nnx.Linear(input_dim, width, dtype=dtype, rngs=rngs)
@@ -529,10 +545,22 @@ class BoardlawDirichletNet(nnx.Module):
                 bias_init=jax.nn.initializers.zeros,
                 rngs=rngs,
             )
+            initial_excess = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+            if dirichlet_initial_concentration is not None:
+                initial_excess = (
+                    float(dirichlet_initial_concentration) - concentration_floor
+                )
+                if initial_excess <= 0.0:
+                    raise ValueError(
+                        "dirichlet_initial_concentration must exceed the dumb-prior "
+                        f"floor {concentration_floor}; got "
+                        f"{dirichlet_initial_concentration}"
+                    )
             concentration_bias_init = jax.nn.initializers.constant(
                 _smooth_dirichlet_concentration_logit(
                     concentration_floor,
                     self.dirichlet_concentration_clip,
+                    initial_excess=initial_excess,
                 )
             )
             self.value_conc_head = nnx.Linear(
@@ -653,6 +681,12 @@ def build_model(
                 config.training.regularization.dirichlet_concentration_clip
             ),
             legacy_dirichlet_head_init=config.model.legacy_dirichlet_head_init,
+            dirichlet_concentration_floor=(
+                config.model.dirichlet_concentration_floor
+            ),
+            dirichlet_initial_concentration=(
+                config.model.dirichlet_initial_concentration
+            ),
             rezero_kernel_init=config.model.rezero_kernel_init,
             rngs=rngs,
         )
