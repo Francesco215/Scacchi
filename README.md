@@ -15,13 +15,28 @@ predicts:
   value,
 - an action Dirichlet-Q head for uncertainty over each legal move's WDL value.
 
-Search refines these WDL beliefs by passing Dirichlet messages through the tree. The
-search-improved policy target is the posterior probability that each action is
-optimal, and the value/Q heads are trained toward posterior Dirichlet targets.
+Search refines uncertain WDL beliefs by passing Dirichlet messages through the
+tree and propagates exact terminal results as native categorical
+outcome/distance certificates. Categorical branches are absorbing and pruned;
+the search-improved policy compares their exact utility with Thompson samples
+from unresolved branches. Value/Q heads use posterior KL for unresolved targets
+and epsilon-interior Dirichlet density NLL for categorical targets.
+
+The native search has one scalar posterior-repair constant, `kappa`, used only
+in the structural mixing weight
+`gamma = n_down / (kappa + n_down)`. Terminal expansion instead returns an
+exact `terminal_outcome` tag. It does not manufacture a terminal Dirichlet or
+inject a fixed concentration: model alphas remain the learned representation
+for unresolved leaves and caches, while categorical outcome/distance sidecars
+own solved semantics.
+For a mixed node-cache update, a categorical edge is projected temporarily as
+$(\sum_i A_i)e_z$: the exact tag supplies its direction and its existing
+effective alpha supplies the learned mass. This projection is neither stored
+nor used as a categorical target.
 
 The Thompson tree-search backend lives in `scacchi/dirichlet_mctx/`;
 `scacchi/dirichlet_q_search.py` contains the shared leaf expansion,
-posterior-target helpers, and the small adapter used by Dirichlet-Gumbel MCTX.
+terminal-outcome extraction, and posterior-target helpers.
 
 ## Codebase Structure
 
@@ -35,8 +50,8 @@ posterior-target helpers, and the small adapter used by Dirichlet-Gumbel MCTX.
   boundaries.
 - `scacchi/dirichlet_mctx/`: lightweight MCTX-shaped Dirichlet Thompson search.
 - `scacchi/pipeline.py`: replay/minibatch handling and per-iteration training.
-- `scacchi/loss.py`: policy, scalar value, Dirichlet KL, and outcome losses.
-- `scacchi/dirichlet_tree/`: categorical target metadata helpers.
+- `scacchi/loss.py`: policy, scalar value, typed Dirichlet/categorical, and
+  outcome losses.
 - `scacchi/configs/`: Hydra YAML configs, currently centered on Hex.
 - `scripts/`: benchmarks, sweeps, and plotting utilities.
 - `tests/`: unit tests for config validation, losses, network behavior, and

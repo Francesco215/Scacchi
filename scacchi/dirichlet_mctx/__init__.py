@@ -1,7 +1,10 @@
 """A small MCTX-shaped backend for Dirichlet Thompson tree search."""
 
 from .action_selection import (
+    CATEGORICAL_DRAW_RULES,
     align_outcome,
+    categorical_action,
+    categorical_utility,
     effective_action_alpha,
     flip_outcome,
     masked_argmax,
@@ -12,10 +15,22 @@ from .action_selection import (
     thompson_action_selection,
     thompson_policy,
     thompson_sample,
+    validate_categorical_draw_rule,
 )
 from .base import PolicyOutput, RecurrentFnOutput, RootFnOutput
+from .categorical import (
+    NO_DISTANCE,
+    NO_OUTCOME,
+    TARGET_CATEGORICAL,
+    TARGET_DIRICHLET,
+    TARGET_PAD,
+    categorical_point,
+    dirichlet_nll_at_categorical,
+    native_fields_from_beta,
+)
 from .policies import dirichlet_thompson_policy, posterior_best_policy_target
 from .posterior_updates import (
+    DEFAULT_KAPPA,
     DEFAULT_POLICY_SAMPLE_CHUNK_SIZE,
     DEFAULT_POLICY_SAMPLES,
     mix_value_prior,
@@ -34,24 +49,36 @@ from .tree import (
 
 __all__ = [
     "PolicyOutput",
+    "CATEGORICAL_DRAW_RULES",
     "ChildrenView",
+    "DEFAULT_KAPPA",
     "DEFAULT_POLICY_SAMPLE_CHUNK_SIZE",
     "DEFAULT_POLICY_SAMPLES",
     "LeafView",
     "NodePosterior",
     "NodeView",
+    "NO_DISTANCE",
+    "NO_OUTCOME",
     "PosteriorUpdateContext",
     "RecurrentFnOutput",
     "RootFnOutput",
     "SearchSummary",
+    "TARGET_CATEGORICAL",
+    "TARGET_DIRICHLET",
+    "TARGET_PAD",
     "Tree",
     "align_outcome",
+    "categorical_action",
+    "categorical_point",
+    "categorical_utility",
     "dirichlet_thompson_policy",
+    "dirichlet_nll_at_categorical",
     "effective_action_alpha",
     "flip_outcome",
     "instantiate_tree_from_root",
     "masked_argmax",
     "mix_value_prior",
+    "native_fields_from_beta",
     "outcome_mean",
     "outcome_utility",
     "posterior_best_policy_target",
@@ -62,4 +89,5 @@ __all__ = [
     "thompson_policy",
     "thompson_sample",
     "update_posterior",
+    "validate_categorical_draw_rule",
 ]

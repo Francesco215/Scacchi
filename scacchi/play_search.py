@@ -10,19 +10,19 @@ import mctx
 import pgx
 
 from . import dirichlet_mctx
+from .dirichlet_mctx.categorical import (
+    NO_OUTCOME,
+    TARGET_CATEGORICAL,
+    TARGET_DIRICHLET,
+    TARGET_PAD,
+)
 from .dirichlet_q_search import (
-    adapt_dirichlet_expand_fn_to_mctx,
-    make_dirichlet_expand_fn_from_constants,
-    make_dirichlet_root,
+    make_dirichlet_expand_fn,
     outcome_mean,
     outcome_utility,
     posterior_best_action,
-    posterior_best_policy_target,
     posterior_sample_action,
-    posterior_targets,
     q_loss_weight_from_mode,
-    q_evidence_sum_from_tree,
-    root_action_value_priors_from_tree,
 )
 from .network import policy_value_from_output
 from .types import (
@@ -34,8 +34,6 @@ from .types import (
     SearchKind,
 )
 
-
-_POSTERIOR_POLICY_TARGET_SAMPLES = 32
 
 class EvaluatorOutput(NamedTuple):
     logits: Float[Array, "*batch action"]
@@ -55,6 +53,14 @@ class TargetMetadata(NamedTuple):
     mask: Bool[Array, "*batch"] | None = None
     q_weight: Float[Array, "*batch action"] | None = None
     search_action: Int[Array, "*batch"] | None = None
+    q_target_kind: Int[Array, "*batch action"] | None = None
+    q_target_weight: Float[Array, "*batch action"] | None = None
+    q_target_outcome: Int[Array, "*batch action"] | None = None
+    q_target_distance: Int[Array, "*batch action"] | None = None
+    v_target_kind: Int[Array, "*batch"] | None = None
+    v_target_weight: Float[Array, "*batch"] | None = None
+    v_target_outcome: Int[Array, "*batch"] | None = None
+    v_target_distance: Int[Array, "*batch"] | None = None
 
 
 class PosteriorTargets(NamedTuple):
@@ -138,75 +144,6 @@ def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
     return jnp.sum(action_weights, axis=-1) > 0
 
 
-def _run_dirichlet_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_loss_weight_mode: str) -> SearchOutput:
-    """Run scalar Gumbel MuZero search against a Dirichlet-output network.
-
-    MCTX consumes policy logits and scalar values, so the Dirichlet value head
-    is reduced to ``outcome_utility(outcome_mean(alpha_v))`` for tree search.
-    ``qtransform_completed_by_mix_value`` likewise operates only on MCTX's
-    scalar tree Q estimates; it does not transform Dirichlet parameters or use
-    the Q-head Dirichlets to select actions.
-
-    The Dirichlet information is retained separately.  Search-collected WDL
-    pseudo-count evidence becomes the Q target when added to each action's
-    target prior, and the posterior policy-weighted evidence becomes the value
-    target.  Thus the transform affects training only indirectly, by changing
-    which actions Gumbel search explores and hence which evidence it collects.
-    """
-    alpha_v = _required_output(prediction.alpha_v, "alpha_v")
-    alpha_q = _required_output(prediction.alpha_q, "alpha_q")
-    root = make_dirichlet_root(env_state, prediction.logits, alpha_v)
-    search_key, posterior_key = jax.random.split(rng_key)
-    search_output = mctx.gumbel_muzero_policy(
-        params=(),
-        rng_key=search_key,
-        root=root,
-        recurrent_fn=expand_fn,
-        num_simulations=int(search_cfg.num_simulations),
-        invalid_actions=~env_state.legal_action_mask,
-        qtransform=mctx.qtransform_completed_by_mix_value,
-        gumbel_scale=float(search_cfg.gumbel_scale),
-    )
-    q_evidence_sum = q_evidence_sum_from_tree(search_output.search_tree)
-    action_value_target_prior = root_action_value_priors_from_tree(
-        search_output.search_tree,
-        alpha_q,
-    )
-    action_alpha_post = action_value_target_prior + q_evidence_sum
-    policy_samples = _POSTERIOR_POLICY_TARGET_SAMPLES
-    chunk_size = search_cfg.policy_sample_chunk_size
-    posterior_policy_target = posterior_best_policy_target(
-        posterior_key,
-        action_alpha_post,
-        env_state.legal_action_mask,
-        policy_samples,
-        chunk_size=policy_samples if chunk_size is None else int(chunk_size),
-    )
-    beta_Q_target, beta_V_target = posterior_targets(
-        alpha_v,
-        action_value_target_prior,
-        q_evidence_sum,
-        posterior_policy_target,
-    )
-    policy_target = cast(jax.Array, search_output.action_weights)
-    search_action = cast(jax.Array, search_output.action)
-    posterior_prediction = PosteriorPrediction(
-        policy=policy_target,
-        alpha_v=beta_V_target,
-        alpha_q=beta_Q_target,
-    )
-    metadata = TargetMetadata(
-        mask=_search_loss_mask(policy_target),
-        q_weight=q_loss_weight_from_mode(
-            q_loss_weight_mode,
-            q_evidence_sum,
-            posterior_policy_target,
-        ),
-        search_action=search_action,
-    )
-    return SearchOutput(PosteriorTargets(prediction=posterior_prediction, metadata=metadata))
-
-
 def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_loss_weight_mode: str) -> SearchOutput:
     value = _required_output(prediction.value, "value")
     root = mctx.RootFnOutput(prior_logits=prediction.logits, value=value, embedding=env_state)
@@ -260,6 +197,7 @@ def _run_dirichlet_thompson_search(
     )
     posterior_update = functools.partial(
         dirichlet_mctx.update_posterior,
+        kappa=float(search_cfg.kappa),
         policy_samples=max(1, posterior_policy_samples),
         policy_sample_chunk_size=(
             max(1, int(search_cfg.policy_sample_chunk_size))
@@ -278,6 +216,7 @@ def _run_dirichlet_thompson_search(
         max_depth=search_cfg.max_depth,
         policy_samples=int(search_cfg.policy_samples),
         policy_sample_chunk_size=search_cfg.policy_sample_chunk_size,
+        categorical_draw_rule=str(search_cfg.categorical_draw_rule),
     )
     policy_target = policy_output.action_weights
     search_action = policy_output.action
@@ -289,6 +228,35 @@ def _run_dirichlet_thompson_search(
     beta_Q_target = summary.alpha
     beta_V_target = summary.value_alpha
     q_search_count = summary.visit_counts[..., None]
+    q_is_categorical = summary.q_categorical_outcome != int(NO_OUTCOME)
+    v_is_categorical = summary.v_categorical_outcome != int(NO_OUTCOME)
+    legal = env_state.legal_action_mask
+    q_target_kind = jnp.where(
+        legal,
+        jnp.where(
+            q_is_categorical,
+            jnp.asarray(int(TARGET_CATEGORICAL), dtype=jnp.int8),
+            jnp.asarray(int(TARGET_DIRICHLET), dtype=jnp.int8),
+        ),
+        jnp.asarray(int(TARGET_PAD), dtype=jnp.int8),
+    )
+    v_target_kind = jnp.where(
+        v_is_categorical,
+        jnp.asarray(int(TARGET_CATEGORICAL), dtype=jnp.int8),
+        jnp.asarray(int(TARGET_DIRICHLET), dtype=jnp.int8),
+    )
+    q_loss_weight = q_loss_weight_from_mode(
+        q_loss_weight_mode,
+        q_search_count,
+        policy_target,
+    )
+    # Every exact legal action target is useful supervision, even when a
+    # one-hot solved policy or a sampled posterior gives that action no mass.
+    q_loss_weight = jnp.where(
+        legal & q_is_categorical,
+        jnp.maximum(q_loss_weight, jnp.ones_like(q_loss_weight)),
+        q_loss_weight,
+    )
     posterior_prediction = PosteriorPrediction(
         policy=policy_target,
         alpha_v=beta_V_target,
@@ -296,12 +264,19 @@ def _run_dirichlet_thompson_search(
     )
     metadata = TargetMetadata(
         mask=_search_loss_mask(policy_target),
-        q_weight=q_loss_weight_from_mode(
-            q_loss_weight_mode,
-            q_search_count,
-            policy_target,
-        ),
+        q_weight=q_loss_weight,
         search_action=search_action,
+        q_target_kind=q_target_kind,
+        q_target_weight=legal.astype(beta_Q_target.dtype),
+        q_target_outcome=summary.q_categorical_outcome,
+        q_target_distance=summary.q_categorical_distance,
+        v_target_kind=v_target_kind,
+        v_target_weight=jnp.ones_like(
+            summary.v_categorical_distance,
+            dtype=beta_V_target.dtype,
+        ),
+        v_target_outcome=summary.v_categorical_outcome,
+        v_target_distance=summary.v_categorical_distance,
     )
     return SearchOutput(
         PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
@@ -309,11 +284,7 @@ def _run_dirichlet_thompson_search(
 
 
 def _make_dirichlet_thompson_search(env, evaluator: Evaluator, search_cfg: DirichletThompsonSearchConfig, q_loss_weight_mode: str) -> Search:
-    expand_fn = make_dirichlet_expand_fn_from_constants(
-        env,
-        evaluator,
-        search_cfg.constants,
-    )
+    expand_fn = make_dirichlet_expand_fn(env, evaluator)
 
     def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
         prediction = evaluator(root_state.observation)
@@ -350,22 +321,22 @@ def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfi
 
 def _make_gumbel_search(env, evaluator: Evaluator, search_cfg: GumbelSearchConfig, q_loss_weight_mode: str) -> Search:
     scalar_expand_fn = make_gumbel_expand_fn(env, evaluator)
-    shared_dirichlet_expand_fn = make_dirichlet_expand_fn_from_constants(
-        env,
-        evaluator,
-        search_cfg.constants,
-    )
-    dirichlet_expand_fn = adapt_dirichlet_expand_fn_to_mctx(
-        shared_dirichlet_expand_fn
-    )
 
     def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
         prediction = evaluator(root_state.observation)
-        is_dirichlet = prediction.alpha_q is not None
-        search_fn = _run_dirichlet_gumbel_search if is_dirichlet else _run_scalar_gumbel_search
-        expand_fn = dirichlet_expand_fn if is_dirichlet else scalar_expand_fn
-
-        return search_fn(root_state,prediction,expand_fn,rng_key,search_cfg,q_loss_weight_mode)
+        if prediction.alpha_q is not None:
+            raise ValueError(
+                "Gumbel search supports scalar policy/value models only; "
+                "use dirichlet_thompson for a Dirichlet-output model."
+            )
+        return _run_scalar_gumbel_search(
+            root_state,
+            prediction,
+            scalar_expand_fn,
+            rng_key,
+            search_cfg,
+            q_loss_weight_mode,
+        )
 
     return search
 

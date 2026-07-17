@@ -5,9 +5,7 @@ const MAX_FRAME_SAMPLES = 80;
 const RENDER_INTERVAL_MS = 140;
 const POLICY_SAMPLES = 128;
 const PLOT_SAMPLES = 180;
-const KAPPA_N = 4;
-const EPSILON_TERM = 0.01;
-const KAPPA_TERM = 80;
+const KAPPA = 4;
 const DUMB_ALPHA = Object.freeze([1, 1, 1]);
 const WIN_LINES = Object.freeze([
   [0, 1, 2],
@@ -39,23 +37,28 @@ const OUTCOME = Object.freeze({
 class Edge {
   constructor() {
     this.B = null;
+    this.outcome = null;
+    this.distance = null;
     this.m = false;
     this.R = 0;
   }
 }
 
 class Node {
-  constructor(board, player, parent = null, parentAction = null) {
+  constructor(board, player) {
     this.board = board.slice();
     this.player = player;
-    this.parent = parent;
-    this.parentAction = parentAction;
     this.children = new Map();
     this.edges = new Map();
     this.alphaV = DUMB_ALPHA.slice();
     this.alphaQ = Array.from({ length: 9 }, () => DUMB_ALPHA.slice());
     this.cache = this.alphaV.slice();
     this.nDown = 0;
+    const result = gameResult(this.board);
+    this.outcome = result.terminal
+      ? terminalOutcome(this.board, this.player)
+      : null;
+    this.distance = result.terminal ? 0 : null;
   }
 
   edge(action) {
@@ -175,17 +178,26 @@ function gameResult(stateBoard) {
   };
 }
 
-function terminalOutcomeAlpha(stateBoard, playerToMove) {
+function terminalOutcome(stateBoard, playerToMove) {
   const result = gameResult(stateBoard);
-  const alpha = [EPSILON_TERM, EPSILON_TERM, EPSILON_TERM];
-  let index = OUTCOME.DRAW;
-
-  if (!result.draw) {
-    index = result.winner === playerToMove ? OUTCOME.WIN : OUTCOME.LOSS;
+  if (result.draw) {
+    return OUTCOME.DRAW;
   }
+  return result.winner === playerToMove ? OUTCOME.WIN : OUTCOME.LOSS;
+}
 
-  alpha[index] += KAPPA_TERM;
-  return alpha;
+function categoricalMean(outcome) {
+  return [0, 0, 0].map((_, index) => (index === outcome ? 1 : 0));
+}
+
+function flipOutcome(outcome) {
+  if (outcome === OUTCOME.LOSS) {
+    return OUTCOME.WIN;
+  }
+  if (outcome === OUTCOME.WIN) {
+    return OUTCOME.LOSS;
+  }
+  return OUTCOME.DRAW;
 }
 
 function placeMove(stateBoard, player, action) {
@@ -203,15 +215,14 @@ function alphaMean(alpha) {
   return alpha.map((value) => value / total);
 }
 
-function utilityFromAlpha(alpha) {
-  const mean = alphaMean(alpha);
-  return mean[OUTCOME.WIN] - mean[OUTCOME.LOSS];
-}
-
 function edgePosterior(node, action) {
   const edge = node.edge(action);
-  if (edge.m) {
+  if (edge.m && edge.B !== null) {
     return edge.B.slice();
+  }
+
+  if (edge.outcome !== null) {
+    return node.alphaQ[action].slice();
   }
 
   const child = node.children.get(action);
@@ -220,6 +231,39 @@ function edgePosterior(node, action) {
   }
 
   return node.alphaQ[action].slice();
+}
+
+function actionPosterior(node, action) {
+  const edge = node.edge(action);
+  return {
+    alpha: edgePosterior(node, action),
+    outcome: edge.m ? edge.outcome : null,
+  };
+}
+
+function searchableActions(node) {
+  return legalActions(node.board).filter(
+    (action) => node.edge(action).outcome === null,
+  );
+}
+
+function posteriorMean(posterior) {
+  return posterior.outcome === null
+    ? alphaMean(posterior.alpha)
+    : categoricalMean(posterior.outcome);
+}
+
+function posteriorUtility(posterior) {
+  const mean = posteriorMean(posterior);
+  return mean[OUTCOME.WIN] - mean[OUTCOME.LOSS];
+}
+
+function samplePosteriorUtility(posterior) {
+  if (posterior.outcome !== null) {
+    return posteriorUtility(posterior);
+  }
+  const phi = sampleDirichlet(posterior.alpha);
+  return phi[OUTCOME.WIN] - phi[OUTCOME.LOSS];
 }
 
 function hasChildEvidence(node) {
@@ -236,8 +280,7 @@ function thompsonSelect(node, actions) {
   let bestUtility = -Infinity;
 
   for (const action of actions) {
-    const phi = sampleDirichlet(edgePosterior(node, action));
-    const utility = phi[OUTCOME.WIN] - phi[OUTCOME.LOSS];
+    const utility = samplePosteriorUtility(actionPosterior(node, action));
     if (utility > bestUtility) {
       bestUtility = utility;
       bestAction = action;
@@ -270,10 +313,20 @@ function getOrCreateChild(node, action) {
 }
 
 function runSearch(root, simulationCount) {
-  for (let i = 0; i < simulationCount; i += 1) {
-    runSimulation(root);
+  if (root.outcome !== null) {
+    return 0;
   }
-  repairSubtree(root);
+  let completed = 0;
+  for (let i = 0; i < simulationCount; i += 1) {
+    if (!runSimulation(root)) {
+      break;
+    }
+    completed += 1;
+  }
+  if (completed > 0) {
+    repairSubtree(root);
+  }
+  return completed;
 }
 
 function runSimulation(root) {
@@ -282,42 +335,56 @@ function runSimulation(root) {
 
   while (true) {
     const result = gameResult(node.board);
-    if (result.terminal) {
-      backupPath(path, terminalOutcomeAlpha(node.board, node.player));
-      return;
+    if (result.terminal || node.outcome !== null) {
+      return false;
     }
 
-    const actions = legalActions(node.board);
+    const actions = searchableActions(node);
     if (actions.length === 0) {
-      backupPath(path, terminalOutcomeAlpha(node.board, node.player));
-      return;
+      repairNode(node);
+      return false;
     }
 
     const action = thompsonSelect(node, actions);
     path.push({ node, action });
 
     const { child, isNew } = getOrCreateChild(node, action);
-    const childResult = gameResult(child.board);
-    if (childResult.terminal || isNew) {
-      const beta = childResult.terminal
-        ? terminalOutcomeAlpha(child.board, child.player)
-        : child.alphaV.slice();
-      backupPath(path, beta);
-      return;
+    if (child.outcome !== null) {
+      backupPath(path, null, child.outcome, child.distance);
+      return true;
+    }
+    if (isNew) {
+      backupPath(path, child.alphaV.slice());
+      return true;
     }
 
     node = child;
   }
 }
 
-function backupPath(path, betaLeaf) {
+function backupPath(
+  path,
+  betaLeaf,
+  categoricalOutcome = null,
+  categoricalDistance = null,
+) {
   if (path.length === 0) {
     return;
   }
 
   const finalStep = path[path.length - 1];
   const finalEdge = finalStep.node.edge(finalStep.action);
-  finalEdge.B = flipAlpha(betaLeaf);
+  if (categoricalOutcome === null) {
+    finalEdge.B = flipAlpha(betaLeaf);
+    finalEdge.outcome = null;
+    finalEdge.distance = null;
+  } else {
+    // A terminal result is exact. Keep it in a categorical sidecar instead
+    // of inventing a concentrated Dirichlet pseudo-observation.
+    finalEdge.B = null;
+    finalEdge.outcome = flipOutcome(categoricalOutcome);
+    finalEdge.distance = categoricalDistance + 1;
+  }
   finalEdge.m = true;
   finalEdge.R += 1;
 
@@ -346,12 +413,25 @@ function repairNode(node) {
 
   for (const action of legalActions(node.board)) {
     const child = node.children.get(action);
-    if (!child || gameResult(child.board).terminal || !hasChildEvidence(child)) {
+    if (!child) {
       continue;
     }
 
     const edge = node.edge(action);
+    if (child.outcome !== null) {
+      if (edge.outcome === null) {
+        edge.outcome = flipOutcome(child.outcome);
+        edge.distance = child.distance + 1;
+        edge.m = true;
+      }
+      continue;
+    }
+    if (edge.outcome !== null || !hasChildEvidence(child)) {
+      continue;
+    }
     edge.B = flipAlpha(child.cache);
+    edge.outcome = null;
+    edge.distance = null;
     edge.m = true;
     edge.R = 1 + child.nDown;
   }
@@ -365,37 +445,97 @@ function repairNode(node) {
   const posterior = computeStateSearchPosterior(node);
   node.cache = posterior.alpha;
   node.nDown = posterior.nDown;
+  categorizeNode(node);
+}
+
+function categoricalAction(node) {
+  const candidates = legalActions(node.board).filter(
+    (action) => node.edge(action).outcome === node.outcome,
+  );
+  if (candidates.length === 0) {
+    return null;
+  }
+  if (node.outcome === OUTCOME.WIN) {
+    return candidates.reduce((best, action) =>
+      node.edge(action).distance < node.edge(best).distance ? action : best,
+    );
+  }
+  if (node.outcome === OUTCOME.LOSS) {
+    return candidates.reduce((best, action) =>
+      node.edge(action).distance > node.edge(best).distance ? action : best,
+    );
+  }
+  return candidates[0];
+}
+
+function categorizeNode(node) {
+  if (node.outcome !== null) {
+    return;
+  }
+  const actions = legalActions(node.board);
+  const known = actions.filter(
+    (action) => node.edge(action).outcome !== null,
+  );
+  const winning = known.filter(
+    (action) => node.edge(action).outcome === OUTCOME.WIN,
+  );
+
+  if (winning.length > 0) {
+    node.outcome = OUTCOME.WIN;
+  } else if (known.length === actions.length) {
+    node.outcome = known.some(
+      (action) => node.edge(action).outcome === OUTCOME.DRAW,
+    )
+      ? OUTCOME.DRAW
+      : OUTCOME.LOSS;
+  } else {
+    return;
+  }
+
+  const action = categoricalAction(node);
+  node.distance = node.edge(action).distance;
 }
 
 function computeStateSearchPosterior(node) {
   const actions = legalActions(node.board);
-  const alphaByAction = new Map();
+  const posteriorByAction = new Map();
   let nDown = 0;
 
   for (const action of actions) {
-    alphaByAction.set(action, edgePosterior(node, action));
+    posteriorByAction.set(action, actionPosterior(node, action));
     nDown += node.edge(action).R;
   }
 
-  const policy = posteriorBestPolicy(alphaByAction, actions, POLICY_SAMPLES);
+  const policy = posteriorBestPolicy(
+    posteriorByAction,
+    actions,
+    POLICY_SAMPLES,
+  );
   const searchWeighted = [0, 0, 0];
 
   for (const action of actions) {
     const weight = policy.get(action) ?? 0;
-    const alpha = alphaByAction.get(action);
+    const posterior = posteriorByAction.get(action);
+    let alpha = posterior.alpha;
+    if (posterior.outcome !== null) {
+      const learnedMass = alpha.reduce((sum, value) => sum + value, 0);
+      alpha = categoricalMean(posterior.outcome).map(
+        (probability) => probability * learnedMass,
+      );
+    }
     for (let i = 0; i < 3; i += 1) {
       searchWeighted[i] += weight * alpha[i];
     }
   }
 
-  const gamma = nDown / (KAPPA_N + nDown);
+  const gamma = nDown / (KAPPA + nDown);
   return {
     alpha: node.alphaV.map((prior, i) => (1 - gamma) * prior + gamma * searchWeighted[i]),
     nDown,
   };
 }
 
-function posteriorBestPolicy(alphaByAction, actions, sampleCount) {
+function posteriorBestPolicy(posteriorByAction, actions, sampleCount) {
   const counts = new Map(actions.map((action) => [action, 0]));
 
   for (let sample = 0; sample < sampleCount; sample += 1) {
@@ -403,8 +543,7 @@ function posteriorBestPolicy(alphaByAction, actions, sampleCount) {
     let bestUtility = -Infinity;
 
     for (const action of actions) {
-      const phi = sampleDirichlet(alphaByAction.get(action));
-      const utility = phi[OUTCOME.WIN] - phi[OUTCOME.LOSS];
+      const utility = samplePosteriorUtility(posteriorByAction.get(action));
       if (utility > bestUtility) {
         bestUtility = utility;
         bestAction = action;
@@ -426,7 +565,8 @@ function analyzePosition() {
   if (result.terminal) {
     return {
       root: null,
-      valueAlpha: terminalOutcomeAlpha(board, currentPlayer),
+      valueAlpha: DUMB_ALPHA.slice(),
+      valueOutcome: terminalOutcome(board, currentPlayer),
       rootPosteriors: new Map(),
       policy: new Map(),
       bestAction: null,
@@ -442,15 +582,25 @@ function analyzePosition() {
   const actions = legalActions(board);
   const rootPosteriors = new Map();
   for (const action of actions) {
-    rootPosteriors.set(action, edgePosterior(rootTree, action));
+    rootPosteriors.set(action, actionPosterior(rootTree, action));
   }
 
-  const policy = posteriorBestPolicy(rootPosteriors, actions, POLICY_SAMPLES);
-  const bestAction = bestPolicyAction(policy, actions);
+  let policy;
+  let bestAction;
+  if (rootTree.outcome !== null) {
+    bestAction = categoricalAction(rootTree);
+    policy = new Map(
+      actions.map((action) => [action, action === bestAction ? 1 : 0]),
+    );
+  } else {
+    policy = posteriorBestPolicy(rootPosteriors, actions, POLICY_SAMPLES);
+    bestAction = bestPolicyAction(policy, actions);
+  }
 
   return {
     root: rootTree,
     valueAlpha: rootTree.cache.slice(),
+    valueOutcome: rootTree.outcome,
     rootPosteriors,
     policy,
     bestAction,
@@ -548,22 +698,26 @@ function renderStatus() {
 
 function renderPosterior() {
   const alpha = analysis.valueAlpha;
-  const mean = alphaMean(alpha);
+  const posterior = { alpha, outcome: analysis.valueOutcome };
+  const mean = posteriorMean(posterior);
+  const displayedAlpha =
+    posterior.outcome === null ? alpha : categoricalMean(posterior.outcome);
   const total = alpha.reduce((sum, value) => sum + value, 0);
 
   els.perspective.textContent = currentPlayer;
   els.sims.textContent = String(analysis.simulations);
   els.recommended.textContent = actionName(analysis.bestAction);
-  els.alphaTotal.textContent = formatNumber(total);
+  els.alphaTotal.textContent =
+    posterior.outcome === null ? formatNumber(total) : "exact";
   els.nodeCount.textContent = String(analysis.nodes);
-  els.alphaReadout.textContent = `L=${formatNumber(alpha[0])}  D=${formatNumber(
-    alpha[1],
-  )}  W=${formatNumber(alpha[2])}`;
+  els.alphaReadout.textContent = `L=${formatNumber(displayedAlpha[0])}  D=${formatNumber(
+    displayedAlpha[1],
+  )}  W=${formatNumber(displayedAlpha[2])}`;
 
   setBar(els.lossBar, els.lossPct, mean[OUTCOME.LOSS]);
   setBar(els.drawBar, els.drawPct, mean[OUTCOME.DRAW]);
   setBar(els.winBar, els.winPct, mean[OUTCOME.WIN]);
-  drawSimplex(alpha);
+  drawSimplex(alpha, posterior.outcome);
 }
 
 function setBar(bar, label, value) {
@@ -587,8 +741,11 @@ function renderActions() {
   for (const action of actions) {
     const row = document.createElement("div");
     const probability = analysis.policy.get(action) ?? 0;
-    const alpha = analysis.rootPosteriors.get(action) ?? DUMB_ALPHA;
-    const q = utilityFromAlpha(alpha);
+    const posterior = analysis.rootPosteriors.get(action) ?? {
+      alpha: DUMB_ALPHA,
+      outcome: null,
+    };
+    const q = posteriorUtility(posterior);
 
     row.className = "action-row";
     if (action === analysis.bestAction) {
@@ -662,8 +819,7 @@ function searchTick(timestamp) {
     const samplesToRun = Math.min(Math.floor(sampleCarry), MAX_FRAME_SAMPLES);
 
     if (samplesToRun > 0) {
-      runSearch(rootTree, samplesToRun);
-      completedSamples += samplesToRun;
+      completedSamples += runSearch(rootTree, samplesToRun);
       sampleCarry -= samplesToRun;
 
       if (timestamp - lastRenderTime >= RENDER_INTERVAL_MS) {
@@ -733,7 +889,7 @@ function sampleDirichlet(alpha) {
   return gammas.map((value) => value / total);
 }
 
-function drawSimplex(alpha) {
+function drawSimplex(alpha, categoricalOutcome = null) {
   const canvas = els.simplex;
   const context = canvas.getContext("2d");
   const rect = canvas.getBoundingClientRect();
@@ -774,15 +930,21 @@ function drawSimplex(alpha) {
   context.fillText("L", vertices.L.x - 14, vertices.L.y + 4);
   context.fillText("W", vertices.W.x + 14, vertices.W.y + 4);
 
-  context.fillStyle = "rgba(31, 122, 140, 0.24)";
-  for (let i = 0; i < PLOT_SAMPLES; i += 1) {
-    const point = simplexPoint(sampleDirichlet(alpha), vertices);
-    context.beginPath();
-    context.arc(point.x, point.y, 2.2, 0, Math.PI * 2);
-    context.fill();
+  if (categoricalOutcome === null) {
+    context.fillStyle = "rgba(31, 122, 140, 0.24)";
+    for (let i = 0; i < PLOT_SAMPLES; i += 1) {
+      const point = simplexPoint(sampleDirichlet(alpha), vertices);
+      context.beginPath();
+      context.arc(point.x, point.y, 2.2, 0, Math.PI * 2);
+      context.fill();
+    }
   }
 
-  const meanPoint = simplexPoint(alphaMean(alpha), vertices);
+  const mean =
+    categoricalOutcome === null
+      ? alphaMean(alpha)
+      : categoricalMean(categoricalOutcome);
+  const meanPoint = simplexPoint(mean, vertices);
   context.fillStyle = "#c2413d";
   context.strokeStyle = "#ffffff";
   context.lineWidth = 2;
@@ -812,7 +974,7 @@ els.computeSlider.addEventListener("input", (event) => {
 });
 window.addEventListener("resize", () => {
   if (analysis) {
-    drawSimplex(analysis.valueAlpha);
+    drawSimplex(analysis.valueAlpha, analysis.valueOutcome);
   }
 });
 

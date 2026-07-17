@@ -4,14 +4,66 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, Protocol, Self, TypeGuard
 
+import numpy as np
 from tqdm import tqdm
 
 from .types import config_to_dict
 
 Scalar = float | int
+
+
+class PrecomputedHistogram:
+    """Backend-neutral histogram represented by bucket counts and bin edges."""
+
+    __slots__ = ("counts", "bin_edges")
+
+    counts: np.ndarray
+    bin_edges: np.ndarray
+
+    def __init__(self, counts: Any, bin_edges: Any) -> None:
+        try:
+            counts_array = np.asarray(counts, dtype=np.float64)
+            edges_array = np.asarray(bin_edges, dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise ValueError("histogram counts and bin edges must be numeric") from error
+
+        if counts_array.ndim != 1:
+            raise ValueError("histogram counts must be one-dimensional")
+        if edges_array.ndim != 1:
+            raise ValueError("histogram bin edges must be one-dimensional")
+        if counts_array.size == 0:
+            raise ValueError("a histogram must contain at least one bucket")
+        if counts_array.size > 512:
+            raise ValueError("a histogram may contain at most 512 buckets")
+        if edges_array.size != counts_array.size + 1:
+            raise ValueError("histogram bin edges must have len(counts) + 1 entries")
+
+        if not np.all(np.isfinite(counts_array)):
+            raise ValueError("histogram counts must be finite")
+        if np.any(counts_array < 0):
+            raise ValueError("histogram counts must be nonnegative")
+        rounded_counts = np.rint(counts_array)
+        if not np.array_equal(counts_array, rounded_counts):
+            raise ValueError("histogram counts must be integer-like")
+        if np.any(rounded_counts > np.iinfo(np.int64).max):
+            raise ValueError("histogram counts exceed the supported integer range")
+
+        if not np.all(np.isfinite(edges_array)):
+            raise ValueError("histogram bin edges must be finite")
+        if not np.all(np.diff(edges_array) > 0):
+            raise ValueError("histogram bin edges must be strictly increasing")
+
+        self.counts = rounded_counts.astype(np.int64)
+        self.bin_edges = edges_array
+        self.counts.setflags(write=False)
+        self.bin_edges.setflags(write=False)
+
+
+Metric = Scalar | PrecomputedHistogram
 
 
 def _to_scalar(value: Any) -> Scalar:
@@ -78,7 +130,7 @@ class Logger:
         self._initialized = False
         return False
 
-    def log_metrics(self, step: int, metrics: dict[str, Scalar], prefix: str) -> None:
+    def log_metrics(self, step: int, metrics: Mapping[str, Metric], prefix: str) -> None:
         pass
 
     def log_returns(
@@ -119,9 +171,12 @@ class Logger:
 
         self.log_metrics(step, clean, prefix)
 
-    def _convert_metrics(self, metrics: dict[str, Any]) -> dict[str, Scalar]:
-        clean: dict[str, Scalar] = {}
+    def _convert_metrics(self, metrics: dict[str, Any]) -> dict[str, Metric]:
+        clean: dict[str, Metric] = {}
         for key, value in metrics.items():
+            if isinstance(value, PrecomputedHistogram):
+                clean[key] = value
+                continue
             if hasattr(value, "item"):
                 value = value.item()
             if isinstance(value, (float, int)):
@@ -136,15 +191,19 @@ class Logger:
     def _update_pbar(
         self,
         pbar: tqdm[Any],
-        metrics: dict[str, Scalar],
+        metrics: Mapping[str, Metric],
         float_fmt: str,
         pbar_filter: str | None,
     ) -> None:
-        filtered = metrics
+        filtered = {
+            key: value
+            for key, value in metrics.items()
+            if isinstance(value, (float, int))
+        }
         if pbar_filter is not None:
             pattern = re.compile(pbar_filter)
             filtered = {
-                key: value for key, value in metrics.items() if pattern.search(key)
+                key: value for key, value in filtered.items() if pattern.search(key)
             }
 
         postfix = {
@@ -199,13 +258,23 @@ class WandbLogger(Logger):
     def log_metrics(
         self,
         step: int,
-        metrics: dict[str, Scalar],
+        metrics: Mapping[str, Metric],
         prefix: str = "train/",
     ) -> None:
         import wandb
 
+        payload = {
+            f"{prefix}{key}": (
+                wandb.Histogram(
+                    np_histogram=(value.counts, value.bin_edges),
+                )
+                if isinstance(value, PrecomputedHistogram)
+                else value
+            )
+            for key, value in metrics.items()
+        }
         wandb.log(
-            {f"{prefix}{key}": value for key, value in metrics.items()},
+            payload,
             step=step,
         )
 

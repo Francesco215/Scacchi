@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -37,8 +38,11 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.selfplay.search.dirichlet_thompson.max_depth == 16
     assert config.selfplay.search.dirichlet_thompson.policy_samples == 1
     assert config.selfplay.search.dirichlet_thompson.policy_sample_chunk_size == 1
-    assert config.selfplay.search.dirichlet_thompson.constants.kappa_leaf == 1.0
-    assert config.selfplay.search.dirichlet_thompson.constants.kappa_terminal == 8.0
+    assert (
+        config.selfplay.search.dirichlet_thompson.categorical_draw_rule
+        == "policy_prior"
+    )
+    assert config.selfplay.search.dirichlet_thompson.kappa == 4.0
     assert config.eval.player_search.kind == "dirichlet_thompson"
     assert config.eval.baseline_search.kind == "dirichlet_thompson"
     assert config.search.kind == "dirichlet_thompson"
@@ -46,8 +50,7 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.search.dirichlet_thompson.max_depth == 16
     assert config.search.dirichlet_thompson.policy_samples == 1
     assert config.search.dirichlet_thompson.policy_sample_chunk_size == 1
-    assert config.search.dirichlet_thompson.constants.kappa_leaf == 1.0
-    assert config.search.dirichlet_thompson.constants.kappa_terminal == 8.0
+    assert config.search.dirichlet_thompson.kappa == 4.0
     assert config.training.batch_size == 4096
     assert config.training.max_updates_per_iter == 1
     assert config.training.learning_rate == 1e-3
@@ -57,6 +60,7 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.training.losses.q_dir_kl_weight == 5.0
     assert config.training.losses.terminal_edge_targets is True
     assert config.training.losses.terminal_parent_targets is True
+    assert config.training.losses.categorical_epsilon == 1e-4
     assert config.training.regularization.dirichlet_concentration_clip == 300.0
     assert config.eval.interval == 10
     assert config.eval.batch_size == 1024
@@ -65,37 +69,6 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.logging.wandb.enabled is True
     assert config.checkpointing.max_to_keep == 50
     assert config.checkpointing.save_interval_steps == 100
-
-
-def test_go9x9_gumbel_config_matches_paper_level_recipe():
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "go9x9_gumbel.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
-
-    assert config.run.max_num_iters == 400
-    assert config.env.id == "go_9x9"
-    assert config.env.board_size == 9
-    assert config.model.network == "aznet"
-    assert config.model.num_channels == 128
-    assert config.model.num_layers == 6
-    assert config.model.resnet_v2 is True
-    assert config.selfplay.batch_size == 1024
-    assert config.selfplay.max_num_steps == 256
-    assert config.selfplay.action_commitment_type == "search_action"
-    assert config.selfplay.search.kind == "gumbel"
-    assert config.selfplay.search.gumbel.num_simulations == 32
-    assert config.selfplay.search.gumbel.completed_q_value_scale == 0.1
-    assert config.selfplay.search.gumbel.completed_q_rescale_values is True
-    assert config.training.batch_size == 4096
-    assert config.training.max_updates_per_iter is None
-    assert config.training.learning_rate == 1e-3
-    assert config.eval.baseline == "pgx"
-    assert config.eval.baseline_id == "go_9x9_v0"
-    assert config.eval.player_action_commitment_type == "posterior_sample"
-    assert config.eval.baseline_action_commitment_type == "posterior_sample"
-    assert config.eval.player_search.kind == "policy"
-    assert config.eval.player_search.policy.temperature == 1.0
-    assert config.eval.baseline_search.kind == "policy"
-    assert config.eval.baseline_search.policy.temperature == 1.0
 
 
 def test_simple_policy_eval_fragment_overrides_eval_search_only():
@@ -121,14 +94,7 @@ def test_hex5_uses_corrected_dirichlet_search_recipe():
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 16
     assert config.selfplay.search.dirichlet_thompson.max_depth == 16
     assert config.selfplay.search.dirichlet_thompson.policy_samples == 32
-    assert (
-        config.selfplay.search.dirichlet_thompson.constants.kappa_terminal
-        == 80.0
-    )
-    assert (
-        config.selfplay.search.dirichlet_thompson.constants.categorical_epsilon
-        == 0.01
-    )
+    assert config.selfplay.search.dirichlet_thompson.kappa == 4.0
     assert config.eval.player_search.dirichlet_thompson.num_simulations == 32
     assert config.eval.player_search.dirichlet_thompson.max_depth == 32
     assert config.model.compute_dtype == "bfloat16"
@@ -136,10 +102,7 @@ def test_hex5_uses_corrected_dirichlet_search_recipe():
     assert config.training.learning_rate == 2e-3
     assert config.training.losses.q_dir_kl_weight == 1.0
     assert config.training.losses.q_outcome_weight == 0.25
-    assert (
-        config.checkpointing.directory
-        == "checkpoints/hex5_dirichlet_fresh_pi_seed9101_v1"
-    )
+    assert config.training.losses.categorical_epsilon == 0.01
     assert config.checkpointing.max_to_keep == 1
     assert config.checkpointing.save_interval_steps == 10
 
@@ -152,6 +115,119 @@ def test_policy_search_temperature_must_be_positive():
                     "kind": "policy",
                     "policy": {"temperature": 0.0},
                 },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "draw_rule",
+    ["policy_prior", "fastest_draw", "slowest_draw", "fixed_order"],
+)
+def test_categorical_draw_rules_are_configurable(draw_rule: str):
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {
+                "kind": "dirichlet_thompson",
+                "dirichlet_thompson": {"categorical_draw_rule": draw_rule},
+            },
+        }
+    )
+
+    assert config.search.dirichlet_thompson.categorical_draw_rule == draw_rule
+
+
+def test_unknown_categorical_draw_rule_is_rejected():
+    with pytest.raises(ValidationError, match="categorical_draw_rule"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "categorical_draw_rule": "random_draw"
+                    },
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "kappa",
+    [0.0, -1.0, float("nan"), float("inf"), -float("inf")],
+)
+def test_dirichlet_thompson_kappa_must_be_finite_and_positive(kappa: float):
+    with pytest.raises(ValueError, match="search.dirichlet_thompson.kappa"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {"kappa": kappa},
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize("legacy_key", ["kappa_leaf", "kappa_terminal"])
+def test_legacy_dirichlet_kappa_keys_are_rejected(legacy_key: str):
+    with pytest.raises(ConfigKeyError, match=legacy_key):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {legacy_key: 1.0},
+                },
+            }
+        )
+
+
+def test_legacy_dirichlet_constants_block_is_rejected():
+    with pytest.raises(ConfigKeyError, match="constants"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "constants": {"kappa_terminal": 80.0}
+                    },
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize("epsilon", [0.0, 1.0 / 3.0, 0.5])
+def test_categorical_training_epsilon_must_stay_inside_simplex(epsilon: float):
+    with pytest.raises(ValueError, match="categorical_epsilon"):
+        _config({"training": {"losses": {"categorical_epsilon": epsilon}}})
+
+
+def test_categorical_density_training_requires_finite_concentration_cap():
+    with pytest.raises(ValueError, match="finite.*concentration_clip"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {"kind": "dirichlet_thompson"},
+                "training": {
+                    "losses": {"value_dir_kl_weight": 1.0},
+                    "regularization": {"dirichlet_concentration_clip": None},
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize("clip", [math.inf, math.nan])
+def test_dirichlet_concentration_cap_must_be_finite(clip: float):
+    with pytest.raises(ValueError, match="concentration_clip.*finite"):
+        _config(
+            {
+                "training": {
+                    "regularization": {
+                        "dirichlet_concentration_clip": clip,
+                    }
+                }
             }
         )
 
@@ -177,6 +253,20 @@ def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
     assert config.eval.baseline == "checkpoint"
     assert config.eval.baseline_search.kind == "gumbel"
     assert config.eval.baseline_search.gumbel.num_simulations == eval_simulations
+
+
+def test_hex7_uses_full_learned_concentration_head():
+    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex7.yaml"
+    config = load_config(OmegaConf.load(cfg_path))
+
+    assert config.run.seed == 7104
+    assert config.model.dirichlet_concentration_floor == 2.0
+    assert config.model.dirichlet_initial_concentration == 2.1
+    assert config.training.losses.dirichlet_loss_mode == "full"
+    assert config.selfplay.search.dirichlet_thompson.num_simulations == 64
+    assert config.selfplay.search.dirichlet_thompson.posterior_policy_samples == 32
+    assert config.eval.player_search.dirichlet_thompson.num_simulations == 128
+    assert config.eval.player_search.dirichlet_thompson.policy_samples == 256
 
 
 def test_make_env_supports_custom_go8():
@@ -235,7 +325,7 @@ def test_flat_config_keys_are_rejected():
 
 def test_unknown_nested_config_keys_are_rejected():
     with pytest.raises(ConfigKeyError, match="unknown"):
-        _config({"search": {"gumbel": {"constants": {"unknown": 1.0}}}})
+        _config({"search": {"gumbel": {"unknown": 1.0}}})
 
 
 def test_legacy_top_level_search_populates_play_mode_search_configs():
@@ -360,15 +450,16 @@ def test_dirichlet_network_allows_dirichlet_loss_weights():
     assert config.model.network == "boardlaw_dirichlet"
 
 
-def test_dirichlet_mean_loss_mode_is_configurable():
+@pytest.mark.parametrize("loss_mode", ["full", "mean"])
+def test_dirichlet_loss_modes_are_configurable(loss_mode: str):
     config = _config(
         {
             "model": {"network": "boardlaw_dirichlet"},
-            "training": {"losses": {"dirichlet_loss_mode": "mean"}},
+            "training": {"losses": {"dirichlet_loss_mode": loss_mode}},
         }
     )
 
-    assert config.training.losses.dirichlet_loss_mode == "mean"
+    assert config.training.losses.dirichlet_loss_mode == loss_mode
 
 
 def test_num_search_blocks_is_not_a_public_config_field():

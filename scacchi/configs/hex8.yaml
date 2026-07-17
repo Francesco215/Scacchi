@@ -1,13 +1,8 @@
-# From-scratch Hex8 calibrated-posterior trial with reference loss balance.
+# From-scratch Hex8 native-categorical concentration-learning trial.
 #
-# v13 proved that C64 plus mean-KL learns quickly, reaching 0.217 over fresh
-# games at step 320, but its unit-weight outcome losses then overfit the
-# self-play distribution and competitive strength collapsed to 0.128 by step
-# 420.  Mean-KL already supervises V/Q posterior means, so restore the solved
-# reference's auxiliary outcome weights (V=0.25, Q=0.1).  All search budgets
-# remain at the reference's true total of 32 simulations and the app.js
-# 32-draw node-local repair.  This unique directory is never resumed from an
-# earlier trial.
+# Preserve the successful run's search budget and auxiliary-loss balance, but
+# remove its fixed C64 calibration.  The model starts at Beta(1, 1), and full
+# Dirichlet matching learns both posterior means and state-dependent mass.
 
 run:
   seed: 0
@@ -24,7 +19,8 @@ model:
   num_layers: 8
   compute_dtype: bfloat16
   resnet_v2: true
-  dirichlet_concentration_floor: 64.0
+  dirichlet_concentration_floor: 2.0
+  dirichlet_initial_concentration: 2.1
   rezero_kernel_init: orthogonal
 
 selfplay:
@@ -35,13 +31,10 @@ selfplay:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
+      kappa: 4.0
       policy_samples: 32
       posterior_policy_samples: 32
       policy_sample_chunk_size: 32
-      constants:
-        kappa_leaf: 1.0
-        kappa_terminal: 80.0
-        categorical_epsilon: 0.01
 
 training:
   batch_size: 1024
@@ -55,11 +48,12 @@ training:
     q_outcome_weight: 0.1
     q_loss_weight_mode: evidence_mass
     q_dir_kl_reduction: masked_mean
-    dirichlet_loss_mode: mean
+    dirichlet_loss_mode: full
     loss_mask_mode: value
     terminal_edge_targets: true
     terminal_parent_targets: true
     policy_target_mode: search
+    categorical_epsilon: 0.01
   regularization:
     dirichlet_concentration_clip: 100.0
 
@@ -73,13 +67,10 @@ eval:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
+      kappa: 4.0
       policy_samples: 32
       posterior_policy_samples: 32
       policy_sample_chunk_size: 32
-      constants:
-        kappa_leaf: 1.0
-        kappa_terminal: 80.0
-        categorical_epsilon: 0.01
   baseline_search:
     kind: gumbel
     gumbel:
@@ -94,4 +85,4 @@ logging:
 checkpointing:
   max_to_keep: 3
   save_interval_steps: 10
-  directory: checkpoints/hex8_speedrun_scratch_seed0_v14
+  directory: checkpoints/hex8_nativecat_fullc_c100_seed0_v1

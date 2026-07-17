@@ -166,13 +166,26 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
             if not isinstance(search, dict):
                 return
             settings = search.get("dirichlet_thompson")
-            if not isinstance(settings, dict):
-                return
-            blocks = settings.pop("num_blocks", None)
-            if blocks is not None:
-                settings["num_simulations"] = int(
-                    settings.get("num_simulations", 32)
-                ) * int(blocks)
+            if isinstance(settings, dict):
+                blocks = settings.pop("num_blocks", None)
+                if blocks is not None:
+                    settings["num_simulations"] = int(
+                        settings.get("num_simulations", 32)
+                    ) * int(blocks)
+                # Native categorical search has one prior-mixing kappa.  Old
+                # leaf/terminal constants never represented this quantity;
+                # the implementation used the app.js default of four.
+                settings.pop("constants", None)
+                settings.setdefault("kappa", 4.0)
+            gumbel = search.get("gumbel")
+            if isinstance(gumbel, dict):
+                for stale in (
+                    "constants",
+                    "policy_sample_chunk_size",
+                    "completed_q_value_scale",
+                    "completed_q_rescale_values",
+                ):
+                    gumbel.pop(stale, None)
 
         migrate_search(migrated.get("search"))
         selfplay = migrated.get("selfplay")

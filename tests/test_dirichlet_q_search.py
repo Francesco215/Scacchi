@@ -5,19 +5,49 @@ import jax.numpy as jnp
 from omegaconf import OmegaConf
 
 from scacchi import dirichlet_mctx
+from scacchi.dirichlet_mctx.categorical import NO_OUTCOME
 from scacchi.dirichlet_q_search import (
-    NO_PARENT,
-    NodeEmbedding,
-    adapt_dirichlet_expand_fn_to_mctx,
-    make_dirichlet_expand_fn_from_constants,
+    make_dirichlet_expand_fn,
     posterior_best_action,
     posterior_best_policy_target,
     posterior_sample_action,
-    posterior_targets,
     q_loss_weight_from_mode,
     terminal_outcome_from_reward,
 )
-from scacchi.types import SearchConstantsConfig, load_config
+from scacchi.types import load_config
+
+
+def test_tiny_kappa_cache_mix_remains_a_positive_dirichlet():
+    mixed = dirichlet_mctx.mix_value_prior(
+        value_prior=jnp.array([[1.0, 1.0, 1.0]], dtype=jnp.float32),
+        effective_action_alpha=jnp.array(
+            [[[0.0, 0.0, 3.0]]],
+            dtype=jnp.float32,
+        ),
+        search_policy=jnp.ones((1, 1), dtype=jnp.float32),
+        n_down=jnp.array([32], dtype=jnp.int32),
+        kappa=1e-6,
+    )
+
+    assert jnp.all(mixed > 0.0)
+    assert jnp.all(jnp.isfinite(mixed))
+
+
+def test_huge_finite_kappa_cache_mix_stays_at_the_value_prior():
+    value_prior = jnp.array([[1.0, 2.0, 3.0]], dtype=jnp.float32)
+    mixed = dirichlet_mctx.mix_value_prior(
+        value_prior=value_prior,
+        effective_action_alpha=jnp.array(
+            [[[0.0, 0.0, 3.0]]],
+            dtype=jnp.float32,
+        ),
+        search_policy=jnp.ones((1, 1), dtype=jnp.float32),
+        n_down=jnp.array([32], dtype=jnp.int32),
+        kappa=1e300,
+    )
+
+    assert jnp.all(jnp.isfinite(mixed))
+    assert jnp.allclose(mixed, value_prior)
 
 
 def _root(
@@ -51,19 +81,14 @@ def _constant_recurrent_fn(
     num_actions: int,
     value: tuple[float, ...],
     action_values: tuple[tuple[float, ...], ...] | None = None,
-    leaf_value: tuple[float, ...] | None = None,
-    outcome: tuple[float, ...],
-    evidence_weight: float,
     to_play: int,
-    terminal: bool = False,
+    terminal_outcome: int = int(NO_OUTCOME),
     prior_logits: tuple[float, ...] | None = None,
 ):
     if prior_logits is None:
         prior_logits = (0.0,) * num_actions
     if action_values is None:
         action_values = (value,) * num_actions
-    if leaf_value is None:
-        leaf_value = value
 
     def recurrent_fn(_, rng_key, action, depth):
         del rng_key
@@ -81,18 +106,9 @@ def _constant_recurrent_fn(
                 jnp.asarray(action_values, dtype=jnp.float32),
                 (batch_size, num_actions, len(value)),
             ),
-            leaf_value=jnp.broadcast_to(
-                jnp.asarray(leaf_value, dtype=jnp.float32),
-                (batch_size, len(value)),
+            terminal_outcome=jnp.full(
+                (batch_size,), terminal_outcome, dtype=jnp.int8
             ),
-            outcome=jnp.broadcast_to(
-                jnp.asarray(outcome, dtype=jnp.float32),
-                (batch_size, len(outcome)),
-            ),
-            evidence_weight=jnp.full(
-                (batch_size,), evidence_weight, dtype=jnp.float32
-            ),
-            terminal=jnp.full((batch_size,), terminal, dtype=jnp.bool_),
             to_play=jnp.full((batch_size,), to_play, dtype=jnp.int32),
         )
         return step, depth + 1
@@ -165,7 +181,7 @@ def _expand_evaluator(observation: jax.Array) -> _ExpandPrediction:
     )
 
 
-def test_shared_expand_fn_drives_thompson_and_mctx_adapter():
+def test_native_expand_fn_preserves_learned_alpha_and_tags_nonterminal():
     root_state = _ExpandState(
         observation=jnp.zeros((1, 1), dtype=jnp.float32),
         legal_action_mask=jnp.array([[True, True]]),
@@ -173,42 +189,17 @@ def test_shared_expand_fn_drives_thompson_and_mctx_adapter():
         rewards=jnp.zeros((1, 2), dtype=jnp.float32),
         terminated=jnp.array([False]),
     )
-    expand_fn = make_dirichlet_expand_fn_from_constants(
-        _ExpandEnv(),
-        _expand_evaluator,
-        SearchConstantsConfig(kappa_leaf=2.0, kappa_terminal=8.0),
-    )
+    expand_fn = make_dirichlet_expand_fn(_ExpandEnv(), _expand_evaluator)
     action = jnp.array([0], dtype=jnp.int32)
     step, child_state = expand_fn((), jax.random.PRNGKey(1), action, root_state)
 
-    embedding = NodeEmbedding(
-        state=root_state,
-        outcome_dist=jnp.array([[0.5, 0.5]]),
-        alpha_V_prior=jnp.ones((1, 2)),
-        evidence_weight=jnp.zeros((1,)),
-        root_action=jnp.array([NO_PARENT], dtype=jnp.int32),
-        root_player=root_state.current_player,
-    )
-    mctx_step, mctx_child = adapt_dirichlet_expand_fn_to_mctx(expand_fn)(
-        (),
-        jax.random.PRNGKey(1),
-        action,
-        embedding,
-    )
-    assert all(
-        bool(jnp.array_equal(actual, expected))
-        for actual, expected in zip(
-            jax.tree.leaves(mctx_child.state),
-            jax.tree.leaves(child_state),
-            strict=True,
-        )
-    )
-    assert jnp.array_equal(mctx_child.alpha_V_prior, step.value)
-    assert jnp.array_equal(mctx_child.outcome_dist, step.outcome)
-    assert jnp.array_equal(mctx_step.prior_logits, step.prior_logits)
-    assert jnp.allclose(mctx_step.value, dirichlet_mctx.outcome_utility(step.outcome))
+    prediction = _expand_evaluator(child_state.observation)
+    assert jnp.array_equal(step.value, prediction.alpha_v)
     assert jnp.array_equal(step.action_values, _expand_evaluator(child_state.observation).alpha_q)
-    assert jnp.array_equal(step.leaf_value, step.value)
+    assert jnp.array_equal(
+        step.terminal_outcome,
+        jnp.asarray([int(NO_OUTCOME)], dtype=jnp.int8),
+    )
 
     root = dirichlet_mctx.RootFnOutput(
         prior_logits=jnp.zeros((1, 2)),
@@ -238,6 +229,54 @@ def test_shared_expand_fn_drives_thompson_and_mctx_adapter():
     )
 
 
+def test_native_expand_fn_publishes_exact_terminal_without_rescaling_alpha():
+    root_state = _ExpandState(
+        observation=jnp.zeros((1, 1), dtype=jnp.float32),
+        legal_action_mask=jnp.array([[True, False]]),
+        current_player=jnp.array([0], dtype=jnp.int32),
+        rewards=jnp.array([[1.0, -1.0]], dtype=jnp.float32),
+        terminated=jnp.array([True]),
+    )
+    expand_fn = make_dirichlet_expand_fn(_ExpandEnv(), _expand_evaluator)
+    action = jnp.array([0], dtype=jnp.int32)
+
+    step, _ = expand_fn((), jax.random.PRNGKey(2), action, root_state)
+
+    # Player 0 won, but the child is from player 1's perspective. The exact
+    # terminal tag flips to loss while the network alpha remains untouched.
+    assert jnp.array_equal(step.terminal_outcome, jnp.array([0], dtype=jnp.int8))
+    assert jnp.array_equal(step.value, jnp.array([[2.0, 6.0]]))
+    assert jnp.sum(step.value) == 8.0
+
+    root = dirichlet_mctx.RootFnOutput(
+        prior_logits=jnp.zeros((1, 2), dtype=jnp.float32),
+        value=jnp.ones((1, 2), dtype=jnp.float32),
+        action_values=jnp.ones((1, 2, 2), dtype=jnp.float32),
+        embedding=root_state,
+        terminal=jnp.zeros((1,), dtype=bool),
+        to_play=root_state.current_player,
+    )
+    output = _policy(
+        root,
+        expand_fn,
+        num_simulations=2,
+        invalid_actions=jnp.array([[False, True]]),
+        policy_samples=8,
+    )
+    summary = output.search_tree.summary()
+    assert summary.q_categorical_outcome[0, 0] == 1
+    assert summary.v_categorical_outcome[0] == 1
+    assert jnp.array_equal(output.action_weights, jnp.array([[1.0, 0.0]]))
+    # Exact categorical propagation does not overwrite the uncertain Q slot.
+    # The evaluated child's learned alpha is retained on the child itself.
+    assert jnp.array_equal(summary.alpha[0, 0], jnp.array([1.0, 1.0]))
+    child = output.search_tree.children_index[0, 0, 0]
+    assert jnp.array_equal(
+        output.search_tree.node_value_priors[0, child],
+        step.value[0],
+    )
+
+
 def test_single_thompson_selector_uses_interior_posterior_and_mask():
     child_action_values = (
         (1000.0, 1.0),
@@ -250,8 +289,6 @@ def test_single_thompson_selector_uses_interior_posterior_and_mask():
             num_actions=3,
             value=(2.0, 2.0),
             action_values=child_action_values,
-            outcome=(0.5, 0.5),
-            evidence_weight=1.0,
             to_play=0,
             prior_logits=(0.0, -jnp.inf, 0.0),
         ),
@@ -288,8 +325,6 @@ def test_first_leaf_replaces_q_fallback_with_aligned_child_message():
     recurrent_fn = _constant_recurrent_fn(
         num_actions=2,
         value=(2.0, 6.0),
-        outcome=(0.25, 0.75),
-        evidence_weight=4.0,
         to_play=1,
     )
 
@@ -455,8 +490,6 @@ def test_repeated_depth_cutoff_counts_every_simulation_without_new_nodes():
     recurrent_fn = _constant_recurrent_fn(
         num_actions=1,
         value=(3.0, 1.0),
-        outcome=(0.25, 0.75),
-        evidence_weight=2.0,
         to_play=0,
     )
 
@@ -479,16 +512,13 @@ def test_repeated_depth_cutoff_counts_every_simulation_without_new_nodes():
     )
 
 
-def test_terminal_child_has_no_descendants_and_repeats_terminal_message():
+def test_terminal_child_has_no_descendants_and_short_circuits_search():
     root = _root([[1.0, 1.0], [1.0, 1.0]], to_play=0)
     recurrent_fn = _constant_recurrent_fn(
         num_actions=2,
         value=(4.0, 2.0),
-        leaf_value=(0.01, 8.01),
-        outcome=(1.0, 0.0),
-        evidence_weight=8.0,
         to_play=1,
-        terminal=True,
+        terminal_outcome=0,
         prior_logits=(-jnp.inf, -jnp.inf),
     )
 
@@ -508,19 +538,23 @@ def test_terminal_child_has_no_descendants_and_repeats_terminal_message():
         tree.parents[0],
         jnp.array([-1, 0, -1, -1], dtype=jnp.int32),
     )
-    assert jnp.array_equal(tree.summary().visit_counts, jnp.array([[0.0, 3.0]]))
+    assert jnp.array_equal(tree.summary().visit_counts, jnp.array([[0.0, 1.0]]))
     assert jnp.allclose(
         tree.summary().alpha,
-        jnp.array([[[1.0, 1.0], [8.01, 0.01]]]),
+        jnp.array([[[1.0, 1.0], [1.0, 1.0]]]),
     )
     assert jnp.array_equal(
         tree.root_posterior.action_count > 0,
         jnp.array([[False, True]]),
     )
-    expected_value = (4.0 / 7.0) * jnp.ones(2) + (3.0 / 7.0) * jnp.array(
-        [8.01, 0.01]
-    )
+    # Cache repair projects the exact win onto the existing learned Q mass
+    # (C=2) and mixes it with the root prior using gamma=1/(4+1).
+    expected_value = jnp.array([0.8, 1.2])
     assert jnp.allclose(tree.root_posterior.value_alpha[0], expected_value)
+    child = tree.children_index[0, 0, 1]
+    assert jnp.array_equal(tree.node_value_priors[0, child], jnp.array([4.0, 2.0]))
+    assert tree.node_categorical_outcome[0, 0] == 1
+    assert tree.node_categorical_distance[0, 0] == 1
 
 
 def test_default_max_depth_uses_complete_simulation_budget():
@@ -552,7 +586,6 @@ def test_default_max_depth_uses_complete_simulation_budget():
             -jnp.inf,
             jnp.zeros((batch_size, 1), dtype=jnp.float32),
         )
-        terminal_alpha = jnp.array([0.01, 8.01], dtype=jnp.float32)
         return (
             dirichlet_mctx.RecurrentFnOutput(
                 prior_logits=prior_logits,
@@ -561,18 +594,11 @@ def test_default_max_depth_uses_complete_simulation_budget():
                     (batch_size, 1, 2),
                     dtype=jnp.float32,
                 ),
-                leaf_value=jnp.where(
-                    terminal[:, None],
-                    terminal_alpha,
-                    jnp.ones((batch_size, 2), dtype=jnp.float32),
+                terminal_outcome=jnp.where(
+                    terminal,
+                    jnp.asarray(1, dtype=jnp.int8),
+                    jnp.asarray(int(NO_OUTCOME), dtype=jnp.int8),
                 ),
-                outcome=jnp.where(
-                    terminal[:, None],
-                    jnp.array([0.0, 1.0], dtype=jnp.float32),
-                    jnp.array([0.5, 0.5], dtype=jnp.float32),
-                ),
-                evidence_weight=jnp.where(terminal, 8.0, 1.0),
-                terminal=terminal,
                 to_play=jnp.zeros((batch_size,), dtype=jnp.int32),
             ),
             child_depth,
@@ -599,7 +625,11 @@ def test_default_max_depth_uses_complete_simulation_budget():
         tree.children_index[0, :terminal_depth, 0],
         jnp.arange(1, terminal_depth + 1, dtype=jnp.int32),
     )
-    assert tree.summary().visit_counts[0, 0] == search_cfg.num_simulations
+    # The fifth active simulation reaches the terminal certificate. Exact
+    # categorical descendants propagate through sidecars, not uncertain R/B,
+    # so the root retains the four preceding uncertain messages.
+    assert tree.summary().visit_counts[0, 0] == terminal_depth - 1
+    assert tree.posterior.action_count[0, terminal_depth - 1, 0] == 1
 
 
 def test_terminal_root_does_not_search_even_if_actions_are_marked_legal():
@@ -609,8 +639,6 @@ def test_terminal_root_does_not_search_even_if_actions_are_marked_legal():
         _constant_recurrent_fn(
             num_actions=1,
             value=(2.0, 1.0),
-            outcome=(0.5, 0.5),
-            evidence_weight=1.0,
             to_play=0,
         ),
         num_simulations=1,
@@ -639,11 +667,6 @@ def test_bottom_up_repair_uses_updated_child_cache_and_node_players():
             jnp.array([[2.0, 5.0]]),
             jnp.array([[7.0, 3.0]]),
         )
-        outcome = jnp.where(
-            first[:, None],
-            jnp.array([[0.2, 0.8]]),
-            jnp.array([[0.1, 0.9]]),
-        )
         step = dirichlet_mctx.RecurrentFnOutput(
             prior_logits=jnp.broadcast_to(
                 jnp.array([-jnp.inf, 0.0, -jnp.inf]),
@@ -651,10 +674,9 @@ def test_bottom_up_repair_uses_updated_child_cache_and_node_players():
             ),
             value=value,
             action_values=jnp.ones((batch_size, 3, 2), dtype=jnp.float32),
-            leaf_value=value,
-            outcome=outcome,
-            evidence_weight=jnp.where(first, 1.0, 2.0),
-            terminal=jnp.zeros((batch_size,), dtype=bool),
+            terminal_outcome=jnp.full(
+                (batch_size,), int(NO_OUTCOME), dtype=jnp.int8
+            ),
             # Both descendants have player 1. At depth two the evidence still
             # needs one flip, so a simple depth-parity rule would be wrong.
             to_play=jnp.ones((batch_size,), dtype=jnp.int32),
@@ -695,8 +717,6 @@ def test_simulations_share_one_persistent_tree_and_posterior():
     recurrent_fn = _constant_recurrent_fn(
         num_actions=1,
         value=(4.0, 1.0),
-        outcome=(0.6, 0.4),
-        evidence_weight=2.0,
         to_play=0,
     )
 
@@ -724,8 +744,6 @@ def test_custom_posterior_update_sees_children_and_runs_bottom_up():
     expand_fn = _constant_recurrent_fn(
         num_actions=1,
         value=(2.0, 2.0),
-        outcome=(0.25, 0.75),
-        evidence_weight=1.0,
         to_play=0,
     )
 
@@ -815,8 +833,6 @@ def test_zero_simulation_policy_samples_q_prior_without_tree_updates():
     recurrent_fn = _constant_recurrent_fn(
         num_actions=3,
         value=(1.0, 1.0),
-        outcome=(0.5, 0.5),
-        evidence_weight=1.0,
         to_play=1,
     )
     _, policy_key = jax.random.split(rng_key)
@@ -859,8 +875,6 @@ def test_dirichlet_policy_jits_with_heterogeneous_root_masks():
     recurrent_fn = _constant_recurrent_fn(
         num_actions=2,
         value=(2.0, 4.0),
-        outcome=(0.25, 0.75),
-        evidence_weight=1.0,
         to_play=1,
     )
     invalid_actions = jnp.array([[False, True], [True, False]])
@@ -952,41 +966,16 @@ def test_posterior_action_helpers_respect_legal_mask():
     assert bool(jnp.all(legal_action_mask[jnp.arange(2), sampled]))
 
 
-def test_posterior_targets_add_q_evidence_and_policy_weight_value_evidence():
-    alpha_v_prior = jnp.array([[1.0, 1.0]])
-    action_value_prior = jnp.array(
-        [[[1.0, 2.0], [2.0, 1.0], [1.0, 2.0]]]
-    )
-    q_evidence_sum = jnp.array(
-        [[[2.0, 0.0], [0.0, 0.0], [0.5, 1.5]]]
-    )
-    policy_target = jnp.array([[0.25, 0.0, 0.75]])
-
-    beta_q_target, beta_v_target = posterior_targets(
-        alpha_v_prior,
-        action_value_prior,
-        q_evidence_sum,
-        policy_target,
-    )
-
-    expected_v_evidence = (
-        0.25 * jnp.array([2.0, 0.0])
-        + 0.75 * jnp.array([0.5, 1.5])
-    )
-    assert jnp.allclose(beta_q_target, action_value_prior + q_evidence_sum)
-    assert jnp.allclose(beta_v_target, alpha_v_prior + expected_v_evidence)
-
-
 def test_q_loss_weights_support_policy_and_evidence_mass_modes():
-    evidence = jnp.array([[[2.0, 0.0], [0.5, 1.5], [0.0, 0.0]]])
+    counts = jnp.array([[[2.0], [2.0], [0.0]]])
     policy = jnp.array([[0.25, 0.75, 0.0]])
 
     assert jnp.array_equal(
-        q_loss_weight_from_mode("policy", evidence, policy),
+        q_loss_weight_from_mode("policy", counts, policy),
         policy,
     )
     assert jnp.allclose(
-        q_loss_weight_from_mode("evidence_mass", evidence, policy),
+        q_loss_weight_from_mode("evidence_mass", counts, policy),
         jnp.array([[2.0, 2.0, 0.0]]),
     )
 
@@ -996,9 +985,9 @@ def test_terminal_reward_maps_two_and_three_outcome_spaces():
 
     assert jnp.array_equal(
         terminal_outcome_from_reward(reward, 3),
-        jnp.eye(3, dtype=reward.dtype),
+        jnp.array([0, 1, 2], dtype=jnp.int8),
     )
     assert jnp.array_equal(
         terminal_outcome_from_reward(jnp.array([-1.0, 1.0]), 2),
-        jnp.eye(2, dtype=reward.dtype),
+        jnp.array([0, 1], dtype=jnp.int8),
     )

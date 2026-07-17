@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import math
 from typing import Any, cast
 
 from omegaconf import DictConfig, OmegaConf
@@ -44,6 +45,13 @@ class QDirKLReduction(StrEnum):
 class DirichletLossMode(StrEnum):
     full = "full"
     mean = "mean"
+
+
+class CategoricalDrawRule(StrEnum):
+    policy_prior = "policy_prior"
+    fastest_draw = "fastest_draw"
+    slowest_draw = "slowest_draw"
+    fixed_order = "fixed_order"
 
 
 class LossMaskMode(StrEnum):
@@ -121,23 +129,6 @@ class ModelConfig:
 
 
 @dataclass
-class SearchConstantsConfig:
-    kappa_leaf: float = 1.0
-    kappa_terminal: float = 8.0
-    categorical_epsilon: float = 1e-4
-
-    def __post_init__(self) -> None:
-        _require_gt("search.constants.kappa_leaf", self.kappa_leaf, 0.0)
-        _require_gt("search.constants.kappa_terminal", self.kappa_terminal, 0.0)
-        _require_range(
-            "search.constants.categorical_epsilon",
-            self.categorical_epsilon,
-            lower=0.0,
-            upper=0.5,
-        )
-
-
-@dataclass
 class PolicySearchConfig:
     temperature: float = 1.0
 
@@ -148,34 +139,19 @@ class PolicySearchConfig:
 @dataclass
 class GumbelSearchConfig:
     num_simulations: int = 32
-
-    # Used when Gumbel search runs against a Dirichlet network and produces
-    # posterior targets. Ignored by scalar policy/value models.
-    policy_sample_chunk_size: int | None = 32
-    constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
     gumbel_scale: float = 1.0
-    completed_q_value_scale: float = 0.1
-    completed_q_rescale_values: bool = True
 
     def __post_init__(self) -> None:
         _require_ge("search.gumbel.num_simulations", self.num_simulations, 1)
-        _require_ge(
-            "search.gumbel.policy_sample_chunk_size",
-            self.policy_sample_chunk_size,
-            1,
-        )
         _require_gt("search.gumbel.gumbel_scale", self.gumbel_scale, 0.0)
-        _require_gt(
-            "search.gumbel.completed_q_value_scale",
-            self.completed_q_value_scale,
-            0.0,
-        )
 
 
 @dataclass
 class DirichletThompsonSearchConfig:
     num_simulations: int = 32
     max_depth: int | None = None
+    # Prior mass in gamma = n / (kappa + n) for bottom-up cache repair.
+    kappa: float = 4.0
     policy_samples: int = 32
     # Monte Carlo budget for pi_search inside each bottom-up node repair.
     # None keeps the public root-policy budget.  A smaller value remains an
@@ -183,7 +159,7 @@ class DirichletThompsonSearchConfig:
     # the full root readout budget.
     posterior_policy_samples: int | None = None
     policy_sample_chunk_size: int | None = 32
-    constants: SearchConstantsConfig = field(default_factory=SearchConstantsConfig)
+    categorical_draw_rule: CategoricalDrawRule = CategoricalDrawRule.policy_prior
 
     def __post_init__(self) -> None:
         _require_ge(
@@ -199,6 +175,12 @@ class DirichletThompsonSearchConfig:
             self.max_depth,
             minimum_depth,
         )
+        if not math.isfinite(self.kappa):
+            raise ValueError(
+                "search.dirichlet_thompson.kappa must be finite; "
+                f"got {self.kappa}."
+            )
+        _require_gt("search.dirichlet_thompson.kappa", self.kappa, 0.0)
         _require_ge("search.dirichlet_thompson.policy_samples", self.policy_samples, 0)
         _require_ge(
             "search.dirichlet_thompson.posterior_policy_samples",
@@ -225,15 +207,8 @@ class SearchConfig:
             getattr(self, str(self.kind)),
         )
 
-    def active_constants(self) -> SearchConstantsConfig:
-        active = self.active()
-        return getattr(active, "constants", SearchConstantsConfig())
-
     def value(self, name: str, default: Any) -> Any:
         return getattr(self.active(), name, default)
-
-    def constant(self, name: str, default: Any) -> Any:
-        return getattr(self.active_constants(), name, default)
 
 
 @dataclass
@@ -256,14 +231,14 @@ class TrainingLossConfig:
     q_outcome_weight: float = 0.0
     q_loss_weight_mode: QLossWeightMode = QLossWeightMode.policy
     q_dir_kl_reduction: QDirKLReduction = QDirKLReduction.weighted
-    # ``full`` trains both posterior mean and evidence mass. ``mean`` trains
-    # the same posterior WDL means while leaving concentration to the model
-    # prior, which is useful when evidence mass is a fixed search calibration.
+    # ``full`` trains the coupled Dirichlet density; ``mean`` ignores evidence
+    # mass.
     dirichlet_loss_mode: DirichletLossMode = DirichletLossMode.full
     loss_mask_mode: LossMaskMode = LossMaskMode.search
     terminal_edge_targets: bool = False
     terminal_parent_targets: bool = False
     policy_target_mode: PolicyTargetMode = PolicyTargetMode.search
+    categorical_epsilon: float = 1e-4
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -274,6 +249,12 @@ class TrainingLossConfig:
             ("training.losses.q_outcome_weight", self.q_outcome_weight),
         ):
             _require_gt(name, value, -1.0)
+        _require_range(
+            "training.losses.categorical_epsilon",
+            self.categorical_epsilon,
+            lower=0.0,
+            upper=1.0 / 3.0,
+        )
 
     def active_dirichlet_weights(self) -> list[str]:
         weights = (
@@ -290,6 +271,15 @@ class TrainingRegularizationConfig:
     dirichlet_concentration_clip: float | None = 8.0
 
     def __post_init__(self) -> None:
+        if (
+            self.dirichlet_concentration_clip is not None
+            and not math.isfinite(self.dirichlet_concentration_clip)
+        ):
+            raise ValueError(
+                "training.regularization.dirichlet_concentration_clip must "
+                "be finite when set; got "
+                f"{self.dirichlet_concentration_clip}."
+            )
         _require_gt(
             "training.regularization.dirichlet_concentration_clip",
             self.dirichlet_concentration_clip,
@@ -395,6 +385,27 @@ class TrainConfig:
                     "model.network='aznet_dirichlet' or "
                     "model.network='boardlaw_dirichlet'."
                 )
+        losses = self.training.losses
+        search_emits_categorical = (
+            self.selfplay.search.kind == SearchKind.dirichlet_thompson
+        )
+        categorical_head_loss_active = (
+            losses.value_dir_kl_weight > 0.0
+            and (search_emits_categorical or losses.terminal_parent_targets)
+        ) or (
+            losses.q_dir_kl_weight > 0.0
+            and (search_emits_categorical or losses.terminal_edge_targets)
+        )
+        if (
+            categorical_head_loss_active
+            and self.training.regularization.dirichlet_concentration_clip is None
+        ):
+            raise ValueError(
+                "categorical Dirichlet-density NLL requires a finite "
+                "training.regularization.dirichlet_concentration_clip; "
+                "epsilon moves the target off the simplex boundary but does "
+                "not bound the density optimum."
+            )
         if self.eval.baseline == EvalBaseline.none and self.eval.interval != 0:
             raise ValueError("eval.baseline=none requires eval.interval=0.")
 

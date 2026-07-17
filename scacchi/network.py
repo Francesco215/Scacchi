@@ -22,9 +22,17 @@ def _dtype_from_name(name: str):
     raise ValueError(f"unknown model.compute_dtype: {name!r}")
 
 
+def _squared_softplus_concentration_logit(concentration: float) -> float:
+    """Logit whose squared-softplus transform has the requested mass."""
+
+    if concentration <= 0.0:
+        raise ValueError(f"concentration must be > 0, got {concentration}")
+    return math.log(math.expm1(math.sqrt(concentration)))
+
+
 def _unit_dirichlet_concentration_logit(num_outcomes: int) -> float:
     """Logit whose squared-softplus transform totals ``num_outcomes``."""
-    return math.log(math.expm1(math.sqrt(num_outcomes)))
+    return _squared_softplus_concentration_logit(float(num_outcomes))
 
 
 _DIRICHLET_INITIAL_EXCESS_CONCENTRATION = 0.1
@@ -499,7 +507,7 @@ class BoardlawDirichletNet(nnx.Module):
         self.depth = depth
         self.dtype = dtype
         concentration_floor = (
-            float(num_outcomes)
+            None
             if dirichlet_concentration_floor is None
             else float(dirichlet_concentration_floor)
         )
@@ -545,23 +553,46 @@ class BoardlawDirichletNet(nnx.Module):
                 bias_init=jax.nn.initializers.zeros,
                 rngs=rngs,
             )
-            initial_excess = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
-            if dirichlet_initial_concentration is not None:
-                initial_excess = (
-                    float(dirichlet_initial_concentration) - concentration_floor
+            if concentration_floor is None:
+                initial_concentration = (
+                    float(num_outcomes)
+                    + _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+                    if dirichlet_initial_concentration is None
+                    else float(dirichlet_initial_concentration)
                 )
-                if initial_excess <= 0.0:
+                if (
+                    self.dirichlet_concentration_clip is not None
+                    and initial_concentration
+                    >= float(self.dirichlet_concentration_clip)
+                ):
                     raise ValueError(
-                        "dirichlet_initial_concentration must exceed the dumb-prior "
-                        f"floor {concentration_floor}; got "
-                        f"{dirichlet_initial_concentration}"
+                        "dirichlet_concentration_clip must exceed "
+                        "dirichlet_initial_concentration; got "
+                        f"initial={initial_concentration}, "
+                        f"clip={self.dirichlet_concentration_clip}"
                     )
-            concentration_bias_init = jax.nn.initializers.constant(
-                _smooth_dirichlet_concentration_logit(
+                concentration_logit = _squared_softplus_concentration_logit(
+                    initial_concentration
+                )
+            else:
+                initial_excess = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+                if dirichlet_initial_concentration is not None:
+                    initial_excess = (
+                        float(dirichlet_initial_concentration) - concentration_floor
+                    )
+                    if initial_excess <= 0.0:
+                        raise ValueError(
+                            "dirichlet_initial_concentration must exceed the "
+                            f"configured floor {concentration_floor}; got "
+                            f"{dirichlet_initial_concentration}"
+                        )
+                concentration_logit = _smooth_dirichlet_concentration_logit(
                     concentration_floor,
                     self.dirichlet_concentration_clip,
                     initial_excess=initial_excess,
                 )
+            concentration_bias_init = jax.nn.initializers.constant(
+                concentration_logit
             )
             self.value_conc_head = nnx.Linear(
                 width,

@@ -46,7 +46,12 @@ import pgx
 from .checkpoint import build_checkpoint_manager, from_pretrained, maybe_save, restore
 from .envs import make_env
 from .evaluations import make_mcts_evaluate
-from .logger import build_logger, returns_metrics
+from .logger import PrecomputedHistogram, build_logger, returns_metrics
+from .loss import (
+    CONCENTRATION_HISTOGRAM_BIN_EDGES,
+    CONCENTRATION_HISTOGRAM_NUM_BINS,
+    CONCENTRATION_HISTOGRAM_SERIES,
+)
 from .network import build_model
 from .pipeline import make_training_iteration
 from .types import Config, EvalBaseline, load_config
@@ -107,6 +112,180 @@ def _block_until_ready(value: Any) -> Any:
         lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
         value,
     )
+
+
+def _weighted_metric_mean(values: Any, counts: Any) -> float:
+    values_np = np.asarray(jax.device_get(values), dtype=np.float64)
+    counts_np = np.asarray(jax.device_get(counts), dtype=np.float64)
+    total = float(np.sum(counts_np))
+    if total <= 0.0:
+        return 0.0
+    return float(np.sum(values_np * counts_np) / total)
+
+
+def _pooled_metric_std(means: Any, stds: Any, counts: Any) -> float:
+    means_np = np.asarray(jax.device_get(means), dtype=np.float64)
+    stds_np = np.asarray(jax.device_get(stds), dtype=np.float64)
+    counts_np = np.asarray(jax.device_get(counts), dtype=np.float64)
+    total = float(np.sum(counts_np))
+    if total <= 0.0:
+        return 0.0
+    mean = float(np.sum(means_np * counts_np) / total)
+    second_moment = float(
+        np.sum((np.square(stds_np) + np.square(means_np)) * counts_np)
+        / total
+    )
+    return float(np.sqrt(max(second_moment - mean * mean, 0.0)))
+
+
+def _count_fraction(numerator: Any, denominator: Any) -> float:
+    numerator_total = float(
+        np.sum(np.asarray(jax.device_get(numerator), dtype=np.float64))
+    )
+    denominator_total = float(
+        np.sum(np.asarray(jax.device_get(denominator), dtype=np.float64))
+    )
+    if denominator_total <= 0.0:
+        return 0.0
+    return numerator_total / denominator_total
+
+
+def _concentration_metrics_for_logging(train_metrics: Any) -> dict[str, float]:
+    """Aggregate per-minibatch concentration diagnostics by target count."""
+
+    result: dict[str, float] = {}
+    for head, lower in (("V", "v"), ("Q", "q")):
+        dir_count = getattr(train_metrics, f"{lower}_dirichlet_target_count")
+        cat_count = getattr(train_metrics, f"{lower}_categorical_target_count")
+        native_count = getattr(train_metrics, f"{lower}_native_target_count")
+        alpha_mean = getattr(train_metrics, f"alpha_{head}_concentration")
+        alpha_std = getattr(train_metrics, f"alpha_{head}_concentration_std")
+        pred_dir_mean = getattr(
+            train_metrics,
+            f"alpha_{head}_dirichlet_concentration",
+        )
+        pred_dir_std = getattr(
+            train_metrics,
+            f"alpha_{head}_dirichlet_concentration_std",
+        )
+        target_dir_mean = getattr(train_metrics, f"beta_{head}_concentration")
+        target_dir_std = getattr(
+            train_metrics,
+            f"beta_{head}_concentration_std",
+        )
+        pred_cat_mean = getattr(
+            train_metrics,
+            f"alpha_{head}_categorical_concentration",
+        )
+
+        result[f"train/alpha_{head}_concentration"] = _weighted_metric_mean(
+            alpha_mean,
+            native_count,
+        )
+        result[f"train/alpha_{head}_concentration_std"] = _pooled_metric_std(
+            alpha_mean,
+            alpha_std,
+            native_count,
+        )
+        result[f"train/{head}_C_pred_mean_dir"] = _weighted_metric_mean(
+            pred_dir_mean,
+            dir_count,
+        )
+        result[f"train/{head}_C_pred_std_dir"] = _pooled_metric_std(
+            pred_dir_mean,
+            pred_dir_std,
+            dir_count,
+        )
+        result[f"train/{head}_C_target_mean_dir"] = _weighted_metric_mean(
+            target_dir_mean,
+            dir_count,
+        )
+        result[f"train/{head}_C_target_std_dir"] = _pooled_metric_std(
+            target_dir_mean,
+            target_dir_std,
+            dir_count,
+        )
+        result[f"train/{head}_C_log_mae_dir"] = _weighted_metric_mean(
+            getattr(
+                train_metrics,
+                f"{lower}_dirichlet_log_concentration_mae",
+            ),
+            dir_count,
+        )
+        result[f"train/{head}_C_at_floor_fraction_dir"] = (
+            _weighted_metric_mean(
+                getattr(
+                    train_metrics,
+                    f"alpha_{head}_dirichlet_concentration_floor_fraction",
+                ),
+                dir_count,
+            )
+        )
+        result[f"train/{head}_C_at_clip_fraction_dir"] = _weighted_metric_mean(
+            getattr(
+                train_metrics,
+                f"alpha_{head}_dirichlet_concentration_clip_fraction",
+            ),
+            dir_count,
+        )
+        result[f"train/{head}_C_pred_mean_cat"] = _weighted_metric_mean(
+            pred_cat_mean,
+            cat_count,
+        )
+        result[f"train/{head}_C_at_clip_fraction_cat"] = (
+            _weighted_metric_mean(
+                getattr(
+                    train_metrics,
+                    f"alpha_{head}_categorical_concentration_clip_fraction",
+                ),
+                cat_count,
+            )
+        )
+        result[f"data/{lower}_categorical_target_fraction"] = _count_fraction(
+            cat_count,
+            native_count,
+        )
+        result[f"data/{lower}_dirichlet_target_count"] = float(
+            np.sum(np.asarray(jax.device_get(dir_count), dtype=np.float64))
+        )
+        result[f"data/{lower}_categorical_target_count"] = float(
+            np.sum(np.asarray(jax.device_get(cat_count), dtype=np.float64))
+        )
+    return result
+
+
+def _concentration_histograms_for_logging(
+    train_metrics: Any,
+) -> dict[str, PrecomputedHistogram]:
+    """Pool minibatch bucket counts into matched prior/posterior histograms."""
+
+    counts = np.asarray(
+        jax.device_get(
+            train_metrics.dirichlet_concentration_histogram_counts
+        ),
+        dtype=np.float64,
+    )
+    expected_tail = (
+        len(CONCENTRATION_HISTOGRAM_SERIES),
+        CONCENTRATION_HISTOGRAM_NUM_BINS,
+    )
+    if counts.ndim < 2 or counts.shape[-2:] != expected_tail:
+        raise ValueError(
+            "concentration histogram counts must end in "
+            f"{expected_tail}; got {counts.shape}."
+        )
+    leading_axes = tuple(range(counts.ndim - 2))
+    pooled = np.sum(counts, axis=leading_axes) if leading_axes else counts
+    edges = np.asarray(CONCENTRATION_HISTOGRAM_BIN_EDGES, dtype=np.float64)
+
+    histograms: dict[str, PrecomputedHistogram] = {}
+    for index, series in enumerate(CONCENTRATION_HISTOGRAM_SERIES):
+        head, role = series.split("_", maxsplit=1)
+        histograms[f"train/{head}_C_{role}_hist_dir"] = PrecomputedHistogram(
+            pooled[index],
+            edges,
+        )
+    return histograms
 
 
 def _load_eval_baseline(config: Config, env: pgx.Env, parallel=None):
@@ -395,8 +574,6 @@ def main(cfg: DictConfig) -> None:
                             "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
                             "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
                             "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
-                            "train/alpha_V_concentration": train_metrics.alpha_V_concentration.mean().item(),
-                            "train/alpha_Q_concentration": train_metrics.alpha_Q_concentration.mean().item(),
                             "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
                             "data/value_mask_fraction": train_metrics.data_value_mask_fraction.mean().item(),
                             "data/pass_fraction": train_metrics.data_pass_fraction.mean().item(),
@@ -408,6 +585,12 @@ def main(cfg: DictConfig) -> None:
                             "train/hours": hours,
                             "train/frames": frames,
                         }
+                    )
+                    dict_to_log.update(
+                        _concentration_metrics_for_logging(train_metrics)
+                    )
+                    dict_to_log.update(
+                        _concentration_histograms_for_logging(train_metrics)
                     )
                     logger.log(iteration, dict_to_log, pbar=pbar, prefix="", pbar_filter=r"loss|avg_R")
                     maybe_save(ckpt_mgr, iteration, model, optimizer, rng_key, config, hours, frames)

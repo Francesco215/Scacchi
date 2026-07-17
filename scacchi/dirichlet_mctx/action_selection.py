@@ -6,6 +6,7 @@ import chex
 import jax
 import jax.numpy as jnp
 
+from .categorical import NO_OUTCOME
 from .tree import Tree
 
 
@@ -14,6 +15,10 @@ from .tree import Tree
 # keeping the sampler affordable inside every node repair. The rare rejected
 # lane still has a finite, positive fallback below.
 _GAMMA_PROPOSALS = 4
+
+CATEGORICAL_DRAW_RULES = frozenset(
+    {"policy_prior", "fastest_draw", "slowest_draw", "fixed_order"}
+)
 
 
 def flip_outcome(outcome: jax.Array) -> jax.Array:
@@ -38,6 +43,79 @@ def outcome_mean(alpha: jax.Array) -> jax.Array:
 
 def outcome_utility(outcome: jax.Array) -> jax.Array:
     return outcome[..., -1] - outcome[..., 0]
+
+
+def categorical_utility(outcome: jax.Array, num_outcomes: int) -> jax.Array:
+    """Return exact scalar utility for a categorical outcome index."""
+
+    outcome = jnp.asarray(outcome)
+    dtype = jnp.result_type(outcome, jnp.float32)
+    return jnp.where(
+        outcome == int(num_outcomes) - 1,
+        jnp.asarray(1.0, dtype=dtype),
+        jnp.where(
+            outcome == 0,
+            jnp.asarray(-1.0, dtype=dtype),
+            jnp.asarray(0.0, dtype=dtype),
+        ),
+    )
+
+
+def validate_categorical_draw_rule(rule: str) -> str:
+    rule = str(rule)
+    if rule not in CATEGORICAL_DRAW_RULES:
+        allowed = ", ".join(sorted(CATEGORICAL_DRAW_RULES))
+        raise ValueError(
+            f"categorical_draw_rule must be one of {allowed}; got {rule!r}"
+        )
+    return rule
+
+
+def categorical_action(
+    node_outcome: jax.Array,
+    edge_outcome: jax.Array,
+    edge_distance: jax.Array,
+    prior_logits: jax.Array,
+    invalid_actions: jax.Array,
+    *,
+    num_outcomes: int,
+    draw_rule: str,
+) -> jax.Array:
+    """Choose the deterministic certified action for categorical nodes.
+
+    Win certificates prefer the shortest edge and loss certificates the
+    longest. Draw actions are selected only from categorical draws using the
+    configured rule. ``argmax`` supplies the stable lowest-action tie break.
+    """
+
+    draw_rule = validate_categorical_draw_rule(draw_rule)
+    legal = ~invalid_actions
+    win_index = int(num_outcomes) - 1
+    win_candidates = legal & (edge_outcome == win_index)
+    loss_candidates = legal & (edge_outcome == 0)
+    draw_candidates = legal & (edge_outcome == 1)
+
+    distance = edge_distance.astype(jnp.float32)
+    win_scores = jnp.where(win_candidates, -distance, -jnp.inf)
+    loss_scores = jnp.where(loss_candidates, distance, -jnp.inf)
+    if draw_rule == "policy_prior":
+        draw_scores = jnp.where(draw_candidates, prior_logits, -jnp.inf)
+    elif draw_rule == "fastest_draw":
+        draw_scores = jnp.where(draw_candidates, -distance, -jnp.inf)
+    elif draw_rule == "slowest_draw":
+        draw_scores = jnp.where(draw_candidates, distance, -jnp.inf)
+    else:
+        # All candidates have the same score, so argmax takes the first.
+        draw_scores = jnp.where(draw_candidates, 0.0, -jnp.inf)
+
+    is_win = node_outcome == win_index
+    is_loss = node_outcome == 0
+    scores = jnp.where(
+        is_win[..., None],
+        win_scores,
+        jnp.where(is_loss[..., None], loss_scores, draw_scores),
+    )
+    return jnp.argmax(scores, axis=-1).astype(jnp.int32)
 
 
 def masked_argmax(scores: jax.Array, invalid_actions: jax.Array) -> jax.Array:
@@ -130,11 +208,20 @@ def thompson_sample(
     rng_key: chex.PRNGKey,
     alpha: jax.Array,
     invalid_actions: jax.Array,
+    categorical_outcome: jax.Array | None = None,
 ) -> jax.Array:
     """Apply the one action-selection rule used throughout this backend."""
 
     sampled = sample_dirichlet(rng_key, alpha)
-    return masked_argmax(outcome_utility(sampled), invalid_actions)
+    utility = outcome_utility(sampled)
+    if categorical_outcome is not None:
+        categorical_outcome = jnp.asarray(categorical_outcome)
+        utility = jnp.where(
+            categorical_outcome != int(NO_OUTCOME),
+            categorical_utility(categorical_outcome, alpha.shape[-1]),
+            utility,
+        )
+    return masked_argmax(utility, invalid_actions)
 
 
 def thompson_policy(
@@ -144,6 +231,7 @@ def thompson_policy(
     num_samples: int,
     *,
     chunk_size: int | None = None,
+    categorical_outcome: jax.Array | None = None,
 ) -> jax.Array:
     """Estimate the posterior-best policy by repeating one Thompson rule.
 
@@ -162,14 +250,24 @@ def thompson_policy(
     num_actions = alpha.shape[-2]
 
     if num_samples == 1:
-        best = thompson_sample(rng_key, alpha, invalid_actions)
+        best = thompson_sample(
+            rng_key,
+            alpha,
+            invalid_actions,
+            categorical_outcome,
+        )
         policy = jax.nn.one_hot(best, num_actions, dtype=alpha.dtype)
         return jnp.where(invalid_actions, 0.0, policy)
 
     def sample_chunk(total_hits, chunk):
         keys, valid_samples = chunk
         best = jax.vmap(
-            lambda key: thompson_sample(key, alpha, invalid_actions)
+            lambda key: thompson_sample(
+                key,
+                alpha,
+                invalid_actions,
+                categorical_outcome,
+            )
         )(keys)
         hits = jax.nn.one_hot(best, num_actions, dtype=alpha.dtype)
         weight = valid_samples.astype(alpha.dtype).reshape(
@@ -244,8 +342,10 @@ def thompson_action_selection(
 ) -> jax.Array:
     """Take one Thompson draw for every legal action at ``node_index``."""
 
+    categorical = tree.edge_categorical_outcome[node_index]
     return thompson_sample(
         rng_key,
         effective_action_alpha(tree, node_index),
-        tree.invalid_actions[node_index],
+        tree.invalid_actions[node_index]
+        | (categorical != int(NO_OUTCOME)),
     )

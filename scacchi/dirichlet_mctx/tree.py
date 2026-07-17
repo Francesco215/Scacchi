@@ -13,13 +13,17 @@ import jax.numpy as jnp
 class NodePosterior:
     """Search state repaired for one node or stored for every node.
 
-    ``action_alpha`` is the edge message ``B`` from the Tic-Tac-Toe model and
+    ``action_alpha`` is the unresolved edge message ``B`` and
     contains the Q fallback until ``action_count`` becomes positive.
     ``action_count`` is the structural edge count ``R``; because every direct
     or child message has positive ``R``, it also represents the demo's ``m``
     bit without a duplicate boolean table. ``value_alpha`` is the cached state
-    posterior. Leading dimensions are generic: the tree adds ``[B, N]`` and a
-    gathered node adds only ``[B]``.
+    posterior. These arrays remain the unresolved Dirichlet cache; exact
+    solved outcomes live in the tree's categorical sidecars and
+    take precedence over them. Leading dimensions are generic: the tree adds
+    ``[B, N]`` and a gathered node adds only ``[B]``. Categorical edges retain
+    a positive learned alpha slot for fixed shapes, but their exact sidecar is
+    authoritative.
     """
 
     action_alpha: jax.Array
@@ -63,9 +67,10 @@ class ChildrenView:
 class LeafView:
     """The selected leaf edge evaluated by the current simulation.
 
-    ``active`` is true only for the deepest path node.  It is false for every
-    ancestor, allowing the same posterior-update callback to own both the
-    direct leaf message and all child-to-parent repairs.
+    ``value_alpha`` is the evaluated child value. ``active`` is true only for
+    the deepest path node. The default update writes it only when that edge is
+    unresolved; categorical edges increment structural count without turning
+    exact truth into pseudo-counts.
     """
 
     action: jax.Array
@@ -79,15 +84,19 @@ class PosteriorUpdateContext:
     """Per-node input to ``PosteriorUpdateFn`` during bottom-up backup.
 
     Every invocation has the same node, children, and selected-leaf contract.
-    The callback is responsible for the deepest direct ``B/m/R`` write as well
-    as child repairs, so replacing it replaces the complete backward rule.
-    Ancestors observe the freshly repaired value posterior of every child.
+    The callback is responsible for unresolved Dirichlet ``B/m/R`` writes and
+    child repairs. Exact terminal detection, categorical propagation, and
+    absorbing solved state are search responsibilities exposed through the
+    edge sidecars. Ancestors observe both the freshly repaired cache and any
+    exact child certificate.
     """
 
     node: NodeView
     children: ChildrenView
     leaf: LeafView
     active: jax.Array
+    edge_categorical_outcome: jax.Array | None = None
+    edge_categorical_distance: jax.Array | None = None
 
 
 @chex.dataclass(frozen=True)
@@ -95,6 +104,10 @@ class SearchSummary:
     visit_counts: jax.Array
     alpha: jax.Array
     value_alpha: jax.Array
+    q_categorical_outcome: jax.Array
+    q_categorical_distance: jax.Array
+    v_categorical_outcome: jax.Array
+    v_categorical_distance: jax.Array
 
 
 @chex.dataclass(frozen=True)
@@ -103,15 +116,22 @@ class Tree:
 
     The topology is MCTX-like, but the statistics mirror the Tic-Tac-Toe
     implementation: every edge has ``(B, R)`` (with ``m == (R > 0)``) and every
-    node caches a full value Dirichlet. ``node_n_down`` caches the edge-count
-    reduction so gathering child summaries stays linear in the action count.
-    The posterior rule repairs these data bottom-up.
+    node caches a full value Dirichlet. Exact categorical node and edge
+    certificates are stored separately and are authoritative once published.
+    ``node_n_down`` caches the edge-count reduction so gathering child
+    summaries stays linear in the action count. The posterior rule repairs the
+    unresolved Dirichlet data bottom-up.
     """
 
     parents: jax.Array  # [B, N]
     children_index: jax.Array  # [B, N, A]
     node_to_play: jax.Array  # [B, N]
     node_terminal: jax.Array  # [B, N]
+    node_prior_logits: jax.Array  # [B, N, A]
+    node_categorical_outcome: jax.Array  # [B, N]
+    node_categorical_distance: jax.Array  # [B, N]
+    edge_categorical_outcome: jax.Array  # [B, N, A]
+    edge_categorical_distance: jax.Array  # [B, N, A]
     node_value_priors: jax.Array  # [B, N, O]
     node_n_down: jax.Array  # [B, N]
     invalid_actions: jax.Array  # [B, N, A]
@@ -171,4 +191,16 @@ class Tree:
             visit_counts=visit_counts,
             alpha=alpha,
             value_alpha=posterior.value_alpha,
+            q_categorical_outcome=self.edge_categorical_outcome[
+                :, self.ROOT_INDEX
+            ],
+            q_categorical_distance=self.edge_categorical_distance[
+                :, self.ROOT_INDEX
+            ],
+            v_categorical_outcome=self.node_categorical_outcome[
+                :, self.ROOT_INDEX
+            ],
+            v_categorical_distance=self.node_categorical_distance[
+                :, self.ROOT_INDEX
+            ],
         )

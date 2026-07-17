@@ -1,8 +1,8 @@
-# From-scratch Hex6 speedrun.  Every trial must use a unique empty checkpoint
-# directory: warm starts and continuation runs do not count.
+# From-scratch Hex6 persistent-tree speedrun. Every trial uses a unique empty
+# checkpoint directory: warm starts and continuation runs do not count.
 
 run:
-  seed: 9103
+  seed: 9105
   max_num_iters: 200
 
 env:
@@ -16,25 +16,30 @@ model:
   num_layers: 8
   compute_dtype: bfloat16
   resnet_v2: true
+  # Start at the uninformative Dirichlet [1, 1, 1], then learn evidence mass.
+  # Unlike the old calibrated runs, this is a low floor rather than a fixed C.
+  dirichlet_concentration_floor: 3.0
+  dirichlet_initial_concentration: 3.1
 
 selfplay:
   batch_size: 4096
   max_num_steps: 64
-  # The app.js player commits the argmax of posteriorBestPolicy.  Traversal
-  # itself remains one Thompson draw from every action posterior.
-  action_commitment_type: posterior_argmax
+  # Sample the searched posterior policy during self-play so independent games
+  # keep exploring; evaluation still commits its deterministic argmax below.
+  action_commitment_type: posterior_sample
   search:
     kind: dirichlet_thompson
     dirichlet_thompson:
+      # Keep the corrected persistent tree small enough for a true speedrun.
+      # The DT128 trial learned, but was ~11x slower per iteration than the
+      # old 32-expansion reference and therefore spent its compute poorly.
       num_simulations: 32
-      # Same posterior-best estimator as app.js, with a smaller population as
-      # the speed/variance trade-off for this first controlled speedrun.
+      kappa: 4.0
       policy_samples: 32
+      # The node-local estimator remains unbiased; eight draws amortize the
+      # every-node posterior repair without reverting to root-only updates.
+      posterior_policy_samples: 8
       policy_sample_chunk_size: 32
-      constants:
-        kappa_leaf: 1.0
-        kappa_terminal: 80.0
-        categorical_epsilon: 0.01
 
 training:
   batch_size: 1024
@@ -48,12 +53,18 @@ training:
     q_outcome_weight: 1.0
     q_loss_weight_mode: evidence_mass
     q_dir_kl_reduction: masked_mean
+    # Full KL is intentional: mean-only KL has exactly zero concentration
+    # gradient on unresolved Dirichlet targets.
+    dirichlet_loss_mode: full
     loss_mask_mode: value
     terminal_edge_targets: true
     terminal_parent_targets: true
     policy_target_mode: search
+    categorical_epsilon: 0.01
   regularization:
-    dirichlet_concentration_clip: 8.0
+    # A broad ceiling regularizes categorical density without pinning the
+    # unresolved state-dependent concentration learned by the model.
+    dirichlet_concentration_clip: 16.0
 
 eval:
   interval: 5
@@ -65,12 +76,10 @@ eval:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
+      kappa: 4.0
       policy_samples: 32
+      posterior_policy_samples: 32
       policy_sample_chunk_size: 32
-      constants:
-        kappa_leaf: 1.0
-        kappa_terminal: 80.0
-        categorical_epsilon: 0.01
   baseline_search:
     kind: gumbel
     gumbel:
@@ -85,4 +94,4 @@ logging:
 checkpointing:
   max_to_keep: 1
   save_interval_steps: 10
-  directory: checkpoints/hex6_speedrun_scratch_seed9103_v1
+  directory: checkpoints/hex6_nativecat_fullc_c16_dt32p8_psample_seed9105_v4

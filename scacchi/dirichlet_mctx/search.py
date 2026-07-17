@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 
 from . import action_selection, base
+from .categorical import NO_DISTANCE, NO_OUTCOME
 from .tree import (
     ChildrenView,
     LeafView,
@@ -120,6 +121,30 @@ def instantiate_tree_from_root(
         node_terminal=jnp.zeros(batch_node, dtype=bool).at[:, Tree.ROOT_INDEX].set(
             root.terminal
         ),
+        node_prior_logits=jnp.zeros(
+            batch_node_action,
+            dtype=root.prior_logits.dtype,
+        ).at[:, Tree.ROOT_INDEX].set(root.prior_logits),
+        node_categorical_outcome=jnp.full(
+            batch_node,
+            int(NO_OUTCOME),
+            dtype=jnp.int8,
+        ),
+        node_categorical_distance=jnp.full(
+            batch_node,
+            int(NO_DISTANCE),
+            dtype=jnp.int32,
+        ),
+        edge_categorical_outcome=jnp.full(
+            batch_node_action,
+            int(NO_OUTCOME),
+            dtype=jnp.int8,
+        ),
+        edge_categorical_distance=jnp.full(
+            batch_node_action,
+            int(NO_DISTANCE),
+            dtype=jnp.int32,
+        ),
         node_value_priors=jnp.ones(
             (*batch_node, num_outcomes),
             dtype=root.value.dtype,
@@ -147,22 +172,69 @@ def simulate(
     """Traverse one unbatched tree to an unvisited, terminal, or cutoff edge."""
 
     root_index = jnp.asarray(Tree.ROOT_INDEX, dtype=jnp.int32)
+    root_searchable_actions = (
+        ~tree.invalid_actions[root_index]
+        & (
+            tree.edge_categorical_outcome[root_index]
+            == int(NO_OUTCOME)
+        )
+    )
     root_active = (
         ~tree.node_terminal[root_index]
-        & jnp.any(~tree.invalid_actions[root_index])
+        & (tree.node_categorical_outcome[root_index] == int(NO_OUTCOME))
+        & jnp.any(root_searchable_actions)
     )
 
     def body_fn(state: _SimulationState) -> _SimulationState:
         node_index = state.next_node_index
         next_key, selection_key = jax.random.split(state.rng_key)
-        action = action_selection_fn(selection_key, tree, node_index)
+        searchable_actions = (
+            ~tree.invalid_actions[node_index]
+            & (
+                tree.edge_categorical_outcome[node_index]
+                == int(NO_OUTCOME)
+            )
+        )
+        # Categorical exclusion is part of traversal, not a convention that
+        # only the default selector knows about. Existing custom selectors see
+        # the certified edges through the same invalid-action contract.
+        selection_tree = replace(
+            tree,
+            invalid_actions=tree.invalid_actions.at[node_index].set(
+                ~searchable_actions
+            ),
+        )
+        proposed_action = action_selection_fn(
+            selection_key,
+            selection_tree,
+            node_index,
+        )
+        # Selectors are expected to honor the mask. The fallback also makes
+        # the categorical invariant robust to an older selector that does not.
+        fallback_action = jnp.argmax(searchable_actions).astype(jnp.int32)
+        action = jnp.where(
+            searchable_actions[proposed_action],
+            proposed_action,
+            fallback_action,
+        )
         child_index = tree.children_index[node_index, action]
         visited = child_index != Tree.UNVISITED
         safe_child = jnp.where(visited, child_index, Tree.ROOT_INDEX)
         depth = state.depth + 1
+        child_has_searchable_action = jnp.any(
+            ~tree.invalid_actions[safe_child]
+            & (
+                tree.edge_categorical_outcome[safe_child]
+                == int(NO_OUTCOME)
+            )
+        )
         child_selectable = (
             ~tree.node_terminal[safe_child]
-            & jnp.any(~tree.invalid_actions[safe_child])
+            & (
+                tree.node_categorical_outcome[safe_child]
+                == int(NO_OUTCOME)
+            )
+            & child_has_searchable_action
         )
         continuing = visited & child_selectable & (depth < max_depth)
         return _SimulationState(
@@ -211,6 +283,25 @@ def expand(
     step, child_embedding = recurrent_fn(params, rng_key, action, embedding)
     child_invalid_actions = ~jnp.isfinite(step.prior_logits)
     initialize = simulation.active & is_new
+    num_outcomes = tree.posterior.value_alpha.shape[-1]
+    child_terminal_outcome = step.terminal_outcome.astype(jnp.int8)
+    child_terminal = child_terminal_outcome != int(NO_OUTCOME)
+    parent_player = tree.node_to_play[batch, parent_index]
+    parent_terminal_outcome = jnp.where(
+        step.to_play == parent_player,
+        child_terminal_outcome,
+        (num_outcomes - 1 - child_terminal_outcome).astype(jnp.int8),
+    )
+    old_edge_categorical = tree.edge_categorical_outcome[
+        batch,
+        parent_index,
+        action,
+    ]
+    publish_terminal = (
+        simulation.active
+        & child_terminal
+        & (old_edge_categorical == int(NO_OUTCOME))
+    )
     posterior = tree.posterior
 
     tree = replace(
@@ -237,8 +328,52 @@ def expand(
         node_terminal=_set_new_node(
             tree.node_terminal,
             new_node_index,
-            step.terminal,
+            child_terminal,
             initialize,
+        ),
+        node_prior_logits=_set_new_node(
+            tree.node_prior_logits,
+            new_node_index,
+            step.prior_logits,
+            initialize,
+        ),
+        node_categorical_outcome=_set_new_node(
+            tree.node_categorical_outcome,
+            new_node_index,
+            jnp.where(
+                child_terminal,
+                child_terminal_outcome,
+                jnp.asarray(int(NO_OUTCOME), dtype=jnp.int8),
+            ),
+            initialize,
+        ),
+        node_categorical_distance=_set_new_node(
+            tree.node_categorical_distance,
+            new_node_index,
+            jnp.where(
+                child_terminal,
+                jnp.zeros_like(child_terminal, dtype=jnp.int32),
+                jnp.full_like(
+                    child_terminal,
+                    int(NO_DISTANCE),
+                    dtype=jnp.int32,
+                ),
+            ),
+            initialize,
+        ),
+        edge_categorical_outcome=_set_edge(
+            tree.edge_categorical_outcome,
+            parent_index,
+            action,
+            parent_terminal_outcome,
+            publish_terminal,
+        ),
+        edge_categorical_distance=_set_edge(
+            tree.edge_categorical_distance,
+            parent_index,
+            action,
+            jnp.ones_like(parent_terminal_outcome, dtype=jnp.int32),
+            publish_terminal,
         ),
         node_value_priors=_set_new_node(
             tree.node_value_priors,
@@ -370,14 +505,138 @@ def _set_node_posterior(
     )
 
 
+def _categorize_node_and_publish(
+    tree: Tree,
+    node_index: jax.Array,
+    active: jax.Array,
+    categorical_draw_rule: str,
+) -> Tree:
+    """Publish an absorbing node certificate and its incoming edge."""
+
+    batch = jnp.arange(tree.parents.shape[0])
+    edge_outcome = tree.edge_categorical_outcome[batch, node_index]
+    edge_distance = tree.edge_categorical_distance[batch, node_index]
+    invalid_actions = tree.invalid_actions[batch, node_index]
+    legal = ~invalid_actions
+    known = legal & (edge_outcome != int(NO_OUTCOME))
+    has_legal = jnp.any(legal, axis=-1)
+    all_categorical = has_legal & jnp.all(~legal | known, axis=-1)
+    num_outcomes = tree.posterior.value_alpha.shape[-1]
+    win_index = num_outcomes - 1
+    has_win = jnp.any(known & (edge_outcome == win_index), axis=-1)
+    if num_outcomes == 3:
+        has_draw = jnp.any(known & (edge_outcome == 1), axis=-1)
+    else:
+        has_draw = jnp.zeros_like(has_win)
+
+    candidate_outcome = jnp.where(
+        has_win,
+        jnp.asarray(win_index, dtype=jnp.int8),
+        jnp.where(
+            all_categorical & has_draw,
+            jnp.asarray(1, dtype=jnp.int8),
+            jnp.where(
+                all_categorical,
+                jnp.asarray(0, dtype=jnp.int8),
+                jnp.asarray(int(NO_OUTCOME), dtype=jnp.int8),
+            ),
+        ),
+    )
+    candidate_action = action_selection.categorical_action(
+        candidate_outcome,
+        edge_outcome,
+        edge_distance,
+        tree.node_prior_logits[batch, node_index],
+        invalid_actions,
+        num_outcomes=num_outcomes,
+        draw_rule=categorical_draw_rule,
+    )
+    candidate_distance = jnp.take_along_axis(
+        edge_distance,
+        candidate_action[:, None],
+        axis=-1,
+    )[:, 0]
+    old_outcome = tree.node_categorical_outcome[batch, node_index]
+    old_distance = tree.node_categorical_distance[batch, node_index]
+    publish_node = (
+        active
+        & (old_outcome == int(NO_OUTCOME))
+        & (candidate_outcome != int(NO_OUTCOME))
+    )
+    new_outcome = jnp.where(publish_node, candidate_outcome, old_outcome)
+    new_distance = jnp.where(publish_node, candidate_distance, old_distance)
+    tree = replace(
+        tree,
+        node_categorical_outcome=_set_node(
+            tree.node_categorical_outcome,
+            node_index,
+            new_outcome,
+            publish_node,
+        ),
+        node_categorical_distance=_set_node(
+            tree.node_categorical_distance,
+            node_index,
+            new_distance,
+            publish_node,
+        ),
+    )
+
+    # A node certificate induces an exact edge certificate one ply farther
+    # from terminal, aligned to the parent node's player perspective.
+    parent = tree.parents[batch, node_index]
+    has_parent = parent != Tree.NO_PARENT
+    safe_parent = jnp.where(has_parent, parent, Tree.ROOT_INDEX)
+    parent_children = tree.children_index[batch, safe_parent]
+    incoming = parent_children == node_index[:, None]
+    has_incoming = jnp.any(incoming, axis=-1)
+    incoming_action = jnp.argmax(incoming, axis=-1).astype(jnp.int32)
+    old_edge_outcome = tree.edge_categorical_outcome[
+        batch,
+        safe_parent,
+        incoming_action,
+    ]
+    publish_edge = (
+        active
+        & has_parent
+        & has_incoming
+        & (new_outcome != int(NO_OUTCOME))
+        & (old_edge_outcome == int(NO_OUTCOME))
+    )
+    node_player = tree.node_to_play[batch, node_index]
+    parent_player = tree.node_to_play[batch, safe_parent]
+    aligned_outcome = jnp.where(
+        node_player == parent_player,
+        new_outcome,
+        (num_outcomes - 1 - new_outcome).astype(jnp.int8),
+    )
+    return replace(
+        tree,
+        edge_categorical_outcome=_set_edge(
+            tree.edge_categorical_outcome,
+            safe_parent,
+            incoming_action,
+            aligned_outcome,
+            publish_edge,
+        ),
+        edge_categorical_distance=_set_edge(
+            tree.edge_categorical_distance,
+            safe_parent,
+            incoming_action,
+            new_distance + jnp.asarray(1, dtype=jnp.int32),
+            publish_edge,
+        ),
+    )
+
+
 def backward(
     rng_key: chex.PRNGKey,
     tree: Tree,
     simulation: Simulation,
     step: base.RecurrentFnOutput,
     posterior_update: base.PosteriorUpdateFn,
+    categorical_draw_rule: str,
 ) -> Tree:
-    """Repair every traversed parent bottom-up using one replaceable rule."""
+    """Repair uncertain posteriors and propagate exact certificates upward."""
 
     batch = jnp.arange(tree.parents.shape[0])
     active = simulation.active
@@ -398,14 +657,28 @@ def backward(
             children=children,
             leaf=LeafView(
                 action=simulation.action,
-                value_alpha=step.leaf_value,
+                value_alpha=step.value,
                 to_play=step.to_play,
                 active=leaf_active,
             ),
             active=active,
+            edge_categorical_outcome=tree.edge_categorical_outcome[
+                batch,
+                safe_node,
+            ],
+            edge_categorical_distance=tree.edge_categorical_distance[
+                batch,
+                safe_node,
+            ],
         )
         repaired = posterior_update(update_key, context)
         tree = _set_node_posterior(tree, safe_node, repaired, active)
+        tree = _categorize_node_and_publish(
+            tree,
+            safe_node,
+            active,
+            categorical_draw_rule,
+        )
         at_root = active & (safe_node == Tree.ROOT_INDEX)
         parent = tree.parents[batch, safe_node]
         next_node = jnp.where(active & ~at_root, parent, Tree.ROOT_INDEX)
@@ -436,6 +709,7 @@ def search(
     num_simulations: int,
     max_depth: int | None = None,
     invalid_actions: jax.Array | None = None,
+    categorical_draw_rule: str = "policy_prior",
     loop_fn: base.LoopFn = jax.lax.fori_loop,
 ) -> Tree:
     """Run ``simulate -> expand -> bottom-up repair`` a fixed number of times."""
@@ -452,6 +726,9 @@ def search(
     max_depth = max(1, int(max_depth))
     if invalid_actions is None:
         invalid_actions = jnp.zeros_like(root.prior_logits, dtype=bool)
+    categorical_draw_rule = action_selection.validate_categorical_draw_rule(
+        categorical_draw_rule
+    )
 
     tree = instantiate_tree_from_root(
         root,
@@ -470,26 +747,35 @@ def search(
             action_selection_fn,
             max_depth,
         )
-        parent = jnp.where(simulation.active, simulation.parent_index, 0)
-        action = jnp.where(simulation.active, simulation.action, 0)
-        child = tree.children_index[batch, parent, action]
-        is_new = simulation.active & (child == Tree.UNVISITED)
-        new_node = jnp.asarray(simulation_index + 1, dtype=jnp.int32)
-        tree, step = expand(
-            params,
-            expand_key,
+        def run_active_simulation(tree: Tree) -> Tree:
+            parent = jnp.where(simulation.active, simulation.parent_index, 0)
+            action = jnp.where(simulation.active, simulation.action, 0)
+            child = tree.children_index[batch, parent, action]
+            is_new = simulation.active & (child == Tree.UNVISITED)
+            new_node = jnp.asarray(simulation_index + 1, dtype=jnp.int32)
+            tree, step = expand(
+                params,
+                expand_key,
+                tree,
+                recurrent_fn,
+                simulation,
+                new_node,
+                is_new,
+            )
+            return backward(
+                backward_key,
+                tree,
+                simulation,
+                step,
+                posterior_update,
+                categorical_draw_rule,
+            )
+
+        tree = jax.lax.cond(
+            jnp.any(simulation.active),
+            run_active_simulation,
+            lambda current_tree: current_tree,
             tree,
-            recurrent_fn,
-            simulation,
-            new_node,
-            is_new,
-        )
-        tree = backward(
-            backward_key,
-            tree,
-            simulation,
-            step,
-            posterior_update,
         )
         return key, tree
 

@@ -3,25 +3,23 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="A mathematical reference for Dirichlet-Q AlphaZero: WDL uncertainty, posterior search, and training targets.">
-    <title>Dirichlet-Q AlphaZero · Math Reference</title>
+    <meta name="description" content="A math-first explanation of Scacchi's Dirichlet Thompson tree search and bottom-up posterior repair.">
+    <title>Dirichlet Thompson Tree Search</title>
     <script src="https://distill.pub/template.v2.js"></script>
     <style>
       :root {
         --ink: #202124;
         --muted: #646b73;
         --accent: #356859;
+        --accent-soft: #eaf2ef;
         --surface: #f5f7f6;
         --rule: #d9dedb;
+        --warm: #fff8e7;
+        --warm-line: #c58b16;
       }
 
-      html {
-        scroll-behavior: smooth;
-      }
-
-      body {
-        color: var(--ink);
-      }
+      html { scroll-behavior: smooth; }
+      body { color: var(--ink); }
 
       d-title {
         border-bottom: 1px solid var(--rule);
@@ -30,30 +28,21 @@
 
       d-title h1 {
         letter-spacing: -0.025em;
+        max-width: 820px;
       }
 
       d-title p {
         color: var(--muted);
-        max-width: 720px;
+        max-width: 760px;
       }
 
       d-article h2 {
         border-top: 1px solid var(--rule);
-        margin-top: 3.25rem;
+        margin-top: 3.4rem;
         padding-top: 1.2rem;
       }
 
-      d-article h3 {
-        margin-top: 2.3rem;
-      }
-
-      d-article hr {
-        border: 0;
-        border-top: 1px solid var(--rule);
-        grid-column: text;
-        margin: 2.5rem 0 0;
-        width: 100%;
-      }
+      d-article h3 { margin-top: 2.2rem; }
 
       d-article code {
         background: var(--surface);
@@ -62,27 +51,147 @@
         padding: 0.12em 0.32em;
       }
 
-      d-article li {
-        margin-bottom: 0.35rem;
+      d-article li { margin-bottom: 0.4rem; }
+
+      .lead {
+        color: #38413e;
+        font-size: 1.1rem;
+        line-height: 1.65;
       }
 
-      .implementation-note {
+      .correction {
+        background: var(--warm);
+        border-left: 3px solid var(--warm-line);
+        box-sizing: border-box;
+        grid-column: text;
+        margin: 1.6rem 0;
+        padding: 0.9rem 1rem;
+        width: 100%;
+      }
+
+      .correction p { margin: 0; }
+
+      .symbol-table {
+        border-collapse: collapse;
+        grid-column: text;
+        margin: 1.5rem 0 2rem;
+        width: 100%;
+      }
+
+      .symbol-table th,
+      .symbol-table td {
+        border-bottom: 1px solid var(--rule);
+        padding: 0.65rem 0.55rem;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      .symbol-table th {
+        color: var(--muted);
+        font-size: 0.82rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .symbol-table td:first-child {
+        color: var(--accent);
+        white-space: nowrap;
+        width: 18%;
+      }
+
+      .stage-row {
+        display: grid;
+        gap: 0.85rem;
+        grid-column: text;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        margin: 1.7rem 0 2rem;
+        width: 100%;
+      }
+
+      .stage {
         background: var(--surface);
-        border-left: 3px solid var(--accent);
-        color: #424846;
+        border-top: 3px solid var(--accent);
+        padding: 0.9rem 1rem;
+      }
+
+      .stage .number {
+        color: var(--accent);
+        font-size: 0.76rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .stage-title {
+        font-size: 1.02rem;
+        font-weight: 600;
+        margin: 0.25rem 0 0.45rem;
+      }
+
+      .stage p {
+        color: #4e5552;
+        font-size: 0.9rem;
+        line-height: 1.5;
+        margin: 0;
+      }
+
+      .equation-note {
+        border-left: 2px solid var(--rule);
+        color: var(--muted);
+        font-size: 0.9rem;
+        margin: -0.5rem 0 1.75rem;
+        padding-left: 0.8rem;
+      }
+
+      .step-label {
+        color: var(--accent);
+        font-size: 0.8rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-top: 2.1rem;
+        text-transform: uppercase;
+      }
+
+      .two-column {
+        display: grid;
+        gap: 1rem;
+        grid-column: text;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin: 1.5rem 0;
+        width: 100%;
+      }
+
+      .mini-card {
+        background: var(--accent-soft);
         padding: 0.85rem 1rem;
       }
 
-      .page-footer {
-        color: var(--muted);
-        font-size: 0.85rem;
-        margin-top: 4rem;
+      .mini-card p {
+        font-size: 0.9rem;
+        margin: 0.3rem 0;
       }
 
-      @media (max-width: 700px) {
+      .page-footer {
+        border-top: 1px solid var(--rule);
+        color: var(--muted);
+        font-size: 0.86rem;
+        margin-top: 4rem;
+        padding-top: 1rem;
+      }
+
+      @media (max-width: 760px) {
         d-title h1 {
           font-size: 2.2rem;
           line-height: 1.08;
+        }
+
+        .stage-row,
+        .two-column {
+          grid-template-columns: 1fr;
+        }
+
+        .symbol-table {
+          font-size: 0.9rem;
         }
 
         d-article d-math[block] {
@@ -94,1612 +203,537 @@
   </head>
   <body>
     <d-title>
-      <h1>Dirichlet-Q AlphaZero</h1>
-      <p>A mathematical reference for uncertainty-aware WDL search, posterior policy improvement, and Dirichlet training targets.</p>
+      <h1>Dirichlet Thompson Tree Search</h1>
+      <p>A math-first explanation of Scacchi's lightweight tree, its bottom-up message passing, and the targets returned to the network.</p>
     </d-title>
 
     <d-article>
       <d-contents></d-contents>
 
-    <p class="implementation-note"><strong>Implementation note:</strong> the active Dirichlet-Q search is implemented in JAX on top of MCTX. Visited-node evidence is aligned to the root player's perspective, grouped by the first root action, and added to that action's Dirichlet prior.</p>
+      <p class="lead">The search represents unresolved state and action values as learned Dirichlet beliefs over loss, draw, and win. Exact terminal and solved results live in categorical outcome/distance sidecars. A simulation walks unresolved edges by Thompson sampling, evaluates one frontier edge, and repairs every node on the path back to the root.</p>
 
-    <h2 id="1-big-picture">1. Big picture</h2>
+      <div class="correction">
+        <p><strong>The central idea:</strong> an unresolved edge stores the latest repaired Dirichlet message; it does not keep adding leaf evidence. A separate structural count controls prior mixing. Once an edge is categorical, its exact sidecar—not an artificially concentrated alpha—owns its semantics.</p>
+      </div>
 
-    <p>The network predicts three objects at each state:</p>
+      <h2 id="1-network-beliefs">1. Network beliefs</h2>
 
-    <ol>
+      <p>At state <d-math>s</d-math>, the network predicts a policy together with one state Dirichlet and one Dirichlet for every action:</p>
 
-      <li>a policy head <d-math>\pi_\theta(a \mid s)</d-math>,</li>
-
-      <li>a state-value Dirichlet head <d-math>\alpha_\theta^V(s)</d-math>,</li>
-
-      <li>an action-value Dirichlet-Q head <d-math>\alpha_\theta^Q(s,a)</d-math>.</li>
-
-    </ol>
-
-    <p>The value head represents uncertainty over the WDL value of a state:</p>
-
-    <d-math block>
-\alpha_\theta^V(s) \Longrightarrow p(\phi_s^V \mid s).
-    </d-math>
-
-    <p>The Q head represents uncertainty over the WDL value of each action:</p>
-
-    <d-math block>
-\alpha_\theta^Q(s,a) \Longrightarrow p(\phi_{s,a}^Q \mid s,a).
-    </d-math>
-
-    <p>Search evaluates actions and accumulates WDL evidence by the first root action. For policy improvement and Q-target construction, each action uses the next-state value Dirichlet as its prior, aligned back to the root player's perspective:</p>
-
-    <d-math block>
-\alpha_a^{\mathrm{child}}(s)=
-\textrm{flip}
-\left(
-\alpha_{\theta^-}^V(s_a)
-\right),
+      <d-math block>
+\pi_\theta(a\mid s),
 \qquad
-s_a = \textrm{Step}(s,a).
-    </d-math>
-
-    <p>The action posterior used for the search-improved policy and Q target is</p>
-
-    <d-math block>
-\alpha_a^{\mathrm{post}}(s)=
-\alpha_a^{\mathrm{child}}(s)+E_Q(s,a),
-    </d-math>
-
-    <p>The policy target after search is the posterior probability that each action is optimal:</p>
-
-    <d-math block>
-\pi_{\mathrm{search}}(a \mid s) =
-\mathbb{P}
-\left(
-a = \arg\max_b U(\phi_b)
-\right).
-    </d-math>
-
-    <p>The policy head distills this expensive Bayesian search target into a fast amortized prediction:</p>
-
-    <d-math block>
-\pi_\theta(a \mid s)
-\approx
-\pi_{\mathrm{search}}(a \mid s).
-    </d-math>
-
-    <p>The value head is used to evaluate non-terminal search leaves and to replace the Q fallback once a one-ply child state has been explored. The Q head supplies the action-level prior for unexplored actions and is trained to predict the action-level posteriors produced for explored actions. Both Dirichlet heads are trained by KL divergence toward posterior Dirichlet targets produced by Bayesian-style evidence updates.</p>
-
-    <hr>
-
-    <h2 id="2-outcome-space-utility-and-perspective">2. Outcome space, utility, and perspective</h2>
-
-    <p>For a two-player zero-sum game, define the terminal outcome from the current player's perspective as</p>
-
-    <d-math block>
-z \in \mathcal{Z} = \{L,D,W\},
-    </d-math>
-
-    <p>where</p>
-
-    <d-math block>
-L = -1, \qquad D = 0, \qquad W = +1.
-    </d-math>
-
-    <p>A WDL distribution is</p>
-
-    <d-math block>
-\phi = (p_L,p_D,p_W) \in \Delta^2.
-    </d-math>
-
-    <p>Here <d-math>p_z</d-math> is the probability of outcome <d-math>z</d-math> from the perspective of the player to move.</p>
-
-    <p>Use the same utility everywhere:</p>
-
-    <d-math block>
-U(\phi) = p_W - p_L.
-    </d-math>
-
-    <p>This utility is used for search selection, posterior-best policy construction, final action selection, and policy training.</p>
-
-    <p>For any action-level WDL sample <d-math>\phi_a</d-math>, the preferred action is</p>
-
-    <d-math block>
-a^\star =
-\arg\max_a U(\phi_a).
-    </d-math>
-
-    <p>WDL distributions are always represented from the perspective of the player to move. If</p>
-
-    <d-math block>
-d = (d_L,d_D,d_W),
-    </d-math>
-
-    <p>then the opponent-perspective WDL distribution is</p>
-
-    <d-math block>
-\textrm{flip}(d) =
-(d_W,d_D,d_L).
-    </d-math>
-
-    <p>The utility changes sign under this flip:</p>
-
-    <d-math block>
-U(\textrm{flip}(d)) =
--U(d).
-    </d-math>
-
-    <p>The same flip applies to Dirichlet parameters:</p>
-
-    <d-math block>
-\textrm{flip}(\alpha_L,\alpha_D,\alpha_W) =
-(\alpha_W,\alpha_D,\alpha_L).
-    </d-math>
-
-    <p>During backup, apply this flip whenever the player-to-move perspective changes.</p>
-
-    <hr>
-
-    <h2 id="3-network-outputs">3. Network outputs</h2>
-
-    <p>The network has three heads:</p>
-
-    <d-math block>
-\pi_\theta(a \mid s),
+V_s=\alpha_\theta^V(s),
 \qquad
-\alpha_\theta^V(s),
+Q_{s,a}=\alpha_\theta^Q(s,a).
+      </d-math>
+
+      <p>A Dirichlet parameter vector <d-math>\alpha</d-math> represents uncertainty about an outcome distribution:</p>
+
+      <d-math block>
+\phi\sim\mathrm{Dirichlet}(\alpha),
 \qquad
-\alpha_\theta^Q(s,a).
-    </d-math>
+\mu(\alpha)=\mathbb E[\phi]
+=\frac{\alpha}{\sum_z\alpha_z}.
+      </d-math>
 
-    <h3 id="3-1-policy-head">3.1 Policy head</h3>
+      <p>The outcomes are ordered as <d-math>(L,W)</d-math> or <d-math>(L,D,W)</d-math>. Search compares samples with the same utility everywhere:</p>
 
-    <p>The policy head is</p>
+      <d-math block>
+U(\phi)=\phi_W-\phi_L.
+      </d-math>
 
-    <d-math block>
-\pi_\theta(a \mid s) =
-\textrm{softmax}(\ell_\theta(s,a)).
-    </d-math>
+      <h3 id="1-1-player-perspective">1.1 Player perspective</h3>
 
-    <p>Its intended meaning is</p>
+      <p>Values belong to the player to move at their node. Moving a value to the opponent's perspective reverses loss and win:</p>
 
-    <d-math block>
-\pi_\theta(a \mid s)
-\approx
-\mathbb{P}
-\left(
-a =
-\arg\max_b U(\phi_{s,b}^Q)
-\right).
-    </d-math>
+      <d-math block>
+\mathrm{flip}(x_L,x_D,x_W)
+=(x_W,x_D,x_L).
+      </d-math>
 
-    <p>That is, the policy head predicts the posterior probability that each move is optimal.</p>
-
-    <hr>
-
-    <h3 id="3-2-state-value-dirichlet-head">3.2 State-value Dirichlet head</h3>
-
-    <p>The value head predicts Dirichlet parameters</p>
-
-    <d-math block>
-\alpha_\theta^V(s) =
-\left(
-\alpha_{\theta,L}^V(s),
-\alpha_{\theta,D}^V(s),
-\alpha_{\theta,W}^V(s)
-\right),
-\qquad
-\alpha_{\theta,z}^V(s) > 0.
-    </d-math>
-
-    <p>The latent WDL value distribution is modeled as</p>
-
-    <d-math block>
-\phi_s^V
-\sim
-\textrm{Dirichlet}
-\left(
-\alpha_\theta^V(s)
-\right).
-    </d-math>
-
-    <p>The value-head mean is</p>
-
-    <d-math block>
-\bar{\phi}_{\theta,z}^V(s) =
-\frac{\alpha_{\theta,z}^V(s)}
-{\alpha_{\theta,0}^V(s)},
-\qquad
-\alpha_{\theta,0}^V(s) =
-\sum_{z \in \{L,D,W\}}
-\alpha_{\theta,z}^V(s).
-    </d-math>
-
-    <p>The value head answers:</p>
-
-    <d-math block>
-V(s) =
-\text{WDL belief for state } s.
-    </d-math>
-
-    <hr>
-
-    <h3 id="3-3-action-dirichlet-q-head">3.3 Action Dirichlet-Q head</h3>
-
-    <p>The Q head predicts Dirichlet parameters for each state-action pair:</p>
-
-    <d-math block>
-\alpha_\theta^Q(s,a) =
-\left(
-\alpha_{\theta,L}^Q(s,a),
-\alpha_{\theta,D}^Q(s,a),
-\alpha_{\theta,W}^Q(s,a)
-\right),
-\qquad
-\alpha_{\theta,z}^Q(s,a) > 0.
-    </d-math>
-
-    <p>The latent WDL distribution for action <d-math>a</d-math> is modeled as</p>
-
-    <d-math block>
-\phi_{s,a}^Q
-\sim
-\textrm{Dirichlet}
-\left(
-\alpha_\theta^Q(s,a)
-\right).
-    </d-math>
-
-    <p>The Q-head mean is</p>
-
-    <d-math block>
-\bar{\phi}_{\theta,z}^Q(s,a) =
-\frac{\alpha_{\theta,z}^Q(s,a)}
-{\alpha_{\theta,0}^Q(s,a)},
-\qquad
-\alpha_{\theta,0}^Q(s,a) =
-\sum_{z \in \{L,D,W\}}
-\alpha_{\theta,z}^Q(s,a).
-    </d-math>
-
-    <p>The Q head answers:</p>
-
-    <d-math block>
-Q(s,a) =
-\text{WDL belief after choosing action } a \text{ in state } s.
-    </d-math>
-
-    <hr>
-
-    <h2 id="4-stable-dirichlet-parameterization">4. Stable Dirichlet parameterization</h2>
-
-    <p>For both the value head and the Q head, use a mean-concentration parameterization.</p>
-
-    <p>The network predicts:</p>
-
-    <ul>
-
-      <li>WDL mean logits <d-math>r_\theta</d-math>,</li>
-
-      <li>one scalar concentration logit <d-math>t_\theta</d-math>.</li>
-
-    </ul>
-
-    <p>Define the predicted WDL mean as</p>
-
-    <d-math block>
-\bar{\phi}_\theta =
-\textrm{softmax}(r_\theta)
-\in \Delta^2.
-    </d-math>
-
-    <p>Define the Dirichlet concentration as</p>
-
-    <d-math block>
-\alpha_{\theta,0} =
-\textrm{softplus}(t_\theta)^2 > 0.
-    </d-math>
-
-    <p>Then define the Dirichlet parameters as</p>
-
-    <d-math block>
-\alpha_\theta =
-\alpha_{\theta,0}\bar{\phi}_\theta.
-    </d-math>
-
-    <p>Equivalently, component-wise:</p>
-
-    <d-math block>
-\alpha_{\theta,z} =
-\textrm{softplus}(t_\theta)^2\bar{\phi}_{\theta,z},
-\qquad
-z \in \{L,D,W\}.
-    </d-math>
-
-    <p>There is no additive base Dirichlet prior in the network parameterization.</p>
-
-    <p>The mean is</p>
-
-    <d-math block>
-\mathbb{E}[\phi_z]=
-\frac{\alpha_{\theta,z}}{\alpha_{\theta,0}}=
-\bar{\phi}_{\theta,z}.
-    </d-math>
-
-    <p>The concentration is</p>
-
-    <d-math block>
-\alpha_{\theta,0}=
-\sum_z \alpha_{\theta,z}.
-    </d-math>
-
-    <p>Low concentration means broad epistemic uncertainty over the true WDL probabilities. High concentration means high confidence.</p>
-
-    <p>For the value head:</p>
-
-    <d-math block>
-\bar{\phi}_\theta^V(s) =
-\textrm{softmax}(r_\theta^V(s)),
-\qquad
-\alpha_{\theta,0}^V(s) =
-\textrm{softplus}(t_\theta^V(s))^2,
-    </d-math>
-
-    <p>and</p>
-
-    <d-math block>
-\alpha_\theta^V(s) =
-\alpha_{\theta,0}^V(s)
-\bar{\phi}_\theta^V(s).
-    </d-math>
-
-    <p>For the Q head:</p>
-
-    <d-math block>
-\bar{\phi}_\theta^Q(s,a) =
-\textrm{softmax}(r_\theta^Q(s,a)),
-\qquad
-\alpha_{\theta,0}^Q(s,a) =
-\textrm{softplus}(t_\theta^Q(s,a))^2,
-    </d-math>
-
-    <p>and</p>
-
-    <d-math block>
-\alpha_\theta^Q(s,a) =
-\alpha_{\theta,0}^Q(s,a)
-\bar{\phi}_\theta^Q(s,a).
-    </d-math>
-
-    <hr>
-
-    <h2 id="5-evidence-and-dirichlet-updates">5. Evidence and Dirichlet updates</h2>
-
-    <p>Let</p>
-
-    <d-math block>
-\phi
-\sim
-\textrm{Dirichlet}(\alpha)
-    </d-math>
-
-    <p>be a prior over WDL outcome probabilities.</p>
-
-    <p>Suppose we receive WDL evidence</p>
-
-    <d-math block>
-d =
-(d_L,d_D,d_W)
-\in \Delta^2
-    </d-math>
-
-    <p>with evidence strength</p>
-
-    <d-math block>
-\lambda > 0.
-    </d-math>
-
-    <p>Then the posterior is</p>
-
-    <d-math block>
-p(\phi \mid d,\lambda) =
-\textrm{Dirichlet}
-\left(
-\alpha + \lambda d
-\right).
-    </d-math>
-
-    <p>Equivalently, the updated Dirichlet parameters are</p>
-
-    <d-math block>
-\alpha'_z =
-\alpha_z + \lambda d_z,
-\qquad
-z \in \{L,D,W\}.
-    </d-math>
-
-    <p>For a terminal outcome <d-math>z^\star</d-math>, the WDL evidence is one-hot:</p>
-
-    <d-math block>
-d =
-e_{z^\star}.
-    </d-math>
-
-    <p>Then the posterior is</p>
-
-    <d-math block>
-p(\phi \mid z^\star,\lambda) =
-\textrm{Dirichlet}
-\left(
-\alpha + \lambda e_{z^\star}
-\right).
-    </d-math>
-
-    <p>If <d-math>\lambda = 1</d-math>, this is the standard Dirichlet update from one observed categorical sample.</p>
-
-    <p>For multiple independent categorical observations with counts</p>
-
-    <d-math block>
-n =
-(n_L,n_D,n_W),
-    </d-math>
-
-    <p>the exact posterior is</p>
-
-    <d-math block>
-p(\phi \mid n) =
-\textrm{Dirichlet}
-\left(
-\alpha + n
-\right).
-    </d-math>
-
-    <p>The soft-evidence version is recovered by setting</p>
-
-    <d-math block>
-n =
-\lambda d.
-    </d-math>
-
-    <p>In neural search, <d-math>\lambda d</d-math> should be interpreted as calibrated pseudo-evidence unless it comes from actual independent terminal samples.</p>
-
-    <p>The important point is that <d-math>d</d-math> can be one-hot because the posterior target is not <d-math>\lambda d</d-math> alone. The posterior target is</p>
-
-    <d-math block>
-\alpha + \lambda d.
-    </d-math>
-
-    <p>Since the prior <d-math>\alpha</d-math> is strictly positive, the posterior is always a valid Dirichlet distribution.</p>
-
-    <hr>
-
-    <h2 id="6-leaf-evaluation-and-backup">6. Leaf evaluation and backup</h2>
-
-    <p>Search may stop at either terminal or non-terminal leaves.</p>
-
-    <p>The role of leaf evaluation is to return WDL evidence:</p>
-
-    <d-math block>
-\textrm{Eval}(s_\ell) =
-(d_\ell,\lambda_\ell),
-\qquad
-d_\ell \in \Delta^2,
-\qquad
-\lambda_\ell > 0.
-    </d-math>
-
-    <hr>
-
-    <h3 id="6-1-terminal-leaf">6.1 Terminal leaf</h3>
-
-    <p>If the leaf is terminal with outcome <d-math>z</d-math>, return the one-hot WDL target:</p>
-
-    <d-math block>
-d_\ell =
-e_z.
-    </d-math>
-
-    <p>Use terminal evidence strength:</p>
-
-    <d-math block>
-\lambda_\ell =
-c_{\mathrm{terminal}}.
-    </d-math>
-
-    <p>Therefore, the evidence contribution is</p>
-
-    <d-math block>
-\lambda_\ell d_\ell =
-c_{\mathrm{terminal}} e_z.
-    </d-math>
-
-    <hr>
-
-    <h3 id="6-2-non-terminal-leaf">6.2 Non-terminal leaf</h3>
-
-    <p>If the leaf is non-terminal, use the value head.</p>
-
-    <p>The value-head mean is</p>
-
-    <d-math block>
-d_\ell =
-\bar{\phi}_\theta^V(s_\ell).
-    </d-math>
-
-    <p>Using the stable parameterization, this is</p>
-
-    <d-math block>
-d_\ell =
-\textrm{softmax}
-\left(
-r_\theta^V(s_\ell)
-\right).
-    </d-math>
-
-    <p>Use neural leaf evidence strength:</p>
-
-    <d-math block>
-\lambda_\ell =
-c_{\mathrm{leaf}}.
-    </d-math>
-
-    <p>Therefore, the evidence contribution is</p>
-
-    <d-math block>
-\lambda_\ell d_\ell =
-c_{\mathrm{leaf}}
-\bar{\phi}_\theta^V(s_\ell).
-    </d-math>
-
-    <p>Usually,</p>
-
-    <d-math block>
-c_{\mathrm{terminal}} > c_{\mathrm{leaf}}.
-    </d-math>
-
-    <p>This encodes the fact that terminal outcomes are more reliable than bootstrapped neural evaluations.</p>
-
-    <hr>
-
-    <h3 id="6-3-backup-with-perspective-changes">6.3 Backup with perspective changes</h3>
-
-    <p>During backup, return the evidence to the state or action being trained.</p>
-
-    <p>Whenever the player-to-move perspective changes, flip the WDL vector:</p>
-
-    <d-math block>
-d \leftarrow \textrm{flip}(d).
-    </d-math>
-
-    <p>The backed-up evaluation for a root action <d-math>a</d-math> has the form</p>
-
-    <d-math block>
-\textrm{Eval}(s,a) =
-(d_a,\lambda_a),
-\qquad
-d_a \in \Delta^2,
-\qquad
-\lambda_a > 0.
-    </d-math>
-
-    <p>The root action posterior can then be updated with</p>
-
-    <d-math block>
-\alpha_a
-\leftarrow
-\alpha_a + \lambda_a d_a.
-    </d-math>
-
-    <hr>
-
-    <h2 id="7-root-posterior-search">7. Root posterior search</h2>
-
-    <p>At root state <d-math>s</d-math>, the Q head supplies the fallback action prior:</p>
-
-    <d-math block>
-\alpha_{\mathrm{fallback}}^Q(s,a)=
-\alpha_{\theta^-}^Q(s,a).
-    </d-math>
-
-    <p>If search expands action <d-math>a</d-math>, define the one-ply child state <d-math>s_a=\textrm{Step}(s,a)</d-math>. The value head on <d-math>s_a</d-math> predicts the value from the next player-to-move perspective. Align it back to the root player's perspective:</p>
-
-    <d-math block>
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)=
-\textrm{flip}
-\left(
-\alpha_{\theta^-}^V(s_a)
-\right),
-\qquad
-a \in \mathcal{A}(s).
-    </d-math>
-
-    <p>For each root action, use the Q prior only while the child state has not been explored. Once the child state has been expanded, use the aligned value-head Dirichlet because the state-value prediction is more precise than the state-action prediction:</p>
-
-    <d-math block>
-\alpha_{\mathrm{base}}(s,a;\mathrm{tree})=
+      <d-math block>
+\mathrm{Align}(x;p\to q)=
 \begin{cases}
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a),
-& \text{if } \textrm{Step}(s,a) \text{ has been expanded in the tree},\\
-\alpha_{\theta^-}^Q(s,a),
+x,&p=q,\\
+\mathrm{flip}(x),&p\ne q.
+\end{cases}
+      </d-math>
+
+      <p class="equation-note">Every child-to-parent message is aligned before it is stored.</p>
+
+      <h2 id="2-what-the-tree-remembers">2. What the tree remembers</h2>
+
+      <p>The tree separates network priors, mutable messages, and structural counts:</p>
+
+      <table class="symbol-table">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Meaning</th>
+            <th>Role</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><d-math>V_s</d-math></td>
+            <td>Network value prior</td>
+            <td>Fixed anchor for node <d-math>s</d-math></td>
+          </tr>
+          <tr>
+            <td><d-math>Q_{s,a}</d-math></td>
+            <td>Network action prior</td>
+            <td>Fallback before the edge has information</td>
+          </tr>
+          <tr>
+            <td><d-math>B_{s,a}</d-math></td>
+            <td>Edge message</td>
+            <td>Latest leaf or repaired-child Dirichlet</td>
+          </tr>
+          <tr>
+            <td><d-math>R_{s,a}</d-math></td>
+            <td>Structural count</td>
+            <td>Marks a message and measures repaired depth below it</td>
+          </tr>
+          <tr>
+            <td><d-math>C_s</d-math></td>
+            <td>Node cache</td>
+            <td>Current repaired state Dirichlet</td>
+          </tr>
+          <tr>
+            <td><d-math>A_{s,a}</d-math></td>
+            <td>Effective unresolved edge alpha</td>
+            <td>Message, child-value prior, or Q fallback</td>
+          </tr>
+          <tr>
+            <td><d-math>(z_{s,a},\tau_{s,a})</d-math></td>
+            <td>Exact categorical edge certificate</td>
+            <td>Outcome and certified distance; <d-math>z=\bot</d-math> means unresolved</td>
+          </tr>
+          <tr>
+            <td><d-math>(z_s,\tau_s)</d-math></td>
+            <td>Exact categorical node certificate</td>
+            <td>Absorbing solved value derived from edge certificates</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>Initially, <d-math>C_s=V_s</d-math> and the edge slot contains the Q fallback. A real message is present exactly when</p>
+
+      <d-math block>
+m_{s,a}=\mathbf 1[R_{s,a}>0].
+      </d-math>
+
+      <h3 id="2-1-effective-edge-posterior">2.1 Effective edge posterior</h3>
+
+      <p>For an expanded child <d-math>s_a</d-math>, the Dirichlet used by search is</p>
+
+      <d-math block>
+A_{s,a}=
+\begin{cases}
+B_{s,a},
+& R_{s,a}>0,\\[3pt]
+\mathrm{Align}(V_{s_a};p_{s_a}\to p_s),
+& R_{s,a}=0\ \text{and }s_a\text{ exists},\\[3pt]
+Q_{s,a},
 & \text{otherwise}.
 \end{cases}
-    </d-math>
+      </d-math>
 
-    <p>The Q head is still trained toward the posterior target for explored actions; unexplored actions have zero Q-evidence mass and are masked out of the Q KL loss.</p>
+      <div class="two-column">
+        <div class="mini-card">
+          <p><strong>Expanded but unrepaired</strong></p>
+          <p>Use the child's fixed value prior <d-math>V_{s_a}</d-math>.</p>
+        </div>
+        <div class="mini-card">
+          <p><strong>Child has downstream information</strong></p>
+          <p>Its repaired cache is promoted into <d-math>B_{s,a}</d-math>.</p>
+        </div>
+      </div>
 
-    <p>Using the stable value parameterization:</p>
+      <p>Neither <d-math>R</d-math> nor a visit count is added to <d-math>A</d-math>. Its concentration remains learned through the network alphas and repaired messages.</p>
 
-    <d-math block>
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a) =
-\textrm{flip}
-\left[
-\textrm{softplus}(t_{\theta^-}^V(s_a))^2
-\textrm{softmax}
-\left(
-r_{\theta^-}^V(s_a)
-\right)
-\right]
-    </d-math>
+      <h3 id="2-2-native-categorical-certificates">2.2 Native categorical certificates</h3>
 
-    <p>At simulation <d-math>t</d-math>, sample one WDL distribution per legal action:</p>
+      <p>An action is one of two native objects:</p>
 
-    <d-math block>
-\phi_a^{(t)}
-\sim
-\textrm{Dirichlet}
-\left(
-\alpha_a^{(t)}
-\right),
+      <d-math block>
+Y_{s,a}=
+\begin{cases}
+\mathrm{Cat}(z_{s,a},\tau_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
+\mathrm{Dir}(A_{s,a}),&z_{s,a}=\bot.
+\end{cases}
+      </d-math>
+
+      <p>A terminal child has distance zero and its incoming edge has distance one. The certificates are exact, absorbing, and stored separately from every alpha. A certified edge is pruned from later traversal. One certified win solves a node; a draw or loss is proved only after every legal edge is categorical.</p>
+
+      <d-math block>
+u_{\mathrm{cat}}(L)=-1,
 \qquad
-a \in \mathcal{A}(s).
-    </d-math>
-
-    <p>Select the action with highest sampled utility:</p>
-
-    <d-math block>
-a_t =
-\arg\max_{a \in \mathcal{A}(s)}
-U(\phi_a^{(t)}).
-    </d-math>
-
-    <p>After evaluating <d-math>a_t</d-math> by search, suppose the backed-up evaluation gives</p>
-
-    <d-math block>
-\textrm{Eval}(s,a_t) =
-\left(
-d_{a_t}^{(t)},
-\lambda_{a_t}^{(t)}
-\right),
+u_{\mathrm{cat}}(D)=0,
 \qquad
-d_{a_t}^{(t)} \in \Delta^2,
-\qquad
-\lambda_{a_t}^{(t)} > 0.
-    </d-math>
+u_{\mathrm{cat}}(W)=1.
+      </d-math>
 
-    <p>Update the selected action posterior as</p>
+      <h2 id="3-one-thompson-rule">3. One Thompson rule</h2>
 
-    <d-math block>
-\alpha_{a_t}^{(t+1)} =
-\alpha_{a_t}^{(t)}+\lambda_{a_t}^{(t)}
-d_{a_t}^{(t)}.
-    </d-math>
+      <p>At every node—root or internal—the same selector assigns one utility to each native action:</p>
 
-    <p>For actions not selected at simulation <d-math>t</d-math>:</p>
+      <d-math block>
+X(Y_{s,a})=
+\begin{cases}
+u_{\mathrm{cat}}(z_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
+U(\phi_a),\quad \phi_a\sim\mathrm{Dirichlet}(A_{s,a}),&z_{s,a}=\bot,
+\end{cases}
+      </d-math>
 
-    <d-math block>
-\alpha_a^{(t+1)} =
-\alpha_a^{(t)},
-\qquad
-a \neq a_t.
-    </d-math>
+      <p>and chooses the legal action with highest utility:</p>
 
-    <p>Equivalently:</p>
+      <d-math block>
+a^*=\arg\max_{a\in\mathcal A(s)}X(Y_{s,a}).
+      </d-math>
 
-    <d-math block>
-p
-\left(
-\phi_{a_t}
-\mid
-d_{a_t}^{(t)},
-\lambda_{a_t}^{(t)}
-\right)=
-\textrm{Dirichlet}
-\left(
-\alpha_{a_t}^{(t)}+\lambda_{a_t}^{(t)}
-d_{a_t}^{(t)}
-\right).
-    </d-math>
+      <p>Repeating this same choice <d-math>M</d-math> times estimates the probability that each action is best:</p>
 
-    <p>This is exact Bayesian updating if the evidence corresponds to independent categorical outcome evidence. In neural search, it is calibrated pseudo-evidence.</p>
-
-    <p>After <d-math>T</d-math> root simulations, the final root posterior is</p>
-
-    <d-math block>
-\alpha_a^{(T)},
-\qquad
-a \in \mathcal{A}(s).
-    </d-math>
-
-    <p>In the current MCTX implementation, search traversal itself may use MCTX's root selection rule, but the posterior used for policy targets is reconstructed from the accumulated root-action evidence and the mixed Q-fallback/value-prior base described above.</p>
-
-    <hr>
-
-    <h2 id="8-search-improved-policy-target">8. Search-improved policy target</h2>
-
-    <p>After search, define the search-improved policy as the posterior probability that each action is optimal under utility.</p>
-
-    <p>The posterior used here is the child-value-prior posterior:</p>
-
-    <d-math block>
-\alpha_b^{(T)}=
-\alpha_{\theta^-}^{V \rightarrow Q}(s,b)+
-E_Q(s,b),
-    </d-math>
-
-    <p>where <d-math>E_Q(s,b)</d-math> is the accumulated root-player-perspective evidence for action <d-math>b</d-math>.</p>
-
-    <p>For each legal action <d-math>a</d-math>:</p>
-
-    <d-math block>
-\pi_{\mathrm{search}}(a \mid s) =
-\mathbb{P}
-\left(
-a =
-\arg\max_{b \in \mathcal{A}(s)}
-U(\phi_b)
-\right),
-\qquad
-\phi_b
-\sim
-\textrm{Dirichlet}
-\left(
-\alpha_b^{(T)}
-\right).
-    </d-math>
-
-    <p>Estimate this probability by Monte Carlo.</p>
-
-    <p>For <d-math>m = 1,\ldots,M</d-math>, sample</p>
-
-    <d-math block>
-\phi_b^{(m)}
-\sim
-\textrm{Dirichlet}
-\left(
-\alpha_b^{(T)}
-\right),
-\qquad
-b \in \mathcal{A}(s).
-    </d-math>
-
-    <p>Then compute</p>
-
-    <d-math block>
-a_m^\star =
-\arg\max_{b \in \mathcal{A}(s)}
-U(\phi_b^{(m)}).
-    </d-math>
-
-    <p>The Monte Carlo estimator is</p>
-
-    <d-math block>
-\hat{\pi}_{\mathrm{search}}(a \mid s) =
-\frac{1}{M}
-\sum_{m=1}^M
-\mathbf{1}
-\left[
-a_m^\star = a
+      <d-math block>
+\widehat\pi_M(a\mid s)
+=
+\frac1M
+\sum_{j=1}^{M}
+\mathbf 1\!\left[
+a=\arg\max_b X(Y_{s,b})^{(j)}
 \right].
-    </d-math>
+      </d-math>
 
-    <p>This is the final policy target.</p>
+      <d-math block>
+X(\mathrm{Cat}(z,\tau))=u_{\mathrm{cat}}(z),
+\qquad
+X(\mathrm{Dir}(A))=U(\phi),\quad
+\phi\sim\mathrm{Dirichlet}(A).
+      </d-math>
 
-    <p>Unlike standard AlphaZero, the policy target is not just visit count. It is the posterior probability that each move is optimal after search.</p>
+      <p class="equation-note">Traversal applies this rule only to unresolved edges; mixed policy readout compares exact categorical utility with sampled Dirichlet utility. Node repair and root readout use populations of the same selector. There is no second action-selection algorithm.</p>
 
-    <hr>
+      <h2 id="4-one-simulation">4. One simulation</h2>
 
-    <h2 id="9-policy-loss">9. Policy loss</h2>
+      <div class="stage-row">
+        <div class="stage">
+          <div class="number">Stage 1</div>
+          <div class="stage-title">Simulate</div>
+          <p>Thompson-sample at each node and follow existing children to an unexpanded, terminal, or depth-cutoff edge.</p>
+        </div>
+        <div class="stage">
+          <div class="number">Stage 2</div>
+          <div class="stage-title">Expand</div>
+          <p>Step the environment and evaluate the child. Create a node only when the selected edge is new.</p>
+        </div>
+        <div class="stage">
+          <div class="number">Stage 3</div>
+          <div class="stage-title">Repair</div>
+          <p>Walk from the deepest parent back to the root and update every node with the same posterior rule.</p>
+        </div>
+      </div>
 
-    <p>Train the policy head toward the search-improved posterior-best policy:</p>
+      <d-math block>
+\text{simulation}
+=
+\text{traversal}
+\longrightarrow
+\text{leaf evaluation}
+\longrightarrow
+\text{bottom-up repair}.
+      </d-math>
 
-    <d-math block>
-\mathcal{L}_\pi(s) =
--\sum_{a \in \mathcal{A}(s)}
-\textrm{stopgrad}
-\left(
-\hat{\pi}_{\mathrm{search}}(a \mid s)
-\right)
-\log \pi_\theta(a \mid s).
-    </d-math>
+      <h3 id="4-1-leaf-result">4.1 Tagged leaf result</h3>
 
-    <p>Equivalently:</p>
+      <p>A non-terminal frontier contributes its complete network value prior:</p>
 
-    <d-math block>
-\mathcal{L}_\pi(s) =
+      <d-math block>
+L_{s'}=V_{s'}.
+      </d-math>
+
+      <p>Expansion also returns one exact tag:</p>
+
+      <d-math block>
+\mathrm{terminal\_outcome}(s')=
+\begin{cases}
+z_{s'},&s'\text{ is terminal},\\
+\mathrm{NO\_OUTCOME},&s'\text{ is non-terminal}.
+\end{cases}
+      </d-math>
+
+      <p>A terminal tag creates <d-math>\mathrm{Cat}(z_{s'},0)</d-math> on the child and the aligned distance-one certificate on its incoming edge. It does not create a terminal Dirichlet. Model alphas are used as unresolved leaf messages and caches only.</p>
+
+      <h2 id="5-bottom-up-posterior-repair">5. Bottom-up posterior repair</h2>
+
+      <p>The default rule is local: it receives one node, all of its child summaries, and the final leaf only when this is the deepest path node.</p>
+
+      <div class="step-label">Step A · write the final edge</div>
+
+      <p>At the deepest node <d-math>s_d</d-math>, increment the selected edge's structural count. Replace its alpha message only if the edge is still unresolved:</p>
+
+      <d-math block>
+R_{s_d,a_d}\leftarrow R_{s_d,a_d}+1,
+      </d-math>
+
+      <d-math block>
+B_{s_d,a_d}\leftarrow
+\mathrm{Align}(V_{s'};p_{s'}\to p_{s_d})
+\quad\text{only when }z_{s_d,a_d}=\bot.
+      </d-math>
+
+      <p class="equation-note"><d-math>B</d-math> is replaced, not added. A terminal edge keeps its exact sidecar and does not overwrite <d-math>B</d-math> with a synthetic alpha.</p>
+
+      <div class="step-label">Step B · refresh from children</div>
+
+      <p>For every expanded, non-terminal child with repaired information below it, replace the parent edge by the child's current cache:</p>
+
+      <d-math block>
+n_{s_a}
+=
+\sum_{b\in\mathcal A(s_a)}R_{s_a,b}.
+      </d-math>
+
+      <d-math block>
+B_{s,a}
+\leftarrow
+\mathrm{Align}(C_{s_a};p_{s_a}\to p_s),
+\qquad
+R_{s,a}
+\leftarrow
+1+n_{s_a},
+\quad n_{s_a}>0.
+      </d-math>
+
+      <p>Categorical children are not refreshed this way; their exact outcome/distance already lives on the edge sidecar.</p>
+
+      <div class="step-label">Step C · form a fresh node policy</div>
+
+      <p>Recompute all effective action posteriors and estimate a fresh posterior-best policy:</p>
+
+      <d-math block>
+\pi_s
+=
+\widehat\pi_{M_{\mathrm{node}}}
+(\,\cdot\mid s;Y_s).
+      </d-math>
+
+      <p>This is not a visit distribution or a running average. It is a new mixed-native population: categorical utilities are exact and unresolved utilities are freshly Thompson-sampled.</p>
+
+      <div class="step-label">Step D · repair the node value</div>
+
+      <p>Let the total structural support below the node be</p>
+
+      <d-math block>
+n_s=\sum_{a\in\mathcal A(s)}R_{s,a},
+\qquad
+\gamma_s=\frac{n_s}{\kappa+n_s}.
+      </d-math>
+
+      <p>For the numeric cache mixture only, preserve each categorical edge's learned effective-alpha mass but replace its direction by the exact sidecar outcome:</p>
+
+      <d-math block>
+\widetilde A_{s,a}=
+\begin{cases}
+A_{s,a},&z_{s,a}=\bot,\\[3pt]
+\left(\sum_i A_{s,a,i}\right)e_{z_{s,a}},&z_{s,a}\ne\bot.
+\end{cases}
+      </d-math>
+
+      <p>Average these cache operands with the fresh search policy:</p>
+
+      <d-math block>
+\bar A_s
+=
+\sum_{a\in\mathcal A(s)}
+\pi_s(a)\widetilde A_{s,a}.
+      </d-math>
+
+      <p>Then interpolate between the fixed network value and the repaired descendants:</p>
+
+      <d-math block>
+\boxed{
+C_s
+=
+(1-\gamma_s)V_s
++
+\gamma_s\bar A_s
+}.
+      </d-math>
+
+      <p>If <d-math>n_s=0</d-math>, then <d-math>C_s=V_s</d-math>. The sole constant <d-math>\kappa&gt;0</d-math> is the strength of that learned value prior against repaired descendants. It is not leaf evidence or terminal confidence. The categorical projection does not mutate <d-math>A</d-math> and never replaces the exact sidecar or categorical training target.</p>
+
+      <h3 id="5-1-why-the-order-matters">5.1 Why the order matters</h3>
+
+      <p>For a selected path</p>
+
+      <d-math block>
+s_0\to s_1\to\cdots\to s_d,
+      </d-math>
+
+      <p>repair runs in the reverse order:</p>
+
+      <d-math block>
+s_d,\ s_{d-1},\ \ldots,\ s_0.
+      </d-math>
+
+      <p>When <d-math>s_i</d-math> is repaired, it therefore sees the new <d-math>C_{s_{i+1}}</d-math> computed moments earlier. This is how one local rule transports information all the way to the root.</p>
+
+      <h2 id="6-root-readout-and-training-targets">6. Root readout and training targets</h2>
+
+      <p>If the root remains unresolved, its policy is another mixed-native posterior-best population. If the root is categorical, the policy is one-hot on its certified action:</p>
+
+      <d-math block>
+\pi_{\mathrm{search}}(a\mid s_0)
+=
+\begin{cases}
+\widehat\pi_{M_{\mathrm{root}}}(a\mid s_0;Y_{s_0}),
+&z_{s_0}=\bot,\\[3pt]
+\mathbf 1[a=a_{\mathrm{cat}}(s_0)],
+&z_{s_0}\ne\bot.
+\end{cases}
+      </d-math>
+
+      <p>The Q and V targets retain the same native tags used by search:</p>
+
+      <d-math block>
+T^Q_{s,a}=
+\begin{cases}
+\mathrm{Pad},&a\text{ illegal},\\
+\mathrm{Cat}(z_{s,a},\tau_{s,a}),&z_{s,a}\ne\bot,\\
+\mathrm{Dir}(A_{s,a}),&z_{s,a}=\bot,
+\end{cases}
+      </d-math>
+
+      <d-math block>
+T^V_s=
+\begin{cases}
+\mathrm{Cat}(z_s,\tau_s),&z_s\ne\bot,\\
+\mathrm{Dir}(C_s),&z_s=\bot.
+\end{cases}
+      </d-math>
+
+      <d-math block>
+\pi_{\mathrm{target}}(a\mid s_0)
+=
+\pi_{\mathrm{search}}(a\mid s_0).
+      </d-math>
+
+      <div class="correction">
+        <p>There is no root-only reconstruction <d-math>\beta_Q=\alpha_{\mathrm{base}}+E_Q</d-math>, and <d-math>R</d-math> is never added to Dirichlet concentration. A categorical target consumes the exact sidecar, not the numeric cache projection.</p>
+      </div>
+
+      <h3 id="6-1-losses">6.1 Losses</h3>
+
+      <p>The policy head distills the posterior-best distribution:</p>
+
+      <d-math block>
+\mathcal L_\pi
+=
+-\sum_{a\in\mathcal A(s)}
+\mathrm{stopgrad}(\pi_{\mathrm{target}}(a\mid s))
+\log\pi_\theta(a\mid s).
+      </d-math>
+
+      <p>Full Dirichlet training matches both mean and concentration:</p>
+
+      <d-math block>
+\mathcal L_{\mathrm{full}}(\beta,\alpha_\theta)
+=
 D_{\mathrm{KL}}
 \left(
-\textrm{stopgrad}
-\left(
-\hat{\pi}_{\mathrm{search}}(\cdot \mid s)
-\right)
+\mathrm{Dirichlet}(\mathrm{stopgrad}\beta)
 \,\|\,
-\pi_\theta(\cdot \mid s)
-\right)
-    </d-math>
-
-    <p>up to an additive constant independent of <d-math>\theta</d-math>.</p>
-
-    <hr>
-
-    <h2 id="10-dirichlet-training-targets">10. Dirichlet training targets</h2>
-
-    <p>The value and Q heads are trained by KL divergence toward posterior Dirichlet targets.</p>
-
-    <p>The key rule is:</p>
-
-    <d-math block>
-\beta =
-\alpha_{\mathrm{prior}} + \lambda d.
-    </d-math>
-
-    <p>Here:</p>
-
-    <ul>
-
-      <li><d-math>d \in \Delta^2</d-math> is WDL evidence,</li>
-
-      <li><d-math>\lambda > 0</d-math> is evidence strength,</li>
-
-      <li><d-math>\alpha_{\mathrm{prior}}</d-math> is the positive Dirichlet prior used when the evidence was generated,</li>
-
-      <li><d-math>\beta</d-math> is the posterior Dirichlet target.</li>
-
-    </ul>
-
-    <p>There is no target of the form</p>
-
-    <d-math block>
-\beta =
-\kappa d.
-    </d-math>
-
-    <p>That form would be invalid for one-hot <d-math>d</d-math>, but it is not the target used here.</p>
-
-    <p>The actual target is</p>
-
-    <d-math block>
-\beta_z =
-\alpha_{\mathrm{prior},z}+\lambda d_z.
-    </d-math>
-
-    <p>Because</p>
-
-    <d-math block>
-\alpha_{\mathrm{prior},z} > 0
-    </d-math>
-
-    <p>for every <d-math>z</d-math>, the target satisfies</p>
-
-    <d-math block>
-\beta_z > 0
-    </d-math>
-
-    <p>for every <d-math>z</d-math>, even when <d-math>d</d-math> is one-hot.</p>
-
-    <p>Therefore no smoothing is needed.</p>
-
-    <hr>
-
-    <h2 id="11-search-time-target-storage">11. Search-time target storage</h2>
-
-    <p>During self-play or search, the network snapshot used to create the search priors should be treated as fixed. Denote that snapshot by <d-math>\theta^-</d-math>.</p>
-
-    <p>For a state <d-math>s</d-math>, the value prior at data-generation time is</p>
-
-    <d-math block>
-\alpha_{\mathrm{prior}}^V(s) =
-\alpha_{\theta^-}^V(s).
-    </d-math>
-
-    <p>For a state-action pair <d-math>(s,a)</d-math>, the action-level fallback prior is the root Q-head prediction:</p>
-
-    <d-math block>
-\alpha_{\mathrm{prior}}^Q(s,a) =
-\alpha_{\theta^-}^Q(s,a).
-    </d-math>
-
-    <p>If search expands action <d-math>a</d-math>, the action-level prior used for policy and Q targets is replaced by the child value prior aligned to the root perspective:</p>
-
-    <d-math block>
-\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a) =
-\textrm{flip}
-\left(
-\alpha_{\theta^-}^V(\textrm{Step}(s,a))
+\mathrm{Dirichlet}(\alpha_\theta)
 \right).
-    </d-math>
+      </d-math>
 
-    <p>Thus unexplored actions use <d-math>\alpha_{\mathrm{prior}}^Q(s,a)</d-math>, while explored actions use <d-math>\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a)</d-math>.</p>
+      <p>Mean-only training ignores concentration and matches normalized outcome probabilities:</p>
 
-    <p>Denote this mixed base by <d-math>\alpha_{\mathrm{base}}(s,a;\mathrm{tree})</d-math>.</p>
-
-    <p>After evidence is collected, construct posterior targets:</p>
-
-    <d-math block>
-\beta_V(s) =
-\alpha_{\mathrm{prior}}^V(s)+\lambda_V d_V(s),
-    </d-math>
-
-    <p>and</p>
-
-    <d-math block>
-\beta_Q(s,a) =
-\alpha_{\mathrm{base}}(s,a;\mathrm{tree})+\lambda_Q d_Q(s,a).
-    </d-math>
-
-    <p>These <d-math>\beta</d-math> targets should be stored or treated as stop-gradient targets during training.</p>
-
-    <p>Do not construct moving targets from the current trainable <d-math>\alpha_\theta</d-math> inside the same gradient step. The target should represent the posterior produced by search, not a target that chases the current prediction.</p>
-
-    <hr>
-
-    <h2 id="12-value-target-and-value-loss">12. Value target and value loss</h2>
-
-    <p>For a state <d-math>s</d-math>, suppose search or self-play produces WDL evidence</p>
-
-    <d-math block>
-d_V(s) \in \Delta^2
-    </d-math>
-
-    <p>with evidence strength</p>
-
-    <d-math block>
-\lambda_V > 0.
-    </d-math>
-
-    <p>The value prior from the data-generation network is</p>
-
-    <d-math block>
-\alpha_{\mathrm{prior}}^V(s) =
-\alpha_{\theta^-}^V(s).
-    </d-math>
-
-    <p>The posterior value target is</p>
-
-    <d-math block>
-\beta_V(s) =
-\alpha_{\mathrm{prior}}^V(s)+\lambda_V d_V(s).
-    </d-math>
-
-    <p>Then train the current value head by KL:</p>
-
-    <d-math block>
-\mathcal{L}_V(s) =
+      <d-math block>
+\mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta)
+=
 D_{\mathrm{KL}}
 \left(
-\textrm{Dirichlet}
-\left(
-\textrm{stopgrad}
-\left(
-\beta_V(s)
-\right)
-\right)
+\mathrm{stopgrad}\mu(\beta)
 \,\|\,
-\textrm{Dirichlet}
-\left(
-\alpha_\theta^V(s)
-\right)
+\mu(\alpha_\theta)
 \right).
-    </d-math>
+      </d-math>
 
-    <p>If the value evidence comes from a terminal outcome <d-math>z</d-math>, then</p>
+      <p>For an exact categorical outcome <d-math>z</d-math>, move the point just inside the simplex and train the predicted Dirichlet by density likelihood:</p>
 
-    <d-math block>
-d_V(s) =
-e_z.
-    </d-math>
-
-    <p>The target becomes</p>
-
-    <d-math block>
-\beta_V(s) =
-\alpha_{\theta^-}^V(s)+\lambda_V e_z.
-    </d-math>
-
-    <p>This is valid because <d-math>\alpha_{\theta^-}^V(s)</d-math> is strictly positive.</p>
-
-    <p>If the value evidence comes from a non-terminal leaf, then</p>
-
-    <d-math block>
-d_V(s) =
-\textrm{stopgrad}
-\left(
-\bar{\phi}_{\theta^-}^V(s_\ell)
-\right),
-    </d-math>
-
-    <p>after applying the correct perspective flip.</p>
-
-    <p>Then</p>
-
-    <d-math block>
-\beta_V(s) =
-\alpha_{\theta^-}^V(s)+\lambda_V
-\textrm{stopgrad}
-\left(
-\bar{\phi}_{\theta^-}^V(s_\ell)
-\right).
-    </d-math>
-
-    <hr>
-
-    <h2 id="13-q-target-and-q-loss">13. Q target and Q loss</h2>
-
-    <p>For a searched action <d-math>(s,a)</d-math>, suppose search produces WDL evidence</p>
-
-    <d-math block>
-d_Q(s,a) \in \Delta^2
-    </d-math>
-
-    <p>with evidence strength</p>
-
-    <d-math block>
-\lambda_Q > 0.
-    </d-math>
-
-    <p>The prior for the Q target is not the old Q-head prediction. It is the one-ply child value Dirichlet from the data-generation network, aligned to the root player's perspective:</p>
-
-    <d-math block>
-\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a) =
-\textrm{flip}
-\left(
-\alpha_{\theta^-}^V(s_a)
-\right),
+      <d-math block>
+\phi_z^\epsilon
+=(1-K\epsilon)e_z+\epsilon\mathbf 1,
 \qquad
-s_a = \textrm{Step}(s,a).
-    </d-math>
+\mathcal L_{\mathrm{cat}}(\alpha_\theta,z)
+=-\log p_{\mathrm{Dirichlet}(\alpha_\theta)}
+(\phi_z^\epsilon).
+      </d-math>
 
-    <p>The posterior Q target is</p>
+      <p>Thus unresolved rows use full or mean Dirichlet matching, while categorical rows use this exact-outcome density loss in either mode. The concentration is learned by the model; no terminal concentration constant is injected by search.</p>
 
-    <d-math block>
-\beta_Q(s,a) =
-\alpha_{\mathrm{prior}}^{V \rightarrow Q}(s,a)+\lambda_Q d_Q(s,a).
-    </d-math>
+      <p>The Q loss can be weighted by structural support or by root policy:</p>
 
-    <p>Then train the current Q head by KL:</p>
+      <d-math block>
+w_a=
+\begin{cases}
+R_{s_0,a},
+&\text{structural/evidence-mass mode},\\
+\pi_{\mathrm{search}}(a\mid s_0),
+&\text{policy mode}.
+\end{cases}
+      </d-math>
 
-    <d-math block>
-\mathcal{L}_Q(s,a) =
-D_{\mathrm{KL}}
-\left(
-\textrm{Dirichlet}
-\left(
-\textrm{stopgrad}
-\left(
-\beta_Q(s,a)
-\right)
-\right)
-\,\|\,
-\textrm{Dirichlet}
-\left(
-\alpha_\theta^Q(s,a)
-\right)
-\right).
-    </d-math>
+      <h2 id="7-simulations-are-not-tree-size">7. Simulations are not tree size</h2>
 
-    <p>Average this only over explored actions, i.e. actions with positive accumulated tree evidence:</p>
+      <p>With <code>num_simulations = N</code>, search allocates <d-math>N</d-math> static iterations and performs at most <d-math>N</d-math> active traversal–evaluation–repair cycles on one persistent tree:</p>
 
-    <d-math block>
-\mathcal{L}_Q(s) =
-\textrm{mean}_{a \in \mathcal{A}_{\mathrm{explored}}(s)}
-\mathcal{L}_Q(s,a).
-    </d-math>
+      <d-math block>
+\mathcal T_0
+\xrightarrow{\text{simulation }1}
+\mathcal T_1
+\xrightarrow{\text{simulation }2}
+\cdots
+\xrightarrow{\text{simulation }N}
+\mathcal T_N.
+      </d-math>
 
-    <p>where <d-math>\mathcal{A}_{\mathrm{explored}}(s)</d-math> is</p>
+      <p>JAX allocates a static upper bound of one possible new node per simulation, plus the root:</p>
 
-    <d-math block>
-\mathcal{A}_{\mathrm{explored}}(s)=
-\{
-a \in \mathcal{A}(s):
-\sum_{i \in \mathcal{I}(a)}
-\lambda_i > 0
-\}.
-    </d-math>
+      <d-math block>
+N_{\mathrm{slots}}=N+1.
+      </d-math>
 
-    <p>Unexplored legal actions are excluded from the Q KL. They are not trained toward an unchanged prior.</p>
+      <p>A revisit or depth cutoff still evaluates and repairs the path but does not initialize a new node. Therefore</p>
 
-    <hr>
+      <d-math block>
+N_{\mathrm{real\ nodes}}\le N+1.
+      </d-math>
 
-    <h2 id="14-accumulated-q-targets-from-root-search">14. Accumulated Q targets from root search</h2>
+      <p>The fixed array is capacity, not a requirement to fill every slot. Once the root is categorical, later static iterations are inactive and do not call expansion. <code>max_depth</code> separately limits one traversal's length.</p>
 
-    <p>During root search, action <d-math>a</d-math> may receive multiple pieces of evidence.</p>
+      <h2 id="8-the-replaceable-part">8. The replaceable part</h2>
 
-    <p>Let</p>
+      <p>The tree-search engine owns traversal, exact terminal tags, categorical sidecars, proof propagation, storage, and bottom-up order. The posterior callback owns unresolved Dirichlet repair and the cache mixture:</p>
 
-    <d-math block>
-\mathcal{I}(a)
-    </d-math>
+      <d-math block>
+\mathcal F_{\mathrm{posterior}}:
+(\text{key},\ \text{node},\ \text{children},\ \text{leaf})
+\longmapsto
+(B_s,\ R_s,\ C_s).
+      </d-math>
 
-    <p>be the set of simulations in which action <d-math>a</d-math> was evaluated.</p>
+      <p>It is called once for every node on the selected path. A different rule can inspect the current node embedding and all child summaries, then return a complete replacement posterior without changing traversal or the public search API. The default callback exposes its single prior-strength choice as <d-math>\kappa</d-math> in <d-math>\gamma=n/(\kappa+n)</d-math>; exact categorical semantics remain search-owned.</p>
 
-    <p>Each evaluation gives</p>
+      <d-math block>
+\text{search mechanics}
+\quad\perp\quad
+\text{posterior mathematics}.
+      </d-math>
 
-    <d-math block>
-(d_i,\lambda_i),
-\qquad
-i \in \mathcal{I}(a).
-    </d-math>
-
-    <p>The initial action prior is the Q-head fallback:</p>
-
-    <d-math block>
-\alpha_a^{(0)} =
-\alpha_{\theta^-}^Q(s,a).
-    </d-math>
-
-    <p>If action <d-math>a</d-math> is explored, replace that fallback with <d-math>\alpha_{\theta^-}^{V \rightarrow Q}(s,a)</d-math> before adding accumulated evidence.</p>
-
-    <p>The final posterior after all evidence for action <d-math>a</d-math> is</p>
-
-    <d-math block>
-\alpha_a^{(T)} =
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)+\sum_{i \in \mathcal{I}(a)}
-\lambda_i d_i.
-    </d-math>
-
-    <p>Therefore the Q training target for action <d-math>a</d-math> can be</p>
-
-    <d-math block>
-\beta_Q(s,a) =
-\alpha_a^{(T)}.
-    </d-math>
-
-    <p>Equivalently:</p>
-
-    <d-math block>
-\beta_Q(s,a) =
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)+\sum_{i \in \mathcal{I}(a)}
-\lambda_i d_i.
-    </d-math>
-
-    <p>Then the Q loss is</p>
-
-    <d-math block>
-\mathcal{L}_Q(s,a) =
-D_{\mathrm{KL}}
-\left(
-\textrm{Dirichlet}
-\left(
-\textrm{stopgrad}
-\left(
-\alpha_a^{(T)}
-\right)
-\right)
-\,\|\,
-\textrm{Dirichlet}
-\left(
-\alpha_\theta^Q(s,a)
-\right)
-\right).
-    </d-math>
-
-    <p>This trains the Q head to predict the posterior that search produced from the mixed Q-fallback/value-prior base plus evidence. The loss is applied only when <d-math>\mathcal{I}(a)</d-math> is non-empty, equivalently when the accumulated evidence mass for action <d-math>a</d-math> is positive.</p>
-
-    <hr>
-
-    <h2 id="15-total-loss">15. Total loss</h2>
-
-    <p>The full training objective is</p>
-
-    <d-math block>
-\mathcal{L} =
-\lambda_\pi \mathcal{L}_\pi+\lambda_V \mathcal{L}_V+\lambda_Q \mathcal{L}_Q.
-    </d-math>
-
-    <p>The policy loss is</p>
-
-    <d-math block>
-\mathcal{L}_\pi(s) =
--\sum_{a \in \mathcal{A}(s)}
-\textrm{stopgrad}
-\left(
-\hat{\pi}_{\mathrm{search}}(a \mid s)
-\right)
-\log \pi_\theta(a \mid s).
-    </d-math>
-
-    <p>The value loss is</p>
-
-    <d-math block>
-\mathcal{L}_V(s) =
-D_{\mathrm{KL}}
-\left(
-\textrm{Dirichlet}
-\left(
-\textrm{stopgrad}
-\left(
-\beta_V(s)
-\right)
-\right)
-\,\|\,
-\textrm{Dirichlet}
-\left(
-\alpha_\theta^V(s)
-\right)
-\right).
-    </d-math>
-
-    <p>The Q loss is</p>
-
-    <d-math block>
-\mathcal{L}_Q(s) =
-\textrm{mean}_{a \in \mathcal{A}_{\mathrm{explored}}(s)}
-D_{\mathrm{KL}}
-\left(
-\textrm{Dirichlet}
-\left(
-\textrm{stopgrad}
-\left(
-\beta_Q(s,a)
-\right)
-\right)
-\,\|\,
-\textrm{Dirichlet}
-\left(
-\alpha_\theta^Q(s,a)
-\right)
-\right).
-    </d-math>
-
-    <p>The targets are posterior Dirichlets:</p>
-
-    <d-math block>
-\beta_V(s) =
-\alpha_{\theta^-}^V(s)+\lambda_V d_V(s),
-    </d-math>
-
-    <p>and</p>
-
-    <d-math block>
-\beta_Q(s,a) =
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)+\sum_{i \in \mathcal{I}(a)}
-\lambda_i d_i.
-    </d-math>
-
-    <p>No separate mean loss is required. The Dirichlet KL trains both the WDL mean and the concentration.</p>
-
-    <hr>
-
-    <h2 id="16-dirichlet-kl-formula">16. Dirichlet KL formula</h2>
-
-    <p>For</p>
-
-    <d-math block>
-\textrm{Dirichlet}(\alpha_1)
-\quad\text{and}\quad
-\textrm{Dirichlet}(\alpha_2),
-    </d-math>
-
-    <p>with</p>
-
-    <d-math block>
-\alpha_{10} =
-\sum_{i=1}^{k}
-\alpha_{1i},
-\qquad
-\alpha_{20} =
-\sum_{i=1}^{k}
-\alpha_{2i},
-    </d-math>
-
-    <p>the KL divergence is</p>
-
-    <d-math block>
-D_{\mathrm{KL}}
-\left(
-\textrm{Dirichlet}(\alpha_1)
-\,\|\,
-\textrm{Dirichlet}(\alpha_2)
-\right)=
-\log
-\frac{\Gamma(\alpha_{10})}
-{\Gamma(\alpha_{20})}+\sum_{i=1}^{k}
-\log
-\frac{\Gamma(\alpha_{2i})}
-{\Gamma(\alpha_{1i})}+\sum_{i=1}^{k}
-(\alpha_{1i}-\alpha_{2i})
-\left[
-\psi(\alpha_{1i})-
-\psi(\alpha_{10})
-\right].
-    </d-math>
-
-    <p>For training, use</p>
-
-    <d-math block>
-\alpha_1 =
-\textrm{stopgrad}(\beta),
-\qquad
-\alpha_2 =
-\alpha_\theta.
-    </d-math>
-
-    <p>Here <d-math>\Gamma</d-math> is the gamma function and <d-math>\psi</d-math> is the digamma function.</p>
-
-    <hr>
-
-    <h2 id="17-core-algorithm-summary">17. Core algorithm summary</h2>
-
-    <p>At a root state <d-math>s</d-math>, initialize each legal action with the Q-head Dirichlet:</p>
-
-    <d-math block>
-\alpha_a^{(0)} =
-\alpha_\theta^Q(s,a).
-    </d-math>
-
-    <p>When search expands action <d-math>a</d-math> and reaches <d-math>s_a=\textrm{Step}(s,a)</d-math>, replace the root action's Q fallback with the value-head Dirichlet aligned to the root perspective:</p>
-
-    <d-math block>
-\alpha_\theta^{V \rightarrow Q}(s,a) =
-\textrm{flip}
-\left[
-\textrm{softplus}(t_\theta^V(\textrm{Step}(s,a)))^2
-\textrm{softmax}
-\left(
-r_\theta^V(\textrm{Step}(s,a))
-\right)
-\right]
-    </d-math>
-
-    <p>Thereafter the live root posterior for action <d-math>a</d-math> is this aligned value prior plus all accumulated evidence for that root action. Actions whose child states have not been expanded keep <d-math>\alpha_\theta^Q(s,a)</d-math>.</p>
-
-    <p>Search repeatedly samples from these posteriors:</p>
-
-    <d-math block>
-\phi_a^{(t)}
-\sim
-\textrm{Dirichlet}
-\left(
-\alpha_a^{(t)}
-\right).
-    </d-math>
-
-    <p>It chooses an action by utility:</p>
-
-    <d-math block>
-a_t =
-\arg\max_a U(\phi_a^{(t)}).
-    </d-math>
-
-    <p>It evaluates the selected action and receives WDL evidence:</p>
-
-    <d-math block>
-(d_{a_t}^{(t)},\lambda_{a_t}^{(t)}).
-    </d-math>
-
-    <p>It updates the selected action posterior:</p>
-
-    <d-math block>
-\alpha_{a_t}^{(t+1)} =
-\alpha_{a_t}^{(t)}+\lambda_{a_t}^{(t)}
-d_{a_t}^{(t)}.
-    </d-math>
-
-    <p>Terminal leaves return one-hot evidence:</p>
-
-    <d-math block>
-d =
-e_z.
-    </d-math>
-
-    <p>Non-terminal leaves return value-head mean evidence:</p>
-
-    <d-math block>
-d =
-\bar{\phi}_\theta^V(s_\ell).
-    </d-math>
-
-    <p>After search, the policy target is the posterior probability that each action is optimal:</p>
-
-    <d-math block>
-\pi_{\mathrm{search}}(a \mid s) =
-\mathbb{P}
-\left(
-a =
-\arg\max_b U(\phi_b)
-\right),
-\qquad
-\phi_b
-\sim
-\textrm{Dirichlet}
-\left(
-\alpha_b^{(T)}
-\right).
-    </d-math>
-
-    <p>The policy head learns this posterior-best distribution:</p>
-
-    <d-math block>
-\pi_\theta(a \mid s)
-\approx
-\pi_{\mathrm{search}}(a \mid s).
-    </d-math>
-
-    <p>The value head learns posterior state-level WDL beliefs:</p>
-
-    <d-math block>
-\beta_V(s) =
-\alpha_{\theta^-}^V(s)+\lambda_V d_V(s).
-    </d-math>
-
-    <p>The Q head learns posterior action-level WDL beliefs:</p>
-
-    <d-math block>
-\beta_Q(s,a) =
-\alpha_{\theta^-}^{V \rightarrow Q}(s,a)+\sum_{i \in \mathcal{I}(a)}
-\lambda_i d_i.
-    </d-math>
-
-    <p>The Q KL is averaged only over explored actions with positive accumulated evidence mass.</p>
-
-    <p>The central search primitive is always the same Dirichlet evidence update:</p>
-
-    <d-math block>
-p(\phi \mid d,\lambda) =
-\textrm{Dirichlet}
-\left(
-\alpha + \lambda d
-\right).
-    </d-math>
-
-    <p>The central network parameterization is always the same mean-concentration form:</p>
-
-    <d-math block>
-\alpha_\theta =
-\textrm{softplus}(t_\theta)^2
-\textrm{softmax}(r_\theta).
-    </d-math>
-
-    <p>There is no additive <d-math>\alpha_{\mathrm{base}}</d-math> and no smoothing term.</p>
-
-    <hr>
-
-    <h2 id="appendix-a-policy-improvement-and-committed-action-modes">Appendix A. Policy improvement and committed-action modes</h2>
-
-    <p>Search separates three objects:</p>
-
-    <ol>
-
-      <li>the proposal/search mechanism that decides which actions receive evidence,</li>
-
-      <li>the posterior after search, <d-math>\alpha_{\mathrm{search}}</d-math>,</li>
-
-      <li>the committed move used to advance the self-play game.</li>
-
-    </ol>
-
-    <p>For Dirichlet-Q search, root traversal can use Thompson sampling while the training target remains the posterior-best distribution</p>
-
-    <d-math block>
-\pi_{\mathrm{search}}(a \mid s)=
-\mathbb{P}
-\left(
-a =
-\arg\max_b U(\phi_b)
-\right),
-\qquad
-\phi_b \sim
-\textrm{Dirichlet}
-\left(
-\alpha_{\mathrm{search}}(s,b)
-\right).
-    </d-math>
-
-    <p>This is estimated by Monte Carlo as <d-math>\hat{\pi}_{\mathrm{search}}</d-math>. The policy head is trained toward <d-math>\hat{\pi}_{\mathrm{search}}</d-math> regardless of which committed-action mode is used.</p>
-
-    <h3 id="a-1-committed-action-modes">A.1 Committed-action modes</h3>
-
-    <p>The deterministic posterior-best mode commits</p>
-
-    <d-math block>
-A_{\mathrm{argmax}}=
-\arg\max_{a \in \mathcal{A}(s)}
-\hat{\pi}_{\mathrm{search}}(a \mid s).
-    </d-math>
-
-    <p>In config this is <code>selfplay_action_source: posterior_best</code> or <code>selfplay_action_source: posterior_argmax</code>.</p>
-
-    <p>The stochastic posterior-sample mode commits</p>
-
-    <d-math block>
-A_{\mathrm{sample}}
-\sim
-\textrm{Categorical}
-\left(
-\hat{\pi}_{\mathrm{search}}(\cdot \mid s)
-\right).
-    </d-math>
-
-    <p>In config this is <code>selfplay_action_source: posterior_sample</code>. This mode keeps the old stochastic committed-move behavior: sample the played move from the Monte Carlo posterior-best target. It changes only the action used to step the environment; it does not change the target used for the policy loss.</p>
-
-    <h3 id="a-2-improvement-in-posterior-optimality-probability">A.2 Improvement in posterior optimality probability</h3>
-
-    <p>Let</p>
-
-    <d-math block>
-p_T(a) = \hat{\pi}_{\mathrm{search}}(a \mid s).
-    </d-math>
-
-    <p>The posterior-argmax committed action satisfies the pointwise inequality</p>
-
-    <d-math block>
-p_T(A_{\mathrm{argmax}})
-\ge
-p_T(a),
-\qquad
-\forall a \in \mathcal{A}(s).
-    </d-math>
-
-    <p>Therefore, for any proposal distribution <d-math>\nu</d-math> over legal actions and <d-math>A_0 \sim \nu</d-math>,</p>
-
-    <d-math block>
-\mathbb{E}
-\left[
-p_T(A_{\mathrm{argmax}})
-\right]
-\ge
-\mathbb{E}_{A_0 \sim \nu}
-\left[
-p_T(A_0)
-\right]=
-\sum_a
-\nu(a)p_T(a).
-    </d-math>
-
-    <p>Thus <code>posterior_argmax</code> is greedy-improving with respect to the search posterior's own optimal-action probability score. In particular, it is at least as good under <d-math>p_T</d-math> as committing a move drawn from the pre-search proposal, the search-time Thompson proposal, or the posterior-sample distribution.</p>
-
-    <p>The posterior-sample mode does not take this greedy step. Instead it performs posterior probability matching after search:</p>
-
-    <d-math block>
-\mathbb{P}
-\left(
-A_{\mathrm{sample}}=a
-\right)=
-\hat{\pi}_{\mathrm{search}}(a \mid s).
-    </d-math>
-
-    <p>This preserves stochastic exploration in self-play while still training the policy head on the same search-improved posterior-best target.</p>
-
-    <h3 id="a-3-relation-to-scalar-q-policy-improvement-guarantees">A.3 Relation to scalar-Q policy-improvement guarantees</h3>
-
-    <p>The Gumbel-style deterministic bandit guarantee is a scalar-estimate guarantee. Let search produce a scalar estimate <d-math>\hat{q}_T(a)</d-math> for each action in a candidate set <d-math>C</d-math>, and let the baseline proposal action <d-math>A_0</d-math> belong to <d-math>C</d-math>. If the committed action is</p>
-
-    <d-math block>
-A_+=
-\arg\max_{a \in C}
-\hat{q}_T(a),
-    </d-math>
-
-    <p>then</p>
-
-    <d-math block>
-\hat{q}_T(A_+) \ge \hat{q}_T(A_0)
-    </d-math>
-
-    <p>pointwise, and therefore also in expectation.</p>
-
-    <p>In Dirichlet-Q, a natural scalar estimate is the posterior mean utility</p>
-
-    <d-math block>
-\hat{q}_T(a)=
-U
-\left(
-\frac{\alpha_{\mathrm{search}}(s,a)}
-{\sum_z \alpha_{\mathrm{search},z}(s,a)}
-\right).
-    </d-math>
-
-    <p>The above scalar-Q guarantee applies directly if the committed move is chosen greedily by this scalar estimate. The implemented posterior-best mode instead chooses greedily by <d-math>p_T(a)=\hat{\pi}_{\mathrm{search}}(a \mid s)</d-math>. This is a Bayesian posterior-optimality decision rule. It coincides with the scalar-Q greedy rule only when the posterior-optimality probabilities and posterior mean utilities induce the same action ranking.</p>
-
-      <p class="page-footer">Scacchi research reference · Generated from <code>math.md</code></p>
+      <p class="page-footer">For field-level contracts, concentration parameterization, action commitment modes, and the full loss definition, see <a href="math.md"><code>math.md</code></a>. The algorithm follows the message-passing logic in <code>tictactoe-demo/app.js</code> and the active <code>scacchi.dirichlet_mctx</code> backend.</p>
     </d-article>
   </body>
 </html>
-

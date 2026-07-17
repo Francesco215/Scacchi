@@ -1,3 +1,5 @@
+import math
+
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -120,6 +122,7 @@ def test_boardlaw_dirichlet_heads_initialize_near_uniform_dumb_prior():
 
     logits, alpha_v, alpha_q = model(obs, train=False)
 
+    assert model.dirichlet_concentration_floor is None
     assert jnp.allclose(logits, jnp.zeros_like(logits))
     assert jnp.allclose(jax.nn.softmax(logits, axis=-1), jnp.full_like(logits, 0.1))
     expected_alpha = (3.0 + 0.1) / 3.0
@@ -148,6 +151,27 @@ def test_boardlaw_dirichlet_heads_accept_trainable_initial_concentration():
     assert jnp.allclose(outcome_mean(alpha_q), 0.5)
 
 
+def test_no_floor_concentration_keeps_recovery_gradient_below_dumb_prior():
+    mean_logits = jnp.zeros((1, 2))
+    low_concentration = 0.5
+    low_logit = jnp.asarray(
+        [math.log(math.expm1(math.sqrt(low_concentration)))]
+    )
+
+    def concentration(logit):
+        return jnp.sum(
+            dirichlet_from_logits(
+                mean_logits,
+                logit,
+                concentration_floor=None,
+                concentration_clip=100.0,
+            )
+        )
+
+    assert jnp.allclose(concentration(low_logit), low_concentration)
+    assert jax.grad(concentration)(low_logit)[0] > 0.5
+
+
 def test_boardlaw_dirichlet_heads_accept_configurable_concentration_floor():
     model = BoardlawDirichletNet(
         num_actions=10,
@@ -163,6 +187,7 @@ def test_boardlaw_dirichlet_heads_accept_configurable_concentration_floor():
 
     _, alpha_v, alpha_q = model(obs, train=False)
 
+    assert model.dirichlet_concentration_floor == 32.0
     assert jnp.allclose(jnp.sum(alpha_v, axis=-1), 32.1)
     assert jnp.allclose(jnp.sum(alpha_q, axis=-1), 32.1)
     assert jnp.allclose(outcome_mean(alpha_v), 0.5)

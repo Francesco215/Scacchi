@@ -1,20 +1,16 @@
-from pathlib import Path
-
 import jax
 import jax.numpy as jnp
 import optax
 import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
-from omegaconf import OmegaConf
 
 from scacchi.distributed import BatchParallel, assert_batch_axis_sharded
-from scacchi.dirichlet_q_search import terminal_outcome_from_reward
-from scacchi.dirichlet_tree.native import (
+from scacchi.dirichlet_mctx.categorical import (
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
     dirichlet_nll_at_categorical,
 )
-from scacchi.dirichlet_tree.native import native_fields_from_beta
+from scacchi.dirichlet_mctx.categorical import native_fields_from_beta
 from scacchi.loss import (
     DIRICHLET_KL_LOSS_CUTOFF,
     Sample,
@@ -30,16 +26,11 @@ from scacchi.play import TrainingSamples
 from scacchi.play_search import PosteriorPrediction, PosteriorTargets, TargetMetadata
 from scacchi.types import (
     Config,
-    GumbelSearchConfig,
     ModelConfig,
     Network,
-    SearchConfig,
-    SearchConstantsConfig,
-    SearchKind,
     SelfplayConfig,
     TrainingConfig,
     TrainingLossConfig,
-    load_config,
 )
 
 
@@ -67,14 +58,6 @@ def _loss_config(
     return Config(
         model=ModelConfig(network=Network.boardlaw_dirichlet),
         selfplay=SelfplayConfig(max_num_steps=max_num_steps),
-        search=SearchConfig(
-            kind=SearchKind.gumbel,
-            gumbel=GumbelSearchConfig(
-                constants=SearchConstantsConfig(
-                    categorical_epsilon=categorical_epsilon,
-                ),
-            ),
-        ),
         training=TrainingConfig(
             losses=TrainingLossConfig(
                 policy_weight=policy_loss_weight,
@@ -85,6 +68,7 @@ def _loss_config(
                 dirichlet_loss_mode=dirichlet_loss_mode,
                 terminal_edge_targets=terminal_edge_targets,
                 terminal_parent_targets=terminal_parent_targets,
+                categorical_epsilon=categorical_epsilon,
             ),
         ),
     )
@@ -319,6 +303,58 @@ def test_compute_loss_input_trains_root_search_targets_before_terminal_result():
     assert jnp.array_equal(sample.policy_loss_mask, jnp.ones((3, 2), dtype=jnp.bool_))
     assert jnp.array_equal(sample.value_loss_mask, jnp.ones((3, 2), dtype=jnp.bool_))
     assert jnp.array_equal(sample.outcome_mask, jnp.zeros((3, 2), dtype=jnp.bool_))
+
+
+def test_compute_loss_input_preserves_search_native_target_metadata():
+    q_target_kind = jnp.array(
+        [[[int(TARGET_CATEGORICAL), int(TARGET_DIRICHLET)]]],
+        dtype=jnp.int8,
+    )
+    q_target_weight = jnp.array([[[1.0, 0.25]]], dtype=jnp.float32)
+    q_target_outcome = jnp.array([[[2, -1]]], dtype=jnp.int8)
+    q_target_distance = jnp.array([[[3, -1]]], dtype=jnp.int32)
+    v_target_kind = jnp.array([[int(TARGET_CATEGORICAL)]], dtype=jnp.int8)
+    v_target_weight = jnp.array([[0.75]], dtype=jnp.float32)
+    v_target_outcome = jnp.array([[2]], dtype=jnp.int8)
+    v_target_distance = jnp.array([[3]], dtype=jnp.int32)
+    data = TrainingSamples(
+        obs=jnp.zeros((1, 1, 1)),
+        reward=jnp.zeros((1, 1)),
+        terminated=jnp.zeros((1, 1), dtype=jnp.bool_),
+        discount=-jnp.ones((1, 1)),
+        posterior=PosteriorTargets(
+            prediction=PosteriorPrediction(
+                policy=jnp.array([[[1.0, 0.0]]]),
+                alpha_v=jnp.ones((1, 1, 3)),
+                alpha_q=jnp.ones((1, 1, 2, 3)),
+            ),
+            metadata=TargetMetadata(
+                mask=jnp.ones((1, 1), dtype=jnp.bool_),
+                q_weight=jnp.ones((1, 1, 2)),
+                q_target_kind=q_target_kind,
+                q_target_weight=q_target_weight,
+                q_target_outcome=q_target_outcome,
+                q_target_distance=q_target_distance,
+                v_target_kind=v_target_kind,
+                v_target_weight=v_target_weight,
+                v_target_outcome=v_target_outcome,
+                v_target_distance=v_target_distance,
+            ),
+        ),
+        played_action=jnp.zeros((1, 1), dtype=jnp.int32),
+        legal_action_mask=jnp.ones((1, 1, 2), dtype=jnp.bool_),
+    )
+
+    sample = make_compute_input_for_lossfn(_loss_config())(data)
+
+    assert jnp.array_equal(sample.q_target_kind, q_target_kind)
+    assert jnp.array_equal(sample.q_target_weight, q_target_weight)
+    assert jnp.array_equal(sample.q_target_outcome, q_target_outcome)
+    assert jnp.array_equal(sample.q_target_distance, q_target_distance)
+    assert jnp.array_equal(sample.v_target_kind, v_target_kind)
+    assert jnp.array_equal(sample.v_target_weight, v_target_weight)
+    assert jnp.array_equal(sample.v_target_outcome, v_target_outcome)
+    assert jnp.array_equal(sample.v_target_distance, v_target_distance)
 
 
 def test_compute_loss_input_can_mark_played_terminal_edge_categorical():
@@ -665,6 +701,71 @@ def test_dirichlet_mean_kl_ignores_concentration_but_preserves_mean_signal():
     assert _dirichlet_mean_kl(beta, different_mean)[0] > 0.0
 
 
+def test_full_kl_has_radial_concentration_signal_while_mean_kl_does_not():
+    beta = jnp.array([[2.0, 8.0]])
+    mean = beta / jnp.sum(beta, axis=-1, keepdims=True)
+    initial_log_concentration = jnp.log(jnp.asarray(4.0))
+
+    def radial_loss(log_concentration, loss_fn):
+        alpha = jnp.exp(log_concentration) * mean
+        return jnp.sum(loss_fn(beta, alpha))
+
+    full_gradient = jax.grad(radial_loss)(
+        initial_log_concentration,
+        _dirichlet_kl,
+    )
+    mean_gradient = jax.grad(radial_loss)(
+        initial_log_concentration,
+        _dirichlet_mean_kl,
+    )
+
+    assert jnp.abs(full_gradient) > 1e-3
+    assert jnp.allclose(mean_gradient, 0.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("concentration_clip", [8.0, 100.0])
+def test_concentration_floor_metric_tolerance_is_independent_of_clip(
+    concentration_clip: float,
+):
+    concentrations = jnp.asarray([2.005, 2.03, 2.5])
+    alpha_v = concentrations[:, None] * jnp.full((3, 2), 0.5)
+    alpha_q = alpha_v[:, None, :]
+    data = Sample(
+        obs=jnp.zeros((3, 1)),
+        policy_tgt=jnp.ones((3, 1)),
+        value_tgt=jnp.ones((3,)),
+        played_action=jnp.zeros((3,), dtype=jnp.int32),
+        policy_mask=jnp.ones((3, 1), dtype=jnp.bool_),
+        value_mask=jnp.ones((3,), dtype=jnp.bool_),
+        beta_Q_target=alpha_q,
+        beta_V_target=alpha_v,
+        q_loss_weight=jnp.ones((3, 1)),
+    )
+    config = _loss_config()
+    config.model.dirichlet_concentration_floor = 2.0
+    config.training.regularization.dirichlet_concentration_clip = (
+        concentration_clip
+    )
+
+    _, metrics = _compute_dirichlet_losses(
+        jnp.zeros((3, 1)),
+        alpha_v,
+        alpha_q,
+        data,
+        config,
+    )
+
+    expected_fraction = jnp.asarray(1.0 / 3.0)
+    assert jnp.allclose(
+        metrics.alpha_V_dirichlet_concentration_floor_fraction,
+        expected_fraction,
+    )
+    assert jnp.allclose(
+        metrics.alpha_Q_dirichlet_concentration_floor_fraction,
+        expected_fraction,
+    )
+
+
 def test_mean_dirichlet_loss_mode_does_not_penalize_fixed_evidence_mass():
     data = Sample(
         obs=jnp.zeros((1, 1)),
@@ -809,19 +910,14 @@ def test_dirichlet_kl_losses_ignore_huge_and_nonfinite_terms():
     assert jnp.allclose(metrics.q_dir_kl_loss, 0.0, atol=1e-6)
 
 
-def test_hex5_terminal_dirichlet_target_survives_loss_cutoff():
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex5.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
-    constants = config.selfplay.search.active_constants()
-    terminal_outcome = terminal_outcome_from_reward(
-        jnp.asarray(1.0, dtype=jnp.float32),
-        num_outcomes=3,
+def test_terminal_edge_uses_native_categorical_loss_not_compatibility_alpha():
+    config = _loss_config(
+        policy_loss_weight=0.0,
+        q_dir_kl_weight=1.0,
+        categorical_epsilon=0.01,
+        terminal_edge_targets=True,
     )
-    terminal_alpha = (
-        jnp.asarray(constants.categorical_epsilon, dtype=jnp.float32)
-        + jnp.asarray(constants.kappa_terminal, dtype=jnp.float32)
-        * terminal_outcome
-    )
+    arbitrary_beta = jnp.asarray([1e6, 1.0, 1.0], dtype=jnp.float32)
     source = _training_samples(
         obs=jnp.zeros((1, 1, 1)),
         reward=jnp.ones((1, 1)),
@@ -829,7 +925,7 @@ def test_hex5_terminal_dirichlet_target_survives_loss_cutoff():
         action_weights=jnp.ones((1, 1, 1)),
         played_action=jnp.zeros((1, 1), dtype=jnp.int32),
         legal_action_mask=jnp.ones((1, 1, 1), dtype=jnp.bool_),
-        beta_Q_target=terminal_alpha[None, None, None, :],
+        beta_Q_target=arbitrary_beta[None, None, None, :],
         beta_V_target=jnp.ones((1, 1, 3)),
         q_loss_weight=jnp.ones((1, 1, 1)),
         discount=jnp.zeros((1, 1)),
@@ -838,7 +934,7 @@ def test_hex5_terminal_dirichlet_target_survives_loss_cutoff():
     data = make_compute_input_for_lossfn(config)(source)
     logits = jnp.zeros((1, 1, 1))
     alpha_v = jnp.ones((1, 1, 3))
-    alpha_q = jnp.ones((1, 1, 1, 3))
+    alpha_q = jnp.asarray([[[[1.0, 1000.0, 1.0]]]])
 
     raw_q_kl = _dirichlet_kl(data.beta_Q_target, alpha_q)
     total_loss, metrics = _compute_dirichlet_losses(
@@ -858,16 +954,19 @@ def test_hex5_terminal_dirichlet_target_survives_loss_cutoff():
         )[0]
     )(alpha_q)
 
-    assert data.q_target_kind[0, 0, 0] == int(TARGET_DIRICHLET)
-    assert raw_q_kl[0, 0, 0] > 0.0
-    assert raw_q_kl[0, 0, 0] < DIRICHLET_KL_LOSS_CUTOFF, (
-        f"hex5 categorical_epsilon={constants.categorical_epsilon} produces "
-        f"terminal KL={float(raw_q_kl[0, 0, 0])}"
+    expected_q_loss = dirichlet_nll_at_categorical(
+        alpha_q[0, 0, 0],
+        jnp.asarray(2, dtype=jnp.int8),
+        0.01,
     )
+
+    assert data.q_target_kind[0, 0, 0] == int(TARGET_CATEGORICAL)
+    assert data.q_target_outcome[0, 0, 0] == 2
+    assert raw_q_kl[0, 0, 0] > DIRICHLET_KL_LOSS_CUTOFF
     assert bool(jnp.isfinite(metrics.q_dir_kl_loss))
-    assert metrics.q_dir_kl_loss > 0.0
+    assert jnp.allclose(metrics.q_dir_kl_loss, expected_q_loss)
     assert bool(jnp.isfinite(total_loss))
-    assert total_loss > 0.0
+    assert jnp.allclose(total_loss, expected_q_loss)
     assert bool(jnp.all(jnp.isfinite(alpha_q_grad)))
     assert jnp.linalg.norm(alpha_q_grad) > 0.0
 
@@ -903,7 +1002,13 @@ def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():
     )
 
 
-def test_native_categorical_targets_use_dirichlet_density_nll():
+@pytest.mark.parametrize(
+    "dirichlet_loss_mode",
+    ["full", "mean"],
+)
+def test_native_categorical_targets_use_dirichlet_density_nll(
+    dirichlet_loss_mode: str,
+):
     data = Sample(
         obs=jnp.zeros((1, 1)),
         policy_tgt=jnp.array([[1.0, 0.0]]),
@@ -911,8 +1016,8 @@ def test_native_categorical_targets_use_dirichlet_density_nll():
         played_action=jnp.array([0]),
         policy_mask=jnp.array([[True, True]]),
         value_mask=jnp.array([True]),
-        beta_Q_target=jnp.ones((1, 2, 3)),
-        beta_V_target=jnp.ones((1, 3)),
+        beta_Q_target=jnp.full((1, 2, 3), jnp.nan),
+        beta_V_target=jnp.full((1, 3), jnp.nan),
         q_loss_weight=jnp.array([[1.0, 0.0]]),
         q_target_kind=jnp.array([[int(TARGET_CATEGORICAL), 0]], dtype=jnp.int8),
         q_target_weight=jnp.ones((1, 2), dtype=jnp.float32),
@@ -930,15 +1035,170 @@ def test_native_categorical_targets_use_dirichlet_density_nll():
         policy_loss_weight=0.0,
         value_dir_kl_weight=1.0,
         q_dir_kl_weight=1.0,
-        categorical_epsilon=1e-4,
+        dirichlet_loss_mode=dirichlet_loss_mode,
+        categorical_epsilon=0.01,
     )
 
     _, metrics = _compute_dirichlet_losses(logits, alpha_v, alpha_q, data, config)
+    alpha_v_grad, alpha_q_grad = jax.grad(
+        lambda candidate_v, candidate_q: _compute_dirichlet_losses(
+            logits,
+            candidate_v,
+            candidate_q,
+            data,
+            config,
+        )[0],
+        argnums=(0, 1),
+    )(alpha_v, alpha_q)
 
-    expected_v = dirichlet_nll_at_categorical(alpha_v[0], jnp.asarray(2), 1e-4)
-    expected_q = dirichlet_nll_at_categorical(alpha_q[0, 0], jnp.asarray(2), 1e-4)
+    expected_v = dirichlet_nll_at_categorical(alpha_v[0], jnp.asarray(2), 0.01)
+    expected_q = dirichlet_nll_at_categorical(alpha_q[0, 0], jnp.asarray(2), 0.01)
     assert jnp.allclose(metrics.value_dir_kl_loss, expected_v)
     assert jnp.allclose(metrics.q_dir_kl_loss, expected_q)
+    assert jnp.allclose(metrics.value_outcome_loss, 0.0)
+    assert jnp.allclose(metrics.q_outcome_loss, 0.0)
+    assert jnp.all(jnp.isfinite(alpha_v_grad))
+    assert jnp.all(jnp.isfinite(alpha_q_grad))
+
+
+def test_categorical_density_nll_is_not_removed_by_dirichlet_kl_cutoff():
+    data = Sample(
+        obs=jnp.zeros((2, 1)),
+        policy_tgt=jnp.ones((2, 1)),
+        value_tgt=jnp.ones((2,)),
+        played_action=jnp.zeros((2,), dtype=jnp.int32),
+        policy_mask=jnp.ones((2, 1), dtype=jnp.bool_),
+        value_mask=jnp.ones((2,), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((2, 1, 3)),
+        beta_V_target=jnp.ones((2, 3)),
+        q_loss_weight=jnp.ones((2, 1)),
+        q_target_kind=jnp.full(
+            (2, 1),
+            int(TARGET_CATEGORICAL),
+            dtype=jnp.int8,
+        ),
+        q_target_outcome=jnp.full((2, 1), 2, dtype=jnp.int8),
+        v_target_kind=jnp.full(
+            (2,),
+            int(TARGET_CATEGORICAL),
+            dtype=jnp.int8,
+        ),
+        v_target_outcome=jnp.full((2,), 2, dtype=jnp.int8),
+    )
+    logits = jnp.zeros((2, 1))
+    alpha_v = jnp.array(
+        [
+            [300.0, 1.0, 1.0],
+            [jnp.nan, 1.0, 1.0],
+        ]
+    )
+    alpha_q = alpha_v[:, None, :]
+    config = _loss_config(
+        policy_loss_weight=0.0,
+        value_dir_kl_weight=1.0,
+        q_dir_kl_weight=1.0,
+        categorical_epsilon=0.01,
+    )
+
+    finite_nll = dirichlet_nll_at_categorical(
+        alpha_v[0],
+        jnp.asarray(2),
+        0.01,
+    )
+    nonfinite_nll = dirichlet_nll_at_categorical(
+        alpha_v[1],
+        jnp.asarray(2),
+        0.01,
+    )
+    _, metrics = _compute_dirichlet_losses(
+        logits,
+        alpha_v,
+        alpha_q,
+        data,
+        config,
+    )
+
+    assert finite_nll > DIRICHLET_KL_LOSS_CUTOFF
+    assert not bool(jnp.isfinite(nonfinite_nll))
+    assert jnp.allclose(metrics.value_dir_kl_loss, finite_nll)
+    assert jnp.allclose(metrics.q_dir_kl_loss, finite_nll)
+
+
+def test_invalid_categorical_target_outcome_is_not_clipped_to_a_class():
+    data = Sample(
+        obs=jnp.zeros((1, 1)),
+        policy_tgt=jnp.ones((1, 1)),
+        value_tgt=jnp.ones((1,)),
+        played_action=jnp.zeros((1,), dtype=jnp.int32),
+        policy_mask=jnp.ones((1, 1), dtype=jnp.bool_),
+        value_mask=jnp.ones((1,), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((1, 1, 3)),
+        beta_V_target=jnp.ones((1, 3)),
+        q_loss_weight=jnp.ones((1, 1)),
+        q_target_kind=jnp.full(
+            (1, 1),
+            int(TARGET_CATEGORICAL),
+            dtype=jnp.int8,
+        ),
+        q_target_outcome=jnp.full((1, 1), -1, dtype=jnp.int8),
+        v_target_kind=jnp.full(
+            (1,),
+            int(TARGET_CATEGORICAL),
+            dtype=jnp.int8,
+        ),
+        v_target_outcome=jnp.full((1,), -1, dtype=jnp.int8),
+    )
+    config = _loss_config(
+        policy_loss_weight=0.0,
+        value_dir_kl_weight=1.0,
+        q_dir_kl_weight=1.0,
+        categorical_epsilon=0.01,
+    )
+
+    total_loss, metrics = _compute_dirichlet_losses(
+        jnp.zeros((1, 1)),
+        jnp.ones((1, 3)),
+        jnp.ones((1, 1, 3)),
+        data,
+        config,
+    )
+
+    assert jnp.isnan(total_loss)
+    assert jnp.isnan(metrics.value_dir_kl_loss)
+    assert jnp.isnan(metrics.q_dir_kl_loss)
+
+
+def test_zero_weight_losses_cannot_poison_policy_objective_with_nan():
+    data = Sample(
+        obs=jnp.zeros((1, 1)),
+        policy_tgt=jnp.asarray([[1.0, 0.0]]),
+        value_tgt=jnp.ones((1,)),
+        played_action=jnp.zeros((1,), dtype=jnp.int32),
+        policy_mask=jnp.ones((1, 2), dtype=jnp.bool_),
+        value_mask=jnp.ones((1,), dtype=jnp.bool_),
+        beta_Q_target=jnp.ones((1, 2, 3)),
+        beta_V_target=jnp.ones((1, 3)),
+        q_loss_weight=jnp.ones((1, 2)),
+    )
+    config = _loss_config(
+        policy_loss_weight=1.0,
+        value_dir_kl_weight=0.0,
+        q_dir_kl_weight=0.0,
+        value_outcome_weight=0.0,
+        q_outcome_weight=0.0,
+    )
+
+    total_loss, metrics = _compute_dirichlet_losses(
+        jnp.zeros((1, 2)),
+        jnp.full((1, 3), jnp.nan),
+        jnp.full((1, 2, 3), jnp.nan),
+        data,
+        config,
+    )
+
+    assert jnp.allclose(total_loss, jnp.log(jnp.asarray(2.0)))
+    assert jnp.isnan(metrics.value_dir_kl_loss)
+    assert jnp.isnan(metrics.q_dir_kl_loss)
 
 
 def test_debug_outcome_losses_use_dirichlet_mean_nll_not_density():

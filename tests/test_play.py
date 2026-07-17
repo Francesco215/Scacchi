@@ -8,6 +8,10 @@ import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
 from scacchi import dirichlet_mctx
+from scacchi.dirichlet_mctx.categorical import (
+    TARGET_CATEGORICAL,
+    TARGET_PAD,
+)
 from scacchi.dirichlet_q_search import outcome_utility, posterior_sample_action
 from scacchi.distributed import BatchParallel, assert_batch_axis_sharded
 from scacchi.network import BoardlawNet
@@ -68,6 +72,20 @@ class _ToySearchEnv:
             current_player=state.current_player,
             rewards=state.rewards,
             terminated=state.terminated,
+        )
+
+
+class _TerminalToySearchEnv:
+    def step(self, state: _ToySearchState, action: jax.Array) -> _ToySearchState:
+        del action
+        actor = state.current_player
+        rewards = 2.0 * jax.nn.one_hot(actor, 2, dtype=state.observation.dtype) - 1.0
+        return _ToySearchState(
+            observation=state.observation + 1.0,
+            legal_action_mask=jnp.zeros_like(state.legal_action_mask),
+            current_player=1 - actor,
+            rewards=rewards,
+            terminated=jnp.asarray(True),
         )
 
 
@@ -180,33 +198,19 @@ def test_scalar_gumbel_search_preserves_batch_sharding_without_collectives():
     assert metadata.search_action.shape == (batch_size,)
 
 
-def test_dirichlet_gumbel_search_uses_shared_expand_adapter():
+def test_scalar_gumbel_search_rejects_dirichlet_outputs():
     env_state = _toy_dirichlet_state()
     search = make_search(
         _ToySearchEnv(),
         _toy_dirichlet_evaluator,
         SearchConfig(
             kind=SearchKind.gumbel,
-            gumbel=GumbelSearchConfig(
-                num_simulations=2,
-                policy_sample_chunk_size=2,
-            ),
+            gumbel=GumbelSearchConfig(num_simulations=2),
         ),
     )
 
-    output = search(env_state, jax.random.PRNGKey(5))
-
-    prediction = output.posterior.prediction
-    metadata = output.posterior.metadata
-    assert metadata is not None
-    assert prediction.alpha_v is not None
-    assert prediction.alpha_q is not None
-    assert metadata.q_weight is not None
-    assert metadata.search_action is not None
-    assert prediction.policy.shape == env_state.legal_action_mask.shape
-    assert prediction.alpha_v.shape == (2, 2)
-    assert prediction.alpha_q.shape == (2, 3, 2)
-    assert jnp.all(prediction.policy[~env_state.legal_action_mask] == 0.0)
+    with pytest.raises(ValueError, match="scalar policy/value models only"):
+        search(env_state, jax.random.PRNGKey(5))
 
 
 def test_dirichlet_thompson_prior_only_search_preserves_rng_and_targets():
@@ -296,6 +300,51 @@ def test_dirichlet_thompson_tree_search_builds_legal_targets():
         axis=-1,
     )
     assert bool(selected_is_legal.all())
+
+
+def test_dirichlet_thompson_exports_categorical_root_and_q_targets():
+    env_state = _toy_dirichlet_state()
+    search = make_search(
+        _TerminalToySearchEnv(),
+        _toy_dirichlet_evaluator,
+        SearchConfig(
+            kind=SearchKind.dirichlet_thompson,
+            dirichlet_thompson=DirichletThompsonSearchConfig(
+                num_simulations=4,
+                policy_samples=4,
+            ),
+        ),
+    )
+
+    output = search(env_state, jax.random.PRNGKey(29))
+    prediction = output.posterior.prediction
+    metadata = output.posterior.metadata
+    assert metadata is not None
+    assert metadata.search_action is not None
+    assert metadata.q_target_kind is not None
+    assert metadata.q_target_outcome is not None
+    assert metadata.q_target_distance is not None
+    assert metadata.v_target_kind is not None
+    assert metadata.v_target_outcome is not None
+    assert metadata.v_target_distance is not None
+
+    batch = jnp.arange(env_state.current_player.shape[0])
+    action = metadata.search_action
+    assert jnp.array_equal(
+        prediction.policy,
+        jax.nn.one_hot(action, prediction.policy.shape[-1]),
+    )
+    assert jnp.all(
+        metadata.q_target_kind[batch, action] == int(TARGET_CATEGORICAL)
+    )
+    assert jnp.all(metadata.q_target_outcome[batch, action] == 1)
+    assert jnp.all(metadata.q_target_distance[batch, action] == 1)
+    assert jnp.all(metadata.v_target_kind == int(TARGET_CATEGORICAL))
+    assert jnp.all(metadata.v_target_outcome == 1)
+    assert jnp.all(metadata.v_target_distance == 1)
+    assert jnp.all(
+        metadata.q_target_kind[~env_state.legal_action_mask] == int(TARGET_PAD)
+    )
 
 
 def test_policy_search_uses_masked_logits_without_tree_search():

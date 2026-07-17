@@ -27,15 +27,11 @@ selfplay:
 
     dirichlet_thompson:
       num_simulations: 16
+      kappa: 4.0
       # Final root policy population. Internal repair draws its own fresh
       # population from each node's just-updated edge posteriors.
       policy_samples: 32
 
-      constants:
-        kappa_leaf: 1.0
-        # Match the categorical evidence used by tictactoe-demo/app.js.
-        kappa_terminal: 80.0
-        categorical_epsilon: 0.01
 
 training:
   batch_size: 2048
@@ -54,6 +50,7 @@ training:
     terminal_edge_targets: false
     terminal_parent_targets: false
     policy_target_mode: search
+    categorical_epsilon: 0.01
 
   regularization:
     dirichlet_concentration_clip: 8.0
@@ -66,11 +63,8 @@ eval:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
+      kappa: 4.0
       policy_samples: 32
-      constants:
-        kappa_leaf: 1.0
-        kappa_terminal: 80.0
-        categorical_epsilon: 0.01
   baseline_search:
     kind: gumbel
     gumbel:
