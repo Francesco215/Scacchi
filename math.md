@@ -78,11 +78,9 @@ use $u_{\mathrm{cat}}$ without sampling.
 The policy logits are trained to imitate the search policy. Native Thompson
 traversal does not add them to uncertain edge scores; it uses exact categorical
 utilities or sampled action Dirichlets plus the legal-action mask. Logits are
-not persistent tree state. If `policy_prior` must break a proved draw while a
-search node is being categorized, search evaluates that node's stored
-embedding at that moment. Final root readout instead reuses
-`root.prior_logits`, which remain available for the duration of the policy call
-but are never copied into the tree.
+not persistent tree state and categorical ties never request them. Search
+samples uniformly among tied certified actions using its existing random key,
+without reevaluating the stored embedding.
 
 ### 1.1 Perspective alignment
 
@@ -162,10 +160,6 @@ The root contract parallels MCTX, with full Dirichlet values added:
 ```python
 import functools
 
-def node_evaluation_fn(params, rng_key, state):
-    del params, rng_key
-    return evaluator(state.observation).logits
-
 root = dirichlet_mctx.RootFnOutput(
     prior_logits=prediction.logits,
     value=prediction.alpha_v,
@@ -180,7 +174,6 @@ policy_output = dirichlet_mctx.dirichlet_thompson_policy(
     rng_key=rng_key,
     root=root,
     recurrent_fn=expand_fn,
-    node_evaluation_fn=node_evaluation_fn,
     num_simulations=num_simulations,
     invalid_actions=~env_state.legal_action_mask,
     posterior_update=functools.partial(
@@ -189,17 +182,13 @@ policy_output = dirichlet_mctx.dirichlet_thompson_policy(
     ),
     max_depth=max_depth,
     policy_samples=policy_samples,
-    categorical_draw_rule=categorical_draw_rule,
 )
 ```
 
-`categorical_draw_rule` is one of `policy_prior`, `fastest_draw`,
-`slowest_draw`, or `fixed_order`. It matters only after the node has proved a
-draw and always selects among certified draw edges, never losing edges.
-`node_evaluation_fn` is required when `policy_prior` may be used during a
-nonempty search. It is invoked lazily only when a search node is publishing a
-categorical draw. The later root readout uses the ephemeral logits already
-present in `root`.
+Categorical tie-breaking needs no extra evaluation callback or configuration.
+The search uses its existing random key to sample uniformly among equally good
+certified actions. For a draw, every certified draw edge is tied; losing edges
+are never candidates.
 The sole scalar in the default repair rule is $\kappa>0$, appearing only in
 $\gamma=n/(\kappa+n)$. It is node-prior strength, not leaf or terminal
 evidence.
@@ -392,15 +381,16 @@ $$
 Apply these rules in priority order:
 
 1. If $\mathcal W_s\ne\varnothing$, the node is a categorical win. Derive the
-   winning edge by minimizing $(\tau_{s,a},a)$ over $\mathcal W_s$ and store
-   only its distance as $\tau_s$; the action itself remains derived.
+   winning edge by minimizing $\tau_{s,a}$ over $\mathcal W_s$, sampling
+   uniformly if several edges have the same minimum distance, and store only
+   its distance as $\tau_s$; the action itself remains derived.
 2. Otherwise, while $\mathcal U_s\ne\varnothing$, the node remains unresolved.
 3. If every edge is categorical and $\mathcal D_s\ne\varnothing$, the node is a
-   draw. Choose only among $\mathcal D_s$: highest freshly evaluated policy logit for
-   `policy_prior`, minimum distance for `fastest_draw`, maximum distance for
-   `slowest_draw`, or lowest action index for `fixed_order`.
+   draw. Sample uniformly among $\mathcal D_s$; neither draw distance, policy
+   logits, nor action order breaks the tie.
 4. Otherwise every legal edge is a loss. The node is a categorical loss and
-   derives the action with maximum distance, breaking ties by lowest index.
+   derives an action with maximum distance, sampling uniformly among edges at
+   that distance.
 
 The resulting $(z_s,\tau_s)$ is absorbing. “Shortest” means shortest among
 currently certified winning edges. Immediate absorption cannot prove a
@@ -707,19 +697,16 @@ $$
 (a\mid s_0;Y^{\mathrm{root}}).
 $$
 
-If the root is categorical, derive its certified action $a_{\mathrm{cat}}(s_0)$
-from the tagged edge certificates and draw rule, then return
+If the root is categorical, sample its certified action $a_{\mathrm{cat}}(s_0)$
+uniformly among equally good tagged edge certificates, then return
 
 $$
 \pi_{\mathrm{search}}(a\mid s_0)
 =\mathbf 1[a=a_{\mathrm{cat}}(s_0)].
 $$
 
-For a `policy_prior` root draw, this final derivation uses
-`root.prior_logits` from the already completed root evaluation. During
-bottom-up categorization, a draw node—including the root—calls
-`node_evaluation_fn` on its stored embedding only when the tie-break is
-actually needed. Neither result is retained in `Tree`.
+This tie-break consumes the search RNG directly. It does not use policy logits,
+reevaluate the stored embedding, or add any state to `Tree`.
 
 The backend's `PolicyOutput` contains
 
@@ -1009,17 +996,15 @@ DIRICHLET-THOMPSON-POLICY(root, N, posterior_update):
             context <- (node, child summaries, tagged payloads, final leaf)
             update <- posterior_update(key, context)
             apply unresolved edge-count deltas to node payload (n_down)
-            if publishing a draw and rule is policy_prior:
-                logits <- node_evaluation_fn(node.embedding)
             try categorical win/draw/loss rules at node
+            sample uniformly among tied certified actions
             if node became categorical and has a parent:
                 commit final 1 + n_down delta to parent payload
                 overwrite incoming edge count with distance + 1
                 overwrite node payload n_down with node distance
 
     if root is categorical:
-        root_action <- derive action from root edge certificates and draw rule
-        use ephemeral root.prior_logits only for a policy_prior draw tie-break
+        root_action <- sample uniformly among tied certified edge certificates
         root_policy <- one_hot(root_action)
     else:
         root_native <- categorical edges plus effective Dirichlet edges
@@ -1085,8 +1070,8 @@ A correct implementation maintains all of the following:
     no longer contain counts.
 14. Numeric alphas, cache projections, and caches never override native
     certificates or become categorical targets.
-15. Policy logits are never persistent tree state; internal `policy_prior`
-    draw tie-breaks evaluate the stored embedding on demand.
+15. Categorical ties use the search RNG to sample uniformly among equally good
+    certified actions; they never trigger a policy reevaluation.
 16. Categorical V/Q targets use density NLL in both Dirichlet loss modes;
     unresolved targets retain the configured full/mean behavior.
 17. Terminal means categorical tag plus node payload zero; zero support alone

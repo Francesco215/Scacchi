@@ -176,6 +176,7 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
                 # leaf/terminal constants never represented this quantity;
                 # the implementation used the app.js default of four.
                 settings.pop("constants", None)
+                settings.pop("categorical_draw_rule", None)
                 settings.setdefault("kappa", 4.0)
             gumbel = search.get("gumbel")
             if isinstance(gumbel, dict):

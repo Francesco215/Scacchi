@@ -47,13 +47,6 @@ class DirichletLossMode(StrEnum):
     mean = "mean"
 
 
-class CategoricalDrawRule(StrEnum):
-    policy_prior = "policy_prior"
-    fastest_draw = "fastest_draw"
-    slowest_draw = "slowest_draw"
-    fixed_order = "fixed_order"
-
-
 class LossMaskMode(StrEnum):
     search = "search"
     value = "value"
@@ -159,8 +152,6 @@ class DirichletThompsonSearchConfig:
     # the full root readout budget.
     posterior_policy_samples: int | None = None
     policy_sample_chunk_size: int | None = 32
-    categorical_draw_rule: CategoricalDrawRule = CategoricalDrawRule.policy_prior
-
     def __post_init__(self) -> None:
         _require_ge(
             "search.dirichlet_thompson.num_simulations",

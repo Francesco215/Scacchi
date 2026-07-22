@@ -25,7 +25,6 @@ selfplay:
       kappa: 4.0
       policy_samples: 1
       policy_sample_chunk_size: 1
-      categorical_draw_rule: policy_prior
 
 training:
   batch_size: 4096

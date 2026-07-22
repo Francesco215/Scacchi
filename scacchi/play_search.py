@@ -169,7 +169,6 @@ def _run_dirichlet_thompson_search(
     env_state: pgx.State,
     prediction: EvaluatorOutput,
     expand_fn,
-    node_evaluation_fn,
     rng_key: jax.Array,
     search_cfg: DirichletThompsonSearchConfig,
     q_loss_weight_mode: str,
@@ -222,13 +221,11 @@ def _run_dirichlet_thompson_search(
         root=root,
         recurrent_fn=expand_fn,
         num_simulations=int(search_cfg.num_simulations),
-        node_evaluation_fn=node_evaluation_fn,
         invalid_actions=~env_state.legal_action_mask,
         posterior_update=posterior_update,
         max_depth=search_cfg.max_depth,
         policy_samples=int(search_cfg.policy_samples),
         policy_sample_chunk_size=search_cfg.policy_sample_chunk_size,
-        categorical_draw_rule=str(search_cfg.categorical_draw_rule),
     )
     policy_target = policy_output.action_weights
     search_action = policy_output.action
@@ -298,17 +295,12 @@ def _run_dirichlet_thompson_search(
 def _make_dirichlet_thompson_search(env, evaluator: Evaluator, search_cfg: DirichletThompsonSearchConfig, q_loss_weight_mode: str) -> Search:
     expand_fn = make_dirichlet_expand_fn(env, evaluator)
 
-    def node_evaluation_fn(_, rng_key, env_state):
-        del rng_key
-        return evaluator(env_state.observation).logits
-
     def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
         prediction = evaluator(root_state.observation)
         return _run_dirichlet_thompson_search(
             root_state,
             prediction,
             expand_fn,
-            node_evaluation_fn,
             rng_key,
             search_cfg,
             q_loss_weight_mode,

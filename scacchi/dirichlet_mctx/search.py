@@ -311,39 +311,11 @@ def _set_node_update(
     )
 
 
-def _policy_prior_logits(
-    params: base.Params,
-    rng_key: chex.PRNGKey,
-    tree: Tree,
-    node_index: jax.Array,
-    active_draw: jax.Array,
-    node_evaluation_fn: base.NodeEvaluationFn,
-) -> jax.Array:
-    """Evaluate policy logits only when an active draw needs tie-breaking."""
-
-    batch = jnp.arange(tree.parents.shape[0])
-    embedding = jax.tree.map(
-        lambda value: value[batch, node_index],
-        tree.embeddings,
-    )
-    shape = tree.invalid_actions[batch, node_index].shape
-    dtype = tree.edge_alpha.dtype
-    return jax.lax.cond(
-        jnp.any(active_draw),
-        lambda operand: node_evaluation_fn(*operand),
-        lambda _: jnp.zeros(shape, dtype=dtype),
-        (params, rng_key, embedding),
-    )
-
-
 def _categorize_node_and_publish(
-    params: base.Params,
     rng_key: chex.PRNGKey,
     tree: Tree,
     node_index: jax.Array,
     active: jax.Array,
-    categorical_draw_rule: str,
-    node_evaluation_fn: base.NodeEvaluationFn | None,
 ) -> Tree:
     """Publish a node certificate after preserving its final parent support."""
 
@@ -376,30 +348,13 @@ def _categorize_node_and_publish(
             ),
         ),
     )
-    if categorical_draw_rule == "policy_prior":
-        if node_evaluation_fn is None:
-            raise ValueError(
-                "categorical_draw_rule='policy_prior' requires "
-                "node_evaluation_fn"
-            )
-        prior_logits = _policy_prior_logits(
-            params,
-            rng_key,
-            tree,
-            node_index,
-            active & (candidate_outcome == 1),
-            node_evaluation_fn,
-        )
-    else:
-        prior_logits = jnp.zeros_like(edge_distance, dtype=tree.edge_alpha.dtype)
     candidate_action = action_selection.categorical_action(
+        rng_key,
         candidate_outcome,
         edge_outcome,
         edge_distance,
-        prior_logits,
         invalid_actions,
         num_outcomes=num_outcomes,
-        draw_rule=categorical_draw_rule,
     )
     candidate_distance = edge_distance[batch, candidate_action]
     old_outcome = tree.node_categorical_outcome[batch, node_index]
@@ -486,14 +441,11 @@ def _categorize_node_and_publish(
 
 
 def backward(
-    params: base.Params,
     rng_key: chex.PRNGKey,
     tree: Tree,
     simulation: Simulation,
     step: base.RecurrentFnOutput,
     posterior_update: base.PosteriorUpdateFn,
-    categorical_draw_rule: str,
-    node_evaluation_fn: base.NodeEvaluationFn | None,
 ) -> Tree:
     """Repair uncertain posteriors and propagate exact certificates upward."""
 
@@ -507,12 +459,17 @@ def backward(
 
     def body_fn(state):
         key, tree, node_index, active, leaf_active = state
-        key, update_key, evaluation_key = jax.random.split(key, 3)
+        key, update_key, tie_break_key = jax.random.split(key, 3)
         leaf=LeafView(action=simulation.action,value_alpha=step.value,to_play=step.to_play,active=leaf_active)
         context = PosteriorUpdateContext(node=_gather_node(tree, node_index), children=_gather_children(tree, node_index), leaf=leaf, active=active)
         update = posterior_update(update_key, context)
         tree = _set_node_update(tree, node_index, update, active)
-        tree = _categorize_node_and_publish(params, evaluation_key, tree, node_index, active, categorical_draw_rule, node_evaluation_fn)
+        tree = _categorize_node_and_publish(
+            tie_break_key,
+            tree,
+            node_index,
+            active,
+        )
         continue_up = active & (node_index != Tree.ROOT_INDEX)
         parent = tree.parents[batch, node_index]
         next_node = jnp.where(continue_up, parent, Tree.ROOT_INDEX)
@@ -535,10 +492,8 @@ def search(
     action_selection_fn: base.ActionSelectionFn,
     posterior_update: base.PosteriorUpdateFn,
     num_simulations: int,
-    node_evaluation_fn: base.NodeEvaluationFn | None = None,
     max_depth: int | None = None,
     invalid_actions: jax.Array | None = None,
-    categorical_draw_rule: str = "policy_prior",
     loop_fn: base.LoopFn = jax.lax.fori_loop,
 ) -> Tree:
     """Run ``simulate -> expand -> bottom-up repair`` a fixed number of times."""
@@ -555,13 +510,6 @@ def search(
     max_depth = max(1, int(max_depth))
     if invalid_actions is None:
         invalid_actions = ~jnp.isfinite(root.prior_logits)
-    categorical_draw_rule = action_selection.validate_categorical_draw_rule(
-        categorical_draw_rule
-    )
-    if categorical_draw_rule == "policy_prior" and node_evaluation_fn is None:
-        raise ValueError(
-            "categorical_draw_rule='policy_prior' requires node_evaluation_fn"
-        )
 
     tree = instantiate_tree_from_root(root, num_simulations, invalid_actions)
     batch_size = root.prior_logits.shape[0]
@@ -580,14 +528,11 @@ def search(
             new_node = jnp.asarray(simulation_index + 1, dtype=jnp.int32)
             tree, step = expand(params, expand_key, tree, recurrent_fn, simulation, new_node)
             return backward(
-                params,
                 backward_key,
                 tree,
                 simulation,
                 step,
                 posterior_update,
-                categorical_draw_rule,
-                node_evaluation_fn,
             )
 
         tree = jax.lax.cond(

@@ -6,10 +6,6 @@ flow deliberately matches MCTX:
 ```python
 import functools
 
-def evaluate_policy_logits(params, rng_key, state):
-    del params, rng_key
-    return evaluator(state.observation).logits
-
 root = dirichlet_mctx.RootFnOutput(
     prior_logits=prediction.logits,
     value=prediction.alpha_v,
@@ -23,14 +19,12 @@ policy_output = dirichlet_mctx.dirichlet_thompson_policy(
     rng_key=rng_key,
     root=root,
     recurrent_fn=expand_fn,
-    node_evaluation_fn=evaluate_policy_logits,
     num_simulations=num_simulations,
     invalid_actions=~env_state.legal_action_mask,
     posterior_update=functools.partial(
         dirichlet_mctx.update_posterior,
         kappa=4.0,
     ),
-    categorical_draw_rule="policy_prior",
 )
 ```
 
@@ -72,13 +66,13 @@ when a mixed categorical/Dirichlet policy is read out.
 Bottom-up repair makes a node categorical when any edge is a certified win,
 or when every legal edge has been certified and the minimax result is a draw
 or loss. Wins use the shortest currently certified winning edge; losses delay
-defeat for the longest certified distance. Draws use the configured
-`policy_prior`, `fastest_draw`, `slowest_draw`, or `fixed_order` rule. The
-selected action is derived from immutable edge certificates rather than stored
-on the node. Policy logits are not retained in the tree: `policy_prior` invokes
-`node_evaluation_fn` from the stored embedding only when a draw actually needs
-that tie-break. A categorical root returns a deterministic one-hot policy, and
-remaining static-loop iterations become inactive.
+defeat for the longest certified distance. All certified draw edges are
+equivalent. The search samples uniformly among equally good certified edges,
+including equal-distance win/loss ties, using its existing RNG. The selected
+action is derived from immutable edge certificates rather than stored on the
+node, and no policy reevaluation is needed. A categorical root returns a
+one-hot policy on the sampled certified action, and remaining static-loop
+iterations become inactive.
 
 Backward contains no uncertain-posterior formula. At every path node it gathers
 a `NodeView`, a `ChildrenView`, and a `LeafView`, calls

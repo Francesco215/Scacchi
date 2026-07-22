@@ -38,10 +38,6 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.selfplay.search.dirichlet_thompson.max_depth == 16
     assert config.selfplay.search.dirichlet_thompson.policy_samples == 1
     assert config.selfplay.search.dirichlet_thompson.policy_sample_chunk_size == 1
-    assert (
-        config.selfplay.search.dirichlet_thompson.categorical_draw_rule
-        == "policy_prior"
-    )
     assert config.selfplay.search.dirichlet_thompson.kappa == 4.0
     assert config.eval.player_search.kind == "dirichlet_thompson"
     assert config.eval.baseline_search.kind == "dirichlet_thompson"
@@ -119,33 +115,15 @@ def test_policy_search_temperature_must_be_positive():
         )
 
 
-@pytest.mark.parametrize(
-    "draw_rule",
-    ["policy_prior", "fastest_draw", "slowest_draw", "fixed_order"],
-)
-def test_categorical_draw_rules_are_configurable(draw_rule: str):
-    config = _config(
-        {
-            "model": {"network": "boardlaw_dirichlet"},
-            "search": {
-                "kind": "dirichlet_thompson",
-                "dirichlet_thompson": {"categorical_draw_rule": draw_rule},
-            },
-        }
-    )
-
-    assert config.search.dirichlet_thompson.categorical_draw_rule == draw_rule
-
-
-def test_unknown_categorical_draw_rule_is_rejected():
-    with pytest.raises(ValidationError, match="categorical_draw_rule"):
+def test_removed_categorical_draw_rule_is_rejected():
+    with pytest.raises(ConfigKeyError, match="categorical_draw_rule"):
         _config(
             {
                 "model": {"network": "boardlaw_dirichlet"},
                 "search": {
                     "kind": "dirichlet_thompson",
                     "dirichlet_thompson": {
-                        "categorical_draw_rule": "random_draw"
+                        "categorical_draw_rule": "policy_prior"
                     },
                 },
             }

@@ -35,10 +35,6 @@ RecurrentFn = Callable[
     [Params, chex.PRNGKey, Action, RecurrentState],
     tuple[RecurrentFnOutput, RecurrentState],
 ]
-NodeEvaluationFn = Callable[
-    [Params, chex.PRNGKey, RecurrentState],
-    jax.Array,
-]
 
 
 @chex.dataclass(frozen=True)

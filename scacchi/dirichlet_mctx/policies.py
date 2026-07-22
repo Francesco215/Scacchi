@@ -40,13 +40,11 @@ def dirichlet_thompson_policy(
     root: base.RootFnOutput,
     recurrent_fn: base.RecurrentFn,
     num_simulations: int,
-    node_evaluation_fn: base.NodeEvaluationFn | None = None,
     invalid_actions: jax.Array | None = None,
     posterior_update: base.PosteriorUpdateFn = posterior_updates.update_posterior,
     max_depth: int | None = None,
     policy_samples: int = 32,
     policy_sample_chunk_size: int | None = None,
-    categorical_draw_rule: str = "policy_prior",
     loop_fn: base.LoopFn = jax.lax.fori_loop,
 ) -> base.PolicyOutput:
     """Run Thompson tree search with an MCTX-shaped external API."""
@@ -55,19 +53,8 @@ def dirichlet_thompson_policy(
         raise ValueError(f"num_simulations must be >= 0, got {num_simulations}")
     if policy_samples < 0:
         raise ValueError(f"policy_samples must be >= 0, got {policy_samples}")
-    categorical_draw_rule = action_selection.validate_categorical_draw_rule(
-        categorical_draw_rule
-    )
     if invalid_actions is None:
         invalid_actions = ~jnp.isfinite(root.prior_logits)
-    if (
-        num_simulations > 0
-        and categorical_draw_rule == "policy_prior"
-        and node_evaluation_fn is None
-    ):
-        raise ValueError(
-            "categorical_draw_rule='policy_prior' requires node_evaluation_fn"
-        )
     search_key, policy_key = jax.random.split(rng_key)
 
     if num_simulations == 0:
@@ -81,10 +68,8 @@ def dirichlet_thompson_policy(
             action_selection_fn=action_selection.thompson_action_selection,
             posterior_update=posterior_update,
             num_simulations=num_simulations,
-            node_evaluation_fn=node_evaluation_fn,
             max_depth=max_depth,
             invalid_actions=invalid_actions,
-            categorical_draw_rule=categorical_draw_rule,
             loop_fn=loop_fn,
         )
 
@@ -95,13 +80,12 @@ def dirichlet_thompson_policy(
     ]
     legal_action_mask = ~invalid_actions
     categorical_root_action = action_selection.categorical_action(
+        jax.random.fold_in(policy_key, 0),
         root_categorical_outcome,
         root_edge_categorical_outcome,
         tree.edge_payload[:, tree.ROOT_INDEX],
-        root.prior_logits,
         invalid_actions,
         num_outcomes=alpha.shape[-1],
-        draw_rule=categorical_draw_rule,
     )
     categorical_policy = jax.nn.one_hot(
         categorical_root_action,

@@ -359,7 +359,7 @@ H_{s,a}=Q_{s,a},
 
       <p>Thus <d-math>Q</d-math> and <d-math>B</d-math> are successive contents of one float slot, while <d-math>A</d-math> is computed and never stored. The fixed <d-math>V_s</d-math> and mutable <d-math>C_s</d-math> cannot share a slot while the node is unresolved: every repair needs both at the same time.</p>
 
-      <p>Policy logits are not tree state. Legality is extracted during evaluation and stored as a compact mask. If exact draw tie-breaking later asks for the policy prior, the node embedding is evaluated again.</p>
+      <p>Policy logits are not tree state. Legality is extracted during evaluation and stored as a compact mask. Categorical ties use the search RNG directly, so they never trigger another network evaluation.</p>
 
       <h3 id="2-2-state-transitions">2.2 Safe integer-slot transitions</h3>
 
@@ -412,6 +412,8 @@ Y_{s,a}=
       </d-math>
 
       <p>The categorical tag is exact and absorbing. A certified edge is pruned from traversal. One certified win solves a node; a draw or loss is proved only after every legal edge is categorical.</p>
+
+      <p>Certified wins choose a shortest winning edge and certified losses choose a longest losing edge. All certified draw edges are equivalent. Whenever more than one edge remains tied—including equal-distance win or loss edges—the engine samples uniformly among them with the existing search RNG. Policy logits, draw-distance preferences, and action order do not break categorical ties.</p>
 
       <d-math block>
 u_{\mathrm{cat}}(L)=-1,
@@ -621,7 +623,7 @@ s_d,\ s_{d-1},\ \ldots,\ s_0.
 
       <h2 id="6-root-readout-and-training-targets">6. Root readout and training targets</h2>
 
-      <p>If the root remains unresolved, its policy is another mixed-native posterior-best population. If the root is categorical, the policy is one-hot on its certified action:</p>
+      <p>If the root remains unresolved, its policy is another mixed-native posterior-best population. If the root is categorical, the engine samples uniformly among tied certified actions and returns a one-hot policy on that sample:</p>
 
       <d-math block>
 \pi_{\mathrm{search}}(a\mid s_0)

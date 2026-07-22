@@ -2,7 +2,6 @@ from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
-import pytest
 
 from scacchi import dirichlet_mctx
 from scacchi.dirichlet_mctx import action_selection
@@ -29,7 +28,11 @@ def _root(
             dtype=jnp.float32,
         ),
         embedding=jnp.zeros((1,), dtype=jnp.int32),
-        terminal=jnp.zeros((1,), dtype=bool),
+        terminal_outcome=jnp.full(
+            (1,),
+            int(NO_OUTCOME),
+            dtype=jnp.int8,
+        ),
         to_play=jnp.zeros((1,), dtype=jnp.int32),
     )
 
@@ -39,15 +42,14 @@ def _categorize_root(
     edge_distance: tuple[int, ...],
     *,
     invalid_actions: tuple[bool, ...] | None = None,
-    prior_logits: tuple[float, ...] | None = None,
-    draw_rule: str = "policy_prior",
+    rng_key: jax.Array = jax.random.PRNGKey(0),
 ):
     num_actions = len(edge_outcome)
     if invalid_actions is None:
         invalid_actions = (False,) * num_actions
     invalid = jnp.asarray([invalid_actions], dtype=bool)
     tree = dirichlet_mctx.instantiate_tree_from_root(
-        _root(num_actions, prior_logits=prior_logits),
+        _root(num_actions),
         num_simulations=0,
         root_invalid_actions=invalid,
     )
@@ -56,25 +58,24 @@ def _categorize_root(
         edge_categorical_outcome=tree.edge_categorical_outcome.at[0, 0].set(
             jnp.asarray(edge_outcome, dtype=jnp.int8)
         ),
-        edge_categorical_distance=tree.edge_categorical_distance.at[0, 0].set(
+        edge_payload=tree.edge_payload.at[0, 0].set(
             jnp.asarray(edge_distance, dtype=jnp.int32)
         ),
     )
     tree = _categorize_node_and_publish(
+        rng_key,
         tree,
         jnp.asarray([tree.ROOT_INDEX], dtype=jnp.int32),
         jnp.asarray([True]),
-        draw_rule,
     )
     outcome = tree.node_categorical_outcome[:, tree.ROOT_INDEX]
     action = action_selection.categorical_action(
+        rng_key,
         outcome,
         tree.edge_categorical_outcome[:, tree.ROOT_INDEX],
-        tree.edge_categorical_distance[:, tree.ROOT_INDEX],
-        tree.node_prior_logits[:, tree.ROOT_INDEX],
+        tree.edge_payload[:, tree.ROOT_INDEX],
         invalid,
         num_outcomes=3,
-        draw_rule=draw_rule,
     )
     return tree, action
 
@@ -86,7 +87,7 @@ def test_win_certificate_uses_shortest_certified_edge_despite_unresolved_moves()
     )
 
     assert tree.node_categorical_outcome[0, 0] == 2
-    assert tree.node_categorical_distance[0, 0] == 2
+    assert tree.node_payload[0, 0] == 2
     assert action[0] == 2
 
 
@@ -102,36 +103,42 @@ def test_loss_requires_all_legal_edges_and_uses_longest_defeat():
     )
 
     assert unresolved.node_categorical_outcome[0, 0] == int(NO_OUTCOME)
-    assert unresolved.node_categorical_distance[0, 0] == int(NO_DISTANCE)
+    assert unresolved.summary().v_categorical_distance[0] == int(NO_DISTANCE)
     assert solved.node_categorical_outcome[0, 0] == 0
-    assert solved.node_categorical_distance[0, 0] == 8
+    assert solved.node_payload[0, 0] == 8
     assert action[0] == 1
 
 
-@pytest.mark.parametrize(
-    ("draw_rule", "expected_action", "expected_distance"),
-    [
-        ("policy_prior", 2, 7),
-        ("fastest_draw", 0, 2),
-        ("slowest_draw", 2, 7),
-        ("fixed_order", 0, 2),
-    ],
-)
-def test_draw_certificate_uses_only_draw_edges_and_configured_rule(
-    draw_rule: str,
-    expected_action: int,
-    expected_distance: int,
-):
+def test_draw_certificate_samples_uniformly_only_from_draw_edges():
+    node_outcome = jnp.asarray([1], dtype=jnp.int8)
+    edge_outcome = jnp.asarray([[1, 0, 1, 0]], dtype=jnp.int8)
+    edge_distance = jnp.asarray([[2, 50, 7, 100]], dtype=jnp.int32)
+    invalid = jnp.zeros((1, 4), dtype=bool)
+    keys = jax.random.split(jax.random.PRNGKey(7), 128)
+
+    actions = jax.vmap(
+        lambda key: action_selection.categorical_action(
+            key,
+            node_outcome,
+            edge_outcome,
+            edge_distance,
+            invalid,
+            num_outcomes=3,
+        )[0]
+    )(keys)
+
+    assert set(map(int, actions.tolist())) == {0, 2}
+    counts = jnp.bincount(actions, length=4)
+    assert abs(int(counts[0]) - int(counts[2])) < 40
+
     tree, action = _categorize_root(
         (1, 0, 1, 0),
         (2, 50, 7, 100),
-        prior_logits=(0.1, 100.0, 0.8, 200.0),
-        draw_rule=draw_rule,
+        rng_key=jax.random.PRNGKey(7),
     )
-
     assert tree.node_categorical_outcome[0, 0] == 1
-    assert tree.node_categorical_distance[0, 0] == expected_distance
-    assert action[0] == expected_action
+    assert int(action[0]) in {0, 2}
+    assert tree.node_payload[0, 0] == tree.edge_payload[0, 0, action[0]]
 
 
 def test_draw_requires_every_legal_edge_to_be_draw_or_loss():
@@ -141,26 +148,24 @@ def test_draw_requires_every_legal_edge_to_be_draw_or_loss():
     )
 
     assert tree.node_categorical_outcome[0, 0] == int(NO_OUTCOME)
-    assert tree.node_categorical_distance[0, 0] == int(NO_DISTANCE)
+    assert tree.summary().v_categorical_distance[0] == int(NO_DISTANCE)
 
 
 def test_categorical_certificates_are_absorbing():
     tree, _ = _categorize_root((2, 0), (4, 8))
     tree = replace(
         tree,
-        edge_categorical_distance=tree.edge_categorical_distance.at[0, 0, 0].set(
-            1
-        ),
+        edge_payload=tree.edge_payload.at[0, 0, 0].set(1),
     )
     tree = _categorize_node_and_publish(
+        jax.random.PRNGKey(1),
         tree,
         jnp.asarray([tree.ROOT_INDEX], dtype=jnp.int32),
         jnp.asarray([True]),
-        "policy_prior",
     )
 
     assert tree.node_categorical_outcome[0, 0] == 2
-    assert tree.node_categorical_distance[0, 0] == 4
+    assert tree.node_payload[0, 0] == 4
 
 
 def test_simulation_masks_categorical_edges_for_custom_selectors():
@@ -175,9 +180,7 @@ def test_simulation_masks_categorical_edges_for_custom_selectors():
         edge_categorical_outcome=tree.edge_categorical_outcome.at[0, 0, 0].set(
             0
         ),
-        edge_categorical_distance=tree.edge_categorical_distance.at[0, 0, 0].set(
-            1
-        ),
+        edge_payload=tree.edge_payload.at[0, 0, 0].set(1),
     )
 
     def prefers_first_action(rng_key, candidate_tree, node_index):
@@ -245,7 +248,7 @@ def test_terminal_chain_propagates_perspective_and_distance_and_stops_root():
         jnp.asarray([2, 0, 2, 0], dtype=jnp.int8),
     )
     assert jnp.array_equal(
-        tree.node_categorical_distance[0, :4],
+        tree.node_payload[0, :4],
         jnp.asarray([3, 2, 1, 0], dtype=jnp.int32),
     )
     assert jnp.array_equal(
@@ -253,7 +256,7 @@ def test_terminal_chain_propagates_perspective_and_distance_and_stops_root():
         jnp.asarray([2, 0, 2], dtype=jnp.int8),
     )
     assert jnp.array_equal(
-        tree.edge_categorical_distance[0, :3, 0],
+        tree.edge_payload[0, :3, 0],
         jnp.asarray([3, 2, 1], dtype=jnp.int32),
     )
     assert jnp.array_equal(
@@ -277,7 +280,11 @@ def test_solved_batch_lane_stays_frozen_while_another_lane_keeps_searching():
         value=jnp.repeat(root.value, 2, axis=0),
         action_values=jnp.repeat(root.action_values, 2, axis=0),
         embedding=jnp.zeros((2,), dtype=jnp.int32),
-        terminal=jnp.zeros((2,), dtype=bool),
+        terminal_outcome=jnp.full(
+            (2,),
+            int(NO_OUTCOME),
+            dtype=jnp.int8,
+        ),
         to_play=jnp.zeros((2,), dtype=jnp.int32),
     )
     terminal_depth = jnp.asarray([1, 3], dtype=jnp.int32)
@@ -321,7 +328,7 @@ def test_solved_batch_lane_stays_frozen_while_another_lane_keeps_searching():
         jnp.asarray([2, 2], dtype=jnp.int8),
     )
     assert jnp.array_equal(
-        tree.node_categorical_distance[:, tree.ROOT_INDEX],
+        tree.node_payload[:, tree.ROOT_INDEX],
         jnp.asarray([1, 3], dtype=jnp.int32),
     )
     assert jnp.array_equal(
@@ -361,15 +368,3 @@ def test_mixed_native_thompson_uses_exact_categorical_utility():
     expected = jnp.asarray([[1.0, 0.0]])
     assert jnp.array_equal(policy(contradictory_alpha), expected)
     assert jnp.array_equal(policy(agreeing_alpha), expected)
-
-
-def test_unknown_draw_rule_is_rejected_at_the_public_policy_boundary():
-    with pytest.raises(ValueError, match="categorical_draw_rule"):
-        dirichlet_mctx.dirichlet_thompson_policy(
-            params=(),
-            rng_key=jax.random.PRNGKey(0),
-            root=_root(1),
-            recurrent_fn=lambda *args: args,
-            num_simulations=0,
-            categorical_draw_rule="random",
-        )

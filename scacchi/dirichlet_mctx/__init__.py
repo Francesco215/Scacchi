@@ -1,7 +1,6 @@
 """A small MCTX-shaped backend for Dirichlet Thompson tree search."""
 
 from .action_selection import (
-    CATEGORICAL_DRAW_RULES,
     align_outcome,
     categorical_action,
     categorical_utility,
@@ -15,9 +14,8 @@ from .action_selection import (
     thompson_action_selection,
     thompson_policy,
     thompson_sample,
-    validate_categorical_draw_rule,
 )
-from .base import NodeEvaluationFn, PolicyOutput, RecurrentFnOutput, RootFnOutput
+from .base import PolicyOutput, RecurrentFnOutput, RootFnOutput
 from .categorical import (
     NO_DISTANCE,
     NO_OUTCOME,
@@ -49,13 +47,11 @@ from .tree import (
 
 __all__ = [
     "PolicyOutput",
-    "CATEGORICAL_DRAW_RULES",
     "ChildrenView",
     "DEFAULT_KAPPA",
     "DEFAULT_POLICY_SAMPLE_CHUNK_SIZE",
     "DEFAULT_POLICY_SAMPLES",
     "LeafView",
-    "NodeEvaluationFn",
     "NodeView",
     "NO_DISTANCE",
     "NO_OUTCOME",
@@ -90,5 +86,4 @@ __all__ = [
     "thompson_policy",
     "thompson_sample",
     "update_posterior",
-    "validate_categorical_draw_rule",
 ]

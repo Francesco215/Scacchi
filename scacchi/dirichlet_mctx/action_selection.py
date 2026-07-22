@@ -16,11 +16,6 @@ from .tree import Tree
 # lane still has a finite, positive fallback below.
 _GAMMA_PROPOSALS = 4
 
-CATEGORICAL_DRAW_RULES = frozenset(
-    {"policy_prior", "fastest_draw", "slowest_draw", "fixed_order"}
-)
-
-
 def flip_outcome(outcome: jax.Array) -> jax.Array:
     return outcome[..., ::-1]
 
@@ -61,34 +56,23 @@ def categorical_utility(outcome: jax.Array, num_outcomes: int) -> jax.Array:
     )
 
 
-def validate_categorical_draw_rule(rule: str) -> str:
-    rule = str(rule)
-    if rule not in CATEGORICAL_DRAW_RULES:
-        allowed = ", ".join(sorted(CATEGORICAL_DRAW_RULES))
-        raise ValueError(
-            f"categorical_draw_rule must be one of {allowed}; got {rule!r}"
-        )
-    return rule
-
-
 def categorical_action(
+    rng_key: chex.PRNGKey,
     node_outcome: jax.Array,
     edge_outcome: jax.Array,
     edge_distance: jax.Array,
-    prior_logits: jax.Array,
     invalid_actions: jax.Array,
     *,
     num_outcomes: int,
-    draw_rule: str,
 ) -> jax.Array:
-    """Choose the deterministic certified action for categorical nodes.
+    """Sample a certified action uniformly among equally good candidates.
 
     Win certificates prefer the shortest edge and loss certificates the
-    longest. Draw actions are selected only from categorical draws using the
-    configured rule. ``argmax`` supplies the stable lowest-action tie break.
+    longest. All certified draw actions are equivalent. Ties at each of those
+    outcomes are sampled uniformly instead of consulting policy logits or
+    action order.
     """
 
-    draw_rule = validate_categorical_draw_rule(draw_rule)
     legal = ~invalid_actions
     win_index = int(num_outcomes) - 1
     win_candidates = legal & (edge_outcome == win_index)
@@ -98,15 +82,7 @@ def categorical_action(
     distance = edge_distance.astype(jnp.float32)
     win_scores = jnp.where(win_candidates, -distance, -jnp.inf)
     loss_scores = jnp.where(loss_candidates, distance, -jnp.inf)
-    if draw_rule == "policy_prior":
-        draw_scores = jnp.where(draw_candidates, prior_logits, -jnp.inf)
-    elif draw_rule == "fastest_draw":
-        draw_scores = jnp.where(draw_candidates, -distance, -jnp.inf)
-    elif draw_rule == "slowest_draw":
-        draw_scores = jnp.where(draw_candidates, distance, -jnp.inf)
-    else:
-        # All candidates have the same score, so argmax takes the first.
-        draw_scores = jnp.where(draw_candidates, 0.0, -jnp.inf)
+    draw_scores = jnp.where(draw_candidates, 0.0, -jnp.inf)
 
     is_win = node_outcome == win_index
     is_loss = node_outcome == 0
@@ -115,7 +91,12 @@ def categorical_action(
         win_scores,
         jnp.where(is_loss[..., None], loss_scores, draw_scores),
     )
-    return jnp.argmax(scores, axis=-1).astype(jnp.int32)
+    best = jnp.max(scores, axis=-1, keepdims=True)
+    tied = jnp.isfinite(scores) & (scores == best)
+    tie_logits = jnp.where(tied, 0.0, -jnp.inf)
+    sampled = jax.random.categorical(rng_key, tie_logits, axis=-1)
+    has_candidate = jnp.any(tied, axis=-1)
+    return jnp.where(has_candidate, sampled, 0).astype(jnp.int32)
 
 
 def masked_argmax(scores: jax.Array, invalid_actions: jax.Array) -> jax.Array:
