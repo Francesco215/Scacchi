@@ -773,12 +773,6 @@ REMOTE_ENV=(
   "TPU_RUNTIME_METRICS_PORTS=${TPU_RUNTIME_METRICS_PORTS}"
 )
 for name in \
-  SCACCHI_RAW_SNAPSHOT_DIR \
-  SCACCHI_PROFILE_DIR \
-  SCACCHI_PROFILE_START_ITER \
-  SCACCHI_PROFILE_NUM_ITERS \
-  SCACCHI_PROFILE_PROCESS \
-  SCACCHI_PROFILE_PERFETTO \
   SCACCHI_DISABLE_DISTRIBUTED \
   SCACCHI_JAX_INITIALIZATION_TIMEOUT \
   SCACCHI_JAX_LOCAL_DEVICE_IDS \
@@ -829,8 +823,4 @@ set -e
 remote_training_active=0
 if [[ "${remote_training_status}" -ne 0 ]]; then
   exit "${remote_training_status}"
-fi
-
-if [[ -n "${SCACCHI_PROFILE_DIR:-}" ]]; then
-  echo "Profile traces were written under ${SCACCHI_PROFILE_DIR} on the selected TPU workers."
 fi

@@ -9,7 +9,7 @@ from scacchi.loss import (
     CONCENTRATION_HISTOGRAM_NUM_BINS,
     CONCENTRATION_HISTOGRAM_SERIES,
 )
-from scacchi.train import _concentration_histograms_for_logging
+from scacchi.logger import concentration_histograms
 
 
 def test_concentration_histograms_pool_updates_with_shared_edges() -> None:
@@ -23,7 +23,7 @@ def test_concentration_histograms_pool_updates_with_shared_edges() -> None:
         dirichlet_concentration_histogram_counts=jnp.asarray(per_update)
     )
 
-    histograms = _concentration_histograms_for_logging(metrics)
+    histograms = concentration_histograms(metrics)
 
     assert tuple(histograms) == (
         "train/V_C_prior_hist_dir",
@@ -47,4 +47,4 @@ def test_concentration_histograms_reject_wrong_metric_shape() -> None:
     )
 
     with pytest.raises(ValueError, match="must end in"):
-        _concentration_histograms_for_logging(metrics)
+        concentration_histograms(metrics)

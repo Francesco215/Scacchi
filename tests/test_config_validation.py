@@ -7,7 +7,7 @@ from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import ConfigKeyError, ValidationError
 
 from scacchi.envs import make_env
-from scacchi.train import _load_eval_baseline
+from scacchi.evaluations import load_eval_baseline
 from scacchi.types import Config, load_config
 
 
@@ -270,7 +270,7 @@ def test_gardner_pgx_eval_baseline_matches_env_action_space():
         }
     )
 
-    baseline = _load_eval_baseline(config, env)
+    baseline = load_eval_baseline(config, env)
     observation = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
     output = baseline(observation)
     logits = output[0] if isinstance(output, tuple) else output
@@ -293,7 +293,7 @@ def test_incompatible_pgx_eval_baseline_raises():
     )
 
     with pytest.raises(ValueError, match="incompatible"):
-        _load_eval_baseline(config, env)
+        load_eval_baseline(config, env)
 
 
 def test_flat_config_keys_are_rejected():
