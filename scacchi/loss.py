@@ -1,4 +1,5 @@
-from typing import Any, NamedTuple
+from collections.abc import Mapping
+from typing import Any, NamedTuple, cast
 
 from flax import nnx
 import jax
@@ -471,11 +472,11 @@ def _native_target_values(source: Any) -> dict[str, jax.Array | None]:
 
 def _native_fields_from_values(
     values: dict[str, jax.Array | None],
-    defaults: dict[str, jax.Array],
+    defaults: Mapping[str, object],
 ) -> _NativeTargetFields:
     def value_or_default(field: str) -> jax.Array:
         value = values[field]
-        return defaults[field] if value is None else value
+        return cast(jax.Array, defaults[field]) if value is None else value
 
     return _NativeTargetFields(
         *(value_or_default(field) for field in _NATIVE_TARGET_FIELD_NAMES)

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TypedDict
 
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import gammaln
+from jaxtyping import Array, DTypeLike, Float, Int, ScalarLike, Shaped
 
 
 TARGET_PAD = 0
@@ -16,40 +17,38 @@ NO_OUTCOME = -1
 NO_DISTANCE = -1
 
 
-def _full_like_input_sharding(
-    source: jax.Array,
-    value: Any,
-    dtype: Any,
-) -> jax.Array:
+class _NativeTargetFields(TypedDict):
+    q_target_kind: Int[Array, "*batch action"]
+    q_target_weight: Float[Array, "*batch action"]
+    q_target_outcome: Int[Array, "*batch action"]
+    q_target_distance: Int[Array, "*batch action"]
+    v_target_kind: Int[Array, "*batch"]
+    v_target_weight: Float[Array, "*batch"]
+    v_target_outcome: Int[Array, "*batch"]
+    v_target_distance: Int[Array, "*batch"]
+
+
+_EmptyNative = tuple[Int[Array, "*target"], Float[Array, "*target"], Int[Array, "*target"], Int[Array, "*target"]]
+
+
+def _full_like_input_sharding(source: Shaped[Array, "*batch"], value: ScalarLike, dtype: DTypeLike) -> Shaped[Array, "*batch"]:
     # Plain full_like/ones_like constants can be replicated under jit.
     # Keep a zero-valued dependency so defaults inherit source sharding.
     zero = jax.lax.stop_gradient(source - jax.lax.stop_gradient(source))
     return zero.astype(dtype) + jnp.asarray(value, dtype=dtype)
 
 
-def _empty_native(
-    beta: Any,
-    *,
-    kind: int = int(TARGET_DIRICHLET),
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+def _empty_native(beta: Float[Array, "*target outcome"], *, kind: int = int(TARGET_DIRICHLET)) -> _EmptyNative:
     beta = jnp.asarray(beta)
     target = beta[..., 0]
     target_kind = _full_like_input_sharding(target, int(kind), jnp.int8)
     target_weight = _full_like_input_sharding(target, 1.0, beta.dtype)
-    target_outcome = _full_like_input_sharding(
-        target,
-        int(NO_OUTCOME),
-        jnp.int8,
-    )
-    target_distance = _full_like_input_sharding(
-        target,
-        int(NO_DISTANCE),
-        jnp.int32,
-    )
+    target_outcome = _full_like_input_sharding(target, int(NO_OUTCOME), jnp.int8)
+    target_distance = _full_like_input_sharding(target, int(NO_DISTANCE), jnp.int32)
     return target_kind, target_weight, target_outcome, target_distance
 
 
-def native_fields_from_beta(beta_q: Any, beta_v: Any) -> dict[str, jax.Array]:
+def native_fields_from_beta(beta_q: Float[Array, "*batch action outcome"], beta_v: Float[Array, "*batch outcome"]) -> _NativeTargetFields:
     """Create ordinary-Dirichlet sidecars matching Q and V target shapes."""
 
     q_kind, q_weight, q_outcome, q_distance = _empty_native(beta_q)
@@ -66,12 +65,7 @@ def native_fields_from_beta(beta_q: Any, beta_v: Any) -> dict[str, jax.Array]:
     }
 
 
-def categorical_point(
-    outcome: jax.Array,
-    num_outcomes: int,
-    epsilon: float,
-    dtype: Any = jnp.float32,
-) -> jax.Array:
+def categorical_point(outcome: Int[Array, "*batch"], num_outcomes: int, epsilon: float, dtype: DTypeLike = jnp.float32) -> Float[Array, "*batch outcome"]:
     """Return an epsilon-interior simplex point for a categorical outcome.
 
     Every non-target coordinate is ``epsilon`` and the target coordinate is
@@ -86,41 +80,23 @@ def categorical_point(
         raise ValueError(f"unsupported outcome count: {num_outcomes}")
     epsilon = float(epsilon)
     if not 0.0 < epsilon < 1.0 / float(num_outcomes):
-        raise ValueError(
-            "epsilon must be > 0 and < 1 / num_outcomes; "
-            f"got epsilon={epsilon}, num_outcomes={num_outcomes}"
-        )
+        raise ValueError(f"epsilon must be > 0 and < 1 / num_outcomes; got epsilon={epsilon}, num_outcomes={num_outcomes}")
     eps = jnp.asarray(epsilon, dtype=dtype)
     outcome = jnp.asarray(outcome, dtype=jnp.int32)
     one_hot = jax.nn.one_hot(outcome, num_outcomes, dtype=dtype)
     peak = 1.0 - (float(num_outcomes) - 1.0) * eps
     point = one_hot * peak + (1.0 - one_hot) * eps
     valid_outcome = (outcome >= 0) & (outcome < num_outcomes)
-    return jnp.where(
-        valid_outcome[..., None],
-        point,
-        jnp.full_like(point, jnp.nan),
-    )
+    return jnp.where(valid_outcome[..., None], point, jnp.full_like(point, jnp.nan))
 
 
-def dirichlet_nll_at_categorical(
-    alpha: jax.Array,
-    outcome: jax.Array,
-    epsilon: float,
-) -> jax.Array:
+def dirichlet_nll_at_categorical(alpha: Float[Array, "*batch outcome"], outcome: Int[Array, "*batch"], epsilon: float) -> Float[Array, "*batch"]:
     """Negative log Dirichlet density at an epsilon-smoothed category."""
 
     dtype = jnp.result_type(alpha, jnp.float32)
     alpha_epsilon = jnp.asarray(1e-6, dtype=dtype)
     alpha = jnp.maximum(alpha.astype(dtype), alpha_epsilon)
-    point = jax.lax.stop_gradient(
-        categorical_point(
-            outcome,
-            alpha.shape[-1],
-            epsilon,
-            dtype=dtype,
-        )
-    )
+    point = jax.lax.stop_gradient(categorical_point(outcome, alpha.shape[-1], epsilon, dtype=dtype))
     alpha_sum = jnp.sum(alpha, axis=-1)
     return (
         -gammaln(alpha_sum)

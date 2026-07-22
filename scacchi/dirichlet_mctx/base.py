@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Generic, TypeVar
+from typing import TYPE_CHECKING, Callable, Generic, TypeVar
 
 import chex
-import jax
+from jaxtyping import Array, Bool, Float, Int, Key, PRNGKeyArray, PyTree, Shaped, UInt32
+
+if TYPE_CHECKING:
+    from .tree import PosteriorUpdate, PosteriorUpdateContext, Tree
 
 
-Params = chex.ArrayTree
-Action = jax.Array
-RecurrentState = Any
+Params = PyTree[Shaped[Array, "..."]]
+Action = Int[Array, "batch"]
+RecurrentState = PyTree[Shaped[Array, "batch ..."]]
+PRNGKey = PRNGKeyArray
+BatchedPRNGKey = Key[Array, "batch"] | UInt32[Array, "batch 2"]
 
 
 @chex.dataclass(frozen=True)
@@ -24,17 +29,14 @@ class RecurrentFnOutput:
     of ``to_play`` for a terminal child and ``NO_OUTCOME`` otherwise.
     """
 
-    value: jax.Array
-    action_values: jax.Array
-    invalid_actions: jax.Array
-    terminal_outcome: jax.Array
-    to_play: jax.Array
+    value: Float[Array, "batch outcome"]
+    action_values: Float[Array, "batch action outcome"]
+    invalid_actions: Bool[Array, "batch action"]
+    terminal_outcome: Int[Array, "batch"]
+    to_play: Int[Array, "batch"]
 
 
-RecurrentFn = Callable[
-    [Params, chex.PRNGKey, Action, RecurrentState],
-    tuple[RecurrentFnOutput, RecurrentState],
-]
+RecurrentFn = Callable[[Params, PRNGKey, Action, RecurrentState], tuple[RecurrentFnOutput, RecurrentState]]
 
 
 @chex.dataclass(frozen=True)
@@ -47,26 +49,27 @@ class RootFnOutput:
     ``to_play`` for a terminal root and ``NO_OUTCOME`` otherwise.
     """
 
-    prior_logits: jax.Array
-    value: jax.Array
-    action_values: jax.Array
+    prior_logits: Float[Array, "batch action"]
+    value: Float[Array, "batch outcome"]
+    action_values: Float[Array, "batch action outcome"]
     embedding: RecurrentState
-    terminal_outcome: jax.Array
-    to_play: jax.Array
+    terminal_outcome: Int[Array, "batch"]
+    to_play: Int[Array, "batch"]
 
 
 T = TypeVar("T")
+LoopState = TypeVar("LoopState")
 
 
 @chex.dataclass(frozen=True)
 class PolicyOutput(Generic[T]):
     """The selected action, policy target, and completed search tree."""
 
-    action: jax.Array
-    action_weights: jax.Array
+    action: Int[Array, "batch"]
+    action_weights: Float[Array, "batch action"]
     search_tree: T
 
 
-ActionSelectionFn = Callable[[chex.PRNGKey, Any, jax.Array], jax.Array]
-PosteriorUpdateFn = Callable[[chex.PRNGKey, Any], Any]
-LoopFn = Callable[[int, int, Callable[[Any, Any], Any], Any], Any]
+ActionSelectionFn = Callable[[PRNGKey, "Tree", Int[Array, ""]], Int[Array, ""]]
+PosteriorUpdateFn = Callable[[PRNGKey, "PosteriorUpdateContext"], "PosteriorUpdate"]
+LoopFn = Callable[[int, int, Callable[[int, LoopState], LoopState], LoopState], LoopState]

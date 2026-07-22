@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import chex
-import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int, PyTree, Shaped
 
 from .categorical import NO_DISTANCE, NO_OUTCOME
 
@@ -31,7 +30,7 @@ class NodeView:
     """The current node passed to a configurable posterior repair rule."""
 
     index: Int[Array, "batch"]
-    embedding: Any
+    embedding: PyTree[Shaped[Array, "batch ..."]]
     value_prior: Float[Array, "batch outcome"]
     value_alpha: Float[Array, "batch outcome"]
     node_payload: Int[Array, "batch"]
@@ -54,7 +53,7 @@ class ChildrenView:
 
     index: Int[Array, "batch action"]
     visited: Bool[Array, "batch action"]
-    embedding_table: Any
+    embedding_table: PyTree[Shaped[Array, "batch node ..."]]
     value_prior: Float[Array, "batch action outcome"]
     value_alpha: Float[Array, "batch action outcome"]
     node_payload: Int[Array, "batch action"]
@@ -123,7 +122,7 @@ class Tree:
     node_value_alpha: Float[Array, "batch node outcome"]
     edge_alpha: Float[Array, "batch node action outcome"]
     invalid_actions: Bool[Array, "batch node action"]
-    embeddings: Any  # pytree with leaves [B, N, ...]
+    embeddings: PyTree[Shaped[Array, "batch node ..."]]
 
     ROOT_INDEX: ClassVar[int] = 0
     NO_PARENT: ClassVar[int] = -1
@@ -175,27 +174,15 @@ class Tree:
         child_prior = self.node_value_priors[batch, safe_child]
         child_player = self.node_to_play[batch, safe_child]
         root_player = self.node_to_play[:, root, None]
-        child_prior = jnp.where(
-            (child_player == root_player)[..., None],
-            child_prior,
-            child_prior[..., ::-1],
-        )
+        child_prior = jnp.where((child_player == root_player)[..., None], child_prior, child_prior[..., ::-1])
         stored = self.edge_alpha[:, root]
         fallback = jnp.where(visited[..., None], child_prior, stored)
         use_stored = ~unresolved | (counts > 0)
         alpha = jnp.where(use_stored[..., None], stored, fallback)
 
-        edge_distance = jnp.where(
-            unresolved,
-            jnp.asarray(int(NO_DISTANCE), dtype=jnp.int32),
-            edge_payload,
-        )
+        edge_distance = jnp.where(unresolved, jnp.asarray(int(NO_DISTANCE), dtype=jnp.int32), edge_payload)
         node_outcome = self.node_categorical_outcome[:, root]
-        node_distance = jnp.where(
-            node_outcome == int(NO_OUTCOME),
-            jnp.asarray(int(NO_DISTANCE), dtype=jnp.int32),
-            self.node_payload[:, root],
-        )
+        node_distance = jnp.where(node_outcome == int(NO_OUTCOME), jnp.asarray(int(NO_DISTANCE), dtype=jnp.int32), self.node_payload[:, root])
         return SearchSummary(
             visit_counts=counts.astype(stored.dtype),
             alpha=alpha,
