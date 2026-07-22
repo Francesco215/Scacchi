@@ -83,10 +83,10 @@ def _constant_recurrent_fn(
     action_values: tuple[tuple[float, ...], ...] | None = None,
     to_play: int,
     terminal_outcome: int = int(NO_OUTCOME),
-    prior_logits: tuple[float, ...] | None = None,
+    invalid_actions: tuple[bool, ...] | None = None,
 ):
-    if prior_logits is None:
-        prior_logits = (0.0,) * num_actions
+    if invalid_actions is None:
+        invalid_actions = (False,) * num_actions
     if action_values is None:
         action_values = (value,) * num_actions
 
@@ -94,10 +94,6 @@ def _constant_recurrent_fn(
         del rng_key
         batch_size = action.shape[0]
         step = dirichlet_mctx.RecurrentFnOutput(
-            prior_logits=jnp.broadcast_to(
-                jnp.asarray(prior_logits, dtype=jnp.float32),
-                (batch_size, num_actions),
-            ),
             value=jnp.broadcast_to(
                 jnp.asarray(value, dtype=jnp.float32),
                 (batch_size, len(value)),
@@ -105,6 +101,10 @@ def _constant_recurrent_fn(
             action_values=jnp.broadcast_to(
                 jnp.asarray(action_values, dtype=jnp.float32),
                 (batch_size, num_actions, len(value)),
+            ),
+            invalid_actions=jnp.broadcast_to(
+                jnp.asarray(invalid_actions, dtype=jnp.bool_),
+                (batch_size, num_actions),
             ),
             terminal_outcome=jnp.full(
                 (batch_size,), terminal_outcome, dtype=jnp.int8
@@ -290,7 +290,7 @@ def test_single_thompson_selector_uses_interior_posterior_and_mask():
             value=(2.0, 2.0),
             action_values=child_action_values,
             to_play=0,
-            prior_logits=(0.0, -jnp.inf, 0.0),
+            invalid_actions=(False, True, False),
         ),
         num_simulations=1,
         invalid_actions=jnp.array([[False, True, True]]),
@@ -519,7 +519,7 @@ def test_terminal_child_has_no_descendants_and_short_circuits_search():
         value=(4.0, 2.0),
         to_play=1,
         terminal_outcome=0,
-        prior_logits=(-jnp.inf, -jnp.inf),
+        invalid_actions=(True, True),
     )
 
     output = _policy(
@@ -581,19 +581,14 @@ def test_default_max_depth_uses_complete_simulation_budget():
         child_depth = depth + 1
         batch_size = child_depth.shape[0]
         terminal = child_depth >= terminal_depth
-        prior_logits = jnp.where(
-            terminal[:, None],
-            -jnp.inf,
-            jnp.zeros((batch_size, 1), dtype=jnp.float32),
-        )
         return (
             dirichlet_mctx.RecurrentFnOutput(
-                prior_logits=prior_logits,
                 value=jnp.ones((batch_size, 2), dtype=jnp.float32),
                 action_values=jnp.ones(
                     (batch_size, 1, 2),
                     dtype=jnp.float32,
                 ),
+                invalid_actions=terminal[:, None],
                 terminal_outcome=jnp.where(
                     terminal,
                     jnp.asarray(1, dtype=jnp.int8),
@@ -668,12 +663,12 @@ def test_bottom_up_repair_uses_updated_child_cache_and_node_players():
             jnp.array([[7.0, 3.0]]),
         )
         step = dirichlet_mctx.RecurrentFnOutput(
-            prior_logits=jnp.broadcast_to(
-                jnp.array([-jnp.inf, 0.0, -jnp.inf]),
-                (batch_size, 3),
-            ),
             value=value,
             action_values=jnp.ones((batch_size, 3, 2), dtype=jnp.float32),
+            invalid_actions=jnp.broadcast_to(
+                jnp.array([True, False, True]),
+                (batch_size, 3),
+            ),
             terminal_outcome=jnp.full(
                 (batch_size,), int(NO_OUTCOME), dtype=jnp.int8
             ),

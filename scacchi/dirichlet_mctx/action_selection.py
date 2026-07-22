@@ -320,11 +320,13 @@ def effective_action_alpha(tree: Tree, node_index: chex.Array) -> jax.Array:
         child_player,
         tree.node_to_play[node_index],
     )
-    posterior = tree.posterior
-    stored = posterior.action_alpha[node_index]
+    stored = tree.edge_alpha[node_index]
+    edge_outcome = tree.edge_categorical_outcome[node_index]
+    unresolved = edge_outcome == int(NO_OUTCOME)
+    count = jnp.where(unresolved, tree.edge_payload[node_index], 0)
     fallback = jnp.where(visited[..., None], child_fallback, stored)
     return jnp.where(
-        (posterior.action_count[node_index] > 0)[..., None],
+        ((~unresolved) | (count > 0))[..., None],
         stored,
         fallback,
     )

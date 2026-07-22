@@ -262,110 +262,156 @@ x,&p=q,\\
 
       <p class="equation-note">Every child-to-parent message is aligned before it is stored.</p>
 
-      <h2 id="2-what-the-tree-remembers">2. What the tree remembers</h2>
+      <h2 id="2-what-the-tree-remembers">2. A compact tree layout</h2>
 
-      <p>The tree separates network priors, mutable messages, and structural counts:</p>
+      <p>The equations use separate symbols for separate meanings, but the tree does not need one permanent array for every symbol. Its storage follows the state of each node and edge. When an unresolved object becomes categorical, information that will never be read again is overwritten in place by the exact certificate.</p>
+
+      <p>The tree has no nested <code>NodePosterior</code>. It stores the following arrays directly:</p>
 
       <table class="symbol-table">
         <thead>
           <tr>
-            <th>Symbol</th>
-            <th>Meaning</th>
-            <th>Role</th>
+            <th>Physical slot</th>
+            <th>Unresolved interpretation</th>
+            <th>Categorical interpretation</th>
           </tr>
         </thead>
         <tbody>
           <tr>
-            <td><d-math>V_s</d-math></td>
-            <td>Network value prior</td>
-            <td>Fixed anchor for node <d-math>s</d-math></td>
+            <td><d-math>H_{s,a}</d-math> · float <d-math>[A,O]</d-math></td>
+            <td>Network <d-math>Q_{s,a}</d-math> until repaired, then the latest message <d-math>B_{s,a}</d-math></td>
+            <td>Last learned alpha, retained only while an unresolved parent needs its concentration for the numeric cache mixture</td>
           </tr>
           <tr>
-            <td><d-math>Q_{s,a}</d-math></td>
-            <td>Network action prior</td>
-            <td>Fallback before the edge has information</td>
+            <td><d-math>V_s</d-math> · float <d-math>[O]</d-math></td>
+            <td>Fixed network value prior</td>
+            <td>Unused by search after the node becomes absorbing</td>
           </tr>
           <tr>
-            <td><d-math>B_{s,a}</d-math></td>
-            <td>Edge message</td>
-            <td>Latest leaf or repaired-child Dirichlet</td>
+            <td><d-math>C_s</d-math> · float <d-math>[O]</d-math></td>
+            <td>Current repaired node cache</td>
+            <td>Unused; the exact node certificate owns the value</td>
           </tr>
           <tr>
-            <td><d-math>R_{s,a}</d-math></td>
-            <td>Structural count</td>
-            <td>Marks a message and measures repaired depth below it</td>
+            <td><d-math>z_{s,a}</d-math> · int8 <d-math>[A]</d-math></td>
+            <td><d-math>\bot</d-math></td>
+            <td>Exact edge outcome <d-math>L,D,</d-math> or <d-math>W</d-math></td>
           </tr>
           <tr>
-            <td><d-math>C_s</d-math></td>
-            <td>Node cache</td>
-            <td>Current repaired state Dirichlet</td>
+            <td><d-math>d_{s,a}</d-math> · int32 <d-math>[A]</d-math></td>
+            <td>Structural count <d-math>R_{s,a}</d-math></td>
+            <td>Certified edge distance <d-math>\tau_{s,a}</d-math></td>
           </tr>
           <tr>
-            <td><d-math>A_{s,a}</d-math></td>
-            <td>Effective unresolved edge alpha</td>
-            <td>Message, child-value prior, or Q fallback</td>
+            <td><d-math>z_s</d-math> · int8</td>
+            <td><d-math>\bot</d-math></td>
+            <td>Exact node outcome</td>
           </tr>
           <tr>
-            <td><d-math>(z_{s,a},\tau_{s,a})</d-math></td>
-            <td>Exact categorical edge certificate</td>
-            <td>Outcome and certified distance; <d-math>z=\bot</d-math> means unresolved</td>
-          </tr>
-          <tr>
-            <td><d-math>(z_s,\tau_s)</d-math></td>
-            <td>Exact categorical node certificate</td>
-            <td>Absorbing solved value derived from edge certificates</td>
+            <td><d-math>d_s</d-math> · int32</td>
+            <td>Total structural support <d-math>n_s</d-math></td>
+            <td>Certified node distance <d-math>\tau_s</d-math></td>
           </tr>
         </tbody>
       </table>
 
-      <p>Initially, <d-math>C_s=V_s</d-math> and the edge slot contains the Q fallback. A real message is present exactly when</p>
+      <p>The outcome tag determines how each integer payload is decoded:</p>
 
       <d-math block>
-m_{s,a}=\mathbf 1[R_{s,a}>0].
+d_{s,a}=
+\begin{cases}
+R_{s,a},&z_{s,a}=\bot,\\
+\tau_{s,a},&z_{s,a}\ne\bot,
+\end{cases}
+\qquad
+d_s=
+\begin{cases}
+n_s,&z_s=\bot,\\
+\tau_s,&z_s\ne\bot.
+\end{cases}
       </d-math>
 
-      <h3 id="2-1-effective-edge-posterior">2.1 Effective edge posterior</h3>
+      <p>An unresolved node may have <d-math>n_s=0</d-math>, so zero alone cannot mean terminal once the slots are overlaid. The redundant terminal Boolean disappears, but the exact test is</p>
 
-      <p>For an expanded child <d-math>s_a</d-math>, the Dirichlet used by search is</p>
+      <d-math block>
+\mathrm{terminal}(s)
+\iff
+z_s\ne\bot\ \land\ d_s=0.
+      </d-math>
+
+      <p>This requires root evaluation to provide an exact terminal outcome whenever the root itself can be terminal. A Boolean terminal flag without its outcome is no longer a sufficient root contract.</p>
+
+      <h3 id="2-1-effective-edge-posterior">2.1 Effective actions without duplicate posterior fields</h3>
+
+      <p>While an edge is unresolved, its integer payload is a count and its float slot changes meaning in place:</p>
 
       <d-math block>
 A_{s,a}=
 \begin{cases}
-B_{s,a},
-& R_{s,a}>0,\\[3pt]
+H_{s,a}=B_{s,a},
+&z_{s,a}=\bot\ \land\ d_{s,a}>0,\\[3pt]
 \mathrm{Align}(V_{s_a};p_{s_a}\to p_s),
-& R_{s,a}=0\ \text{and }s_a\text{ exists},\\[3pt]
-Q_{s,a},
-& \text{otherwise}.
+&z_{s,a}=\bot\ \land\ d_{s,a}=0\ \land\ s_a\text{ exists},\\[3pt]
+H_{s,a}=Q_{s,a},
+&z_{s,a}=\bot\ \land\ s_a\text{ does not exist}.
 \end{cases}
       </d-math>
 
-      <div class="two-column">
-        <div class="mini-card">
-          <p><strong>Expanded but unrepaired</strong></p>
-          <p>Use the child's fixed value prior <d-math>V_{s_a}</d-math>.</p>
-        </div>
-        <div class="mini-card">
-          <p><strong>Child has downstream information</strong></p>
-          <p>Its repaired cache is promoted into <d-math>B_{s,a}</d-math>.</p>
-        </div>
+      <p>Thus <d-math>Q</d-math> and <d-math>B</d-math> are successive contents of one float slot, while <d-math>A</d-math> is computed and never stored. The fixed <d-math>V_s</d-math> and mutable <d-math>C_s</d-math> cannot share a slot while the node is unresolved: every repair needs both at the same time.</p>
+
+      <p>Policy logits are not tree state. Legality is extracted during evaluation and stored as a compact mask. If exact draw tie-breaking later asks for the policy prior, the node embedding is evaluated again.</p>
+
+      <h3 id="2-2-state-transitions">2.2 Safe integer-slot transitions</h3>
+
+      <p>The node total is maintained incrementally. For every unresolved edge-count change <d-math>r_{\mathrm{old}}\to r_{\mathrm{new}}</d-math>, update</p>
+
+      <d-math block>
+d_s\leftarrow d_s+r_{\mathrm{new}}-r_{\mathrm{old}}
+\qquad(z_s=\bot)
+      </d-math>
+
+      <p>before writing the new edge payload. The tree never recomputes <d-math>n_s</d-math> by summing a mixture of counts and distances.</p>
+
+      <p>When a child becomes categorical, publication is ordered as one transaction:</p>
+
+      <d-math block>
+\begin{aligned}
+r_{\mathrm{final}}&\leftarrow 1+n_{s_a},\\
+d_s&\leftarrow d_s+r_{\mathrm{final}}-r_{\mathrm{old}},\\
+z_{s,a}&\leftarrow \mathrm{Align}(z_{s_a};p_{s_a}\to p_s),\\
+d_{s,a}&\leftarrow \tau_{s_a}+1.
+\end{aligned}
+      </d-math>
+
+      <p>The first two lines preserve the child's final structural contribution in the unresolved parent. Only then may the edge count be overwritten by distance. Once <d-math>z_{s,a}\ne\bot</d-math>, that payload is never again read as a count.</p>
+
+      <p>When the node itself becomes categorical, first publish its final <d-math>1+n_s</d-math> contribution to its unresolved parent using the same transaction. After that value is safe in the parent total, overwrite</p>
+
+      <d-math block>
+z_s\leftarrow z_s^{\mathrm{cat}},
+\qquad
+d_s\leftarrow\tau_s.
+      </d-math>
+
+      <p>A terminal child is the base case: <d-math>\tau_{s_a}=0</d-math>, so its incoming edge receives distance one and contributes structural support one before the overwrite.</p>
+
+      <div class="correction">
+        <p><strong>Information that really is discarded:</strong> after an edge becomes categorical, its individual <d-math>R_{s,a}</d-math> no longer exists. Root summaries report structural counts only for unresolved edges, and categorical Q rows use their explicit categorical weight. The node total preserves mixing support but cannot reconstruct historical per-edge counts.</p>
       </div>
 
-      <p>Neither <d-math>R</d-math> nor a visit count is added to <d-math>A</d-math>. Its concentration remains learned through the network alphas and repaired messages.</p>
+      <h3 id="2-3-native-categorical-certificates">2.3 Native categorical certificates</h3>
 
-      <h3 id="2-2-native-categorical-certificates">2.2 Native categorical certificates</h3>
-
-      <p>An action is one of two native objects:</p>
+      <p>An action is still one of two logical objects even though its count and distance share storage:</p>
 
       <d-math block>
 Y_{s,a}=
 \begin{cases}
-\mathrm{Cat}(z_{s,a},\tau_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
+\mathrm{Cat}(z_{s,a},d_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
 \mathrm{Dir}(A_{s,a}),&z_{s,a}=\bot.
 \end{cases}
       </d-math>
 
-      <p>A terminal child has distance zero and its incoming edge has distance one. The certificates are exact, absorbing, and stored separately from every alpha. A certified edge is pruned from later traversal. One certified win solves a node; a draw or loss is proved only after every legal edge is categorical.</p>
+      <p>The categorical tag is exact and absorbing. A certified edge is pruned from traversal. One certified win solves a node; a draw or loss is proved only after every legal edge is categorical.</p>
 
       <d-math block>
 u_{\mathrm{cat}}(L)=-1,
@@ -470,7 +516,7 @@ z_{s'},&s'\text{ is terminal},\\
 
       <div class="step-label">Step A · write the final edge</div>
 
-      <p>At the deepest node <d-math>s_d</d-math>, increment the selected edge's structural count. Replace its alpha message only if the edge is still unresolved:</p>
+      <p>At the deepest node <d-math>s_d</d-math>, an unresolved selected edge increments its structural count and replaces its alpha message:</p>
 
       <d-math block>
 R_{s_d,a_d}\leftarrow R_{s_d,a_d}+1,
@@ -482,17 +528,11 @@ B_{s_d,a_d}\leftarrow
 \quad\text{only when }z_{s_d,a_d}=\bot.
       </d-math>
 
-      <p class="equation-note"><d-math>B</d-math> is replaced, not added. A terminal edge keeps its exact sidecar and does not overwrite <d-math>B</d-math> with a synthetic alpha.</p>
+      <p class="equation-note"><d-math>B</d-math> is replaced, not added. If expansion is terminal, the engine instead folds support one into <d-math>n_{s_d}</d-math> and overwrites the edge payload with distance one; the posterior callback never reads that distance as <d-math>R</d-math>.</p>
 
       <div class="step-label">Step B · refresh from children</div>
 
-      <p>For every expanded, non-terminal child with repaired information below it, replace the parent edge by the child's current cache:</p>
-
-      <d-math block>
-n_{s_a}
-=
-\sum_{b\in\mathcal A(s_a)}R_{s_a,b}.
-      </d-math>
+      <p>For every expanded, unresolved child with repaired information below it, replace the parent edge by the child's current cache. Its node payload still means <d-math>n_{s_a}</d-math>:</p>
 
       <d-math block>
 B_{s,a}
@@ -505,7 +545,7 @@ R_{s,a}
 \quad n_{s_a}>0.
       </d-math>
 
-      <p>Categorical children are not refreshed this way; their exact outcome/distance already lives on the edge sidecar.</p>
+      <p>When a child becomes categorical, the engine first commits the final <d-math>1+n_{s_a}</d-math> count delta to the parent total, then overwrites the incoming edge count with distance. Categorical children are never refreshed as Dirichlet messages afterwards.</p>
 
       <div class="step-label">Step C · form a fresh node policy</div>
 
@@ -522,13 +562,13 @@ R_{s,a}
 
       <div class="step-label">Step D · repair the node value</div>
 
-      <p>Let the total structural support below the node be</p>
+      <p>While the node is unresolved, its node payload is the incrementally maintained total structural support</p>
 
       <d-math block>
-n_s=\sum_{a\in\mathcal A(s)}R_{s,a},
-\qquad
 \gamma_s=\frac{n_s}{\kappa+n_s}.
       </d-math>
+
+      <p>The incremental form is necessary because categorical edge payloads now contain distance, not their discarded historical count.</p>
 
       <p>For the numeric cache mixture only, preserve each categorical edge's learned effective-alpha mass but replace its direction by the exact sidecar outcome:</p>
 
@@ -674,15 +714,16 @@ D_{\mathrm{KL}}
 
       <p>Thus unresolved rows use full or mean Dirichlet matching, while categorical rows use this exact-outcome density loss in either mode. The concentration is learned by the model; no terminal concentration constant is injected by search.</p>
 
-      <p>The Q loss can be weighted by structural support or by root policy:</p>
+      <p>For an unresolved Q target, the loss can be weighted by structural support or by root policy. A categorical row no longer owns an <d-math>R</d-math> value and receives an explicit unit categorical weight:</p>
 
       <d-math block>
 w_a=
 \begin{cases}
 R_{s_0,a},
-&\text{structural/evidence-mass mode},\\
+&z_{s_0,a}=\bot\ \text{and evidence-mass mode},\\
 \pi_{\mathrm{search}}(a\mid s_0),
-&\text{policy mode}.
+&z_{s_0,a}=\bot\ \text{and policy mode},\\
+1,&z_{s_0,a}\ne\bot.
 \end{cases}
       </d-math>
 
@@ -722,10 +763,10 @@ N_{\mathrm{real\ nodes}}\le N+1.
 \mathcal F_{\mathrm{posterior}}:
 (\text{key},\ \text{node},\ \text{children},\ \text{leaf})
 \longmapsto
-(B_s,\ R_s,\ C_s).
+(H_s,\ d_s^{\mathrm{edge}},\ C_s).
       </d-math>
 
-      <p>It is called once for every node on the selected path. A different rule can inspect the current node embedding and all child summaries, then return a complete replacement posterior without changing traversal or the public search API. The default callback exposes its single prior-strength choice as <d-math>\kappa</d-math> in <d-math>\gamma=n/(\kappa+n)</d-math>; exact categorical semantics remain search-owned.</p>
+      <p>It is called once for every node on the selected path and returns an ephemeral update; the persistent tree remains flat. A different rule can inspect the current node embedding and all child summaries, then replace unresolved alphas, counts, and the node cache without changing traversal. The engine owns count-delta accounting and categorical payload transitions. The default callback exposes its single prior-strength choice as <d-math>\kappa</d-math> in <d-math>\gamma=n/(\kappa+n)</d-math>.</p>
 
       <d-math block>
 \text{search mechanics}

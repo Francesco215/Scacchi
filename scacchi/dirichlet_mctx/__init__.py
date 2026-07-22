@@ -17,7 +17,7 @@ from .action_selection import (
     thompson_sample,
     validate_categorical_draw_rule,
 )
-from .base import PolicyOutput, RecurrentFnOutput, RootFnOutput
+from .base import NodeEvaluationFn, PolicyOutput, RecurrentFnOutput, RootFnOutput
 from .categorical import (
     NO_DISTANCE,
     NO_OUTCOME,
@@ -40,8 +40,8 @@ from .search import instantiate_tree_from_root, search
 from .tree import (
     ChildrenView,
     LeafView,
-    NodePosterior,
     NodeView,
+    PosteriorUpdate,
     PosteriorUpdateContext,
     SearchSummary,
     Tree,
@@ -55,11 +55,12 @@ __all__ = [
     "DEFAULT_POLICY_SAMPLE_CHUNK_SIZE",
     "DEFAULT_POLICY_SAMPLES",
     "LeafView",
-    "NodePosterior",
+    "NodeEvaluationFn",
     "NodeView",
     "NO_DISTANCE",
     "NO_OUTCOME",
     "PosteriorUpdateContext",
+    "PosteriorUpdate",
     "RecurrentFnOutput",
     "RootFnOutput",
     "SearchSummary",

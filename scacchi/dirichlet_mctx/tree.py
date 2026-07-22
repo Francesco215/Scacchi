@@ -7,135 +7,122 @@ from typing import Any, ClassVar
 import chex
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int
+
+from .categorical import NO_DISTANCE, NO_OUTCOME
 
 
 @chex.dataclass(frozen=True)
-class NodePosterior:
-    """Search state repaired for one node or stored for every node.
+class PosteriorUpdate:
+    """Ephemeral result returned by one node-posterior repair.
 
-    ``action_alpha`` is the unresolved edge message ``B`` and
-    contains the Q fallback until ``action_count`` becomes positive.
-    ``action_count`` is the structural edge count ``R``; because every direct
-    or child message has positive ``R``, it also represents the demo's ``m``
-    bit without a duplicate boolean table. ``value_alpha`` is the cached state
-    posterior. These arrays remain the unresolved Dirichlet cache; exact
-    solved outcomes live in the tree's categorical sidecars and
-    take precedence over them. Leading dimensions are generic: the tree adds
-    ``[B, N]`` and a gathered node adds only ``[B]``. Categorical edges retain
-    a positive learned alpha slot for fixed shapes, but their exact sidecar is
-    authoritative.
+    The persistent tree is deliberately flat.  This object only groups the
+    three arrays produced by a configurable repair callback before search
+    writes them back into their tree slots.
     """
 
-    action_alpha: jax.Array
-    action_count: jax.Array
-    value_alpha: jax.Array
+    edge_alpha: Float[Array, "batch action outcome"]
+    edge_payload: Int[Array, "batch action"]
+    value_alpha: Float[Array, "batch outcome"]
 
 
 @chex.dataclass(frozen=True)
 class NodeView:
     """The current node passed to a configurable posterior repair rule."""
 
-    index: jax.Array
+    index: Int[Array, "batch"]
     embedding: Any
-    value_prior: jax.Array
-    to_play: jax.Array
-    terminal: jax.Array
-    invalid_actions: jax.Array
-    posterior: NodePosterior
+    value_prior: Float[Array, "batch outcome"]
+    value_alpha: Float[Array, "batch outcome"]
+    node_payload: Int[Array, "batch"]
+    edge_alpha: Float[Array, "batch action outcome"]
+    edge_payload: Int[Array, "batch action"]
+    edge_categorical_outcome: Int[Array, "batch action"]
+    to_play: Int[Array, "batch"]
+    invalid_actions: Bool[Array, "batch action"]
 
 
 @chex.dataclass(frozen=True)
 class ChildrenView:
     """Action-indexed child summaries needed to repair their parent.
 
-    ``embedding_table`` is left ungathered so large game states are not copied
-    across the full action axis. A custom rule that truly needs them can gather
-    ``embedding_table[batch, index]`` using ``visited`` and safe indices.
+    ``node_payload`` is support for unresolved children and distance for
+    categorical children.  Consumers must inspect ``categorical_outcome``
+    before interpreting it. ``embedding_table`` remains ungathered so large
+    game states are not copied over the complete action axis.
     """
 
-    index: jax.Array
-    visited: jax.Array
+    index: Int[Array, "batch action"]
+    visited: Bool[Array, "batch action"]
     embedding_table: Any
-    value_prior: jax.Array
-    value_alpha: jax.Array
-    count: jax.Array
-    to_play: jax.Array
-    terminal: jax.Array
+    value_prior: Float[Array, "batch action outcome"]
+    value_alpha: Float[Array, "batch action outcome"]
+    node_payload: Int[Array, "batch action"]
+    categorical_outcome: Int[Array, "batch action"]
+    to_play: Int[Array, "batch action"]
 
 
 @chex.dataclass(frozen=True)
 class LeafView:
-    """The selected leaf edge evaluated by the current simulation.
+    """The selected leaf edge evaluated by the current simulation."""
 
-    ``value_alpha`` is the evaluated child value. ``active`` is true only for
-    the deepest path node. The default update writes it only when that edge is
-    unresolved; categorical edges increment structural count without turning
-    exact truth into pseudo-counts.
-    """
-
-    action: jax.Array
-    value_alpha: jax.Array
-    to_play: jax.Array
-    active: jax.Array
+    action: Int[Array, "batch"]
+    value_alpha: Float[Array, "batch outcome"]
+    to_play: Int[Array, "batch"]
+    active: Bool[Array, "batch"]
 
 
 @chex.dataclass(frozen=True)
 class PosteriorUpdateContext:
-    """Per-node input to ``PosteriorUpdateFn`` during bottom-up backup.
-
-    Every invocation has the same node, children, and selected-leaf contract.
-    The callback is responsible for unresolved Dirichlet ``B/m/R`` writes and
-    child repairs. Exact terminal detection, categorical propagation, and
-    absorbing solved state are search responsibilities exposed through the
-    edge sidecars. Ancestors observe both the freshly repaired cache and any
-    exact child certificate.
-    """
+    """Per-node input to ``PosteriorUpdateFn`` during bottom-up backup."""
 
     node: NodeView
     children: ChildrenView
     leaf: LeafView
-    active: jax.Array
-    edge_categorical_outcome: jax.Array | None = None
-    edge_categorical_distance: jax.Array | None = None
+    active: Bool[Array, "batch"]
 
 
 @chex.dataclass(frozen=True)
 class SearchSummary:
-    visit_counts: jax.Array
-    alpha: jax.Array
-    value_alpha: jax.Array
-    q_categorical_outcome: jax.Array
-    q_categorical_distance: jax.Array
-    v_categorical_outcome: jax.Array
-    v_categorical_distance: jax.Array
+    """Root search targets decoded from the compact tree representation."""
+
+    # Structural counts exist only for unresolved edges. Categorical entries
+    # are zero because their shared payload stores distance instead.
+    visit_counts: Float[Array, "batch action"]
+    alpha: Float[Array, "batch action outcome"]
+    value_alpha: Float[Array, "batch outcome"]
+    q_categorical_outcome: Int[Array, "batch action"]
+    q_categorical_distance: Int[Array, "batch action"]
+    v_categorical_outcome: Int[Array, "batch"]
+    v_categorical_distance: Int[Array, "batch"]
 
 
 @chex.dataclass(frozen=True)
 class Tree:
-    """A small JAX tree specialized for Dirichlet message passing.
+    """A compact JAX tree with state-dependent integer payloads.
 
-    The topology is MCTX-like, but the statistics mirror the Tic-Tac-Toe
-    implementation: every edge has ``(B, R)`` (with ``m == (R > 0)``) and every
-    node caches a full value Dirichlet. Exact categorical node and edge
-    certificates are stored separately and are authoritative once published.
-    ``node_n_down`` caches the edge-count reduction so gathering child
-    summaries stays linear in the action count. The posterior rule repairs the
-    unresolved Dirichlet data bottom-up.
+    ``edge_payload`` is structural count ``R`` while the corresponding edge
+    outcome is ``NO_OUTCOME`` and categorical distance otherwise.
+    ``node_payload`` similarly stores total structural support ``n_down`` for
+    unresolved nodes and categorical distance for solved nodes.  Outcome tags
+    are therefore the mandatory discriminants for both arrays.
+
+    ``edge_alpha`` contains the network Q fallback until repaired, then the
+    latest unresolved edge message. ``node_value_priors`` is fixed and
+    ``node_value_alpha`` is the mutable repaired cache.
     """
 
-    parents: jax.Array  # [B, N]
-    children_index: jax.Array  # [B, N, A]
-    node_to_play: jax.Array  # [B, N]
-    node_terminal: jax.Array  # [B, N]
-    node_prior_logits: jax.Array  # [B, N, A]
-    node_categorical_outcome: jax.Array  # [B, N]
-    node_categorical_distance: jax.Array  # [B, N]
-    edge_categorical_outcome: jax.Array  # [B, N, A]
-    edge_categorical_distance: jax.Array  # [B, N, A]
-    node_value_priors: jax.Array  # [B, N, O]
-    node_n_down: jax.Array  # [B, N]
-    invalid_actions: jax.Array  # [B, N, A]
-    posterior: NodePosterior
+    parents: Int[Array, "batch node"]
+    children_index: Int[Array, "batch node action"]
+    node_to_play: Int[Array, "batch node"]
+    node_categorical_outcome: Int[Array, "batch node"]
+    node_payload: Int[Array, "batch node"]
+    edge_categorical_outcome: Int[Array, "batch node action"]
+    edge_payload: Int[Array, "batch node action"]
+    node_value_priors: Float[Array, "batch node outcome"]
+    node_value_alpha: Float[Array, "batch node outcome"]
+    edge_alpha: Float[Array, "batch node action outcome"]
+    invalid_actions: Bool[Array, "batch node action"]
     embeddings: Any  # pytree with leaves [B, N, ...]
 
     ROOT_INDEX: ClassVar[int] = 0
@@ -151,56 +138,70 @@ class Tree:
         return self.children_index.shape[1] - 1
 
     @property
-    def root_posterior(self) -> NodePosterior:
-        return NodePosterior(
-            action_alpha=self.posterior.action_alpha[:, self.ROOT_INDEX],
-            action_count=self.posterior.action_count[:, self.ROOT_INDEX],
-            value_alpha=self.posterior.value_alpha[:, self.ROOT_INDEX],
-        )
+    def root_action_alpha(self) -> Float[Array, "batch action outcome"]:
+        return self.edge_alpha[:, self.ROOT_INDEX]
 
     @property
-    def root_invalid_actions(self) -> jax.Array:
+    def root_edge_payload(self) -> Int[Array, "batch action"]:
+        return self.edge_payload[:, self.ROOT_INDEX]
+
+    @property
+    def root_value_alpha(self) -> Float[Array, "batch outcome"]:
+        return self.node_value_alpha[:, self.ROOT_INDEX]
+
+    @property
+    def root_invalid_actions(self) -> Bool[Array, "batch action"]:
         return self.invalid_actions[:, self.ROOT_INDEX]
 
+    @property
+    def searchable_actions(self) -> Bool[Array, "batch node action"]:
+        """Actions that are legal and do not have a categorical outcome."""
+
+        return ~self.invalid_actions & (
+            self.edge_categorical_outcome == int(NO_OUTCOME)
+        )
+
     def summary(self) -> SearchSummary:
-        posterior = self.root_posterior
-        visit_counts = posterior.action_count.astype(posterior.action_alpha.dtype)
-        child_index = self.children_index[:, self.ROOT_INDEX]
+        root = self.ROOT_INDEX
+        edge_outcome = self.edge_categorical_outcome[:, root]
+        unresolved = edge_outcome == int(NO_OUTCOME)
+        edge_payload = self.edge_payload[:, root]
+        counts = jnp.where(unresolved, edge_payload, 0)
+
+        child_index = self.children_index[:, root]
         visited = child_index != self.UNVISITED
-        safe_child = jnp.where(visited, child_index, self.ROOT_INDEX)
+        safe_child = jnp.where(visited, child_index, root)
         batch = jnp.arange(self.parents.shape[0])[:, None]
         child_prior = self.node_value_priors[batch, safe_child]
         child_player = self.node_to_play[batch, safe_child]
-        root_player = self.node_to_play[:, self.ROOT_INDEX, None]
+        root_player = self.node_to_play[:, root, None]
         child_prior = jnp.where(
             (child_player == root_player)[..., None],
             child_prior,
             child_prior[..., ::-1],
         )
-        fallback = jnp.where(
-            visited[..., None],
-            child_prior,
-            posterior.action_alpha,
+        stored = self.edge_alpha[:, root]
+        fallback = jnp.where(visited[..., None], child_prior, stored)
+        use_stored = ~unresolved | (counts > 0)
+        alpha = jnp.where(use_stored[..., None], stored, fallback)
+
+        edge_distance = jnp.where(
+            unresolved,
+            jnp.asarray(int(NO_DISTANCE), dtype=jnp.int32),
+            edge_payload,
         )
-        alpha = jnp.where(
-            (posterior.action_count > 0)[..., None],
-            posterior.action_alpha,
-            fallback,
+        node_outcome = self.node_categorical_outcome[:, root]
+        node_distance = jnp.where(
+            node_outcome == int(NO_OUTCOME),
+            jnp.asarray(int(NO_DISTANCE), dtype=jnp.int32),
+            self.node_payload[:, root],
         )
         return SearchSummary(
-            visit_counts=visit_counts,
+            visit_counts=counts.astype(stored.dtype),
             alpha=alpha,
-            value_alpha=posterior.value_alpha,
-            q_categorical_outcome=self.edge_categorical_outcome[
-                :, self.ROOT_INDEX
-            ],
-            q_categorical_distance=self.edge_categorical_distance[
-                :, self.ROOT_INDEX
-            ],
-            v_categorical_outcome=self.node_categorical_outcome[
-                :, self.ROOT_INDEX
-            ],
-            v_categorical_distance=self.node_categorical_distance[
-                :, self.ROOT_INDEX
-            ],
+            value_alpha=self.node_value_alpha[:, root],
+            q_categorical_outcome=edge_outcome,
+            q_categorical_distance=edge_distance,
+            v_categorical_outcome=node_outcome,
+            v_categorical_distance=node_distance,
         )

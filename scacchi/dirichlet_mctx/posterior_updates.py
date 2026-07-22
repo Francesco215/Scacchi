@@ -9,7 +9,7 @@ import jax.numpy as jnp
 
 from .categorical import NO_OUTCOME
 from .action_selection import align_outcome, thompson_policy
-from .tree import NodePosterior, PosteriorUpdateContext
+from .tree import PosteriorUpdate, PosteriorUpdateContext
 
 
 DEFAULT_KAPPA = 4.0
@@ -65,7 +65,7 @@ def update_posterior(
     kappa: float = DEFAULT_KAPPA,
     policy_samples: int = DEFAULT_POLICY_SAMPLES,
     policy_sample_chunk_size: int = DEFAULT_POLICY_SAMPLE_CHUNK_SIZE,
-) -> NodePosterior:
+) -> PosteriorUpdate:
     """Repair one path node using the Tic-Tac-Toe message-passing rule.
 
     This function owns the posterior mathematics. Search only gathers the
@@ -86,41 +86,34 @@ def update_posterior(
     node = context.node
     children = context.children
     leaf = context.leaf
-    old = node.posterior
     active = context.active
-    action_alpha = old.action_alpha
-    action_count = old.action_count
+    edge_alpha = node.edge_alpha
+    edge_payload = node.edge_payload
+    edge_outcome = node.edge_categorical_outcome
+    unresolved = edge_outcome == int(NO_OUTCOME)
 
     # The direct final-edge message is applied only at the deepest node.
-    # Exact categorical edges increment R but never inject a fixed alpha.
-    batch = jnp.arange(action_count.shape[0])
+    # Terminal expansion has already folded support into the parent and
+    # replaced this payload with distance, so categorical edges are untouched.
+    batch = jnp.arange(edge_payload.shape[0])
     leaf_action = jnp.where(leaf.active, leaf.action, 0)
     direct_alpha = align_outcome(
         leaf.value_alpha,
         leaf.to_play,
         node.to_play,
     )
-    old_direct_alpha = action_alpha[batch, leaf_action]
-    old_direct_count = action_count[batch, leaf_action]
-    edge_categorical_outcome = context.edge_categorical_outcome
-    if edge_categorical_outcome is None:
-        edge_categorical_outcome = jnp.full_like(
-            action_count,
-            int(NO_OUTCOME),
-            dtype=jnp.int8,
-        )
-    direct_is_dirichlet = leaf.active & (
-        edge_categorical_outcome[batch, leaf_action] == int(NO_OUTCOME)
-    )
-    action_alpha = action_alpha.at[batch, leaf_action].set(
+    old_direct_alpha = edge_alpha[batch, leaf_action]
+    old_direct_count = edge_payload[batch, leaf_action]
+    direct_is_dirichlet = leaf.active & unresolved[batch, leaf_action]
+    edge_alpha = edge_alpha.at[batch, leaf_action].set(
         jnp.where(
             direct_is_dirichlet[..., None],
             direct_alpha,
             old_direct_alpha,
         )
     )
-    action_count = action_count.at[batch, leaf_action].set(
-        old_direct_count + leaf.active.astype(action_count.dtype)
+    edge_payload = edge_payload.at[batch, leaf_action].set(
+        old_direct_count + direct_is_dirichlet.astype(edge_payload.dtype)
     )
 
     child_value = align_outcome(
@@ -131,12 +124,12 @@ def update_posterior(
     refresh = (
         active[:, None]
         & children.visited
-        & ~children.terminal
-        & (children.count > 0)
-        & (edge_categorical_outcome == int(NO_OUTCOME))
+        & (children.categorical_outcome == int(NO_OUTCOME))
+        & (children.node_payload > 0)
+        & unresolved
     )
-    action_alpha = jnp.where(refresh[..., None], child_value, action_alpha)
-    action_count = jnp.where(refresh, 1 + children.count, action_count)
+    edge_alpha = jnp.where(refresh[..., None], child_value, edge_alpha)
+    edge_payload = jnp.where(refresh, 1 + children.node_payload, edge_payload)
 
     # Rebuild the effective edge posterior after the direct and child repairs.
     child_prior = align_outcome(
@@ -147,11 +140,12 @@ def update_posterior(
     fallback = jnp.where(
         children.visited[..., None],
         child_prior,
-        action_alpha,
+        edge_alpha,
     )
+    unresolved_count = jnp.where(unresolved, edge_payload, 0)
     effective_alpha = jnp.where(
-        (action_count > 0)[..., None],
-        action_alpha,
+        ((~unresolved) | (unresolved_count > 0))[..., None],
+        edge_alpha,
         fallback,
     )
     legal = ~node.invalid_actions
@@ -164,12 +158,12 @@ def update_posterior(
         node.invalid_actions,
         policy_samples,
         chunk_size=policy_sample_chunk_size,
-        categorical_outcome=edge_categorical_outcome,
+        categorical_outcome=edge_outcome,
     )
-    categorical = edge_categorical_outcome != int(NO_OUTCOME)
+    categorical = ~unresolved
     safe_categorical_outcome = jnp.where(
         categorical,
-        edge_categorical_outcome,
+        edge_outcome,
         0,
     )
     categorical_mean = jax.nn.one_hot(
@@ -188,7 +182,12 @@ def update_posterior(
         categorical_alpha,
         effective_alpha,
     )
-    n_down = jnp.sum(jnp.where(legal, action_count, 0), axis=-1)
+    old_unresolved_count = jnp.where(unresolved, node.edge_payload, 0)
+    count_delta = jnp.sum(
+        jnp.where(legal, unresolved_count - old_unresolved_count, 0),
+        axis=-1,
+    )
+    n_down = node.node_payload + count_delta
     repaired_value = mix_value_prior(
         node.value_prior,
         cache_alpha,
@@ -200,10 +199,10 @@ def update_posterior(
     value_alpha = jnp.where(
         (active & has_message)[..., None],
         repaired_value,
-        old.value_alpha,
+        node.value_alpha,
     )
-    return NodePosterior(
-        action_alpha=action_alpha,
-        action_count=action_count,
+    return PosteriorUpdate(
+        edge_alpha=edge_alpha,
+        edge_payload=edge_payload,
         value_alpha=value_alpha,
     )

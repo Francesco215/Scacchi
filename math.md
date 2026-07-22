@@ -15,11 +15,12 @@ The most important correction to the previous specification is:
 
 That correction describes unresolved, uncertain values. Exact terminal and
 solved values use a second, native representation: a categorical outcome and a
-certified distance to terminal. These categorical certificates are stored in
-sidecar arrays rather than encoded by a large or sharply peaked Dirichlet. They
-are absorbing and authoritative. Model alphas remain the learned representation
-for unresolved leaves and caches; a solved result is never reconstructed from
-their shape or concentration.
+certified distance to terminal. Each certificate is stored by changing an
+outcome tag and reinterpreting an existing integer payload, rather than by
+allocating a parallel posterior object or encoding the result as a large or
+sharply peaked Dirichlet. Certificates are absorbing and authoritative. Model
+alphas remain the learned representation for unresolved leaves and caches; a
+solved result is never reconstructed from their shape or concentration.
 
 ---
 
@@ -76,8 +77,12 @@ use $u_{\mathrm{cat}}$ without sampling.
 
 The policy logits are trained to imitate the search policy. Native Thompson
 traversal does not add them to uncertain edge scores; it uses exact categorical
-utilities or sampled action Dirichlets plus the legal-action mask. Stored logits
-only break categorical draws under `policy_prior`.
+utilities or sampled action Dirichlets plus the legal-action mask. Logits are
+not persistent tree state. If `policy_prior` must break a proved draw while a
+search node is being categorized, search evaluates that node's stored
+embedding at that moment. Final root readout instead reuses
+`root.prior_logits`, which remain available for the duration of the policy call
+but are never copied into the tree.
 
 ### 1.1 Perspective alignment
 
@@ -157,12 +162,16 @@ The root contract parallels MCTX, with full Dirichlet values added:
 ```python
 import functools
 
+def node_evaluation_fn(params, rng_key, state):
+    del params, rng_key
+    return evaluator(state.observation).logits
+
 root = dirichlet_mctx.RootFnOutput(
     prior_logits=prediction.logits,
     value=prediction.alpha_v,
     action_values=prediction.alpha_q,
     embedding=env_state,
-    terminal=env_state.terminated,
+    terminal_outcome=root_terminal_outcome,
     to_play=env_state.current_player,
 )
 
@@ -171,6 +180,7 @@ policy_output = dirichlet_mctx.dirichlet_thompson_policy(
     rng_key=rng_key,
     root=root,
     recurrent_fn=expand_fn,
+    node_evaluation_fn=node_evaluation_fn,
     num_simulations=num_simulations,
     invalid_actions=~env_state.legal_action_mask,
     posterior_update=functools.partial(
@@ -186,6 +196,10 @@ policy_output = dirichlet_mctx.dirichlet_thompson_policy(
 `categorical_draw_rule` is one of `policy_prior`, `fastest_draw`,
 `slowest_draw`, or `fixed_order`. It matters only after the node has proved a
 draw and always selects among certified draw edges, never losing edges.
+`node_evaluation_fn` is required when `policy_prior` may be used during a
+nonempty search. It is invoked lazily only when a search node is publishing a
+categorical draw. The later root readout uses the ephemeral logits already
+present in `root`.
 The sole scalar in the default repair rule is $\kappa>0$, appearing only in
 $\gamma=n/(\kappa+n)$. It is node-prior strength, not leaf or terminal
 evidence.
@@ -199,12 +213,12 @@ $$
 +\operatorname{Evaluate}(s').
 $$
 
-It returns the child embedding, child policy logits, $V_{s'}$, all
-$Q_{s',b}$, player to move, and one exact `terminal_outcome` tag. The tag is an
-outcome index from the child's player perspective when the child is terminal,
-and `NO_OUTCOME` otherwise. It is the complete terminal payload: search uses it
-to publish the native categorical certificate without constructing a terminal
-Dirichlet.
+It returns the child embedding, $V_{s'}$, all $Q_{s',b}$, the child's legal
+action mask, player to move, and one exact `terminal_outcome` tag. The tag is
+an outcome index from the child's player perspective when the child is
+terminal, and `NO_OUTCOME` otherwise. It is the complete terminal payload:
+search uses it to publish the native categorical certificate without
+constructing a terminal Dirichlet.
 
 ### 3.1 Native leaf result
 
@@ -238,26 +252,33 @@ target. There is no leaf-strength or terminal-strength constant.
 
 ## 4. Lightweight tree state
 
-For every node $s$, the tree stores:
+The tree is flat: it has no persistent `NodePosterior`. For each node it stores
+fixed $V_s$, mutable $C_s$, topology, player, legality, embedding, an `int8`
+outcome tag $z_s$, and one `int32` payload $d_s$. For each edge it stores one
+alpha slot $H_{s,a}$, an `int8` outcome tag $z_{s,a}$, and one `int32` payload
+$d_{s,a}$. Payload meanings depend on the outcome tags:
 
-- the fixed network value prior $V_s$;
-- a mutable cached state posterior $C_s$;
-- fixed policy logits, used only by the `policy_prior` draw rule;
-- a categorical outcome $z_s\in\mathcal Z\cup\{\bot\}$ and distance
-  $\tau_s\in\mathbb N_0\cup\{-1\}$;
-- topology, player, terminal status, legality, and environment embedding.
+$$
+d_{s,a}=\begin{cases}
+R_{s,a},&z_{s,a}=\bot,\\
+\tau_{s,a},&z_{s,a}\ne\bot,
+\end{cases}
+\qquad
+d_s=\begin{cases}
+n_s,&z_s=\bot,\\
+\tau_s,&z_s\ne\bot.
+\end{cases}
+$$
 
-For every edge $(s,a)$ it stores:
+These are the actual storage dtypes: outcome tags remain `int8`, while count,
+support, and distance arithmetic remains `int32`. Reusing a payload slot never
+requires a cast or aliases differently typed arrays. Alpha slots retain their
+network floating dtype.
 
-- a mutable Dirichlet message $B_{s,a}$;
-- a non-negative structural count $R_{s,a}$.
-- a categorical outcome $z_{s,a}\in\mathcal Z\cup\{\bot\}$ and distance
-  $\tau_{s,a}\in\mathbb N\cup\{-1\}$.
-
-Here $\bot$ and distance $-1$ mean unresolved. Terminal children discovered by
-expansion have distance zero. A root supplied as already terminal is skipped,
-but remains unresolved in these sidecars because `RootFnOutput` carries no
-terminal outcome. An expanded categorical child publishes an aligned edge certificate
+An unresolved node and a terminal node can both have payload zero. Therefore
+terminal state is exactly $z_s\ne\bot\land d_s=0$, never merely $d_s=0$. A
+terminal root supplies its exact outcome through
+`RootFnOutput.terminal_outcome`. An expanded categorical child publishes
 
 $$
 z_{s,a}=\operatorname{Align}(z_{s_a};p_{s_a}\to p_s),
@@ -265,9 +286,8 @@ z_{s,a}=\operatorname{Align}(z_{s_a};p_{s_a}\to p_s),
 \tau_{s,a}=1+\tau_{s_a}.
 $$
 
-The implementation caches both node and edge sidecars, but it does not store a
-categorical action. The action is derived deterministically from the immutable
-edge certificates whenever readout needs it.
+The implementation does not store a categorical action. The action is derived
+deterministically from immutable edge certificates whenever readout needs it.
 
 The cache is initialized from the state prior:
 
@@ -275,9 +295,9 @@ $$
 C_s\leftarrow V_s.
 $$
 
-The action-message array is initialized with the network fallback $Q_{s,a}$.
-That fallback occupies the slot until a real message replaces it, and the slot
-is considered a real message only when
+The edge-alpha array is initialized with the network fallback $Q_{s,a}$. That
+fallback occupies $H_{s,a}$ until a real message replaces it. While the edge
+is unresolved, the slot is a real message exactly when
 
 $$
 m_{s,a}=\mathbf 1[R_{s,a}>0].
@@ -285,14 +305,11 @@ $$
 
 This single condition replaces the demo's separate Boolean `m` field.
 
-Define the node's downstream count as
-
-$$
-n_s=\sum_{a\in\mathcal A(s)}R_{s,a}.
-$$
-
-`R` and $n_s$ describe repaired tree structure. They are not Dirichlet
-parameters and are never added to $B$, $C$, $V$, or $Q$.
+The node support $n_s$ is maintained incrementally. When an unresolved edge
+count changes from $r_{old}$ to $r_{new}$, search applies
+$n_s\leftarrow n_s+r_{new}-r_{old}$. Before a count is overwritten by
+categorical distance, its final delta is committed to the unresolved parent.
+Counts and support are never added to $H$, $C$, $V$, or $Q$.
 
 ### 4.1 Effective native action object
 
@@ -302,12 +319,12 @@ used for selection and readout is
 $$
 A_{s,a}=
 \begin{cases}
-B_{s,a},
-& R_{s,a}>0,\\[3pt]
+H_{s,a}=B_{s,a},
+&z_{s,a}=\bot\text{ and }d_{s,a}>0,\\[3pt]
 \operatorname{Align}(V_{s_a};p_{s_a}\to p_s),
-& R_{s,a}=0\text{ and }s_a\text{ exists},\\[3pt]
-Q_{s,a},
-& \text{otherwise}.
+&z_{s,a}=\bot\text{ and }d_{s,a}=0\text{ and }s_a\text{ exists},\\[3pt]
+H_{s,a}=Q_{s,a},
+&z_{s,a}=\bot\text{ and }s_a\text{ does not exist}.
 \end{cases}
 $$
 
@@ -326,7 +343,7 @@ The native action object is
 $$
 Y_{s,a}=
 \begin{cases}
-\operatorname{Cat}(z_{s,a},\tau_{s,a}),&z_{s,a}\ne\bot,\\
+\operatorname{Cat}(z_{s,a},d_{s,a}),&z_{s,a}\ne\bot,\\
 \operatorname{Dir}(A_{s,a}),&z_{s,a}=\bot.
 \end{cases}
 $$
@@ -334,7 +351,8 @@ $$
 Alpha-shaped arrays remain populated for every edge and node because JAX needs
 fixed shapes and the unresolved state-cache update needs a learned mass for
 its numeric mixture. Categorical utility, propagation, root choice, and neural
-loss always consult the sidecars. Once $z_s\ne\bot$, the node certificate
+loss always decode the outcome tag before interpreting its payload. Once
+$z_s\ne\bot$, the node certificate
 overrides $C_s$ completely.
 
 When an unresolved node has a mixed set of categorical and Dirichlet edges,
@@ -348,12 +366,12 @@ A_{s,a},&z_{s,a}=\bot,\\[3pt]
 \end{cases}
 $$
 
-Thus the exact sidecar supplies the direction of a categorical edge, while its
-existing effective alpha supplies only the learned concentration. That mass
-may come from the Q fallback, an expanded-child prior, or an earlier repaired
-message. The projection is computed only as an operand of the node-cache
-mixture: it does not mutate $A_{s,a}$, does not replace the sidecar, and is not
-emitted as a categorical neural target.
+Thus the exact outcome tag supplies the direction of a categorical edge, while
+its existing effective alpha supplies only the learned concentration. That
+mass may come from the Q fallback, an expanded-child prior, or an earlier
+repaired message. The projection is computed only as an operand of the
+node-cache mixture: it does not mutate $A_{s,a}$, does not replace the tagged
+certificate, and is not emitted as a categorical neural target.
 
 ### 4.2 Categorical node rules
 
@@ -378,7 +396,7 @@ Apply these rules in priority order:
    only its distance as $\tau_s$; the action itself remains derived.
 2. Otherwise, while $\mathcal U_s\ne\varnothing$, the node remains unresolved.
 3. If every edge is categorical and $\mathcal D_s\ne\varnothing$, the node is a
-   draw. Choose only among $\mathcal D_s$: highest stored policy logit for
+   draw. Choose only among $\mathcal D_s$: highest freshly evaluated policy logit for
    `policy_prior`, minimum distance for `fastest_draw`, maximum distance for
    `slowest_draw`, or lowest action index for `fixed_order`.
 4. Otherwise every legal edge is a loss. The node is a categorical loss and
@@ -456,8 +474,8 @@ Starting at the root:
 1. if the root or current node is categorical, emit no active simulation;
 2. form $\mathcal A_{\mathrm{search}}(s)$ by removing categorical edges;
 3. choose one unresolved action with the Thompson rule in Section 5;
-4. follow its child if that edge is expanded and the child is unresolved and
-   non-terminal;
+4. follow its child if that edge is expanded and the child's outcome tag is
+   unresolved;
 5. repeat until the chosen edge is unexpanded or reaches `max_depth`.
 
 The tree is persistent across all simulations in one policy call, so later
@@ -467,8 +485,8 @@ simulations see every message and cache repaired by earlier simulations.
 
 Call `expand_fn` once on the final unresolved parent-action pair. This performs
 the environment step and leaf evaluation only for an active simulation. If the
-edge is new, initialize the child node with its embedding, logits, $V$, $Q$,
-player, terminal flag, and legal-action mask. A terminal result immediately
+edge is new, initialize the child node with its embedding, $V$, $Q$, player,
+exact terminal-outcome tag, and legal-action mask. A terminal result immediately
 publishes $\operatorname{Cat}(z,0)$ on the child and its aligned distance-one
 edge certificate. A depth-cutoff revisit reuses existing topology and its fresh
 uncertain leaf message.
@@ -476,9 +494,12 @@ uncertain leaf message.
 ### 6.3 Repair
 
 Begin at the final parent and walk through parent links back to the root. At
-every node, repair the unresolved Dirichlet posterior, refresh categorical
-sidecars, and apply the categorical rules in Section 4.2. A newly categorical
-node publishes its aligned certificate to its incoming edge. The order is
+every node, repair the unresolved Dirichlet state, decode the tagged payloads,
+and apply the categorical rules in Section 4.2. When an edge changes from
+unresolved to categorical, its last count delta is first committed to $n_s$;
+only then may the same edge payload be overwritten by distance. Likewise, when
+a node becomes categorical, its final $n_s$ is propagated to the parent before
+the node payload is overwritten by node distance. The repair order is
 deepest-first, so one terminal discovery can categorize several ancestors in
 the same simulation.
 
@@ -496,44 +517,46 @@ PosteriorUpdateContext(
     children=ChildrenView(...),
     leaf=LeafView(...),
     active=...,
-    edge_categorical_outcome=...,
-    edge_categorical_distance=...,
 )
 ```
 
 and invokes
 
 ```python
-new_posterior = posterior_update(rng_key, context)
+update = posterior_update(rng_key, context)
 ```
 
 The callback returns a complete
 
 ```python
-NodePosterior(
-    action_alpha=...,
-    action_count=...,
+PosteriorUpdate(
+    edge_alpha=...,
+    edge_payload=...,
     value_alpha=...,
 )
 ```
 
 for that node. The context exposes:
 
-- the current node embedding, fixed $V_s$, legality, player, and old posterior;
-- action-indexed child indices, fixed $V_{s_a}$, repaired $C_{s_a}$, $n_{s_a}$,
-  player, and terminal flag;
+- the current node embedding, fixed $V_s$, mutable $C_s$, node support payload,
+  edge alphas/payloads/tags, legality, and player;
+- action-indexed child indices, fixed $V_{s_a}$, repaired $C_{s_a}$, tagged
+  node payload, player, and categorical outcome;
 - the final selected edge and its model value alpha, active only at the deepest
   path node and written as a Dirichlet message only while that edge is
   unresolved;
-- the current action-indexed categorical outcome/distance sidecars.
+- categorical state through outcome tags and their overlaid payloads.
 
 Large child embeddings are not copied across the action axis. A custom rule
 that needs them can gather the shared embedding table using child indices.
 
 The callback owns the direct unresolved-message write and uncertain
-child-to-parent Dirichlet repairs. Replacing it changes those posterior
-mathematics at every node, but not terminal detection, categorical minimax
-rules, absorbing certificates, or traversal pruning.
+child-to-parent Dirichlet repairs. Search applies count deltas to node support
+and owns every count-to-distance transition. Only unresolved positions of the
+returned edge alpha and payload are accepted; categorical positions in the
+tree remain untouched. Replacing the callback changes posterior mathematics at
+every node, but not terminal detection, categorical minimax rules, absorbing
+certificates, payload safety, or traversal pruning.
 
 ---
 
@@ -544,8 +567,8 @@ logic in `tictactoe-demo/app.js`.
 
 ### 8.1 Write the final leaf message
 
-Only at the deepest path node $s_d$, for final action $a_d$, increment the
-structural count:
+Only at the deepest path node $s_d$, an unresolved final action $a_d$
+increments its structural count:
 
 $$
 R_{s_d,a_d}\leftarrow R_{s_d,a_d}+1.
@@ -562,15 +585,16 @@ $$
 This is a replacement, not
 $B_{s_d,a_d}\leftarrow B_{s_d,a_d}+L_{s'}$.
 
-If `terminal_outcome` is present, expansion has already published the native
-categorical node/edge certificate. The update records structural support in
-$R$ but does not overwrite $B$ with a terminal alpha. The exact sidecar owns
-selection, propagation, readout, and training.
+If `terminal_outcome` is present, expansion first commits structural support
+one to the parent total, then publishes distance one in the same edge payload.
+The posterior callback neither increments that payload nor overwrites $B$ with
+a terminal alpha. The exact tag owns selection, propagation, readout, and
+training.
 
 ### 8.2 Refresh messages from repaired children
 
-At the current node $s$, inspect all expanded children. For every
-non-terminal child $s_a$ whose edge is unresolved and whose downstream
+At the current node $s$, inspect all expanded children. For every unresolved
+child $s_a$ whose edge is unresolved and whose downstream
 information satisfies $n_{s_a}>0$, replace the parent edge with the child's
 repaired cache:
 
@@ -583,17 +607,19 @@ $$
 R_{s,a}\leftarrow 1+n_{s_a}.
 $$
 
-Categorical children publish aligned categorical edge sidecars with distance
-$1+\tau_{s_a}$ and remain excluded from uncertain alpha refresh. A child with
-no downstream message leaves the alpha slot on its earlier unresolved message
-or fixed child-value fallback.
+When a child becomes categorical, search computes the final edge count
+$1+n_{s_a}$, commits its delta to the parent total, then overwrites the edge
+payload with $1+\tau_{s_a}$. Categorical children remain excluded from
+uncertain alpha refresh. A child with no downstream message leaves the alpha
+slot on its earlier unresolved message or fixed child-value fallback.
 
 ### 8.3 Resolve categorical nodes
 
 After each node's unresolved-posterior repair, apply Section 4.2. A newly
-categorical node immediately publishes its aligned certificate to its parent
-edge. Its certificate is absorbing, and later simulations cannot enter that
-node or edge.
+categorical node first publishes its final $1+n_s$ support contribution and
+aligned certificate to its parent edge, then overwrites its own node support
+with distance. Its certificate is absorbing, and later simulations cannot
+enter that node or edge.
 
 ### 8.4 Rebuild current action posteriors
 
@@ -610,11 +636,9 @@ neither a visit policy nor a historical running average.
 
 ### 8.5 Recompute the state cache
 
-Recompute
+Use the incrementally maintained unresolved node support
 
 $$
-n_s=\sum_{a\in\mathcal A(s)}R_{s,a},
-\qquad
 \gamma_s=\frac{n_s}{\kappa+n_s},
 $$
 
@@ -636,11 +660,13 @@ descendants. It is prior strength in this interpolation, not leaf or terminal
 evidence.
 
 This is a convex interpolation of Dirichlet parameter vectors. It is the
-algorithm's message-passing rule; it should not be described as a conjugate
-update with $R$ categorical observations.
+algorithm's message-passing rule; it is not a conjugate update with $R$
+categorical observations. Individual $R$ values cease to exist when their
+edge payloads become distances.
 
 For a categorical edge, $\widetilde A_{s,a}$ is the learned-mass projection
-from Section 4.1; the sidecar still supplies policy utility and exact semantics.
+from Section 4.1; the outcome tag still supplies policy utility and exact
+semantics.
 For a categorical node, $C_s$ is only a numeric cache and its native certificate
 is the value. The categorical neural target never consumes this alpha.
 
@@ -682,12 +708,18 @@ $$
 $$
 
 If the root is categorical, derive its certified action $a_{\mathrm{cat}}(s_0)$
-from the edge sidecars and draw rule, then return
+from the tagged edge certificates and draw rule, then return
 
 $$
 \pi_{\mathrm{search}}(a\mid s_0)
 =\mathbf 1[a=a_{\mathrm{cat}}(s_0)].
 $$
+
+For a `policy_prior` root draw, this final derivation uses
+`root.prior_logits` from the already completed root evaluation. During
+bottom-up categorization, a draw node—including the root—calls
+`node_evaluation_fn` on its stored embedding only when the tie-break is
+actually needed. Neither result is retained in `Tree`.
 
 The backend's `PolicyOutput` contains
 
@@ -780,11 +812,14 @@ $$
 \pi_{\mathrm{search}}(a\mid s_0).
 $$
 
-The fixed-shape replay record carries the eight sidecars
+The fixed-shape replay record carries eight native-target metadata fields,
 `q_target_kind/weight/outcome/distance` and
 `v_target_kind/weight/outcome/distance`. Unresolved alpha arrays remain in
 `tree.summary().alpha` and `tree.summary().value_alpha`; the learner ignores
 their entries whenever the corresponding kind is categorical or padded.
+`tree.summary().visit_counts` decodes the root edge payload as $R$ only for an
+unresolved edge and returns zero for a categorical edge, whose payload now
+means distance. Categorical distances are decoded separately.
 
 There is no reconstruction
 
@@ -795,22 +830,29 @@ $$
 and no addition of $R$ to Dirichlet concentration. Doing either would train
 the network on a posterior different from the one search actually used.
 
-The Q-loss weight is configurable:
+The Q-loss reduction weight is configurable:
 
 $$
-w_a=
+w_a^{\mathrm{reduce}}=
 \begin{cases}
-R_{s_0,a}, & \texttt{q\_loss\_weight\_mode=evidence\_mass},\\
+R_{s_0,a}, & z_{s_0,a}=\bot\text{ and evidence-mass mode},\\
 \pi_{\mathrm{search}}(a\mid s_0),
-& \texttt{q\_loss\_weight\_mode=policy}.
+& z_{s_0,a}=\bot\text{ and policy mode},\\
+1,&z_{s_0,a}\ne\bot.
 \end{cases}
 $$
 
 Here the name `evidence_mass` is historical: in this backend it receives the
-structural edge count $R$, not added Dirichlet pseudo-count mass.
-Every legal categorical Q edge is given positive effective weight even if a
+structural edge count $R$ only while that edge is unresolved, not added
+Dirichlet pseudo-count mass. Every legal categorical Q edge is given unit
+effective weight even if a
 one-hot solved policy assigns it zero probability, so exact alternative moves
 are not silently discarded.
+
+This reduction weight is distinct from replay's `q_target_weight`. The latter
+is a native-target validity/scale field and is one for every legal emitted Q
+row (zero for padding). The former is stored as `q_loss_weight` and determines
+how legal Q rows are combined by the configured Q-loss reduction.
 
 ### 11.1 Policy loss
 
@@ -897,8 +939,10 @@ $\max(\alpha_{\theta,i},10^{-6})$ componentwise; this is inert for the positive,
 floored head outputs used in normal training.
 
 The value loss applies this to $(T^V,\alpha_\theta^V)$. The Q loss applies it to
-$(T^Q(a),\alpha_\theta^Q(a))$ and reduces actions using the native target weight,
-$w_a$, legality, and the configured reduction mode.
+$(T^Q(a),\alpha_\theta^Q(a))$ using `q_target_weight` to validate/scale each
+native target, then reduces legal action rows using
+$w_a^{\mathrm{reduce}}$, the active row mask, and the configured reduction
+mode.
 
 ### 11.3 Outcome supervision
 
@@ -937,8 +981,10 @@ $$
 ```text
 DIRICHLET-THOMPSON-POLICY(root, N, posterior_update):
     tree <- fixed-capacity tree with N + 1 slots
-    initialize root priors/logits and cache C_root <- V_root
-    initialize every categorical sidecar to unresolved
+    initialize root alphas and cache C_root <- V_root
+    initialize root outcome tag from root.terminal_outcome
+    initialize every other outcome tag to unresolved
+    initialize all integer payloads to zero
 
     repeat N times:
         if root is categorical:
@@ -954,19 +1000,26 @@ DIRICHLET-THOMPSON-POLICY(root, N, posterior_update):
         step <- expand_fn(node.embedding, selected_action)
         initialize the child only when the edge was unexpanded
         if step.terminal_outcome != NO_OUTCOME:
-            child.categorical <- (aligned terminal outcome, distance 0)
-            parent edge categorical <- (parent outcome, distance 1)
+            child tag/payload <- (terminal outcome, distance 0)
+            parent payload (n_down) <- n_down + 1 - old_edge_count
+            parent edge tag/payload <- (aligned outcome, distance 1)
 
         # repair
         for node on the selected path, deepest to root:
-            context <- (node, child summaries, categorical edges, final leaf)
-            node.posterior <- posterior_update(key, context)
+            context <- (node, child summaries, tagged payloads, final leaf)
+            update <- posterior_update(key, context)
+            apply unresolved edge-count deltas to node payload (n_down)
+            if publishing a draw and rule is policy_prior:
+                logits <- node_evaluation_fn(node.embedding)
             try categorical win/draw/loss rules at node
             if node became categorical and has a parent:
-                publish aligned outcome and distance + 1 to incoming edge
+                commit final 1 + n_down delta to parent payload
+                overwrite incoming edge count with distance + 1
+                overwrite node payload n_down with node distance
 
     if root is categorical:
         root_action <- derive action from root edge certificates and draw rule
+        use ephemeral root.prior_logits only for a policy_prior draw tie-break
         root_policy <- one_hot(root_action)
     else:
         root_native <- categorical edges plus effective Dirichlet edges
@@ -981,22 +1034,26 @@ DEFAULT-POSTERIOR-UPDATE(node, children, leaf):
     if this is the deepest path node:
         if leaf edge is unresolved:
             B[leaf.action] <- aligned model leaf Dirichlet
-        R[leaf.action] <- R[leaf.action] + 1
+            R[leaf.action] <- R[leaf.action] + 1
 
-    for each expanded, nonterminal child with child.n_down > 0:
+    for each expanded, unresolved child with child.n_down > 0:
         B[action] <- aligned child.cache
         R[action] <- 1 + child.n_down
 
     A <- effective(B, R, expanded child V priors, Q fallbacks)
-    Y <- categorical sidecar when present, otherwise Dir(A)
+    Y <- Cat(outcome, payload distance) when tagged, otherwise Dir(A)
     pi <- fresh repeated-native policy from Y
-    n_down <- sum of legal R
+    n_down <- previous n_down + sum of unresolved R deltas
     A_tilde <- A for unresolved edges
                or sum(A) * one_hot(exact outcome) for categorical edges
     gamma <- n_down / (kappa + n_down)
     cache <- (1 - gamma) * V_prior
              + gamma * sum_action pi[action] * A_tilde[action]
-    return B, R, cache
+    return ephemeral update(
+        edge_alpha=B,
+        edge_payload=R on unresolved edges; categorical entries preserved,
+        value_alpha=cache,
+    )
 ```
 
 ---
@@ -1007,7 +1064,7 @@ A correct implementation maintains all of the following:
 
 1. Every Dirichlet and categorical outcome uses its node's player perspective.
 2. A terminal child discovered by expansion has distance zero; its parent edge
-   adds one ply. A pre-terminal root has no outcome payload and is only skipped.
+   adds one ply. A terminal root supplies an exact outcome payload.
 3. Categorical certificates are exact, native, and absorbing.
 4. One certified winning edge solves a node using the shortest certified win.
 5. Draw and loss require every legal edge to be categorical.
@@ -1018,12 +1075,23 @@ A correct implementation maintains all of the following:
 9. $A_{s,a}$ follows message, child-value prior, then Q-fallback precedence for
    unresolved Dirichlet objects and the learned mass used by cache projection.
 10. $B$ is replaced, not treated as an additive evidence sum.
-11. $R$ controls structure and prior mixing; it is not Dirichlet concentration.
-12. Numeric alphas, cache projections, and caches never override native
+11. While an edge is unresolved, $R$ controls structure and prior mixing; it
+    is not Dirichlet concentration. Its final delta reaches the parent before
+    the shared payload becomes categorical distance.
+12. The outcome tag is inspected before either shared payload is read: an edge
+    payload means $R$ or edge distance, and a node payload means $n_s$ or node
+    distance, never both at once.
+13. Root summary counts are zero for categorical edges because their payloads
+    no longer contain counts.
+14. Numeric alphas, cache projections, and caches never override native
     certificates or become categorical targets.
-13. Categorical V/Q targets use density NLL in both Dirichlet loss modes;
+15. Policy logits are never persistent tree state; internal `policy_prior`
+    draw tie-breaks evaluate the stored embedding on demand.
+16. Categorical V/Q targets use density NLL in both Dirichlet loss modes;
     unresolved targets retain the configured full/mean behavior.
-14. `num_simulations` and $N+1$ are static iteration/capacity bounds;
+17. Terminal means categorical tag plus node payload zero; zero support alone
+    is not terminal.
+18. `num_simulations` and $N+1$ are static iteration/capacity bounds;
     categorical short-circuiting may use fewer active cycles and real nodes.
 
 ---

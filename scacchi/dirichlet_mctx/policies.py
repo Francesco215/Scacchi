@@ -40,6 +40,7 @@ def dirichlet_thompson_policy(
     root: base.RootFnOutput,
     recurrent_fn: base.RecurrentFn,
     num_simulations: int,
+    node_evaluation_fn: base.NodeEvaluationFn | None = None,
     invalid_actions: jax.Array | None = None,
     posterior_update: base.PosteriorUpdateFn = posterior_updates.update_posterior,
     max_depth: int | None = None,
@@ -58,7 +59,15 @@ def dirichlet_thompson_policy(
         categorical_draw_rule
     )
     if invalid_actions is None:
-        invalid_actions = jnp.zeros_like(root.prior_logits, dtype=bool)
+        invalid_actions = ~jnp.isfinite(root.prior_logits)
+    if (
+        num_simulations > 0
+        and categorical_draw_rule == "policy_prior"
+        and node_evaluation_fn is None
+    ):
+        raise ValueError(
+            "categorical_draw_rule='policy_prior' requires node_evaluation_fn"
+        )
     search_key, policy_key = jax.random.split(rng_key)
 
     if num_simulations == 0:
@@ -72,6 +81,7 @@ def dirichlet_thompson_policy(
             action_selection_fn=action_selection.thompson_action_selection,
             posterior_update=posterior_update,
             num_simulations=num_simulations,
+            node_evaluation_fn=node_evaluation_fn,
             max_depth=max_depth,
             invalid_actions=invalid_actions,
             categorical_draw_rule=categorical_draw_rule,
@@ -87,8 +97,8 @@ def dirichlet_thompson_policy(
     categorical_root_action = action_selection.categorical_action(
         root_categorical_outcome,
         root_edge_categorical_outcome,
-        tree.edge_categorical_distance[:, tree.ROOT_INDEX],
-        tree.node_prior_logits[:, tree.ROOT_INDEX],
+        tree.edge_payload[:, tree.ROOT_INDEX],
+        root.prior_logits,
         invalid_actions,
         num_outcomes=alpha.shape[-1],
         draw_rule=categorical_draw_rule,

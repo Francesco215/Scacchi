@@ -38,13 +38,6 @@ def terminal_outcome_from_reward(
     return outcome.astype(jnp.int8)
 
 
-def mask_invalid_scores(
-    scores: jax.Array,
-    legal_action_mask: jax.Array,
-) -> jax.Array:
-    return jnp.where(legal_action_mask, scores, -jnp.inf)
-
-
 def make_dirichlet_expand_fn(env: Any, evaluator: Any):
     """Build the native environment-step plus leaf-evaluation function."""
 
@@ -55,11 +48,6 @@ def make_dirichlet_expand_fn(env: Any, evaluator: Any):
         prediction = evaluator(child_state.observation)
         alpha_v = _required_output(prediction.alpha_v, "alpha_v")
         alpha_q = _required_output(prediction.alpha_q, "alpha_q")
-        logits = mask_invalid_scores(
-            prediction.logits,
-            child_state.legal_action_mask,
-        )
-
         reward = child_state.rewards[
             jnp.arange(child_state.rewards.shape[0]),
             parent_player,
@@ -79,9 +67,9 @@ def make_dirichlet_expand_fn(env: Any, evaluator: Any):
             jnp.asarray(int(NO_OUTCOME), dtype=jnp.int8),
         )
         step = dirichlet_mctx.RecurrentFnOutput(
-            prior_logits=logits,
             value=alpha_v,
             action_values=alpha_q,
+            invalid_actions=~child_state.legal_action_mask,
             terminal_outcome=terminal_outcome,
             to_play=child_state.current_player,
         )

@@ -206,20 +206,15 @@ def test_terminal_chain_propagates_perspective_and_distance_and_stops_root():
         child_depth = depth + 1
         batch_size = child_depth.shape[0]
         terminal = child_depth >= terminal_depth
-        prior_logits = jnp.where(
-            terminal[:, None],
-            -jnp.inf,
-            jnp.zeros((batch_size, 1), dtype=jnp.float32),
-        )
         value = jnp.ones((batch_size, 3), dtype=jnp.float32)
         return (
             dirichlet_mctx.RecurrentFnOutput(
-                prior_logits=prior_logits,
                 value=value,
                 action_values=jnp.ones(
                     (batch_size, 1, 3),
                     dtype=jnp.float32,
                 ),
+                invalid_actions=terminal[:, None],
                 terminal_outcome=jnp.where(
                     terminal,
                     jnp.asarray(0, dtype=jnp.int8),
@@ -291,17 +286,12 @@ def test_solved_batch_lane_stays_frozen_while_another_lane_keeps_searching():
         del rng_key, action
         child_depth = depth + 1
         terminal = child_depth >= terminal_depth
-        prior_logits = jnp.where(
-            terminal[:, None],
-            -jnp.inf,
-            jnp.zeros((2, 1), dtype=jnp.float32),
-        )
         value = jnp.ones((2, 3), dtype=jnp.float32)
         return (
             dirichlet_mctx.RecurrentFnOutput(
-                prior_logits=prior_logits,
                 value=value,
                 action_values=jnp.ones((2, 1, 3), dtype=jnp.float32),
+                invalid_actions=terminal[:, None],
                 terminal_outcome=jnp.where(
                     terminal,
                     jnp.asarray(0, dtype=jnp.int8),
