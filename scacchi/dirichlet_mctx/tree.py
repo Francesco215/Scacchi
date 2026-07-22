@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Protocol
 
 import chex
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, PyTree, Shaped
+from jaxtyping import Array, Bool, Float, Int8, Int32
 
+from .base import RecurrentState, StoredRecurrentState, UnbatchedRecurrentState
 from .categorical import NO_DISTANCE, NO_OUTCOME
 
 
@@ -21,7 +22,7 @@ class PosteriorUpdate:
     """
 
     edge_alpha: Float[Array, "batch action outcome"]
-    edge_payload: Int[Array, "batch action"]
+    edge_payload: Int32[Array, "batch action"]
     value_alpha: Float[Array, "batch outcome"]
 
 
@@ -29,15 +30,15 @@ class PosteriorUpdate:
 class NodeView:
     """The current node passed to a configurable posterior repair rule."""
 
-    index: Int[Array, "batch"]
-    embedding: PyTree[Shaped[Array, "batch ..."]]
+    index: Int32[Array, "batch"]
+    embedding: RecurrentState
     value_prior: Float[Array, "batch outcome"]
     value_alpha: Float[Array, "batch outcome"]
-    node_payload: Int[Array, "batch"]
+    node_payload: Int32[Array, "batch"]
     edge_alpha: Float[Array, "batch action outcome"]
-    edge_payload: Int[Array, "batch action"]
-    edge_categorical_outcome: Int[Array, "batch action"]
-    to_play: Int[Array, "batch"]
+    edge_payload: Int32[Array, "batch action"]
+    edge_categorical_outcome: Int8[Array, "batch action"]
+    to_play: Int32[Array, "batch"]
     invalid_actions: Bool[Array, "batch action"]
 
 
@@ -51,23 +52,23 @@ class ChildrenView:
     game states are not copied over the complete action axis.
     """
 
-    index: Int[Array, "batch action"]
+    index: Int32[Array, "batch action"]
     visited: Bool[Array, "batch action"]
-    embedding_table: PyTree[Shaped[Array, "batch node ..."]]
+    embedding_table: StoredRecurrentState
     value_prior: Float[Array, "batch action outcome"]
     value_alpha: Float[Array, "batch action outcome"]
-    node_payload: Int[Array, "batch action"]
-    categorical_outcome: Int[Array, "batch action"]
-    to_play: Int[Array, "batch action"]
+    node_payload: Int32[Array, "batch action"]
+    categorical_outcome: Int8[Array, "batch action"]
+    to_play: Int32[Array, "batch action"]
 
 
 @chex.dataclass(frozen=True)
 class LeafView:
     """The selected leaf edge evaluated by the current simulation."""
 
-    action: Int[Array, "batch"]
+    action: Int32[Array, "batch"]
     value_alpha: Float[Array, "batch outcome"]
-    to_play: Int[Array, "batch"]
+    to_play: Int32[Array, "batch"]
     active: Bool[Array, "batch"]
 
 
@@ -90,10 +91,49 @@ class SearchSummary:
     visit_counts: Float[Array, "batch action"]
     alpha: Float[Array, "batch action outcome"]
     value_alpha: Float[Array, "batch outcome"]
-    q_categorical_outcome: Int[Array, "batch action"]
-    q_categorical_distance: Int[Array, "batch action"]
-    v_categorical_outcome: Int[Array, "batch"]
-    v_categorical_distance: Int[Array, "batch"]
+    q_categorical_outcome: Int8[Array, "batch action"]
+    q_categorical_distance: Int32[Array, "batch action"]
+    v_categorical_outcome: Int8[Array, "batch"]
+    v_categorical_distance: Int32[Array, "batch"]
+
+
+class UnbatchedTree(Protocol):
+    """Shape-precise structural view of one ``Tree`` lane.
+
+    JAX preserves the concrete ``Tree`` class when ``vmap`` removes its batch
+    axis.  This protocol describes those transformed leaf shapes without
+    introducing a second runtime tree type for action-selection callbacks.
+    """
+
+    parents: Int32[Array, "node"]
+    children_index: Int32[Array, "node action"]
+    node_to_play: Int32[Array, "node"]
+    node_categorical_outcome: Int8[Array, "node"]
+    node_payload: Int32[Array, "node"]
+    edge_categorical_outcome: Int8[Array, "node action"]
+    edge_payload: Int32[Array, "node action"]
+    node_value_priors: Float[Array, "node outcome"]
+    node_value_alpha: Float[Array, "node outcome"]
+    edge_alpha: Float[Array, "node action outcome"]
+    invalid_actions: Bool[Array, "node action"]
+    embeddings: UnbatchedRecurrentState
+
+    ROOT_INDEX: ClassVar[int]
+    NO_PARENT: ClassVar[int]
+    UNVISITED: ClassVar[int]
+
+    @property
+    def num_actions(self) -> int:
+        ...
+
+    @property
+    def searchable_actions(self) -> Bool[Array, "node action"]:
+        ...
+
+    def replace(self, *, invalid_actions: Bool[Array, "node action"]) -> UnbatchedTree:
+        """Return the same concrete tree with a lane-local action mask."""
+
+        ...
 
 
 @chex.dataclass(frozen=True)
@@ -111,18 +151,18 @@ class Tree:
     ``node_value_alpha`` is the mutable repaired cache.
     """
 
-    parents: Int[Array, "batch node"]
-    children_index: Int[Array, "batch node action"]
-    node_to_play: Int[Array, "batch node"]
-    node_categorical_outcome: Int[Array, "batch node"]
-    node_payload: Int[Array, "batch node"]
-    edge_categorical_outcome: Int[Array, "batch node action"]
-    edge_payload: Int[Array, "batch node action"]
+    parents: Int32[Array, "batch node"]
+    children_index: Int32[Array, "batch node action"]
+    node_to_play: Int32[Array, "batch node"]
+    node_categorical_outcome: Int8[Array, "batch node"]
+    node_payload: Int32[Array, "batch node"]
+    edge_categorical_outcome: Int8[Array, "batch node action"]
+    edge_payload: Int32[Array, "batch node action"]
     node_value_priors: Float[Array, "batch node outcome"]
     node_value_alpha: Float[Array, "batch node outcome"]
     edge_alpha: Float[Array, "batch node action outcome"]
     invalid_actions: Bool[Array, "batch node action"]
-    embeddings: PyTree[Shaped[Array, "batch node ..."]]
+    embeddings: StoredRecurrentState
 
     ROOT_INDEX: ClassVar[int] = 0
     NO_PARENT: ClassVar[int] = -1
@@ -141,7 +181,7 @@ class Tree:
         return self.edge_alpha[:, self.ROOT_INDEX]
 
     @property
-    def root_edge_payload(self) -> Int[Array, "batch action"]:
+    def root_edge_payload(self) -> Int32[Array, "batch action"]:
         return self.edge_payload[:, self.ROOT_INDEX]
 
     @property

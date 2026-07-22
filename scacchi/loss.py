@@ -1,17 +1,17 @@
-from collections.abc import Mapping
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple
 
 from flax import nnx
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import digamma, gammaln
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int, Int8, Int32
 import optax
 
 from .dirichlet_mctx.categorical import (
     TARGET_PAD,
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
+    NativeTargetFields,
     dirichlet_nll_at_categorical,
     native_fields_from_beta,
 )
@@ -72,14 +72,14 @@ class Sample(NamedTuple):
 
 
 class _NativeTargetFields(NamedTuple):
-    q_target_kind: Int[Array, "*batch action"]
+    q_target_kind: Int8[Array, "*batch action"]
     q_target_weight: Float[Array, "*batch action"]
-    q_target_outcome: Int[Array, "*batch action"]
-    q_target_distance: Int[Array, "*batch action"]
-    v_target_kind: Int[Array, "*batch"]
+    q_target_outcome: Int8[Array, "*batch action"]
+    q_target_distance: Int32[Array, "*batch action"]
+    v_target_kind: Int8[Array, "*batch"]
     v_target_weight: Float[Array, "*batch"]
-    v_target_outcome: Int[Array, "*batch"]
-    v_target_distance: Int[Array, "*batch"]
+    v_target_outcome: Int8[Array, "*batch"]
+    v_target_distance: Int32[Array, "*batch"]
 
 
 _NATIVE_TARGET_FIELD_NAMES = _NativeTargetFields._fields
@@ -472,14 +472,21 @@ def _native_target_values(source: Any) -> dict[str, jax.Array | None]:
 
 def _native_fields_from_values(
     values: dict[str, jax.Array | None],
-    defaults: Mapping[str, object],
+    defaults: NativeTargetFields,
 ) -> _NativeTargetFields:
-    def value_or_default(field: str) -> jax.Array:
+    def value_or_default(field: str, default: jax.Array) -> jax.Array:
         value = values[field]
-        return cast(jax.Array, defaults[field]) if value is None else value
+        return default if value is None else value
 
     return _NativeTargetFields(
-        *(value_or_default(field) for field in _NATIVE_TARGET_FIELD_NAMES)
+        q_target_kind=value_or_default("q_target_kind", defaults["q_target_kind"]),
+        q_target_weight=value_or_default("q_target_weight", defaults["q_target_weight"]),
+        q_target_outcome=value_or_default("q_target_outcome", defaults["q_target_outcome"]),
+        q_target_distance=value_or_default("q_target_distance", defaults["q_target_distance"]),
+        v_target_kind=value_or_default("v_target_kind", defaults["v_target_kind"]),
+        v_target_weight=value_or_default("v_target_weight", defaults["v_target_weight"]),
+        v_target_outcome=value_or_default("v_target_outcome", defaults["v_target_outcome"]),
+        v_target_distance=value_or_default("v_target_distance", defaults["v_target_distance"]),
     )
 
 

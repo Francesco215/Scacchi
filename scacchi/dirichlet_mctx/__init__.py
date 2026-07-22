@@ -19,6 +19,7 @@ from .base import PolicyOutput, RecurrentFnOutput, RootFnOutput
 from .categorical import (
     NO_DISTANCE,
     NO_OUTCOME,
+    NativeTargetFields,
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
     TARGET_PAD,
@@ -43,6 +44,7 @@ from .tree import (
     PosteriorUpdateContext,
     SearchSummary,
     Tree,
+    UnbatchedTree,
 )
 
 __all__ = [
@@ -55,6 +57,7 @@ __all__ = [
     "NodeView",
     "NO_DISTANCE",
     "NO_OUTCOME",
+    "NativeTargetFields",
     "PosteriorUpdateContext",
     "PosteriorUpdate",
     "RecurrentFnOutput",
@@ -64,6 +67,7 @@ __all__ = [
     "TARGET_DIRICHLET",
     "TARGET_PAD",
     "Tree",
+    "UnbatchedTree",
     "align_outcome",
     "categorical_action",
     "categorical_point",

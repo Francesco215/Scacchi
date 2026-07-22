@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Bool, Float, Int8
 
 from . import action_selection
 from . import base
@@ -14,12 +14,12 @@ from .search import instantiate_tree_from_root, search
 from .tree import Tree
 
 
-def posterior_best_policy_target(rng_key: PRNGKeyArray, alpha: Float[Array, "*batch action outcome"], legal_action_mask: Bool[Array, "*batch action"], num_samples: int, *, chunk_size: int | None = None, categorical_outcome: Int[Array, "*batch action"] | None = None) -> Float[Array, "*batch action"]:
+def posterior_best_policy_target(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action outcome"], legal_action_mask: Bool[Array, "*batch action"], num_samples: int, *, chunk_size: int | None = None, categorical_outcome: Int8[Array, "*batch action"] | None = None) -> Float[Array, "*batch action"]:
     """Monte Carlo estimate of each action's posterior best probability."""
     return action_selection.thompson_policy(rng_key, alpha, ~legal_action_mask, num_samples, chunk_size=chunk_size, categorical_outcome=categorical_outcome)
 
 
-def dirichlet_thompson_policy(params: base.Params, rng_key: PRNGKeyArray, *, root: base.RootFnOutput, recurrent_fn: base.RecurrentFn, num_simulations: int, invalid_actions: Bool[Array, "batch action"] | None = None, posterior_update: base.PosteriorUpdateFn = posterior_updates.update_posterior, max_depth: int | None = None, policy_samples: int = 32, policy_sample_chunk_size: int | None = None, loop_fn: base.LoopFn = jax.lax.fori_loop) -> base.PolicyOutput[Tree]:
+def dirichlet_thompson_policy(params: base.Params, rng_key: base.PRNGKey, *, root: base.RootFnOutput, recurrent_fn: base.RecurrentFn, num_simulations: int, invalid_actions: Bool[Array, "batch action"] | None = None, posterior_update: base.PosteriorUpdateFn = posterior_updates.update_posterior, max_depth: int | None = None, policy_samples: int = 32, policy_sample_chunk_size: int | None = None, loop_fn: base.LoopFn = jax.lax.fori_loop) -> base.PolicyOutput[Tree]:
     """Run Thompson tree search with an MCTX-shaped external API."""
 
     if num_simulations < 0:
@@ -60,7 +60,10 @@ def dirichlet_thompson_policy(params: base.Params, rng_key: PRNGKeyArray, *, roo
         sampled_policy = posterior_best_policy_target(policy_key, alpha, legal_action_mask, max(1, policy_samples), chunk_size=policy_sample_chunk_size, categorical_outcome=root_edge_categorical_outcome)
         return jnp.where(root_is_categorical[:, None], categorical_policy, sampled_policy)
 
-    action_weights = jax.lax.cond(jnp.all(root_is_categorical), lambda _: categorical_policy, unresolved_policy, operand=None)
+    def categorical_policy_only(_: None) -> Float[Array, "batch action"]:
+        return categorical_policy
+
+    action_weights = jax.lax.cond(jnp.all(root_is_categorical), categorical_policy_only, unresolved_policy, operand=None)
     action = action_selection.masked_argmax(action_weights, invalid_actions)
 
     return base.PolicyOutput(

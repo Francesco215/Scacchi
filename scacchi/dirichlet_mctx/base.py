@@ -5,17 +5,23 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable, Generic, TypeVar
 
 import chex
-from jaxtyping import Array, Bool, Float, Int, Key, PRNGKeyArray, PyTree, Shaped, UInt32
+from jaxtyping import Array, Bool, Float, Int, Int8, Int32, Key, PyTree, Shaped, UInt32
 
 if TYPE_CHECKING:
-    from .tree import PosteriorUpdate, PosteriorUpdateContext, Tree
+    from .tree import PosteriorUpdate, PosteriorUpdateContext, UnbatchedTree
 
 
-Params = PyTree[Shaped[Array, "..."]]
-Action = Int[Array, "batch"]
-RecurrentState = PyTree[Shaped[Array, "batch ..."]]
-PRNGKey = PRNGKeyArray
-BatchedPRNGKey = Key[Array, "batch"] | UInt32[Array, "batch 2"]
+Params = PyTree[Shaped[Array, "*?param_axes"], "Params"]
+Action = Int32[Array, "batch"]
+RecurrentState = PyTree[Shaped[Array, "batch *?state_axes"], "State"]
+StoredRecurrentState = PyTree[Shaped[Array, "batch node *?state_axes"], "State"]
+UnbatchedRecurrentState = PyTree[Shaped[Array, "*?state_axes"], "State"]
+TypedPRNGKey = Key[Array, ""]
+LegacyPRNGKey = UInt32[Array, "2"]
+PRNGKey = TypedPRNGKey | LegacyPRNGKey
+TypedBatchedPRNGKey = Key[Array, "batch"]
+LegacyBatchedPRNGKey = UInt32[Array, "batch 2"]
+BatchedPRNGKey = TypedBatchedPRNGKey | LegacyBatchedPRNGKey
 
 
 @chex.dataclass(frozen=True)
@@ -32,8 +38,8 @@ class RecurrentFnOutput:
     value: Float[Array, "batch outcome"]
     action_values: Float[Array, "batch action outcome"]
     invalid_actions: Bool[Array, "batch action"]
-    terminal_outcome: Int[Array, "batch"]
-    to_play: Int[Array, "batch"]
+    terminal_outcome: Int8[Array, "batch"]
+    to_play: Int32[Array, "batch"]
 
 
 RecurrentFn = Callable[[Params, PRNGKey, Action, RecurrentState], tuple[RecurrentFnOutput, RecurrentState]]
@@ -53,8 +59,8 @@ class RootFnOutput:
     value: Float[Array, "batch outcome"]
     action_values: Float[Array, "batch action outcome"]
     embedding: RecurrentState
-    terminal_outcome: Int[Array, "batch"]
-    to_play: Int[Array, "batch"]
+    terminal_outcome: Int8[Array, "batch"]
+    to_play: Int32[Array, "batch"]
 
 
 T = TypeVar("T")
@@ -65,11 +71,11 @@ LoopState = TypeVar("LoopState")
 class PolicyOutput(Generic[T]):
     """The selected action, policy target, and completed search tree."""
 
-    action: Int[Array, "batch"]
+    action: Int32[Array, "batch"]
     action_weights: Float[Array, "batch action"]
     search_tree: T
 
 
-ActionSelectionFn = Callable[[PRNGKey, "Tree", Int[Array, ""]], Int[Array, ""]]
+ActionSelectionFn = Callable[[PRNGKey, "UnbatchedTree", Int32[Array, ""]], Int32[Array, ""]]
 PosteriorUpdateFn = Callable[[PRNGKey, "PosteriorUpdateContext"], "PosteriorUpdate"]
-LoopFn = Callable[[int, int, Callable[[int, LoopState], LoopState], LoopState], LoopState]
+LoopFn = Callable[[int, int, Callable[[Int[Array, ""], LoopState], LoopState], LoopState], LoopState]

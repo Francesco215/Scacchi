@@ -6,10 +6,8 @@ import jax.numpy as jnp
 from scacchi import dirichlet_mctx
 from scacchi.dirichlet_mctx import action_selection
 from scacchi.dirichlet_mctx.categorical import NO_DISTANCE, NO_OUTCOME
-from scacchi.dirichlet_mctx.search import (
-    _categorize_node_and_publish,
-    simulate,
-)
+from scacchi.dirichlet_mctx.search import simulate
+from scacchi.dirichlet_mctx.utils import _categorize_node_and_publish
 
 
 def _root(

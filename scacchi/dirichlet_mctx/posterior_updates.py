@@ -6,8 +6,9 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Float, Int32
 
+from . import base
 from .categorical import NO_OUTCOME
 from .action_selection import align_outcome, thompson_policy
 from .tree import PosteriorUpdate, PosteriorUpdateContext
@@ -23,7 +24,7 @@ def _validate_kappa(kappa: float) -> None:
         raise ValueError(f"kappa must be finite and > 0, got {kappa}")
 
 
-def mix_value_prior(value_prior: Float[Array, "*batch outcome"], effective_action_alpha: Float[Array, "*batch action outcome"], search_policy: Float[Array, "*batch action"], n_down: Int[Array, "*batch"], *, kappa: float = DEFAULT_KAPPA) -> Float[Array, "*batch outcome"]:
+def mix_value_prior(value_prior: Float[Array, "*batch outcome"], effective_action_alpha: Float[Array, "*batch action outcome"], search_policy: Float[Array, "*batch action"], n_down: Int32[Array, "*batch"], *, kappa: float = DEFAULT_KAPPA) -> Float[Array, "*batch outcome"]:
     """Mix a node prior with its policy-weighted current edge posteriors."""
 
     _validate_kappa(kappa)
@@ -49,7 +50,7 @@ def mix_value_prior(value_prior: Float[Array, "*batch outcome"], effective_actio
     )
 
 
-def update_posterior(rng_key: PRNGKeyArray, context: PosteriorUpdateContext, *, kappa: float = DEFAULT_KAPPA, policy_samples: int = DEFAULT_POLICY_SAMPLES, policy_sample_chunk_size: int = DEFAULT_POLICY_SAMPLE_CHUNK_SIZE) -> PosteriorUpdate:
+def update_posterior(rng_key: base.PRNGKey, context: PosteriorUpdateContext, *, kappa: float = DEFAULT_KAPPA, policy_samples: int = DEFAULT_POLICY_SAMPLES, policy_sample_chunk_size: int = DEFAULT_POLICY_SAMPLE_CHUNK_SIZE) -> PosteriorUpdate:
     """Repair one path node using the Tic-Tac-Toe message-passing rule.
 
     This function owns the posterior mathematics. Search only gathers the
@@ -85,7 +86,8 @@ def update_posterior(rng_key: PRNGKeyArray, context: PosteriorUpdateContext, *, 
     edge_alpha = edge_alpha.at[batch, leaf_action].set(jnp.where(direct_is_dirichlet[..., None], direct_alpha, old_direct_alpha))
     edge_payload = edge_payload.at[batch, leaf_action].set(old_direct_count + direct_is_dirichlet.astype(edge_payload.dtype))
 
-    child_value = align_outcome(children.value_alpha, children.to_play, node.to_play[:, None])
+    child_target_player = jnp.broadcast_to(node.to_play[:, None], children.to_play.shape)
+    child_value = align_outcome(children.value_alpha, children.to_play, child_target_player)
     refresh = (
         active[:, None]
         & children.visited
@@ -97,7 +99,7 @@ def update_posterior(rng_key: PRNGKeyArray, context: PosteriorUpdateContext, *, 
     edge_payload = jnp.where(refresh, 1 + children.node_payload, edge_payload)
 
     # Rebuild the effective edge posterior after the direct and child repairs.
-    child_prior = align_outcome(children.value_prior, children.to_play, node.to_play[:, None])
+    child_prior = align_outcome(children.value_prior, children.to_play, child_target_player)
     fallback = jnp.where(children.visited[..., None], child_prior, edge_alpha)
     unresolved_count = jnp.where(unresolved, edge_payload, 0)
     effective_alpha = jnp.where(((~unresolved) | (unresolved_count > 0))[..., None], edge_alpha, fallback)

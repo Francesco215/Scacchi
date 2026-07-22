@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, Int32, Key, UInt32
+from jaxtyping import Array, Bool, Float, Int, Int8, Int32, Key, UInt32
 
 from . import base
 from .categorical import NO_OUTCOME
-from .tree import Tree
+from .tree import Tree, UnbatchedTree
 
 
 # Marsaglia--Tsang accepts a proposal with very high probability for every
@@ -18,14 +18,14 @@ from .tree import Tree
 _GAMMA_PROPOSALS = 4
 
 
-type _BatchedPRNGKey = Key[Array, "sample"] | UInt32[Array, "sample 2"]
+type _SamplePRNGKeys = Key[Array, "sample"] | UInt32[Array, "sample 2"]
 
 
 def flip_outcome(outcome: Float[Array, "*batch outcome"]) -> Float[Array, "*batch outcome"]:
     return outcome[..., ::-1]
 
 
-def align_outcome(outcome: Float[Array, "*batch outcome"], source_player: Int[Array, "*batch"], target_player: Int[Array, "..."]) -> Float[Array, "*batch outcome"]:
+def align_outcome(outcome: Float[Array, "*batch outcome"], source_player: Int32[Array, "*batch"], target_player: Int32[Array, "*batch"]) -> Float[Array, "*batch outcome"]:
     return jnp.where((source_player == target_player)[..., None], outcome, flip_outcome(outcome))
 
 
@@ -45,7 +45,7 @@ def categorical_utility(outcome: Int[Array, "*batch"], num_outcomes: int) -> Flo
     return jnp.where(outcome == int(num_outcomes) - 1, jnp.asarray(1.0, dtype=dtype), jnp.where(outcome == 0, jnp.asarray(-1.0, dtype=dtype), jnp.asarray(0.0, dtype=dtype)))
 
 
-def categorical_action(rng_key: base.PRNGKey, node_outcome: Int[Array, "*batch"], edge_outcome: Int[Array, "*batch action"], edge_distance: Int[Array, "*batch action"], invalid_actions: Bool[Array, "*batch action"], *, num_outcomes: int) -> Int32[Array, "*batch"]:
+def categorical_action(rng_key: base.PRNGKey, node_outcome: Int8[Array, "*batch"], edge_outcome: Int8[Array, "*batch action"], edge_distance: Int32[Array, "*batch action"], invalid_actions: Bool[Array, "*batch action"], *, num_outcomes: int) -> Int32[Array, "*batch"]:
     """Sample a certified action uniformly among equally good candidates.
 
     Win certificates prefer the shortest edge and loss certificates the
@@ -133,7 +133,7 @@ def sample_dirichlet(rng_key: base.PRNGKey, alpha: Float[Array, "*batch outcome"
     return jax.nn.softmax(log_gamma, axis=-1)
 
 
-def thompson_sample(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action outcome"], invalid_actions: Bool[Array, "*batch action"], categorical_outcome: Int[Array, "*batch action"] | None = None) -> Int32[Array, "*batch"]:
+def thompson_sample(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action outcome"], invalid_actions: Bool[Array, "*batch action"], categorical_outcome: Int8[Array, "*batch action"] | None = None) -> Int32[Array, "*batch"]:
     """Apply the one action-selection rule used throughout this backend."""
 
     sampled = sample_dirichlet(rng_key, alpha)
@@ -144,7 +144,7 @@ def thompson_sample(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action ou
     return masked_argmax(utility, invalid_actions)
 
 
-def thompson_policy(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action outcome"], invalid_actions: Bool[Array, "*batch action"], num_samples: int, *, chunk_size: int | None = None, categorical_outcome: Int[Array, "*batch action"] | None = None) -> Float[Array, "*batch action"]:
+def thompson_policy(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action outcome"], invalid_actions: Bool[Array, "*batch action"], num_samples: int, *, chunk_size: int | None = None, categorical_outcome: Int8[Array, "*batch action"] | None = None) -> Float[Array, "*batch action"]:
     """Estimate the posterior-best policy by repeating one Thompson rule.
 
     This is ``posteriorBestPolicy`` from the Tic-Tac-Toe demo.  Drawing keys
@@ -166,9 +166,13 @@ def thompson_policy(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action ou
         policy = jax.nn.one_hot(best, num_actions, dtype=alpha.dtype)
         return jnp.where(invalid_actions, 0.0, policy)
 
-    def sample_chunk(total_hits: Float[Array, "*batch action"], chunk: tuple[_BatchedPRNGKey, Bool[Array, "sample"]]) -> tuple[Float[Array, "*batch action"], None]:
+    def sample_chunk(total_hits: Float[Array, "*batch action"], chunk: tuple[_SamplePRNGKeys, Bool[Array, "sample"]]) -> tuple[Float[Array, "*batch action"], None]:
         keys, valid_samples = chunk
-        best = jax.vmap(lambda key: thompson_sample(key, alpha, invalid_actions, categorical_outcome))(keys)
+
+        def sample_action(key: base.PRNGKey) -> Int32[Array, "*batch"]:
+            return thompson_sample(key, alpha, invalid_actions, categorical_outcome)
+
+        best = jax.vmap(sample_action)(keys)
         hits = jax.nn.one_hot(best, num_actions, dtype=alpha.dtype)
         weight = valid_samples.astype(alpha.dtype).reshape((chunk_size,) + (1,) * (hits.ndim - 1))
         return total_hits + jnp.sum(hits * weight, axis=0), None
@@ -191,7 +195,7 @@ def thompson_policy(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action ou
     return jnp.where(total > 0, policy / jnp.maximum(total, 1.0), fallback)
 
 
-def effective_action_alpha(tree: Tree, node_index: Int[Array, ""]) -> Float[Array, "action outcome"]:
+def effective_action_alpha(tree: UnbatchedTree, node_index: Int32[Array, ""]) -> Float[Array, "action outcome"]:
     """Return all action Dirichlets for one unbatched node.
 
     This is ``edgePosterior`` from the Tic-Tac-Toe demo: use an edge message
@@ -204,7 +208,8 @@ def effective_action_alpha(tree: Tree, node_index: Int[Array, ""]) -> Float[Arra
     safe_child = jnp.where(visited, child_index, Tree.ROOT_INDEX)
     child_value = tree.node_value_priors[safe_child]
     child_player = tree.node_to_play[safe_child]
-    child_fallback = align_outcome(child_value, child_player, tree.node_to_play[node_index])
+    target_player = jnp.broadcast_to(tree.node_to_play[node_index], child_player.shape)
+    child_fallback = align_outcome(child_value, child_player, target_player)
     stored = tree.edge_alpha[node_index]
     edge_outcome = tree.edge_categorical_outcome[node_index]
     unresolved = edge_outcome == int(NO_OUTCOME)
@@ -214,11 +219,24 @@ def effective_action_alpha(tree: Tree, node_index: Int[Array, ""]) -> Float[Arra
 
 
 def root_action_alpha(tree: Tree) -> Float[Array, "batch action outcome"]:
-    root_index = jnp.asarray(Tree.ROOT_INDEX, dtype=jnp.int32)
-    return jax.vmap(effective_action_alpha, in_axes=(0, None))(tree, root_index)
+    root = Tree.ROOT_INDEX
+    child_index = tree.children_index[:, root]
+    visited = child_index != Tree.UNVISITED
+    safe_child = jnp.where(visited, child_index, root)
+    batch = jnp.arange(tree.parents.shape[0])[:, None]
+    child_value = tree.node_value_priors[batch, safe_child]
+    child_player = tree.node_to_play[batch, safe_child]
+    target_player = jnp.broadcast_to(tree.node_to_play[:, root, None], child_player.shape)
+    child_fallback = align_outcome(child_value, child_player, target_player)
+    stored = tree.edge_alpha[:, root]
+    edge_outcome = tree.edge_categorical_outcome[:, root]
+    unresolved = edge_outcome == int(NO_OUTCOME)
+    count = jnp.where(unresolved, tree.edge_payload[:, root], 0)
+    fallback = jnp.where(visited[..., None], child_fallback, stored)
+    return jnp.where(((~unresolved) | (count > 0))[..., None], stored, fallback)
 
 
-def thompson_action_selection(rng_key: base.PRNGKey, tree: Tree, node_index: Int[Array, ""]) -> Int32[Array, ""]:
+def thompson_action_selection(rng_key: base.PRNGKey, tree: UnbatchedTree, node_index: Int32[Array, ""]) -> Int32[Array, ""]:
     """Take one Thompson draw for every legal action at ``node_index``."""
 
     categorical = tree.edge_categorical_outcome[node_index]

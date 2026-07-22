@@ -7,7 +7,7 @@ from typing import TypedDict
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import gammaln
-from jaxtyping import Array, DTypeLike, Float, Int, ScalarLike, Shaped
+from jaxtyping import Array, DTypeLike, Float, Int, Int8, Int32, ScalarLike, Shaped
 
 
 TARGET_PAD = 0
@@ -17,21 +17,21 @@ NO_OUTCOME = -1
 NO_DISTANCE = -1
 
 
-class _NativeTargetFields(TypedDict):
-    q_target_kind: Int[Array, "*batch action"]
+class NativeTargetFields(TypedDict):
+    q_target_kind: Int8[Array, "*batch action"]
     q_target_weight: Float[Array, "*batch action"]
-    q_target_outcome: Int[Array, "*batch action"]
-    q_target_distance: Int[Array, "*batch action"]
-    v_target_kind: Int[Array, "*batch"]
+    q_target_outcome: Int8[Array, "*batch action"]
+    q_target_distance: Int32[Array, "*batch action"]
+    v_target_kind: Int8[Array, "*batch"]
     v_target_weight: Float[Array, "*batch"]
-    v_target_outcome: Int[Array, "*batch"]
-    v_target_distance: Int[Array, "*batch"]
+    v_target_outcome: Int8[Array, "*batch"]
+    v_target_distance: Int32[Array, "*batch"]
 
 
-_EmptyNative = tuple[Int[Array, "*target"], Float[Array, "*target"], Int[Array, "*target"], Int[Array, "*target"]]
+_EmptyNative = tuple[Int8[Array, "*target"], Float[Array, "*target"], Int8[Array, "*target"], Int32[Array, "*target"]]
 
 
-def _full_like_input_sharding(source: Shaped[Array, "*batch"], value: ScalarLike, dtype: DTypeLike) -> Shaped[Array, "*batch"]:
+def _full_like_input_sharding(source: Float[Array, "*batch"], value: ScalarLike, dtype: DTypeLike) -> Shaped[Array, "*batch"]:
     # Plain full_like/ones_like constants can be replicated under jit.
     # Keep a zero-valued dependency so defaults inherit source sharding.
     zero = jax.lax.stop_gradient(source - jax.lax.stop_gradient(source))
@@ -48,7 +48,7 @@ def _empty_native(beta: Float[Array, "*target outcome"], *, kind: int = int(TARG
     return target_kind, target_weight, target_outcome, target_distance
 
 
-def native_fields_from_beta(beta_q: Float[Array, "*batch action outcome"], beta_v: Float[Array, "*batch outcome"]) -> _NativeTargetFields:
+def native_fields_from_beta(beta_q: Float[Array, "*batch action outcome"], beta_v: Float[Array, "*batch outcome"]) -> NativeTargetFields:
     """Create ordinary-Dirichlet sidecars matching Q and V target shapes."""
 
     q_kind, q_weight, q_outcome, q_distance = _empty_native(beta_q)
@@ -65,7 +65,7 @@ def native_fields_from_beta(beta_q: Float[Array, "*batch action outcome"], beta_
     }
 
 
-def categorical_point(outcome: Int[Array, "*batch"], num_outcomes: int, epsilon: float, dtype: DTypeLike = jnp.float32) -> Float[Array, "*batch outcome"]:
+def categorical_point(outcome: Int[Array, "*batch"], num_outcomes: int, epsilon: float, dtype: DTypeLike = jnp.float32) -> Float[Array, "*batch {num_outcomes}"]:
     """Return an epsilon-interior simplex point for a categorical outcome.
 
     Every non-target coordinate is ``epsilon`` and the target coordinate is
@@ -81,6 +81,8 @@ def categorical_point(outcome: Int[Array, "*batch"], num_outcomes: int, epsilon:
     epsilon = float(epsilon)
     if not 0.0 < epsilon < 1.0 / float(num_outcomes):
         raise ValueError(f"epsilon must be > 0 and < 1 / num_outcomes; got epsilon={epsilon}, num_outcomes={num_outcomes}")
+    if not jnp.issubdtype(dtype, jnp.floating):
+        raise TypeError(f"dtype must be floating, got {dtype}")
     eps = jnp.asarray(epsilon, dtype=dtype)
     outcome = jnp.asarray(outcome, dtype=jnp.int32)
     one_hot = jax.nn.one_hot(outcome, num_outcomes, dtype=dtype)
@@ -108,6 +110,7 @@ def dirichlet_nll_at_categorical(alpha: Float[Array, "*batch outcome"], outcome:
 __all__ = [
     "NO_DISTANCE",
     "NO_OUTCOME",
+    "NativeTargetFields",
     "TARGET_CATEGORICAL",
     "TARGET_DIRICHLET",
     "TARGET_PAD",
