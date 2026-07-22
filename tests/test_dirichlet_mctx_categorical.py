@@ -5,7 +5,7 @@ import jax.numpy as jnp
 
 from scacchi import dirichlet_mctx
 from scacchi.dirichlet_mctx import action_selection
-from scacchi.dirichlet_mctx.categorical import NO_DISTANCE, NO_OUTCOME
+from scacchi.dirichlet_mctx.outcomes import NO_DISTANCE, NO_OUTCOME
 from scacchi.dirichlet_mctx.search import simulate
 from scacchi.dirichlet_mctx.utils import _categorize_node_and_publish
 
@@ -352,7 +352,7 @@ def test_mixed_native_thompson_uses_exact_categorical_utility():
     categorical_outcome = jnp.asarray([[2, int(NO_OUTCOME)]], dtype=jnp.int8)
 
     def policy(alpha):
-        return action_selection.thompson_policy(
+        return action_selection.posterior_best_policy(
             jax.random.PRNGKey(4),
             alpha,
             jnp.asarray([[False, False]]),

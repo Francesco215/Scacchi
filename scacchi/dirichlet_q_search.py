@@ -7,19 +7,13 @@ import jax
 import jax.numpy as jnp
 
 from . import dirichlet_mctx
-from .dirichlet_mctx.categorical import NO_OUTCOME
+from .dirichlet_mctx.outcomes import NO_OUTCOME, align_categorical_outcome
 
 
 def _required_output(value: jax.Array | None, name: str) -> jax.Array:
     if value is None:
         raise ValueError(f"evaluator output is missing {name}")
     return value
-
-
-flip_outcome = dirichlet_mctx.flip_outcome
-outcome_utility = dirichlet_mctx.outcome_utility
-outcome_mean = dirichlet_mctx.outcome_mean
-posterior_best_policy_target = dirichlet_mctx.posterior_best_policy_target
 
 
 def terminal_outcome_from_reward(
@@ -56,11 +50,7 @@ def make_dirichlet_expand_fn(env: Any, evaluator: Any):
             reward,
             alpha_v.shape[-1],
         )
-        child_terminal_outcome = jnp.where(
-            parent_player == child_state.current_player,
-            parent_terminal_outcome,
-            (alpha_v.shape[-1] - 1 - parent_terminal_outcome).astype(jnp.int8),
-        )
+        child_terminal_outcome = align_categorical_outcome(parent_terminal_outcome, parent_player, child_state.current_player, alpha_v.shape[-1])
         terminal_outcome = jnp.where(
             child_state.terminated,
             child_terminal_outcome,

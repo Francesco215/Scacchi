@@ -8,11 +8,12 @@ import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
 from scacchi import dirichlet_mctx
-from scacchi.dirichlet_mctx.categorical import (
+from scacchi.dirichlet_mctx.native_targets import (
     TARGET_CATEGORICAL,
     TARGET_PAD,
 )
-from scacchi.dirichlet_q_search import outcome_utility, posterior_sample_action
+from scacchi.dirichlet_mctx.outcomes import outcome_utility
+from scacchi.dirichlet_q_search import posterior_sample_action
 from scacchi.distributed import BatchParallel, assert_batch_axis_sharded
 from scacchi.network import BoardlawNet
 from scacchi.play import TrainingSamples, play, make_selfplay

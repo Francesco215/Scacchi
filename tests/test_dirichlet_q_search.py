@@ -5,11 +5,10 @@ import jax.numpy as jnp
 from omegaconf import OmegaConf
 
 from scacchi import dirichlet_mctx
-from scacchi.dirichlet_mctx.categorical import NO_OUTCOME
+from scacchi.dirichlet_mctx.outcomes import NO_OUTCOME
 from scacchi.dirichlet_q_search import (
     make_dirichlet_expand_fn,
     posterior_best_action,
-    posterior_best_policy_target,
     posterior_sample_action,
     q_loss_weight_from_mode,
     terminal_outcome_from_reward,
@@ -369,10 +368,10 @@ def test_tree_stores_only_posterior_messages_counts_and_values():
     }
 
 
-def test_thompson_policy_uses_current_alphas_not_previous_hits():
+def test_posterior_best_policy_uses_current_alphas_not_previous_hits():
     alpha = jnp.array([[[100.0, 1.0], [1.0, 100.0]]])
 
-    policy = dirichlet_mctx.thompson_policy(
+    policy = dirichlet_mctx.posterior_best_policy(
         jax.random.PRNGKey(3),
         alpha,
         jnp.array([[False, False]]),
@@ -897,14 +896,14 @@ def test_dirichlet_policy_jits_with_heterogeneous_root_masks():
     )
 
 
-def test_posterior_best_policy_target_masks_invalid_actions():
+def test_posterior_best_policy_masks_invalid_actions():
     alpha_q_post = jnp.array([[[1.0, 2.0], [1.0, 1000.0], [2.0, 1.0]]])
     legal_action_mask = jnp.array([[True, False, True]])
 
-    policy_target = posterior_best_policy_target(
+    policy_target = dirichlet_mctx.posterior_best_policy(
         jax.random.PRNGKey(0),
         alpha_q_post,
-        legal_action_mask,
+        ~legal_action_mask,
         num_samples=128,
     )
 
@@ -913,7 +912,7 @@ def test_posterior_best_policy_target_masks_invalid_actions():
     assert jnp.allclose(policy_target.sum(axis=-1), 1.0)
 
 
-def test_posterior_best_policy_target_chunk_size_matches_full_chunk():
+def test_posterior_best_policy_chunk_size_matches_full_chunk():
     alpha_q_post = jnp.array(
         [
             [[1.0, 2.0], [5.0, 1.0], [2.0, 2.0]],
@@ -928,17 +927,17 @@ def test_posterior_best_policy_target_chunk_size_matches_full_chunk():
     )
     key = jax.random.PRNGKey(3)
 
-    full_chunk = posterior_best_policy_target(
+    full_chunk = dirichlet_mctx.posterior_best_policy(
         key,
         alpha_q_post,
-        legal_action_mask,
+        ~legal_action_mask,
         num_samples=7,
         chunk_size=7,
     )
-    chunked = posterior_best_policy_target(
+    chunked = dirichlet_mctx.posterior_best_policy(
         key,
         alpha_q_post,
-        legal_action_mask,
+        ~legal_action_mask,
         num_samples=7,
         chunk_size=3,
     )

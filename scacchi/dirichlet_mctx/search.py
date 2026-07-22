@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, Int32, Shaped
 
 from . import base, utils
-from .categorical import NO_OUTCOME
+from .outcomes import NO_OUTCOME, align_categorical_outcome
 from .tree import (
     LeafView,
     PosteriorUpdateContext,
@@ -94,7 +94,7 @@ def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn:
     child_outcome = step.terminal_outcome.astype(jnp.int8)
     parent_player = tree.node_to_play[batch, parent_index]
     num_outcomes = tree.node_value_alpha.shape[-1]
-    aligned_outcome = jnp.where(step.to_play == parent_player, child_outcome, (num_outcomes - 1 - child_outcome).astype(jnp.int8))
+    aligned_outcome = align_categorical_outcome(child_outcome, step.to_play, parent_player, num_outcomes)
     publish_terminal = (simulation.active & (child_outcome != int(NO_OUTCOME)))
 
     # A terminal edge's unresolved count is consumed before its payload is
@@ -167,6 +167,8 @@ def search(params: base.Params, rng_key: base.PRNGKey, *, root: base.RootFnOutpu
         invalid_actions = ~jnp.isfinite(root.prior_logits)
 
     tree = instantiate_tree_from_root(root, num_simulations, invalid_actions)
+    if num_simulations == 0:
+        return tree
     batch_size = root.prior_logits.shape[0]
 
     def body_fn(simulation_index: Int[Array, ""], state: base._SearchState) -> base._SearchState:

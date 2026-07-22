@@ -1,4 +1,4 @@
-"""Tagged categorical targets shared by search and neural training."""
+"""Tagged native targets and categorical Dirichlet training loss."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ import jax.numpy as jnp
 from jax.scipy.special import gammaln
 from jaxtyping import Array, DTypeLike, Float, Int, Int8, Int32, ScalarLike, Shaped
 
+from .outcomes import NO_DISTANCE, NO_OUTCOME
+
 
 TARGET_PAD = 0
 TARGET_DIRICHLET = 1
 TARGET_CATEGORICAL = 2
-NO_OUTCOME = -1
-NO_DISTANCE = -1
 
 
 class NativeTargetFields(TypedDict):
@@ -100,16 +100,10 @@ def dirichlet_nll_at_categorical(alpha: Float[Array, "*batch outcome"], outcome:
     alpha = jnp.maximum(alpha.astype(dtype), alpha_epsilon)
     point = jax.lax.stop_gradient(categorical_point(outcome, alpha.shape[-1], epsilon, dtype=dtype))
     alpha_sum = jnp.sum(alpha, axis=-1)
-    return (
-        -gammaln(alpha_sum)
-        + jnp.sum(gammaln(alpha), axis=-1)
-        - jnp.sum((alpha - 1.0) * jnp.log(point), axis=-1)
-    )
+    return -gammaln(alpha_sum) + jnp.sum(gammaln(alpha), axis=-1) - jnp.sum((alpha - 1.0) * jnp.log(point), axis=-1)
 
 
 __all__ = [
-    "NO_DISTANCE",
-    "NO_OUTCOME",
     "NativeTargetFields",
     "TARGET_CATEGORICAL",
     "TARGET_DIRICHLET",

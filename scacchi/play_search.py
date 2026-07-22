@@ -10,16 +10,14 @@ import mctx
 import pgx
 
 from . import dirichlet_mctx
-from .dirichlet_mctx.categorical import (
-    NO_OUTCOME,
+from .dirichlet_mctx.native_targets import (
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
     TARGET_PAD,
 )
+from .dirichlet_mctx.outcomes import NO_OUTCOME, outcome_mean, outcome_utility
 from .dirichlet_q_search import (
     make_dirichlet_expand_fn,
-    outcome_mean,
-    outcome_utility,
     posterior_best_action,
     posterior_sample_action,
     q_loss_weight_from_mode,

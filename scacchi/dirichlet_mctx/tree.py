@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int8, Int32, Shaped
 
 from .base import RecurrentState, RootFnOutput, StoredRecurrentState, UnbatchedRecurrentState
-from .categorical import NO_DISTANCE, NO_OUTCOME
+from .outcomes import NO_DISTANCE, NO_OUTCOME, align_outcome
 
 
 @chex.dataclass(frozen=True)
@@ -179,6 +179,14 @@ class Tree:
 
     @property
     def root_action_alpha(self) -> Float[Array, "batch action outcome"]:
+        """Return fallback-aware effective action alphas at the root."""
+
+        return self.summary().alpha
+
+    @property
+    def root_stored_edge_alpha(self) -> Float[Array, "batch action outcome"]:
+        """Return the root's physical edge-alpha slots without fallbacks."""
+
         return self.edge_alpha[:, self.ROOT_INDEX]
 
     @property
@@ -212,11 +220,11 @@ class Tree:
         visited = child_index != self.UNVISITED
         safe_child = jnp.where(visited, child_index, root)
         batch = jnp.arange(self.parents.shape[0])[:, None]
+        stored = self.edge_alpha[:, root]
         child_prior = self.node_value_priors[batch, safe_child]
         child_player = self.node_to_play[batch, safe_child]
         root_player = self.node_to_play[:, root, None]
-        child_prior = jnp.where((child_player == root_player)[..., None], child_prior, child_prior[..., ::-1])
-        stored = self.edge_alpha[:, root]
+        child_prior = align_outcome(child_prior, child_player, root_player)
         fallback = jnp.where(visited[..., None], child_prior, stored)
         use_stored = ~unresolved | (counts > 0)
         alpha = jnp.where(use_stored[..., None], stored, fallback)

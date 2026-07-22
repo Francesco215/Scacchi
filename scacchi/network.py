@@ -8,6 +8,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from .dirichlet_mctx import outcomes
+
 if TYPE_CHECKING:
     from .types import Config
 
@@ -97,19 +99,11 @@ def dirichlet_from_logits(
     return concentration[..., None] * jax.nn.softmax(mean_logits, axis=-1)
 
 
-def outcome_mean(alpha: jax.Array) -> jax.Array:
-    return alpha / jnp.sum(alpha, axis=-1, keepdims=True)
-
-
-def outcome_utility(outcome_dist: jax.Array) -> jax.Array:
-    return outcome_dist[..., -1] - outcome_dist[..., 0]
-
-
 def policy_value_from_output(output):
     if len(output) == 2:
         return output
     logits, alpha_v, _alpha_q = output
-    return logits, outcome_utility(outcome_mean(alpha_v))
+    return logits, outcomes.outcome_utility(outcomes.outcome_mean(alpha_v))
 
 
 class BlockV1(nnx.Module):

@@ -1,7 +1,7 @@
 import numpy as np
 import jax.numpy as jnp
 
-from scacchi.dirichlet_mctx.categorical import (
+from scacchi.dirichlet_mctx.native_targets import (
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
 )

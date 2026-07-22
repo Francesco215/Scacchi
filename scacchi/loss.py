@@ -7,7 +7,7 @@ from jax.scipy.special import digamma, gammaln
 from jaxtyping import Array, Bool, Float, Int, Int8, Int32
 import optax
 
-from .dirichlet_mctx.categorical import (
+from .dirichlet_mctx.native_targets import (
     TARGET_PAD,
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,

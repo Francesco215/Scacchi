@@ -9,8 +9,8 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float, Int32
 
 from . import base
-from .categorical import NO_OUTCOME
-from .action_selection import align_outcome, thompson_policy
+from .action_selection import posterior_best_policy
+from .outcomes import NO_OUTCOME, align_outcome
 from .tree import PosteriorUpdate, PosteriorUpdateContext
 
 
@@ -102,12 +102,13 @@ def update_posterior(rng_key: base.PRNGKey, context: PosteriorUpdateContext, *, 
     child_prior = align_outcome(children.value_prior, children.to_play, child_target_player)
     fallback = jnp.where(children.visited[..., None], child_prior, edge_alpha)
     unresolved_count = jnp.where(unresolved, edge_payload, 0)
-    effective_alpha = jnp.where(((~unresolved) | (unresolved_count > 0))[..., None], edge_alpha, fallback)
+    use_stored = ~unresolved | (unresolved_count > 0)
+    effective_alpha = jnp.where(use_stored[..., None], edge_alpha, fallback)
     legal = ~node.invalid_actions
     # This is computeStateSearchPosterior from the demo: pi_search is a fresh
     # population from the node's *current* post-repair action posteriors.  It
     # is deliberately neither a visit policy nor a historical running mean.
-    search_policy = thompson_policy(rng_key, effective_alpha, node.invalid_actions, policy_samples, chunk_size=policy_sample_chunk_size, categorical_outcome=edge_outcome)
+    search_policy = posterior_best_policy(rng_key, effective_alpha, node.invalid_actions, policy_samples, chunk_size=policy_sample_chunk_size, categorical_outcome=edge_outcome)
     categorical = ~unresolved
     safe_categorical_outcome = jnp.where(categorical, edge_outcome, 0)
     categorical_mean = jax.nn.one_hot(safe_categorical_outcome, effective_alpha.shape[-1], dtype=effective_alpha.dtype)

@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Int32, Shaped
 
 from . import action_selection, base
-from .categorical import NO_OUTCOME
+from .outcomes import NO_OUTCOME, align_categorical_outcome
 from .tree import ChildrenView, NodeView, PosteriorUpdate, Tree
 
 
@@ -114,7 +114,7 @@ def _categorize_node_and_publish(rng_key: base.PRNGKey, tree: Tree, node_index: 
     new_parent_support = tree.node_payload[batch, safe_parent] + 1 + old_support - old_edge_count
     node_player = tree.node_to_play[batch, node_index]
     parent_player = tree.node_to_play[batch, safe_parent]
-    aligned_outcome = jnp.where(node_player == parent_player, candidate_outcome, (num_outcomes - 1 - candidate_outcome).astype(jnp.int8))
+    aligned_outcome = align_categorical_outcome(candidate_outcome, node_player, parent_player, num_outcomes)
     node_payload = _set_scalar_node(tree.node_payload, safe_parent, new_parent_support, publish_edge)
     node_payload = _set_scalar_node(node_payload, node_index, candidate_distance, publish_node)
     return replace(tree, node_payload=node_payload, node_categorical_outcome=_set_scalar_node(tree.node_categorical_outcome, node_index, candidate_outcome, publish_node), edge_categorical_outcome=_set_edge(tree.edge_categorical_outcome, safe_parent, incoming_action, aligned_outcome, publish_edge), edge_payload=_set_edge(tree.edge_payload, safe_parent, incoming_action, candidate_distance + jnp.asarray(1, dtype=jnp.int32), publish_edge))

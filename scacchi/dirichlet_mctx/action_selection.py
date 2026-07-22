@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, Int8, Int32, Key, UInt32
+from jaxtyping import Array, Bool, Float, Int8, Int32, Key, UInt32
 
 from . import base
-from .categorical import NO_OUTCOME
+from .outcomes import NO_OUTCOME, align_outcome, categorical_utility, outcome_utility
 from .tree import Tree, UnbatchedTree
 
 
@@ -19,30 +19,6 @@ _GAMMA_PROPOSALS = 4
 
 
 type _SamplePRNGKeys = Key[Array, "sample"] | UInt32[Array, "sample 2"]
-
-
-def flip_outcome(outcome: Float[Array, "*batch outcome"]) -> Float[Array, "*batch outcome"]:
-    return outcome[..., ::-1]
-
-
-def align_outcome(outcome: Float[Array, "*batch outcome"], source_player: Int32[Array, "*batch"], target_player: Int32[Array, "*batch"]) -> Float[Array, "*batch outcome"]:
-    return jnp.where((source_player == target_player)[..., None], outcome, flip_outcome(outcome))
-
-
-def outcome_mean(alpha: Float[Array, "*batch outcome"]) -> Float[Array, "*batch outcome"]:
-    return alpha / jnp.sum(alpha, axis=-1, keepdims=True)
-
-
-def outcome_utility(outcome: Float[Array, "*batch outcome"]) -> Float[Array, "*batch"]:
-    return outcome[..., -1] - outcome[..., 0]
-
-
-def categorical_utility(outcome: Int[Array, "*batch"], num_outcomes: int) -> Float[Array, "*batch"]:
-    """Return exact scalar utility for a categorical outcome index."""
-
-    outcome = jnp.asarray(outcome)
-    dtype = jnp.result_type(outcome, jnp.float32)
-    return jnp.where(outcome == int(num_outcomes) - 1, jnp.asarray(1.0, dtype=dtype), jnp.where(outcome == 0, jnp.asarray(-1.0, dtype=dtype), jnp.asarray(0.0, dtype=dtype)))
 
 
 def categorical_action(rng_key: base.PRNGKey, node_outcome: Int8[Array, "*batch"], edge_outcome: Int8[Array, "*batch action"], edge_distance: Int32[Array, "*batch action"], invalid_actions: Bool[Array, "*batch action"], *, num_outcomes: int) -> Int32[Array, "*batch"]:
@@ -144,7 +120,7 @@ def thompson_sample(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action ou
     return masked_argmax(utility, invalid_actions)
 
 
-def thompson_policy(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action outcome"], invalid_actions: Bool[Array, "*batch action"], num_samples: int, *, chunk_size: int | None = None, categorical_outcome: Int8[Array, "*batch action"] | None = None) -> Float[Array, "*batch action"]:
+def posterior_best_policy(rng_key: base.PRNGKey, alpha: Float[Array, "*batch action outcome"], invalid_actions: Bool[Array, "*batch action"], num_samples: int, *, chunk_size: int | None = None, categorical_outcome: Int8[Array, "*batch action"] | None = None) -> Float[Array, "*batch action"]:
     """Estimate the posterior-best policy by repeating one Thompson rule.
 
     This is ``posteriorBestPolicy`` from the Tic-Tac-Toe demo.  Drawing keys
@@ -214,24 +190,6 @@ def effective_action_alpha(tree: UnbatchedTree, node_index: Int32[Array, ""]) ->
     edge_outcome = tree.edge_categorical_outcome[node_index]
     unresolved = edge_outcome == int(NO_OUTCOME)
     count = jnp.where(unresolved, tree.edge_payload[node_index], 0)
-    fallback = jnp.where(visited[..., None], child_fallback, stored)
-    return jnp.where(((~unresolved) | (count > 0))[..., None], stored, fallback)
-
-
-def root_action_alpha(tree: Tree) -> Float[Array, "batch action outcome"]:
-    root = Tree.ROOT_INDEX
-    child_index = tree.children_index[:, root]
-    visited = child_index != Tree.UNVISITED
-    safe_child = jnp.where(visited, child_index, root)
-    batch = jnp.arange(tree.parents.shape[0])[:, None]
-    child_value = tree.node_value_priors[batch, safe_child]
-    child_player = tree.node_to_play[batch, safe_child]
-    target_player = jnp.broadcast_to(tree.node_to_play[:, root, None], child_player.shape)
-    child_fallback = align_outcome(child_value, child_player, target_player)
-    stored = tree.edge_alpha[:, root]
-    edge_outcome = tree.edge_categorical_outcome[:, root]
-    unresolved = edge_outcome == int(NO_OUTCOME)
-    count = jnp.where(unresolved, tree.edge_payload[:, root], 0)
     fallback = jnp.where(visited[..., None], child_fallback, stored)
     return jnp.where(((~unresolved) | (count > 0))[..., None], stored, fallback)
 

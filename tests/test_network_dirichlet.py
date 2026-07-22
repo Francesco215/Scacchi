@@ -11,10 +11,9 @@ from scacchi.network import (
     BoardlawNet,
     build_model,
     dirichlet_from_logits,
-    outcome_mean,
-    outcome_utility,
     policy_value_from_output,
 )
+from scacchi.dirichlet_mctx.outcomes import outcome_mean, outcome_utility
 from scacchi.types import (
     Config,
     EnvConfig,

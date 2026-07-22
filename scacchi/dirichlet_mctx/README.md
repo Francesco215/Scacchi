@@ -32,7 +32,8 @@ The module map is also parallel to MCTX:
 
 - `base.py`: root, expansion, and policy-output contracts.
 - `tree.py`: compact fixed-capacity `Tree` and update-view types.
-- `categorical.py`: native target tags, smoothing, and categorical density NLL.
+- `outcomes.py`: outcome sentinels, perspective alignment, and utilities.
+- `native_targets.py`: native target tags, smoothing, and categorical density NLL.
 - `action_selection.py`: one node-local Thompson selector used everywhere.
 - `search.py`: `simulate -> expand -> bottom-up repair`.
 - `policies.py`: the public `dirichlet_thompson_policy` wrapper.

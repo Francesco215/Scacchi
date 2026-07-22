@@ -3,9 +3,7 @@ import jax.numpy as jnp
 from jax.scipy.special import gammaln
 import pytest
 
-from scacchi.dirichlet_mctx.categorical import (
-    NO_DISTANCE,
-    NO_OUTCOME,
+from scacchi.dirichlet_mctx.native_targets import (
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
     TARGET_PAD,
@@ -13,6 +11,7 @@ from scacchi.dirichlet_mctx.categorical import (
     dirichlet_nll_at_categorical,
     native_fields_from_beta,
 )
+from scacchi.dirichlet_mctx.outcomes import NO_DISTANCE, NO_OUTCOME
 
 
 def test_categorical_point_is_positive_normalized_and_batched():

@@ -5,12 +5,12 @@ import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
 from scacchi.distributed import BatchParallel, assert_batch_axis_sharded
-from scacchi.dirichlet_mctx.categorical import (
+from scacchi.dirichlet_mctx.native_targets import (
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
     dirichlet_nll_at_categorical,
 )
-from scacchi.dirichlet_mctx.categorical import native_fields_from_beta
+from scacchi.dirichlet_mctx.native_targets import native_fields_from_beta
 from scacchi.loss import (
     DIRICHLET_KL_LOSS_CUTOFF,
     Sample,
