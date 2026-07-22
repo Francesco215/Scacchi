@@ -16,6 +16,7 @@ from .dirichlet_mctx.native_targets import (
     TARGET_PAD,
 )
 from .dirichlet_mctx.outcomes import NO_OUTCOME, outcome_mean, outcome_utility
+from .dirichlet_mctx.posterior_updates import DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
 from .dirichlet_q_search import (
     make_dirichlet_expand_fn,
     posterior_best_action,
@@ -210,7 +211,7 @@ def _run_dirichlet_thompson_search(
         policy_sample_chunk_size=(
             max(1, int(search_cfg.policy_sample_chunk_size))
             if search_cfg.policy_sample_chunk_size is not None
-            else dirichlet_mctx.DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
+            else DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
         ),
     )
     policy_output = dirichlet_mctx.dirichlet_thompson_policy(
