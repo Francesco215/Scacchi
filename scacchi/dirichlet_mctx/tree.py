@@ -5,10 +5,11 @@ from __future__ import annotations
 from typing import ClassVar, Protocol
 
 import chex
+import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int8, Int32
+from jaxtyping import Array, Bool, Float, Int8, Int32, Shaped
 
-from .base import RecurrentState, StoredRecurrentState, UnbatchedRecurrentState
+from .base import RecurrentState, RootFnOutput, StoredRecurrentState, UnbatchedRecurrentState
 from .categorical import NO_DISTANCE, NO_OUTCOME
 
 
@@ -232,3 +233,39 @@ class Tree:
             v_categorical_outcome=node_outcome,
             v_categorical_distance=node_distance,
         )
+
+
+def instantiate_tree_from_root(root: RootFnOutput, num_simulations: int, root_invalid_actions: Bool[Array, "batch action"]) -> Tree:
+    """Allocate compact fixed-capacity storage and initialize the root."""
+
+    chex.assert_rank(root.prior_logits, 2)
+    batch_size, num_actions = root.prior_logits.shape
+    num_outcomes = root.action_values.shape[-1]
+    chex.assert_shape(root.value, (batch_size, num_outcomes))
+    chex.assert_shape(root.action_values, (batch_size, num_actions, num_outcomes))
+    chex.assert_shape(root.terminal_outcome, (batch_size,))
+    chex.assert_shape(root_invalid_actions, (batch_size, num_actions))
+    num_nodes = num_simulations + 1
+    batch_node = (batch_size, num_nodes)
+    batch_node_action = (batch_size, num_nodes, num_actions)
+
+    def allocate_embedding(value: Shaped[Array, "batch *embedding_axes"]) -> Shaped[Array, "batch node *embedding_axes"]:
+        table = jnp.zeros((batch_size, num_nodes, *value.shape[1:]), dtype=value.dtype)
+        return table.at[:, Tree.ROOT_INDEX].set(value)
+
+    edge_alpha = jnp.ones((*batch_node_action, num_outcomes), dtype=root.action_values.dtype).at[:, Tree.ROOT_INDEX].set(root.action_values)
+    node_value_alpha = jnp.ones((*batch_node, num_outcomes), dtype=root.value.dtype).at[:, Tree.ROOT_INDEX].set(root.value)
+    return Tree(
+        parents=jnp.full(batch_node, Tree.NO_PARENT, dtype=jnp.int32),
+        children_index=jnp.full(batch_node_action, Tree.UNVISITED, dtype=jnp.int32),
+        node_to_play=jnp.zeros(batch_node, dtype=root.to_play.dtype).at[:, Tree.ROOT_INDEX].set(root.to_play),
+        node_categorical_outcome=jnp.full(batch_node, int(NO_OUTCOME), dtype=jnp.int8).at[:, Tree.ROOT_INDEX].set(root.terminal_outcome.astype(jnp.int8)),
+        node_payload=jnp.zeros(batch_node, dtype=jnp.int32),
+        edge_categorical_outcome=jnp.full(batch_node_action, int(NO_OUTCOME), dtype=jnp.int8),
+        edge_payload=jnp.zeros(batch_node_action, dtype=jnp.int32),
+        node_value_priors=node_value_alpha,
+        node_value_alpha=node_value_alpha,
+        edge_alpha=edge_alpha,
+        invalid_actions=jnp.ones(batch_node_action, dtype=bool).at[:, Tree.ROOT_INDEX].set(root_invalid_actions),
+        embeddings=jax.tree.map(allocate_embedding, root.embedding),
+    )

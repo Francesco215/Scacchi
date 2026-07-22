@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Generic, TypeVar
+from typing import TYPE_CHECKING, Callable, Generic, NamedTuple, TypeVar
 
 import chex
 from jaxtyping import Array, Bool, Float, Int, Int8, Int32, Key, PyTree, Shaped, UInt32
 
 if TYPE_CHECKING:
-    from .tree import PosteriorUpdate, PosteriorUpdateContext, UnbatchedTree
+    from .tree import PosteriorUpdate, PosteriorUpdateContext, Tree, UnbatchedTree
 
 
 Params = PyTree[Shaped[Array, "*?param_axes"], "Params"]
@@ -22,6 +22,31 @@ PRNGKey = TypedPRNGKey | LegacyPRNGKey
 TypedBatchedPRNGKey = Key[Array, "batch"]
 LegacyBatchedPRNGKey = UInt32[Array, "batch 2"]
 BatchedPRNGKey = TypedBatchedPRNGKey | LegacyBatchedPRNGKey
+
+
+class _ScalarSimulation(NamedTuple):
+    parent_index: Int32[Array, ""]
+    action: Int32[Array, ""]
+    active: Bool[Array, ""]
+
+
+class Simulation(NamedTuple):
+    parent_index: Int32[Array, "batch"]
+    action: Int32[Array, "batch"]
+    active: Bool[Array, "batch"]
+
+
+class _SimulationState(NamedTuple):
+    rng_key: PRNGKey
+    node_index: Int32[Array, ""]
+    action: Int32[Array, ""]
+    next_node_index: Int32[Array, ""]
+    depth: Int32[Array, ""]
+    is_continuing: Bool[Array, ""]
+
+
+type _BackwardState = tuple[PRNGKey, Tree, Int32[Array, "batch"], Bool[Array, "batch"], Bool[Array, "batch"]]
+type _SearchState = tuple[PRNGKey, Tree]
 
 
 @chex.dataclass(frozen=True)

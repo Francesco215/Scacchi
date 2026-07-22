@@ -35,7 +35,8 @@ from .posterior_updates import (
     mix_value_prior,
     update_posterior,
 )
-from .search import instantiate_tree_from_root, search
+from .search import search
+from .tree import instantiate_tree_from_root
 from .tree import (
     ChildrenView,
     LeafView,

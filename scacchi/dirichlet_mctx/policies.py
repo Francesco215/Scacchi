@@ -10,7 +10,8 @@ from . import action_selection
 from . import base
 from . import posterior_updates
 from .categorical import NO_OUTCOME
-from .search import instantiate_tree_from_root, search
+from .search import search
+from .tree import instantiate_tree_from_root
 from .tree import Tree
 
 

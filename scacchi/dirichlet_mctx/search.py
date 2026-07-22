@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import NamedTuple
-
-import chex
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, Int32, Shaped
@@ -17,80 +14,18 @@ from .tree import (
     PosteriorUpdateContext,
     Tree,
     UnbatchedTree,
+    instantiate_tree_from_root,
 )
 
 
-class _ScalarSimulation(NamedTuple):
-    parent_index: Int32[Array, ""]
-    action: Int32[Array, ""]
-    active: Bool[Array, ""]
-
-
-class Simulation(NamedTuple):
-    parent_index: Int32[Array, "batch"]
-    action: Int32[Array, "batch"]
-    active: Bool[Array, "batch"]
-
-
-class _SimulationState(NamedTuple):
-    rng_key: base.PRNGKey
-    node_index: Int32[Array, ""]
-    action: Int32[Array, ""]
-    next_node_index: Int32[Array, ""]
-    depth: Int32[Array, ""]
-    is_continuing: Bool[Array, ""]
-
-
-type _BackwardState = tuple[base.PRNGKey, Tree, Int32[Array, "batch"], Bool[Array, "batch"], Bool[Array, "batch"]]
-type _SearchState = tuple[base.PRNGKey, Tree]
-
-
-def instantiate_tree_from_root(root: base.RootFnOutput, num_simulations: int, root_invalid_actions: Bool[Array, "batch action"]) -> Tree:
-    """Allocate compact fixed-capacity storage and initialize the root."""
-
-    chex.assert_rank(root.prior_logits, 2)
-    batch_size, num_actions = root.prior_logits.shape
-    num_outcomes = root.action_values.shape[-1]
-    chex.assert_shape(root.value, (batch_size, num_outcomes))
-    chex.assert_shape(root.action_values, (batch_size, num_actions, num_outcomes))
-    chex.assert_shape(root.terminal_outcome, (batch_size,))
-    chex.assert_shape(root_invalid_actions, (batch_size, num_actions))
-    num_nodes = num_simulations + 1
-    batch_node = (batch_size, num_nodes)
-    batch_node_action = (batch_size, num_nodes, num_actions)
-
-    def allocate_embedding(value: Shaped[Array, "batch *embedding_axes"]) -> Shaped[Array, "batch node *embedding_axes"]:
-        table = jnp.zeros((batch_size, num_nodes, *value.shape[1:]), dtype=value.dtype)
-        return table.at[:, Tree.ROOT_INDEX].set(value)
-
-    edge_alpha = jnp.ones((*batch_node_action, num_outcomes), dtype=root.action_values.dtype).at[:, Tree.ROOT_INDEX].set(root.action_values)
-    node_value_alpha = jnp.ones((*batch_node, num_outcomes), dtype=root.value.dtype).at[:, Tree.ROOT_INDEX].set(root.value)
-    return Tree(
-        parents=jnp.full(batch_node, Tree.NO_PARENT, dtype=jnp.int32),
-        children_index=jnp.full(batch_node_action, Tree.UNVISITED, dtype=jnp.int32),
-        node_to_play=jnp.zeros(batch_node, dtype=root.to_play.dtype).at[:, Tree.ROOT_INDEX].set(root.to_play),
-        node_categorical_outcome=jnp.full(batch_node, int(NO_OUTCOME), dtype=jnp.int8).at[:, Tree.ROOT_INDEX].set(root.terminal_outcome.astype(jnp.int8)),
-        # Zero means unresolved support zero or categorical terminal distance
-        # zero; the outcome tag is the required discriminant.
-        node_payload=jnp.zeros(batch_node, dtype=jnp.int32),
-        edge_categorical_outcome=jnp.full(batch_node_action, int(NO_OUTCOME), dtype=jnp.int8),
-        edge_payload=jnp.zeros(batch_node_action, dtype=jnp.int32),
-        node_value_priors=node_value_alpha,
-        node_value_alpha=node_value_alpha,
-        edge_alpha=edge_alpha,
-        invalid_actions=jnp.ones(batch_node_action, dtype=bool).at[:, Tree.ROOT_INDEX].set(root_invalid_actions),
-        embeddings=jax.tree.map(allocate_embedding, root.embedding),
-    )
-
-
-def _simulate_one(rng_key: base.PRNGKey, tree: UnbatchedTree, action_selection_fn: base.ActionSelectionFn, max_depth: int) -> _ScalarSimulation:
+def _simulate_one(rng_key: base.PRNGKey, tree: UnbatchedTree, action_selection_fn: base.ActionSelectionFn, max_depth: int) -> base._ScalarSimulation:
     """Traverse one unbatched tree to an unvisited or cutoff edge."""
 
     root_index = jnp.asarray(Tree.ROOT_INDEX, dtype=jnp.int32)
     root_searchable_actions = tree.searchable_actions[root_index]
     root_active = (tree.node_categorical_outcome[root_index] == int(NO_OUTCOME)) & jnp.any(root_searchable_actions)
 
-    def body_fn(state: _SimulationState) -> _SimulationState:
+    def body_fn(state: base._SimulationState) -> base._SimulationState:
         next_key, selection_key = jax.random.split(state.rng_key)
         node_index = state.next_node_index
 
@@ -106,7 +41,7 @@ def _simulate_one(rng_key: base.PRNGKey, tree: UnbatchedTree, action_selection_f
         child_selectable = (tree.node_categorical_outcome[safe_child] == int(NO_OUTCOME)) & child_has_searchable_action
         continuing = visited & child_selectable & (depth < max_depth)
 
-        return _SimulationState(
+        return base._SimulationState(
             rng_key=next_key,
             node_index=node_index,
             action=action,
@@ -115,7 +50,7 @@ def _simulate_one(rng_key: base.PRNGKey, tree: UnbatchedTree, action_selection_f
             is_continuing=continuing,
         )
 
-    initial = _SimulationState(
+    initial = base._SimulationState(
         rng_key=rng_key,
         node_index=root_index,
         action=jnp.asarray(0, dtype=jnp.int32),
@@ -124,25 +59,25 @@ def _simulate_one(rng_key: base.PRNGKey, tree: UnbatchedTree, action_selection_f
         is_continuing=root_active,
     )
 
-    def cond_fn(state: _SimulationState) -> Bool[Array, ""]:
+    def cond_fn(state: base._SimulationState) -> Bool[Array, ""]:
         return state.is_continuing
 
     end = jax.lax.while_loop(cond_fn, body_fn, initial)
 
-    return _ScalarSimulation(parent_index=end.node_index, action=end.action, active=root_active)
+    return base._ScalarSimulation(parent_index=end.node_index, action=end.action, active=root_active)
 
 
-def simulate(rng_key: base.BatchedPRNGKey, tree: Tree, action_selection_fn: base.ActionSelectionFn, max_depth: int) -> Simulation:
+def simulate(rng_key: base.BatchedPRNGKey, tree: Tree, action_selection_fn: base.ActionSelectionFn, max_depth: int) -> base.Simulation:
     """Traverse every lane of a batched tree with exact per-lane types."""
 
-    def simulate_one(key: base.PRNGKey, lane_tree: UnbatchedTree) -> _ScalarSimulation:
+    def simulate_one(key: base.PRNGKey, lane_tree: UnbatchedTree) -> base._ScalarSimulation:
         return _simulate_one(key, lane_tree, action_selection_fn, max_depth)
 
     result = jax.vmap(simulate_one)(rng_key, tree)
-    return Simulation(parent_index=result.parent_index, action=result.action, active=result.active)
+    return base.Simulation(parent_index=result.parent_index, action=result.action, active=result.active)
 
 
-def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn: base.RecurrentFn, simulation: Simulation, new_node_index: Int32[Array, ""]) -> tuple[Tree, base.RecurrentFnOutput]:
+def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn: base.RecurrentFn, simulation: base.Simulation, new_node_index: Int32[Array, ""]) -> tuple[Tree, base.RecurrentFnOutput]:
     """Evaluate selected edges and initialize genuinely new child nodes."""
 
     batch = jnp.arange(tree.parents.shape[0])
@@ -190,7 +125,7 @@ def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn:
     return tree, step
 
 
-def backward(rng_key: base.PRNGKey, tree: Tree, simulation: Simulation, step: base.RecurrentFnOutput, posterior_update: base.PosteriorUpdateFn) -> Tree:
+def backward(rng_key: base.PRNGKey, tree: Tree, simulation: base.Simulation, step: base.RecurrentFnOutput, posterior_update: base.PosteriorUpdateFn) -> Tree:
     """Repair uncertain posteriors and propagate exact certificates upward."""
 
     batch = jnp.arange(tree.parents.shape[0])
@@ -198,10 +133,10 @@ def backward(rng_key: base.PRNGKey, tree: Tree, simulation: Simulation, step: ba
     node_index = jnp.where(active, simulation.parent_index, Tree.ROOT_INDEX)
     leaf_active = active
 
-    def cond_fn(state: _BackwardState) -> Bool[Array, ""]:
+    def cond_fn(state: base._BackwardState) -> Bool[Array, ""]:
         return jnp.any(state[3])
 
-    def body_fn(state: _BackwardState) -> _BackwardState:
+    def body_fn(state: base._BackwardState) -> base._BackwardState:
         key, tree, node_index, active, leaf_active = state
         key, update_key, tie_break_key = jax.random.split(key, 3)
         leaf = LeafView(action=simulation.action, value_alpha=step.value, to_play=step.to_play, active=leaf_active)
@@ -234,7 +169,7 @@ def search(params: base.Params, rng_key: base.PRNGKey, *, root: base.RootFnOutpu
     tree = instantiate_tree_from_root(root, num_simulations, invalid_actions)
     batch_size = root.prior_logits.shape[0]
 
-    def body_fn(simulation_index: Int[Array, ""], state: _SearchState) -> _SearchState:
+    def body_fn(simulation_index: Int[Array, ""], state: base._SearchState) -> base._SearchState:
         key, tree = state
         key, simulate_key, expand_key, backward_key = jax.random.split(key, 4)
         simulation = simulate(jax.random.split(simulate_key, batch_size), tree, action_selection_fn, max_depth)
