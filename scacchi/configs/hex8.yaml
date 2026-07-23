@@ -1,11 +1,4 @@
-# From-scratch Hex8 native-categorical concentration-learning trial.
-#
-# Preserve the successful run's search budget and auxiliary-loss balance, but
-# remove its fixed C64 calibration.  The model starts at Beta(1, 1), and full
-# Dirichlet matching learns both posterior means and state-dependent mass.
-
 run:
-  seed: 0
   max_num_iters: 800
 
 env:
@@ -15,13 +8,12 @@ env:
 
 model:
   network: boardlaw_dirichlet
-  num_channels: 1024
+  num_channels: 512
   num_layers: 8
   compute_dtype: bfloat16
   resnet_v2: true
   dirichlet_concentration_floor: 2.0
   dirichlet_initial_concentration: 2.1
-  rezero_kernel_init: orthogonal
 
 selfplay:
   batch_size: 4096
@@ -30,7 +22,7 @@ selfplay:
   search:
     kind: dirichlet_thompson
     dirichlet_thompson:
-      num_simulations: 32
+      num_simulations: 128
       kappa: 4.0
       policy_samples: 32
       posterior_policy_samples: 32
@@ -44,8 +36,8 @@ training:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 0.25
-    q_outcome_weight: 0.1
+    value_outcome_weight: 1.0
+    q_outcome_weight: 1.0
     q_loss_weight_mode: evidence_mass
     q_dir_kl_reduction: masked_mean
     dirichlet_loss_mode: full
@@ -58,23 +50,23 @@ training:
     dirichlet_concentration_clip: 100.0
 
 eval:
-  interval: 5
-  batch_size: 512
+  interval: 10
+  batch_size: 1024
   baseline: checkpoint
   player_action_commitment_type: posterior_argmax
   baseline_action_commitment_type: search_action
   player_search:
     kind: dirichlet_thompson
     dirichlet_thompson:
-      num_simulations: 32
+      num_simulations: 128
       kappa: 4.0
-      policy_samples: 32
+      policy_samples: 256
       posterior_policy_samples: 32
       policy_sample_chunk_size: 32
   baseline_search:
     kind: gumbel
     gumbel:
-      num_simulations: 4
+      num_simulations: 32
 
 logging:
   interval: 1
@@ -83,6 +75,6 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 3
+  max_to_keep: 0
   save_interval_steps: 10
-  directory: checkpoints/hex8_nativecat_fullc_c100_seed0_v1
+  directory: checkpoints/hex8

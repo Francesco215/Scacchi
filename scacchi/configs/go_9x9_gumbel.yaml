@@ -1,0 +1,84 @@
+# Copies the parameters from W&B run pal/scacchi-az/l8c2vaj3
+# (serene-frost-411).
+# Its source config is present at commit
+# ead5a7203c60d5b2239603b5b67ce131287b4777. Obsolete Gumbel fields are
+# omitted: the old scalar aznet path did not read them, and the current schema
+# no longer accepts them.
+
+run:
+  seed: 1
+  max_num_iters: 400
+
+env:
+  id: go_9x9
+  board_size: 9
+  num_outcomes: 3
+
+model:
+  network: aznet
+  num_channels: 128
+  num_layers: 6
+  compute_dtype: float32
+  resnet_v2: true
+  rezero_kernel_init: variance_scaling
+  legacy_dirichlet_head_init: false
+
+selfplay:
+  batch_size: 1024
+  max_num_steps: 256
+  action_commitment_type: search_action
+  search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0
+
+training:
+  batch_size: 4096
+  max_updates_per_iter: null
+  learning_rate: 1e-3
+  lr_decay_after_iters: null
+  lr_decay_factor: 1.0
+  grad_clip_norm: null
+  losses:
+    policy_weight: 1.0
+    value_dir_kl_weight: 0.0
+    q_dir_kl_weight: 0.0
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
+    q_loss_weight_mode: policy
+    q_dir_kl_reduction: weighted
+    loss_mask_mode: pgx
+    terminal_edge_targets: false
+    terminal_parent_targets: false
+    policy_target_mode: search
+  regularization:
+    dirichlet_concentration_clip: 8.0
+
+eval:
+  interval: 1
+  batch_size: 1024
+  baseline: pgx
+  baseline_id: go_9x9_v0
+  checkpoint_path: null
+  player_action_commitment_type: posterior_sample
+  baseline_action_commitment_type: posterior_sample
+  player_search:
+    kind: policy
+    policy:
+      temperature: 1.0
+  baseline_search:
+    kind: policy
+    policy:
+      temperature: 1.0
+
+logging:
+  interval: 1
+  wandb:
+    enabled: true
+    project: scacchi-az
+
+checkpointing:
+  directory: null
+  max_to_keep: 0
+  save_interval_steps: 50

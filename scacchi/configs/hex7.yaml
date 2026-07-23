@@ -8,7 +8,7 @@
 
 run:
   seed: 7104
-  max_num_iters: 650
+  max_num_iters: 100
 
 env:
   id: hex

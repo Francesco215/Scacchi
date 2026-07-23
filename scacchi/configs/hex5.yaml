@@ -15,19 +15,19 @@ model:
   network: boardlaw_dirichlet
   num_channels: 128
   num_layers: 8
-  compute_dtype: bfloat16
+  compute_dtype: float32
   resnet_v2: true
 
 selfplay:
   batch_size: 8192
   max_num_steps: 25
-  action_commitment_type: posterior_argmax
+  action_commitment_type: posterior_sample
   search:
     kind: dirichlet_thompson
 
     dirichlet_thompson:
       num_simulations: 16
-      kappa: 4.0
+      kappa: 3.
       # Final root policy population. Internal repair draws its own fresh
       # population from each node's just-updated edge posteriors.
       policy_samples: 32
@@ -36,7 +36,8 @@ selfplay:
 training:
   batch_size: 2048
   learning_rate: 2e-3
-  grad_clip_norm: 1.0
+  grad_clip_norm: 10.0
+  optimizer: psgd
 
   losses:
     policy_weight: 1.0
@@ -45,10 +46,10 @@ training:
     # Changing the updater and the target weighting in the same run made the
     # earlier short experiment impossible to interpret.
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 0.25
-    terminal_edge_targets: false
-    terminal_parent_targets: false
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
+    terminal_edge_targets: true
+    terminal_parent_targets: true
     policy_target_mode: search
     categorical_epsilon: 0.01
 
@@ -63,7 +64,7 @@ eval:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
-      kappa: 4.0
+      kappa: 3.
       policy_samples: 32
   baseline_search:
     kind: gumbel
@@ -77,7 +78,7 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 1
+  max_to_keep: 0
   # Keep recovery distance small on workstations with a GPU watchdog.
   save_interval_steps: 10
   # Never resume the stale checkpoint produced by an earlier implementation.

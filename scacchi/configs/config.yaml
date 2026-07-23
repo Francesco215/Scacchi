@@ -29,6 +29,7 @@ selfplay:
 training:
   batch_size: 4096
   max_updates_per_iter: 1
+  optimizer: adam
   learning_rate: 1e-3
   grad_clip_norm: 1.0
 

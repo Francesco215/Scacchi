@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import Any, cast
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -31,7 +31,7 @@ from .evaluations import evaluation_metrics, load_eval_baseline, make_mcts_evalu
 from .logger import Metric, build_logger, returns_metrics, training_metrics
 from .network import build_model
 from .pipeline import make_training_iteration
-from .types import Config, load_config
+from .types import Config, OptimizerType, load_config
 
 
 def report_jax_backend() -> None:
@@ -49,6 +49,72 @@ def _block_until_ready(value: Any) -> Any:
     return jax.tree.map(lambda leaf: leaf.block_until_ready() if hasattr(leaf, "block_until_ready") else leaf, value)
 
 
+def _muon_dimension_numbers(params):
+    """Use Muon for matrix-like weights and Adam for vectors and scalars."""
+
+    return jax.tree.map(
+        lambda param: (
+            optax.contrib.MuonDimensionNumbers(
+                reduction_axis=tuple(range(param.ndim - 1)),
+                output_axis=param.ndim - 1,
+            )
+            if param.ndim >= 2
+            else None
+        ),
+        params,
+    )
+
+
+def _psgd_kron(
+    learning_rate: float | optax.Schedule,
+) -> optax.GradientTransformationExtraArgs:
+    """Build PSGD-Kron, including compatibility with current Optax."""
+
+    # psgd-jax 0.2.9 imports this removed private module but never uses it.
+    # Supplying the missing package attribute keeps the upstream implementation
+    # usable with the newer Optax revision pinned by this project.
+    import optax._src as optax_src
+
+    if not hasattr(optax_src, "clipping"):
+        setattr(optax_src, "clipping", None)
+
+    from psgd_jax.kron import kron
+
+    psgd = kron(learning_rate=cast(Any, learning_rate))
+
+    # NNX State leaves carry Variable metadata. PSGD uses each parameter leaf
+    # as a container for a list of Kronecker factors, which NNX later interprets
+    # as nested State and changes the scan carry structure. Give PSGD a plain
+    # mapping instead, then restore only the update tree to the exact parameter
+    # treedef expected by nnx.Optimizer.
+    def to_plain_tree(tree):
+        if isinstance(tree, nnx.State):
+            return {key: to_plain_tree(value) for key, value in tree.items()}
+        if isinstance(tree, nnx.Variable):
+            return to_plain_tree(tree.get_value())
+        return tree
+
+    def restore_state_tree(template, tree):
+        return jax.tree.structure(template).unflatten(jax.tree.leaves(tree))
+
+    def init_fn(params):
+        return psgd.init(to_plain_tree(params))
+
+    def update_fn(updates, state, params=None, **extra_args):
+        plain_updates = to_plain_tree(updates)
+        plain_params = None if params is None else to_plain_tree(params)
+        new_updates, new_state = psgd.update(
+            plain_updates,
+            state,
+            plain_params,
+            **extra_args,
+        )
+        update_template = updates if params is None else params
+        return restore_state_tree(update_template, new_updates), new_state
+
+    return optax.GradientTransformationExtraArgs(init_fn, update_fn)
+
+
 def _build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
     transforms: list[optax.GradientTransformation] = []
     if config.training.grad_clip_norm is not None:
@@ -63,7 +129,18 @@ def _build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
         boundary = config.training.lr_decay_after_iters * updates_per_iteration
         learning_rate = optax.piecewise_constant_schedule(config.training.learning_rate, {boundary: config.training.lr_decay_factor})
 
-    transforms.append(optax.adam(learning_rate))
+    match config.training.optimizer:
+        case OptimizerType.adam:
+            transforms.append(optax.adam(learning_rate))
+        case OptimizerType.muon:
+            transforms.append(
+                optax.contrib.muon(
+                    learning_rate,
+                    muon_weight_dimension_numbers=_muon_dimension_numbers,
+                )
+            )
+        case OptimizerType.psgd:
+            transforms.append(_psgd_kron(learning_rate))
     return nnx.Optimizer(model, optax.chain(*transforms), wrt=nnx.Param)
 
 

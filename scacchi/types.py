@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import math
 from typing import Any, cast
+import warnings
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -18,6 +19,12 @@ class Network(StrEnum):
 class RezeroKernelInit(StrEnum):
     variance_scaling = "variance_scaling"
     orthogonal = "orthogonal"
+
+
+class OptimizerType(StrEnum):
+    adam = "adam"
+    muon = "muon"
+    psgd = "psgd"
 
 
 class ActionCommitmentType(StrEnum):
@@ -246,6 +253,14 @@ class TrainingLossConfig:
             lower=0.0,
             upper=1.0 / 3.0,
         )
+        if self.dirichlet_loss_mode == DirichletLossMode.mean:
+            warnings.warn(
+                "training.losses.dirichlet_loss_mode='mean' trains only "
+                "Dirichlet posterior means; it does not train or penalize "
+                "Dirichlet concentration (evidence mass).",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def active_dirichlet_weights(self) -> list[str]:
         weights = (
@@ -282,6 +297,7 @@ class TrainingRegularizationConfig:
 class TrainingConfig:
     batch_size: int = 4096
     max_updates_per_iter: int | None = None
+    optimizer: OptimizerType = OptimizerType.adam
     learning_rate: float = 0.001
     lr_decay_after_iters: int | None = None
     lr_decay_factor: float = 1.0

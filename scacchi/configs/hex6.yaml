@@ -1,9 +1,5 @@
-# From-scratch Hex6 persistent-tree speedrun. Every trial uses a unique empty
-# checkpoint directory: warm starts and continuation runs do not count.
-
 run:
-  seed: 9105
-  max_num_iters: 200
+  max_num_iters: 500
 
 env:
   id: hex
@@ -12,74 +8,54 @@ env:
 
 model:
   network: boardlaw_dirichlet
-  num_channels: 128
+  num_channels: 256
   num_layers: 8
-  compute_dtype: bfloat16
+  compute_dtype: float32
   resnet_v2: true
-  # Start at the uninformative Dirichlet [1, 1, 1], then learn evidence mass.
-  # Unlike the old calibrated runs, this is a low floor rather than a fixed C.
-  dirichlet_concentration_floor: 3.0
-  dirichlet_initial_concentration: 3.1
 
 selfplay:
-  batch_size: 4096
-  max_num_steps: 64
-  # Sample the searched posterior policy during self-play so independent games
-  # keep exploring; evaluation still commits its deterministic argmax below.
-  action_commitment_type: posterior_sample
+  batch_size: 8192
+  max_num_steps: 25
+  action_commitment_type: posterior_argmax
   search:
     kind: dirichlet_thompson
+
     dirichlet_thompson:
-      # Keep the corrected persistent tree small enough for a true speedrun.
-      # The DT128 trial learned, but was ~11x slower per iteration than the
-      # old 32-expansion reference and therefore spent its compute poorly.
-      num_simulations: 32
-      kappa: 4.0
+      num_simulations: 16
+      kappa: 3.
       policy_samples: 32
-      # The node-local estimator remains unbiased; eight draws amortize the
-      # every-node posterior repair without reverting to root-only updates.
-      posterior_policy_samples: 8
-      policy_sample_chunk_size: 32
+
 
 training:
-  batch_size: 1024
-  learning_rate: 1e-3
-  grad_clip_norm: 1.0
+  batch_size: 2048
+  learning_rate: 2e-3
+  grad_clip_norm: 10.0
+  optimizer: muon
+
   losses:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 1.0
-    q_loss_weight_mode: evidence_mass
-    q_dir_kl_reduction: masked_mean
-    # Full KL is intentional: mean-only KL has exactly zero concentration
-    # gradient on unresolved Dirichlet targets.
-    dirichlet_loss_mode: full
-    loss_mask_mode: value
+    value_outcome_weight: 0.1
+    q_outcome_weight: 0.1
     terminal_edge_targets: true
     terminal_parent_targets: true
     policy_target_mode: search
     categorical_epsilon: 0.01
+
   regularization:
-    # A broad ceiling regularizes categorical density without pinning the
-    # unresolved state-dependent concentration learned by the model.
-    dirichlet_concentration_clip: 16.0
+    dirichlet_concentration_clip: 8.0
 
 eval:
   interval: 5
-  batch_size: 512
+  batch_size: 256
   baseline: checkpoint
-  player_action_commitment_type: posterior_argmax
-  baseline_action_commitment_type: posterior_argmax
   player_search:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
-      kappa: 4.0
+      kappa: 3.
       policy_samples: 32
-      posterior_policy_samples: 32
-      policy_sample_chunk_size: 32
   baseline_search:
     kind: gumbel
     gumbel:
@@ -92,6 +68,9 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 1
+  max_to_keep: 0
+  # Keep recovery distance small on workstations with a GPU watchdog.
   save_interval_steps: 10
-  directory: checkpoints/hex6_nativecat_fullc_c16_dt32p8_psample_seed9105_v4
+  # Never resume the stale checkpoint produced by an earlier implementation.
+  directory: checkpoints/asd
+

@@ -49,6 +49,7 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.search.dirichlet_thompson.kappa == 4.0
     assert config.training.batch_size == 4096
     assert config.training.max_updates_per_iter == 1
+    assert config.training.optimizer == "adam"
     assert config.training.learning_rate == 1e-3
     assert config.training.grad_clip_norm == 1.0
     assert config.training.losses.policy_weight == 0.5
@@ -113,6 +114,23 @@ def test_policy_search_temperature_must_be_positive():
                 },
             }
         )
+
+
+def test_muon_optimizer_loads_from_config():
+    config = _config({"training": {"optimizer": "muon"}})
+
+    assert config.training.optimizer == "muon"
+
+
+def test_psgd_optimizer_loads_from_config():
+    config = _config({"training": {"optimizer": "psgd"}})
+
+    assert config.training.optimizer == "psgd"
+
+
+def test_unknown_optimizer_is_rejected():
+    with pytest.raises(ValidationError, match="optimizer"):
+        _config({"training": {"optimizer": "rmsprop"}})
 
 
 def test_removed_categorical_draw_rule_is_rejected():
@@ -430,12 +448,15 @@ def test_dirichlet_network_allows_dirichlet_loss_weights():
 
 @pytest.mark.parametrize("loss_mode", ["full", "mean"])
 def test_dirichlet_loss_modes_are_configurable(loss_mode: str):
-    config = _config(
-        {
-            "model": {"network": "boardlaw_dirichlet"},
-            "training": {"losses": {"dirichlet_loss_mode": loss_mode}},
-        }
-    )
+    values = {
+        "model": {"network": "boardlaw_dirichlet"},
+        "training": {"losses": {"dirichlet_loss_mode": loss_mode}},
+    }
+    if loss_mode == "mean":
+        with pytest.warns(UserWarning, match="does not train or penalize"):
+            config = _config(values)
+    else:
+        config = _config(values)
 
     assert config.training.losses.dirichlet_loss_mode == loss_mode
 

@@ -143,6 +143,7 @@ dependencies = [
     { name = "optax" },
     { name = "orbax-checkpoint" },
     { name = "pgx" },
+    { name = "psgd-jax" },
     { name = "pytest" },
     { name = "tqdm" },
     { name = "ty" },
@@ -165,6 +166,7 @@ requires-dist = [
     { name = "optax", git = "https://github.com/google-deepmind/optax.git" },
     { name = "orbax-checkpoint", specifier = ">=0.11.36" },
     { name = "pgx", specifier = ">=2.6.0" },
+    { name = "psgd-jax", specifier = ">=0.2.9" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "tqdm" },
     { name = "ty", specifier = ">=0.0.32" },
@@ -1207,6 +1209,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/85/29/64de04a0ac142fb685fd09999bc3d337943fb386f3a0ec57f92fd8203f97/protobuf-7.34.1-cp310-abi3-win32.whl", hash = "sha256:34b84ce27680df7cca9f231043ada0daa55d0c44a2ddfaa58ec1d0d89d8bf60a", size = 426628, upload-time = "2026-03-20T17:34:42.536Z" },
     { url = "https://files.pythonhosted.org/packages/4d/87/cb5e585192a22b8bd457df5a2c16a75ea0db9674c3a0a39fc9347d84e075/protobuf-7.34.1-cp310-abi3-win_amd64.whl", hash = "sha256:e97b55646e6ce5cbb0954a8c28cd39a5869b59090dfaa7df4598a7fba869468c", size = 437901, upload-time = "2026-03-20T17:34:44.112Z" },
     { url = "https://files.pythonhosted.org/packages/88/95/608f665226bca68b736b79e457fded9a2a38c4f4379a4a7614303d9db3bc/protobuf-7.34.1-py3-none-any.whl", hash = "sha256:bb3812cd53aefea2b028ef42bd780f5b96407247f20c6ef7c679807e9d188f11", size = 170715, upload-time = "2026-03-20T17:34:45.384Z" },
+]
+
+[[package]]
+name = "psgd-jax"
+version = "0.2.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jax" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "optax" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e3/60/6cb8d8f765966e6242541ab27fcb75534e6fb4887798282eacfd134e80bd/psgd_jax-0.2.9.tar.gz", hash = "sha256:8a35efebd1f50051ea79a6e9497d7057b25e696387126d3a8fd7b759c2b55990", size = 33082, upload-time = "2024-12-31T22:15:55.376Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/be/be/76a1f5b8b04280f441e8b04321c9d581dbacdcb674bbf6b1561977f4d44c/psgd_jax-0.2.9-py3-none-any.whl", hash = "sha256:6dc90c10818dd3b681baa9d790a89ec823c4c2f5ababc4dea6c2d1e4af515448", size = 35012, upload-time = "2024-12-31T22:15:52.903Z" },
 ]
 
 [[package]]
