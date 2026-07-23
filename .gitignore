@@ -230,3 +230,4 @@ wandb
 artifacts/
 *.tar.gz
 vendor/
+experiments/

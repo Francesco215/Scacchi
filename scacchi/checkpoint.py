@@ -255,6 +255,7 @@ def maybe_save(
     config: Config,
     hours: float,
     frames: int,
+    optimizer_updates: int,
 ) -> None:
     if not manager.should_save(step):
         return
@@ -263,6 +264,7 @@ def maybe_save(
         "step": step,
         "hours": hours,
         "frames": frames,
+        "optimizer_updates": optimizer_updates,
     }
     save_args = ocp.args.Composite(
         model=ocp.args.StandardSave(nnx.state(model)),
@@ -278,12 +280,12 @@ def restore(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
     rng_key: jax.Array,
-) -> tuple[int, jax.Array, float, int]:
-    """Restore in-place; returns (start_iter, rng_key, hours, frames)."""
+) -> tuple[int, jax.Array, float, int, int | None]:
+    """Restore in-place, including the exact optimizer-update counter if saved."""
     step = manager.latest_step()
     if step is None:
         print("No checkpoint found, starting from scratch.")
-        return 0, rng_key, 0.0, 0
+        return 0, rng_key, 0.0, 0, 0
 
     restored = manager.restore(
         step,
@@ -301,7 +303,14 @@ def restore(
     rng_key = _rng_key_from_checkpoint_value(restored["rngs"]["key"], rng_key)
     meta = restored["meta"]
     print(f"Restored checkpoint from step {step}.")
-    return step + 1, rng_key, float(meta["hours"]), int(meta["frames"])
+    optimizer_updates = meta.get("optimizer_updates")
+    return (
+        step + 1,
+        rng_key,
+        float(meta["hours"]),
+        int(meta["frames"]),
+        None if optimizer_updates is None else int(optimizer_updates),
+    )
 
 
 def from_pretrained(

@@ -175,6 +175,20 @@ def search(params: base.Params, rng_key: base.PRNGKey, *, root: base.RootFnOutpu
         key, tree = state
         key, simulate_key, expand_key, backward_key = jax.random.split(key, 4)
         simulation = simulate(jax.random.split(simulate_key, batch_size), tree, action_selection_fn, max_depth)
+        any_active = jnp.any(simulation.active)
+        tree = replace(
+            tree,
+            simulation_active_count=(
+                tree.simulation_active_count
+                + simulation.active.astype(jnp.int32)
+            ),
+            # recurrent_fn is invoked on the complete batch whenever at least
+            # one lane is active, including inactive padding lanes.
+            executed_simulation_call_count=(
+                tree.executed_simulation_call_count
+                + any_active.astype(jnp.int32)
+            ),
+        )
 
         def run_active_simulation(tree: Tree) -> Tree:
             new_node = jnp.asarray(simulation_index + 1, dtype=jnp.int32)

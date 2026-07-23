@@ -5,7 +5,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 from flax import nnx
 import jax
@@ -89,12 +89,16 @@ def local_shard_map(**kwargs):
     option was renamed from ``check_rep`` to ``check_vma`` across JAX versions.
     """
 
-    parameters = inspect.signature(nnx.shard_map).parameters
+    # The accepted checker keyword is intentionally selected at runtime for
+    # compatibility across Flax versions, so the statically known overloads
+    # cannot describe both branches.
+    shard_map = cast(Any, nnx.shard_map)
+    parameters = inspect.signature(shard_map).parameters
     if "check_vma" in parameters:
-        return nnx.shard_map(**kwargs, check_vma=False)
+        return shard_map(**kwargs, check_vma=False)
     if "check_rep" in parameters:
-        return nnx.shard_map(**kwargs, check_rep=False)
-    return nnx.shard_map(**kwargs)
+        return shard_map(**kwargs, check_rep=False)
+    return shard_map(**kwargs)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

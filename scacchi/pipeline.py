@@ -3,10 +3,27 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 
-from .loss import Sample, TrainMetrics, make_compute_input_for_lossfn, train
+from .loss import (
+    Sample,
+    TrainMetrics,
+    evaluate_distillation_discrepancy,
+    make_compute_input_for_lossfn,
+    train,
+)
 from .play import make_selfplay
 from .play import TrainingSamples
+from .search_diagnostics import DistillationDiscrepancy, SearchDiagnostics
 from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, assert_batch_axis_sharded
+
+
+def optimizer_updates_per_iteration(config) -> int:
+    """Return the exact number of optimizer minibatches in one iteration."""
+
+    rows = int(config.selfplay.batch_size) * int(config.selfplay.max_num_steps)
+    updates = rows // int(config.training.batch_size)
+    if config.training.max_updates_per_iter is not None:
+        updates = min(updates, int(config.training.max_updates_per_iter))
+    return updates
 
 
 def make_minibatches(
@@ -86,14 +103,70 @@ def _with_data_stats(
     psk_fraction = jnp.sum(psk_terminated.astype(dtype)) / jnp.maximum(
         num_terminations, 1.0
     )
+    diagnostics = data.posterior.diagnostics
+    metrics = _with_search_diagnostics(metrics, diagnostics)
     return metrics._replace(
         data_value_mask_fraction=jnp.mean(value_mask.astype(dtype)),
+        data_frame_count=jnp.asarray(terminated.size, dtype=dtype),
+        data_termination_count=num_terminations,
         data_pass_fraction=jnp.mean((data.played_action == pass_action).astype(dtype)),
         data_terminations_per_row=jnp.mean(
             jnp.sum(terminated.astype(dtype), axis=1)
         ),
         data_psk_termination_fraction=psk_fraction,
     )
+
+
+def _with_search_diagnostics(
+    metrics: TrainMetrics,
+    diagnostics: SearchDiagnostics | None,
+) -> TrainMetrics:
+    """Pool additive generation metrics before any learner minibatch averaging."""
+
+    if diagnostics is None:
+        return metrics
+    pooled = {
+        field: jnp.sum(value)
+        for field, value in diagnostics._asdict().items()
+    }
+    return metrics._replace(**pooled)
+
+
+def _with_capture_diagnostics(
+    metrics: TrainMetrics,
+    before: DistillationDiscrepancy,
+    after: DistillationDiscrepancy,
+) -> TrainMetrics:
+    """Attach raw fixed-probe gaps on both sides of the optimizer scan."""
+
+    populations = {
+        "policy": ("policy_kl", "count"),
+        "v_semantic": ("v_semantic_kl", "count"),
+        "v_dirichlet": ("v_dirichlet_kl", "count"),
+        "q_semantic": ("q_semantic_kl", "count"),
+        "q_dirichlet": ("q_dirichlet_kl", "count"),
+        "q_weighted_semantic": ("q_weighted_semantic_kl", "weight"),
+        "q_weighted_dirichlet": ("q_weighted_dirichlet_kl", "weight"),
+    }
+    values: dict[str, jax.Array] = {}
+    for destination, (source, denominator) in populations.items():
+        values[f"capture_{destination}_before_sum"] = getattr(
+            before,
+            f"{source}_sum",
+        )
+        values[f"capture_{destination}_before_{denominator}"] = getattr(
+            before,
+            f"{source}_{denominator}",
+        )
+        values[f"capture_{destination}_after_sum"] = getattr(
+            after,
+            f"{source}_sum",
+        )
+        values[f"capture_{destination}_after_{denominator}"] = getattr(
+            after,
+            f"{source}_{denominator}",
+        )
+    return metrics._replace(**values)
 
 
 def make_training_iteration(env, config, parallel: BatchParallel | None = None):
@@ -117,7 +190,31 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
             config.training.max_updates_per_iter,
             parallel,
         )
+        # This is deliberately an in-sample train probe: it measures how much
+        # of one fixed target minibatch survives the complete in-iteration
+        # optimizer scan, not held-out generalization.  The midpoint reduces
+        # the strong recency/forgetting bias of choosing either scan endpoint.
+        probe_index = minibatches.obs.shape[0] // 2
+        probe = jax.tree_util.tree_map(
+            lambda leaf: leaf[probe_index],
+            minibatches,
+        )
+        discrepancy_before = evaluate_distillation_discrepancy(
+            model,
+            probe,
+            config,
+        )
         metrics = train_minibatches(model, optimizer, minibatches, config, parallel)
+        discrepancy_after = evaluate_distillation_discrepancy(
+            model,
+            probe,
+            config,
+        )
+        metrics = _with_capture_diagnostics(
+            metrics,
+            discrepancy_before,
+            discrepancy_after,
+        )
         return _with_data_stats(metrics, data, num_actions)
 
     def training_iteration(

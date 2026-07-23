@@ -2,7 +2,10 @@
 
 from .base import PolicyOutput, RecurrentFnOutput, RootFnOutput
 from .policies import dirichlet_thompson_policy
-from .posterior_updates import update_posterior
+from .posterior_updates import (
+    update_posterior,
+    update_posterior_prefix_cdf,
+)
 from .tree import PosteriorUpdate, PosteriorUpdateContext
 
 __all__ = [
@@ -13,4 +16,5 @@ __all__ = [
     "RootFnOutput",
     "dirichlet_thompson_policy",
     "update_posterior",
+    "update_posterior_prefix_cdf",
 ]

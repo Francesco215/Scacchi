@@ -17,6 +17,10 @@ from .dirichlet_mctx.native_targets import (
 )
 from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, assert_batch_axis_sharded
 from .play import TrainingSamples
+from .search_diagnostics import (
+    DistillationDiscrepancy,
+    distillation_discrepancy,
+)
 
 
 DIRICHLET_KL_LOSS_CUTOFF = 1000.0
@@ -131,7 +135,68 @@ class TrainMetrics(NamedTuple):
     v_native_target_count: Float[Array, "*batch"]
     q_native_target_count: Float[Array, "*batch"]
     q_loss_weight_mean: Float[Array, "*batch"]
+    search_policy_kl_sum: Float[Array, "*batch"]
+    search_policy_kl_count: Float[Array, "*batch"]
+    search_v_semantic_kl_sum: Float[Array, "*batch"]
+    search_v_semantic_kl_count: Float[Array, "*batch"]
+    search_v_dirichlet_kl_sum: Float[Array, "*batch"]
+    search_v_dirichlet_kl_count: Float[Array, "*batch"]
+    search_v_categorical_surprisal_sum: Float[Array, "*batch"]
+    search_v_categorical_surprisal_count: Float[Array, "*batch"]
+    search_q_semantic_kl_sum: Float[Array, "*batch"]
+    search_q_semantic_kl_count: Float[Array, "*batch"]
+    search_q_policy_semantic_kl_sum: Float[Array, "*batch"]
+    search_q_policy_semantic_kl_count: Float[Array, "*batch"]
+    search_q_dirichlet_kl_sum: Float[Array, "*batch"]
+    search_q_dirichlet_kl_count: Float[Array, "*batch"]
+    search_q_categorical_surprisal_sum: Float[Array, "*batch"]
+    search_q_categorical_surprisal_count: Float[Array, "*batch"]
+    search_root_count: Float[Array, "*batch"]
+    search_legal_action_count: Float[Array, "*batch"]
+    search_visited_action_count: Float[Array, "*batch"]
+    search_repaired_action_count: Float[Array, "*batch"]
+    search_categorical_action_count: Float[Array, "*batch"]
+    search_solved_root_count: Float[Array, "*batch"]
+    search_expanded_node_count: Float[Array, "*batch"]
+    search_simulation_active_count: Float[Array, "*batch"]
+    search_executed_simulation_row_count: Float[Array, "*batch"]
+    search_requested_simulation_count: Float[Array, "*batch"]
+    search_structural_support_sum: Float[Array, "*batch"]
+    search_max_depth_sum: Float[Array, "*batch"]
+    search_policy_support_sum: Float[Array, "*batch"]
+    search_policy_ess_sum: Float[Array, "*batch"]
+    search_policy_top1_agreement_count: Float[Array, "*batch"]
+    capture_policy_before_sum: Float[Array, "*batch"]
+    capture_policy_before_count: Float[Array, "*batch"]
+    capture_policy_after_sum: Float[Array, "*batch"]
+    capture_policy_after_count: Float[Array, "*batch"]
+    capture_v_semantic_before_sum: Float[Array, "*batch"]
+    capture_v_semantic_before_count: Float[Array, "*batch"]
+    capture_v_semantic_after_sum: Float[Array, "*batch"]
+    capture_v_semantic_after_count: Float[Array, "*batch"]
+    capture_v_dirichlet_before_sum: Float[Array, "*batch"]
+    capture_v_dirichlet_before_count: Float[Array, "*batch"]
+    capture_v_dirichlet_after_sum: Float[Array, "*batch"]
+    capture_v_dirichlet_after_count: Float[Array, "*batch"]
+    capture_q_semantic_before_sum: Float[Array, "*batch"]
+    capture_q_semantic_before_count: Float[Array, "*batch"]
+    capture_q_semantic_after_sum: Float[Array, "*batch"]
+    capture_q_semantic_after_count: Float[Array, "*batch"]
+    capture_q_dirichlet_before_sum: Float[Array, "*batch"]
+    capture_q_dirichlet_before_count: Float[Array, "*batch"]
+    capture_q_dirichlet_after_sum: Float[Array, "*batch"]
+    capture_q_dirichlet_after_count: Float[Array, "*batch"]
+    capture_q_weighted_semantic_before_sum: Float[Array, "*batch"]
+    capture_q_weighted_semantic_before_weight: Float[Array, "*batch"]
+    capture_q_weighted_semantic_after_sum: Float[Array, "*batch"]
+    capture_q_weighted_semantic_after_weight: Float[Array, "*batch"]
+    capture_q_weighted_dirichlet_before_sum: Float[Array, "*batch"]
+    capture_q_weighted_dirichlet_before_weight: Float[Array, "*batch"]
+    capture_q_weighted_dirichlet_after_sum: Float[Array, "*batch"]
+    capture_q_weighted_dirichlet_after_weight: Float[Array, "*batch"]
     data_value_mask_fraction: Float[Array, "*batch"]
+    data_frame_count: Float[Array, "*batch"]
+    data_termination_count: Float[Array, "*batch"]
     data_pass_fraction: Float[Array, "*batch"]
     data_terminations_per_row: Float[Array, "*batch"]
     data_psk_termination_fraction: Float[Array, "*batch"]
@@ -502,6 +567,59 @@ def _with_native_defaults(
     if native_fields is None:
         native_fields = _native_target_fields(sample)
     return sample._replace(**native_fields._asdict())
+
+
+def evaluate_distillation_discrepancy(
+    model: Any,
+    data: Sample,
+    config: Any,
+) -> DistillationDiscrepancy:
+    """Evaluate a fixed target probe without updating model parameters."""
+
+    output = model(data.obs, train=False)
+    logits = output[0]
+    policy_row_mask = _mask_or(data.policy_loss_mask, data.value_mask)
+    if len(output) == 2:
+        return distillation_discrepancy(
+            prior_logits=logits,
+            target_policy=data.policy_tgt,
+            legal_action_mask=data.policy_mask,
+            policy_row_mask=policy_row_mask,
+        )
+
+    _, alpha_v, alpha_q = output
+    native_fields = _native_target_fields(data)
+    value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
+    search_loss_mask = _mask_or(data.search_loss_mask, policy_row_mask)
+    q_row_mask = (
+        value_loss_mask
+        if config.training.losses.loss_mask_mode == "value"
+        else search_loss_mask
+    )
+    v_mask = value_loss_mask & (native_fields.v_target_weight > 0)
+    q_mask = (
+        data.policy_mask
+        & q_row_mask[..., None]
+        & (data.q_loss_weight > 0)
+        & (native_fields.q_target_weight > 0)
+    )
+    return distillation_discrepancy(
+        prior_logits=logits,
+        target_policy=data.policy_tgt,
+        legal_action_mask=data.policy_mask,
+        policy_row_mask=policy_row_mask,
+        prior_alpha_v=alpha_v,
+        prior_alpha_q=alpha_q,
+        target_alpha_v=data.beta_V_target,
+        target_alpha_q=data.beta_Q_target,
+        v_target_kind=native_fields.v_target_kind,
+        v_target_outcome=native_fields.v_target_outcome,
+        q_target_kind=native_fields.q_target_kind,
+        q_target_outcome=native_fields.q_target_outcome,
+        v_mask=v_mask,
+        q_mask=q_mask,
+        q_sample_weight=data.q_loss_weight,
+    )
 
 
 def _zero_train_metrics_like(reference: jax.Array, **values: jax.Array) -> TrainMetrics:

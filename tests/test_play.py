@@ -8,6 +8,7 @@ import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
 from scacchi import dirichlet_mctx
+from scacchi.dirichlet_mctx.action_selection import sample_dirichlet
 from scacchi.dirichlet_mctx.native_targets import (
     TARGET_CATEGORICAL,
     TARGET_PAD,
@@ -36,6 +37,7 @@ from scacchi.types import (
     ModelConfig,
     Network,
     PolicySearchConfig,
+    PosteriorPolicyEstimator,
     SearchConfig,
     SearchKind,
     SelfplayConfig,
@@ -234,7 +236,7 @@ def test_dirichlet_thompson_prior_only_search_preserves_rng_and_targets():
     root_prediction = _toy_dirichlet_evaluator(env_state.observation)
     assert root_prediction.alpha_q is not None
     _, policy_key = jax.random.split(rng_key)
-    sampled_outcome = dirichlet_mctx.sample_dirichlet(
+    sampled_outcome = sample_dirichlet(
         policy_key,
         root_prediction.alpha_q,
     )
@@ -259,9 +261,48 @@ def test_dirichlet_thompson_prior_only_search_preserves_rng_and_targets():
     assert jnp.array_equal(metadata.q_weight, expected_policy)
     assert jnp.array_equal(metadata.search_action, expected_action)
     assert jnp.array_equal(metadata.mask, jnp.ones((2,), dtype=jnp.bool_))
+    diagnostics = output.posterior.diagnostics
+    assert diagnostics is not None
+    assert jnp.allclose(diagnostics.search_policy_kl_sum, jnp.log(2.0))
+    assert jnp.array_equal(
+        diagnostics.search_policy_kl_count,
+        jnp.ones((2,), dtype=jnp.float32),
+    )
+    assert jnp.allclose(diagnostics.search_v_semantic_kl_sum, 0.0)
+    assert jnp.allclose(diagnostics.search_v_dirichlet_kl_sum, 0.0)
+    assert jnp.allclose(diagnostics.search_q_semantic_kl_sum, 0.0)
+    assert jnp.allclose(diagnostics.search_q_dirichlet_kl_sum, 0.0)
+    assert jnp.array_equal(
+        diagnostics.search_q_dirichlet_kl_count,
+        jnp.full((2,), 2.0),
+    )
+    assert jnp.array_equal(
+        diagnostics.search_legal_action_count,
+        jnp.full((2,), 2.0),
+    )
+    assert jnp.array_equal(
+        diagnostics.search_root_count,
+        jnp.ones((2,), dtype=jnp.float32),
+    )
+    assert jnp.all(diagnostics.search_expanded_node_count == 0)
+    assert jnp.all(diagnostics.search_simulation_active_count == 0)
+    assert jnp.all(
+        diagnostics.search_executed_simulation_row_count == 0
+    )
+    assert jnp.all(diagnostics.search_requested_simulation_count == 0)
+    assert jnp.all(diagnostics.search_max_depth_sum == 0)
 
 
-def test_dirichlet_thompson_tree_search_builds_legal_targets():
+@pytest.mark.parametrize(
+    "posterior_estimator",
+    [
+        PosteriorPolicyEstimator.winner_mc,
+        PosteriorPolicyEstimator.prefix_cdf,
+    ],
+)
+def test_dirichlet_thompson_tree_search_builds_legal_targets(
+    posterior_estimator: PosteriorPolicyEstimator,
+):
     env_state = _toy_dirichlet_state()
     search = make_search(
         _ToySearchEnv(),
@@ -274,6 +315,7 @@ def test_dirichlet_thompson_tree_search_builds_legal_targets():
                 policy_samples=8,
                 posterior_policy_samples=1,
                 policy_sample_chunk_size=2,
+                posterior_policy_estimator=posterior_estimator,
             ),
         ),
     )

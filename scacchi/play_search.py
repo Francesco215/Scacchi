@@ -25,11 +25,13 @@ from .dirichlet_q_search import (
     terminal_outcome_from_reward,
 )
 from .network import policy_value_from_output
+from .search_diagnostics import SearchDiagnostics, root_search_diagnostics
 from .types import (
     ActionCommitmentType,
     DirichletThompsonSearchConfig,
     GumbelSearchConfig,
     PolicySearchConfig,
+    PosteriorPolicyEstimator,
     SearchConfig,
     SearchKind,
 )
@@ -66,6 +68,7 @@ class TargetMetadata(NamedTuple):
 class PosteriorTargets(NamedTuple):
     prediction: PosteriorPrediction
     metadata: TargetMetadata | None = None
+    diagnostics: SearchDiagnostics | None = None
 
 
 class SearchOutput(NamedTuple):
@@ -204,16 +207,37 @@ def _run_dirichlet_thompson_search(
         if search_cfg.posterior_policy_samples is None
         else int(search_cfg.posterior_policy_samples)
     )
-    posterior_update = functools.partial(
-        dirichlet_mctx.update_posterior,
-        kappa=float(search_cfg.kappa),
-        policy_samples=max(1, posterior_policy_samples),
-        policy_sample_chunk_size=(
-            max(1, int(search_cfg.policy_sample_chunk_size))
-            if search_cfg.policy_sample_chunk_size is not None
-            else DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
-        ),
+    posterior_chunk_size = (
+        max(1, int(search_cfg.policy_sample_chunk_size))
+        if search_cfg.policy_sample_chunk_size is not None
+        else DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
     )
+    match search_cfg.posterior_policy_estimator:
+        case PosteriorPolicyEstimator.winner_mc:
+            posterior_update = functools.partial(
+                dirichlet_mctx.update_posterior,
+                kappa=float(search_cfg.kappa),
+                policy_samples=max(1, posterior_policy_samples),
+                policy_sample_chunk_size=posterior_chunk_size,
+            )
+        case PosteriorPolicyEstimator.prefix_cdf:
+            posterior_update = functools.partial(
+                dirichlet_mctx.update_posterior_prefix_cdf,
+                kappa=float(search_cfg.kappa),
+                half_width=int(search_cfg.prefix_cdf_half_width),
+                tail_scale=float(search_cfg.prefix_cdf_tail_scale),
+                min_half_range=float(
+                    search_cfg.prefix_cdf_min_half_range
+                ),
+                max_half_range=float(
+                    search_cfg.prefix_cdf_max_half_range
+                ),
+                fallback_policy_samples=max(
+                    1,
+                    posterior_policy_samples,
+                ),
+                fallback_policy_sample_chunk_size=posterior_chunk_size,
+            )
     policy_output = dirichlet_mctx.dirichlet_thompson_policy(
         params=(),
         rng_key=rng_key,
@@ -286,8 +310,27 @@ def _run_dirichlet_thompson_search(
         v_target_outcome=summary.v_categorical_outcome,
         v_target_distance=summary.v_categorical_distance,
     )
+    diagnostics = root_search_diagnostics(
+        prior_logits=prediction.logits,
+        prior_alpha_v=alpha_v,
+        prior_alpha_q=alpha_q,
+        target_policy=policy_target,
+        target_alpha_v=beta_V_target,
+        target_alpha_q=beta_Q_target,
+        q_target_kind=q_target_kind,
+        q_target_outcome=summary.q_categorical_outcome,
+        v_target_kind=v_target_kind,
+        v_target_outcome=summary.v_categorical_outcome,
+        legal_action_mask=legal,
+        tree=tree,
+        summary=summary,
+    )
     return SearchOutput(
-        PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
+        PosteriorTargets(
+            prediction=posterior_prediction,
+            metadata=metadata,
+            diagnostics=diagnostics,
+        )
     )
 
 

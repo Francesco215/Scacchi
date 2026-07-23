@@ -723,6 +723,38 @@ def test_full_kl_has_radial_concentration_signal_while_mean_kl_does_not():
     assert jnp.allclose(mean_gradient, 0.0, atol=1e-6)
 
 
+def test_q_log_concentration_mae_subtracts_target_log_mass_once():
+    alpha_v = jnp.array([[1.0, 1.0]])
+    beta_v = alpha_v
+    alpha_q = jnp.array([[[1.0, 1.0], [2.0, 2.0]]])
+    beta_q = jnp.array([[[2.0, 2.0], [8.0, 8.0]]])
+    data = Sample(
+        obs=jnp.zeros((1, 1)),
+        policy_tgt=jnp.array([[0.5, 0.5]]),
+        value_tgt=jnp.zeros((1,)),
+        played_action=jnp.zeros((1,), dtype=jnp.int32),
+        policy_mask=jnp.ones((1, 2), dtype=jnp.bool_),
+        value_mask=jnp.ones((1,), dtype=jnp.bool_),
+        beta_Q_target=beta_q,
+        beta_V_target=beta_v,
+        q_loss_weight=jnp.ones((1, 2)),
+    )
+
+    _, metrics = _compute_dirichlet_losses(
+        jnp.zeros((1, 2)),
+        alpha_v,
+        alpha_q,
+        data,
+        _loss_config(),
+    )
+
+    expected = (jnp.log(2.0) + jnp.log(4.0)) / 2.0
+    assert jnp.allclose(
+        metrics.q_dirichlet_log_concentration_mae,
+        expected,
+    )
+
+
 @pytest.mark.parametrize("concentration_clip", [8.0, 100.0])
 def test_concentration_floor_metric_tolerance_is_independent_of_clip(
     concentration_clip: float,

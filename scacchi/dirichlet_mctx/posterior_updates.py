@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
+import chex
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Int32
+from jaxtyping import Array, Bool, Float, Int8, Int32
 
 from . import base
 from .action_selection import posterior_best_policy
+from .estimator_diagnostics import (
+    binary_posterior_best_policy_prefix_quadrature,
+)
 from .outcomes import NO_OUTCOME, align_outcome
 from .tree import PosteriorUpdate, PosteriorUpdateContext
 
@@ -17,6 +22,38 @@ from .tree import PosteriorUpdate, PosteriorUpdateContext
 DEFAULT_KAPPA = 4.0
 DEFAULT_POLICY_SAMPLES = 32
 DEFAULT_POLICY_SAMPLE_CHUNK_SIZE = 4
+DEFAULT_PREFIX_DENSITY_LOG_INTEGRAL_TOLERANCE = 0.01
+
+
+@chex.dataclass(frozen=True)
+class PosteriorEstimatorSnapshot:
+    """Deterministic operands immediately before node-policy estimation.
+
+    This is a benchmark surface, not persistent search state.  In particular,
+    ``effective_alpha`` and ``categorical_outcome`` are the native objects
+    passed to :func:`posterior_best_policy`, while ``cache_alpha`` is the
+    Dirichlet-shaped projection mixed into the node cache after that policy is
+    estimated.  Keeping both avoids reconstructing either object from a
+    completed tree after earlier estimator noise has already propagated.
+    """
+
+    effective_alpha: Float[Array, "batch action outcome"]
+    cache_alpha: Float[Array, "batch action outcome"]
+    invalid_actions: Bool[Array, "batch action"]
+    categorical_mask: Bool[Array, "batch action"]
+    categorical_outcome: Int8[Array, "batch action"]
+    n_down: Int32[Array, "batch"]
+    gamma: Float[Array, "batch"]
+    kappa: Float[Array, ""]
+    value_prior: Float[Array, "batch outcome"]
+    previous_value_alpha: Float[Array, "batch outcome"]
+    active: Bool[Array, "batch"]
+
+
+PosteriorPolicyEstimator = Callable[
+    [base.PRNGKey, PosteriorEstimatorSnapshot],
+    Float[Array, "batch action"],
+]
 
 
 def _validate_kappa(kappa: float) -> None:
@@ -24,12 +61,14 @@ def _validate_kappa(kappa: float) -> None:
         raise ValueError(f"kappa must be finite and > 0, got {kappa}")
 
 
-def mix_value_prior(value_prior: Float[Array, "*batch outcome"], effective_action_alpha: Float[Array, "*batch action outcome"], search_policy: Float[Array, "*batch action"], n_down: Int32[Array, "*batch"], *, kappa: float = DEFAULT_KAPPA) -> Float[Array, "*batch outcome"]:
-    """Mix a node prior with its policy-weighted current edge posteriors."""
+def _mix_weights(
+    n_down: Int32[Array, "*batch"],
+    *,
+    dtype: jnp.dtype,
+    kappa: float,
+) -> tuple[Float[Array, "*batch"], Float[Array, "*batch"]]:
+    """Return the numerically stable prior and descendant cache weights."""
 
-    _validate_kappa(kappa)
-    weighted_alpha = jnp.sum(search_policy[..., None] * effective_action_alpha, axis=-2)
-    dtype = value_prior.dtype
     n_down = n_down.astype(dtype)
     # Compute the normalized weights before multiplying either posterior.
     # The ratio form for kappa >= 1 also avoids overflowing the search dtype
@@ -44,26 +83,35 @@ def mix_value_prior(value_prior: Float[Array, "*batch outcome"], effective_actio
         denominator = kappa_array + n_down
         prior_weight = kappa_array / denominator
         descendant_weight = n_down / denominator
+    return prior_weight, descendant_weight
+
+
+def mix_value_prior(value_prior: Float[Array, "*batch outcome"], effective_action_alpha: Float[Array, "*batch action outcome"], search_policy: Float[Array, "*batch action"], n_down: Int32[Array, "*batch"], *, kappa: float = DEFAULT_KAPPA) -> Float[Array, "*batch outcome"]:
+    """Mix a node prior with its policy-weighted current edge posteriors."""
+
+    _validate_kappa(kappa)
+    weighted_alpha = jnp.sum(search_policy[..., None] * effective_action_alpha, axis=-2)
+    prior_weight, descendant_weight = _mix_weights(
+        n_down,
+        dtype=value_prior.dtype,
+        kappa=kappa,
+    )
     return (
         prior_weight[..., None] * value_prior
         + descendant_weight[..., None] * weighted_alpha
     )
 
 
-def update_posterior(rng_key: base.PRNGKey, context: PosteriorUpdateContext, *, kappa: float = DEFAULT_KAPPA, policy_samples: int = DEFAULT_POLICY_SAMPLES, policy_sample_chunk_size: int = DEFAULT_POLICY_SAMPLE_CHUNK_SIZE) -> PosteriorUpdate:
-    """Repair one path node using the Tic-Tac-Toe message-passing rule.
-
-    This function owns the posterior mathematics. Search only gathers the
-    current node and all child summaries, invokes the function bottom-up, and
-    stores its complete return value. A different rule with the same two-arg
-    contract can therefore replace this implementation directly.
-    """
-
-    _validate_kappa(kappa)
-    if policy_samples < 1:
-        raise ValueError(f"policy_samples must be >= 1, got {policy_samples}")
-    if policy_sample_chunk_size < 1:
-        raise ValueError(f"policy_sample_chunk_size must be >= 1, got {policy_sample_chunk_size}")
+def _prepare_posterior_estimator_snapshot(
+    context: PosteriorUpdateContext,
+    *,
+    kappa: float,
+) -> tuple[
+    PosteriorEstimatorSnapshot,
+    Float[Array, "batch action outcome"],
+    Int32[Array, "batch action"],
+]:
+    """Apply deterministic message repairs and expose estimator operands."""
 
     node = context.node
     children = context.children
@@ -104,11 +152,6 @@ def update_posterior(rng_key: base.PRNGKey, context: PosteriorUpdateContext, *, 
     unresolved_count = jnp.where(unresolved, edge_payload, 0)
     use_stored = ~unresolved | (unresolved_count > 0)
     effective_alpha = jnp.where(use_stored[..., None], edge_alpha, fallback)
-    legal = ~node.invalid_actions
-    # This is computeStateSearchPosterior from the demo: pi_search is a fresh
-    # population from the node's *current* post-repair action posteriors.  It
-    # is deliberately neither a visit policy nor a historical running mean.
-    search_policy = posterior_best_policy(rng_key, effective_alpha, node.invalid_actions, policy_samples, chunk_size=policy_sample_chunk_size, categorical_outcome=edge_outcome)
     categorical = ~unresolved
     safe_categorical_outcome = jnp.where(categorical, edge_outcome, 0)
     categorical_mean = jax.nn.one_hot(safe_categorical_outcome, effective_alpha.shape[-1], dtype=effective_alpha.dtype)
@@ -120,13 +163,235 @@ def update_posterior(rng_key: base.PRNGKey, context: PosteriorUpdateContext, *, 
     )
     cache_alpha = jnp.where(categorical[..., None], categorical_alpha, effective_alpha)
     old_unresolved_count = jnp.where(unresolved, node.edge_payload, 0)
+    legal = ~node.invalid_actions
     count_delta = jnp.sum(jnp.where(legal, unresolved_count - old_unresolved_count, 0), axis=-1)
     n_down = node.node_payload + count_delta
-    repaired_value = mix_value_prior(node.value_prior, cache_alpha, search_policy, n_down, kappa=kappa)
-    has_message = n_down > 0
-    value_alpha = jnp.where((active & has_message)[..., None], repaired_value, node.value_alpha)
+    _, gamma = _mix_weights(
+        n_down,
+        dtype=node.value_prior.dtype,
+        kappa=kappa,
+    )
+    snapshot = PosteriorEstimatorSnapshot(
+        effective_alpha=effective_alpha,
+        cache_alpha=cache_alpha,
+        invalid_actions=node.invalid_actions,
+        categorical_mask=categorical,
+        categorical_outcome=edge_outcome,
+        n_down=n_down,
+        gamma=gamma,
+        kappa=jnp.asarray(kappa, dtype=node.value_prior.dtype),
+        value_prior=node.value_prior,
+        previous_value_alpha=node.value_alpha,
+        active=active,
+    )
+    return snapshot, edge_alpha, edge_payload
+
+
+def posterior_estimator_snapshot(
+    context: PosteriorUpdateContext,
+    *,
+    kappa: float = DEFAULT_KAPPA,
+) -> PosteriorEstimatorSnapshot:
+    """Return the actual pre-estimator operands for offline benchmarking.
+
+    The deterministic direct-edge and child-cache repairs are identical to
+    those performed by :func:`update_posterior`.  No policy samples are drawn
+    and calling this function cannot mutate a tree or affect search behavior.
+    """
+
+    _validate_kappa(kappa)
+    snapshot, _, _ = _prepare_posterior_estimator_snapshot(
+        context,
+        kappa=kappa,
+    )
+    return snapshot
+
+
+def update_posterior_with_estimator(
+    rng_key: base.PRNGKey,
+    context: PosteriorUpdateContext,
+    estimator: PosteriorPolicyEstimator,
+    *,
+    kappa: float = DEFAULT_KAPPA,
+) -> PosteriorUpdate:
+    """Repair one path node using an injected posterior-policy estimator.
+
+    ``estimator`` receives the original node-local PRNG key and the exact
+    post-message, pre-estimator snapshot.  It must return one action
+    distribution per batch lane.  This benchmark hook changes neither
+    traversal nor persistent tree state; only the policy used in the existing
+    cache mixture is replaceable.
+    """
+
+    _validate_kappa(kappa)
+    snapshot, edge_alpha, edge_payload = _prepare_posterior_estimator_snapshot(
+        context,
+        kappa=kappa,
+    )
+    search_policy = estimator(rng_key, snapshot)
+    repaired_value = mix_value_prior(
+        snapshot.value_prior,
+        snapshot.cache_alpha,
+        search_policy,
+        snapshot.n_down,
+        kappa=kappa,
+    )
+    has_message = snapshot.n_down > 0
+    value_alpha = jnp.where(
+        (snapshot.active & has_message)[..., None],
+        repaired_value,
+        snapshot.previous_value_alpha,
+    )
     return PosteriorUpdate(
         edge_alpha=edge_alpha,
         edge_payload=edge_payload,
         value_alpha=value_alpha,
+    )
+
+
+def update_posterior_prefix_cdf(
+    rng_key: base.PRNGKey,
+    context: PosteriorUpdateContext,
+    *,
+    kappa: float = DEFAULT_KAPPA,
+    half_width: int = 20,
+    tail_scale: float = 8.0,
+    min_half_range: float = 6.0,
+    max_half_range: float = 11.0,
+    fallback_policy_samples: int = DEFAULT_POLICY_SAMPLES,
+    fallback_policy_sample_chunk_size: int = (
+        DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
+    ),
+    density_log_integral_tolerance: float = (
+        DEFAULT_PREFIX_DENSITY_LOG_INTEGRAL_TOLERANCE
+    ),
+) -> PosteriorUpdate:
+    """Repair a binary-outcome cache with mass-conserving prefix-CDF Q41.
+
+    Only the policy estimate inside the existing bottom-up cache mixture is
+    replaced.  Tree traversal and the public root-policy readout remain native
+    Thompson sampling.
+
+    The deterministic estimator is used while every batch lane stays inside
+    its validated numerical envelope.  If any lane clips the adaptive tail
+    range, produces a non-finite result, or has excessive pre-normalization
+    density-integral error, the whole repair batch falls back to the original
+    winner-count estimator.  A batch-level ``lax.cond`` keeps the safe hot
+    path from paying the Monte Carlo cost.
+    """
+
+    _validate_kappa(kappa)
+    if half_width < 1:
+        raise ValueError(f"half_width must be >= 1, got {half_width}")
+    if fallback_policy_samples < 1:
+        raise ValueError(
+            "fallback_policy_samples must be >= 1, got "
+            f"{fallback_policy_samples}"
+        )
+    if fallback_policy_sample_chunk_size < 1:
+        raise ValueError(
+            "fallback_policy_sample_chunk_size must be >= 1, got "
+            f"{fallback_policy_sample_chunk_size}"
+        )
+    if (
+        not math.isfinite(density_log_integral_tolerance)
+        or density_log_integral_tolerance <= 0.0
+    ):
+        raise ValueError(
+            "density_log_integral_tolerance must be finite and > 0, got "
+            f"{density_log_integral_tolerance}"
+        )
+
+    def prefix_estimator(
+        estimator_rng_key: base.PRNGKey,
+        snapshot: PosteriorEstimatorSnapshot,
+    ) -> Float[Array, "batch action"]:
+        if snapshot.effective_alpha.shape[-1] != 2:
+            raise ValueError(
+                "prefix-CDF posterior repair requires exactly two "
+                "outcomes; got "
+                f"{snapshot.effective_alpha.shape[-1]}"
+            )
+        estimate = binary_posterior_best_policy_prefix_quadrature(
+            snapshot.effective_alpha,
+            snapshot.invalid_actions,
+            snapshot.categorical_outcome,
+            half_width=half_width,
+            adaptive_range=True,
+            tail_scale=tail_scale,
+            min_half_range=min_half_range,
+            max_half_range=max_half_range,
+            mass_conserving=True,
+        )
+        density_error = jnp.max(
+            jnp.abs(estimate.density_log_integral),
+            axis=-1,
+        )
+        unsafe = (
+            estimate.tail_range_clipped
+            | ~estimate.finite
+            | (density_error > density_log_integral_tolerance)
+        )
+
+        def fallback(_: None) -> Float[Array, "batch action"]:
+            return posterior_best_policy(
+                estimator_rng_key,
+                snapshot.effective_alpha,
+                snapshot.invalid_actions,
+                fallback_policy_samples,
+                chunk_size=fallback_policy_sample_chunk_size,
+                categorical_outcome=snapshot.categorical_outcome,
+            )
+
+        return jax.lax.cond(
+            jnp.any(unsafe),
+            fallback,
+            lambda _: estimate.policy,
+            operand=None,
+        )
+
+    return update_posterior_with_estimator(
+        rng_key,
+        context,
+        prefix_estimator,
+        kappa=kappa,
+    )
+
+
+def update_posterior(rng_key: base.PRNGKey, context: PosteriorUpdateContext, *, kappa: float = DEFAULT_KAPPA, policy_samples: int = DEFAULT_POLICY_SAMPLES, policy_sample_chunk_size: int = DEFAULT_POLICY_SAMPLE_CHUNK_SIZE) -> PosteriorUpdate:
+    """Repair one path node using the Tic-Tac-Toe message-passing rule.
+
+    This function owns the posterior mathematics. Search only gathers the
+    current node and all child summaries, invokes the function bottom-up, and
+    stores its complete return value. A different rule with the same two-arg
+    contract can therefore replace this implementation directly.
+    """
+
+    _validate_kappa(kappa)
+    if policy_samples < 1:
+        raise ValueError(f"policy_samples must be >= 1, got {policy_samples}")
+    if policy_sample_chunk_size < 1:
+        raise ValueError(f"policy_sample_chunk_size must be >= 1, got {policy_sample_chunk_size}")
+
+    def default_estimator(
+        estimator_rng_key: base.PRNGKey,
+        snapshot: PosteriorEstimatorSnapshot,
+    ) -> Float[Array, "batch action"]:
+        # This is computeStateSearchPosterior from the demo: pi_search is a
+        # fresh population from the node's current post-repair action
+        # posteriors. It is neither a visit policy nor a running mean.
+        return posterior_best_policy(
+            estimator_rng_key,
+            snapshot.effective_alpha,
+            snapshot.invalid_actions,
+            policy_samples,
+            chunk_size=policy_sample_chunk_size,
+            categorical_outcome=snapshot.categorical_outcome,
+        )
+
+    return update_posterior_with_estimator(
+        rng_key,
+        context,
+        default_estimator,
+        kappa=kappa,
     )

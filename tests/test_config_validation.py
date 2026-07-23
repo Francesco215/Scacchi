@@ -91,16 +91,16 @@ def test_hex5_uses_corrected_dirichlet_search_recipe():
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 16
     assert config.selfplay.search.dirichlet_thompson.max_depth == 16
     assert config.selfplay.search.dirichlet_thompson.policy_samples == 32
-    assert config.selfplay.search.dirichlet_thompson.kappa == 4.0
+    assert config.selfplay.search.dirichlet_thompson.kappa == 3.0
     assert config.eval.player_search.dirichlet_thompson.num_simulations == 32
     assert config.eval.player_search.dirichlet_thompson.max_depth == 32
-    assert config.model.compute_dtype == "bfloat16"
+    assert config.model.compute_dtype == "float32"
     assert config.training.batch_size == 2048
     assert config.training.learning_rate == 2e-3
     assert config.training.losses.q_dir_kl_weight == 1.0
-    assert config.training.losses.q_outcome_weight == 0.25
+    assert config.training.losses.q_outcome_weight == 0.0
     assert config.training.losses.categorical_epsilon == 0.01
-    assert config.checkpointing.max_to_keep == 1
+    assert config.checkpointing.max_to_keep == 0
     assert config.checkpointing.save_interval_steps == 10
 
 
@@ -235,7 +235,7 @@ def test_dirichlet_concentration_cap_must_be_finite(clip: float):
         ("hex5", 4),
         ("hex6", 4),
         ("hex7", 32),
-        ("hex8", 4),
+        ("hex8", 32),
     ],
 )
 def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
@@ -578,6 +578,52 @@ def test_dirichlet_thompson_accepts_separate_posterior_policy_budget():
     search = config.search.dirichlet_thompson
     assert search.policy_samples == 32
     assert search.posterior_policy_samples == 1
+
+
+def test_dirichlet_thompson_accepts_binary_prefix_cdf_repair_estimator():
+    config = _config(
+        {
+            "env": {"id": "hex", "board_size": 6, "num_outcomes": 2},
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "posterior_policy_estimator": "prefix_cdf",
+                    },
+                },
+            },
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.posterior_policy_estimator == "prefix_cdf"
+    assert search.prefix_cdf_half_width == 20
+
+
+def test_prefix_cdf_repair_rejects_three_outcome_chess():
+    with pytest.raises(
+        ValueError,
+        match="prefix_cdf.*requires env.num_outcomes=2",
+    ):
+        _config(
+            {
+                "env": {
+                    "id": "gardner_chess",
+                    "board_size": 5,
+                    "num_outcomes": 3,
+                },
+                "model": {"network": "boardlaw_dirichlet"},
+                "selfplay": {
+                    "search": {
+                        "kind": "dirichlet_thompson",
+                        "dirichlet_thompson": {
+                            "posterior_policy_estimator": "prefix_cdf",
+                        },
+                    },
+                },
+            }
+        )
 
 
 def test_dirichlet_thompson_posterior_policy_budget_must_be_positive():

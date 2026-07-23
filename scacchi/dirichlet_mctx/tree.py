@@ -117,6 +117,8 @@ class UnbatchedTree(Protocol):
     node_value_alpha: Float[Array, "node outcome"]
     edge_alpha: Float[Array, "node action outcome"]
     invalid_actions: Bool[Array, "node action"]
+    simulation_active_count: Int32[Array, ""]
+    executed_simulation_call_count: Int32[Array, ""]
     embeddings: UnbatchedRecurrentState
 
     ROOT_INDEX: ClassVar[int]
@@ -163,6 +165,10 @@ class Tree:
     node_value_alpha: Float[Array, "batch node outcome"]
     edge_alpha: Float[Array, "batch node action outcome"]
     invalid_actions: Bool[Array, "batch node action"]
+    # Instrumentation only: these counters are never consumed by selection,
+    # expansion, posterior repair, or action commitment.
+    simulation_active_count: Int32[Array, "batch"]
+    executed_simulation_call_count: Int32[Array, "batch"]
     embeddings: StoredRecurrentState
 
     ROOT_INDEX: ClassVar[int] = 0
@@ -275,5 +281,10 @@ def instantiate_tree_from_root(root: RootFnOutput, num_simulations: int, root_in
         node_value_alpha=node_value_alpha,
         edge_alpha=edge_alpha,
         invalid_actions=jnp.ones(batch_node_action, dtype=bool).at[:, Tree.ROOT_INDEX].set(root_invalid_actions),
+        simulation_active_count=jnp.zeros((batch_size,), dtype=jnp.int32),
+        executed_simulation_call_count=jnp.zeros(
+            (batch_size,),
+            dtype=jnp.int32,
+        ),
         embeddings=jax.tree.map(allocate_embedding, root.embedding),
     )

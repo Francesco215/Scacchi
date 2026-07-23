@@ -39,6 +39,11 @@ class SearchKind(StrEnum):
     dirichlet_thompson = "dirichlet_thompson"
 
 
+class PosteriorPolicyEstimator(StrEnum):
+    winner_mc = "winner_mc"
+    prefix_cdf = "prefix_cdf"
+
+
 class QLossWeightMode(StrEnum):
     policy = "policy"
     evidence_mass = "evidence_mass"
@@ -159,6 +164,17 @@ class DirichletThompsonSearchConfig:
     # the full root readout budget.
     posterior_policy_samples: int | None = None
     policy_sample_chunk_size: int | None = 32
+    # Estimator used only for the policy inside bottom-up cache repair.
+    # Traversal remains native Thompson sampling, and the public root readout
+    # continues to use ``policy_samples``.
+    posterior_policy_estimator: PosteriorPolicyEstimator = (
+        PosteriorPolicyEstimator.winner_mc
+    )
+    prefix_cdf_half_width: int = 20
+    prefix_cdf_tail_scale: float = 8.0
+    prefix_cdf_min_half_range: float = 6.0
+    prefix_cdf_max_half_range: float = 11.0
+
     def __post_init__(self) -> None:
         _require_ge(
             "search.dirichlet_thompson.num_simulations",
@@ -190,6 +206,32 @@ class DirichletThompsonSearchConfig:
             self.policy_sample_chunk_size,
             1,
         )
+        _require_ge(
+            "search.dirichlet_thompson.prefix_cdf_half_width",
+            self.prefix_cdf_half_width,
+            1,
+        )
+        _require_gt(
+            "search.dirichlet_thompson.prefix_cdf_tail_scale",
+            self.prefix_cdf_tail_scale,
+            0.0,
+        )
+        _require_gt(
+            "search.dirichlet_thompson.prefix_cdf_min_half_range",
+            self.prefix_cdf_min_half_range,
+            0.0,
+        )
+        if (
+            not math.isfinite(self.prefix_cdf_max_half_range)
+            or self.prefix_cdf_max_half_range
+            < self.prefix_cdf_min_half_range
+        ):
+            raise ValueError(
+                "search.dirichlet_thompson.prefix_cdf_max_half_range "
+                "must be finite and >= prefix_cdf_min_half_range; got "
+                f"{self.prefix_cdf_max_half_range} and "
+                f"{self.prefix_cdf_min_half_range}."
+            )
 
 
 @dataclass
@@ -227,8 +269,8 @@ class TrainingLossConfig:
     q_dir_kl_weight: float = 0.0
     value_outcome_weight: float = 0.0
     q_outcome_weight: float = 0.0
-    q_loss_weight_mode: QLossWeightMode = QLossWeightMode.policy
-    q_dir_kl_reduction: QDirKLReduction = QDirKLReduction.weighted
+    q_loss_weight_mode: QLossWeightMode = QLossWeightMode.evidence_mass
+    q_dir_kl_reduction: QDirKLReduction = QDirKLReduction.masked_mean
     # ``full`` trains the coupled Dirichlet density; ``mean`` ignores evidence
     # mass.
     dirichlet_loss_mode: DirichletLossMode = DirichletLossMode.full
@@ -346,6 +388,7 @@ class WandbConfig:
 class LoggingConfig:
     interval: int = 1
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    jsonl_path: str | None = None
 
 
 @dataclass
@@ -385,6 +428,7 @@ class TrainConfig:
         for name, search in (
             ("selfplay.search", self.selfplay.search),
             ("eval.player_search", self.eval.player_search),
+            ("eval.baseline_search", self.eval.baseline_search),
         ):
             if search.kind == SearchKind.dirichlet_thompson:
                 assert self.model.network in dirichlet_networks, (
@@ -392,6 +436,17 @@ class TrainConfig:
                     "model.network='aznet_dirichlet' or "
                     "model.network='boardlaw_dirichlet'."
                 )
+                if (
+                    search.dirichlet_thompson.posterior_policy_estimator
+                    == PosteriorPolicyEstimator.prefix_cdf
+                    and self.env.num_outcomes != 2
+                ):
+                    raise ValueError(
+                        f"{name}.dirichlet_thompson."
+                        "posterior_policy_estimator='prefix_cdf' requires "
+                        "env.num_outcomes=2; use winner_mc for "
+                        "three-outcome chess."
+                    )
         losses = self.training.losses
         search_emits_categorical = (
             self.selfplay.search.kind == SearchKind.dirichlet_thompson

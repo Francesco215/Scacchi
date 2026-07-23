@@ -30,7 +30,7 @@ from .envs import make_env
 from .evaluations import evaluation_metrics, load_eval_baseline, make_mcts_evaluate
 from .logger import Metric, build_logger, returns_metrics, training_metrics
 from .network import build_model
-from .pipeline import make_training_iteration
+from .pipeline import make_training_iteration, optimizer_updates_per_iteration
 from .types import Config, OptimizerType, load_config
 
 
@@ -122,10 +122,10 @@ def _build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
 
     learning_rate: float | optax.Schedule = config.training.learning_rate
     if config.training.lr_decay_after_iters is not None and config.training.lr_decay_factor != 1.0:
-        rows_per_iteration = max(1, config.selfplay.batch_size * config.selfplay.max_num_steps)
-        updates_per_iteration = max(1, rows_per_iteration // config.training.batch_size)
-        if config.training.max_updates_per_iter is not None:
-            updates_per_iteration = min(updates_per_iteration, config.training.max_updates_per_iter)
+        updates_per_iteration = max(
+            1,
+            optimizer_updates_per_iteration(config),
+        )
         boundary = config.training.lr_decay_after_iters * updates_per_iteration
         learning_rate = optax.piecewise_constant_schedule(config.training.learning_rate, {boundary: config.training.lr_decay_factor})
 
@@ -156,15 +156,34 @@ def _should_evaluate(iteration: int, config: Config) -> bool:
     return config.eval.interval > 0 and (iteration % config.eval.interval == 0 or iteration == config.run.max_num_iters - 1)
 
 
-def _evaluate(iteration: int, rng_key: jax.Array, model: nnx.Module, evaluate, parallel, history: list[float], config: Config) -> dict[str, Metric]:
+def _evaluate(
+    iteration: int,
+    rng_key: jax.Array,
+    model: nnx.Module,
+    evaluate,
+    parallel,
+    history: list[float],
+    config: Config,
+    *,
+    model_frames: int,
+    model_optimizer_updates: int,
+) -> dict[str, Metric]:
     if evaluate is None or not _should_evaluate(iteration, config):
         return {}
     if jax.process_index() == 0:
         print(f"Iteration {iteration}: evaluation starting", flush=True)
     with parallel.mesh_context():
         returns = evaluate(rng_key, model)
-    metrics: dict[str, Metric] = returns_metrics("eval/vs_baseline", returns)
+    metrics: dict[str, Metric] = {}
+    metrics.update(returns_metrics("eval/vs_baseline", returns))
     metrics.update(evaluation_metrics(returns, history))
+    metrics.update(
+        {
+            "eval/model_completed_iterations": iteration,
+            "eval/model_frames": model_frames,
+            "eval/model_optimizer_updates": model_optimizer_updates,
+        }
+    )
     return metrics
 
 
@@ -184,7 +203,19 @@ def _run_loop(config: Config, model: nnx.Module, optimizer: nnx.Optimizer, train
     evaluation_history: list[float] = []
 
     with build_logger(config) as logger, build_checkpoint_manager(config, checkpoint_directory) as checkpoint_manager:
-        start_iteration, rng_key, hours, frames = restore(checkpoint_manager, model, optimizer, rng_key)
+        (
+            start_iteration,
+            rng_key,
+            hours,
+            frames,
+            restored_optimizer_updates,
+        ) = restore(checkpoint_manager, model, optimizer, rng_key)
+        updates_per_iteration = optimizer_updates_per_iteration(config)
+        optimizer_updates = (
+            start_iteration * updates_per_iteration
+            if restored_optimizer_updates is None
+            else restored_optimizer_updates
+        )
         if jax.process_index() == 0:
             print(f"Training loop starting: start_iter={start_iteration}, max_num_iters={config.run.max_num_iters}, eval_interval={config.eval.interval}", flush=True)
         progress = _progress_bar(start_iteration, config)
@@ -192,14 +223,52 @@ def _run_loop(config: Config, model: nnx.Module, optimizer: nnx.Optimizer, train
 
         for iteration in progress:
             rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
-            metrics = _evaluate(iteration, eval_key, model, evaluate, parallel, evaluation_history, config)
+            metrics = _evaluate(
+                iteration,
+                eval_key,
+                model,
+                evaluate,
+                parallel,
+                evaluation_history,
+                config,
+                model_frames=frames,
+                model_optimizer_updates=optimizer_updates,
+            )
             train_result, seconds = _train_iteration(train_key, model, optimizer, training_iteration, parallel)
             frames_this_iteration = config.selfplay.batch_size * config.selfplay.max_num_steps
             frames += frames_this_iteration
+            optimizer_updates += updates_per_iteration
             hours += seconds / 3600
-            metrics.update(training_metrics(train_result, seconds=seconds, hours=hours, frames=frames, frames_this_iteration=frames_this_iteration))
-            logger.log(iteration, metrics, pbar=progress, prefix="", pbar_filter=r"loss|avg_R")
-            maybe_save(checkpoint_manager, iteration, model, optimizer, rng_key, config, hours, frames)
+            metrics.update(
+                training_metrics(
+                    train_result,
+                    seconds=seconds,
+                    hours=hours,
+                    frames=frames,
+                    frames_this_iteration=frames_this_iteration,
+                    optimizer_updates=optimizer_updates,
+                    optimizer_updates_this_iteration=updates_per_iteration,
+                    completed_iterations=iteration + 1,
+                )
+            )
+            logger.log(
+                iteration,
+                metrics,
+                pbar=progress,
+                prefix="",
+                pbar_filter=r"(?:^|/)[^/]*loss$|(?:^|/)avg_R$",
+            )
+            maybe_save(
+                checkpoint_manager,
+                iteration,
+                model,
+                optimizer,
+                rng_key,
+                config,
+                hours,
+                frames,
+                optimizer_updates,
+            )
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
