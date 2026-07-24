@@ -1,0 +1,782 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A math-first explanation of Scacchi's Dirichlet Thompson tree search and bottom-up posterior repair.">
+    <title>Dirichlet Thompson Tree Search</title>
+    <script src="https://distill.pub/template.v2.js"></script>
+    <style>
+      :root {
+        --ink: #202124;
+        --muted: #646b73;
+        --accent: #356859;
+        --accent-soft: #eaf2ef;
+        --surface: #f5f7f6;
+        --rule: #d9dedb;
+        --warm: #fff8e7;
+        --warm-line: #c58b16;
+      }
+
+      html { scroll-behavior: smooth; }
+      body { color: var(--ink); }
+
+      d-title {
+        border-bottom: 1px solid var(--rule);
+        padding-bottom: 1.25rem;
+      }
+
+      d-title h1 {
+        letter-spacing: -0.025em;
+        max-width: 820px;
+      }
+
+      d-title p {
+        color: var(--muted);
+        max-width: 760px;
+      }
+
+      d-article h2 {
+        border-top: 1px solid var(--rule);
+        margin-top: 3.4rem;
+        padding-top: 1.2rem;
+      }
+
+      d-article h3 { margin-top: 2.2rem; }
+
+      d-article code {
+        background: var(--surface);
+        border-radius: 3px;
+        color: var(--accent);
+        padding: 0.12em 0.32em;
+      }
+
+      d-article li { margin-bottom: 0.4rem; }
+
+      .lead {
+        color: #38413e;
+        font-size: 1.1rem;
+        line-height: 1.65;
+      }
+
+      .correction {
+        background: var(--warm);
+        border-left: 3px solid var(--warm-line);
+        box-sizing: border-box;
+        grid-column: text;
+        margin: 1.6rem 0;
+        padding: 0.9rem 1rem;
+        width: 100%;
+      }
+
+      .correction p { margin: 0; }
+
+      .symbol-table {
+        border-collapse: collapse;
+        grid-column: text;
+        margin: 1.5rem 0 2rem;
+        width: 100%;
+      }
+
+      .symbol-table th,
+      .symbol-table td {
+        border-bottom: 1px solid var(--rule);
+        padding: 0.65rem 0.55rem;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      .symbol-table th {
+        color: var(--muted);
+        font-size: 0.82rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .symbol-table td:first-child {
+        color: var(--accent);
+        white-space: nowrap;
+        width: 18%;
+      }
+
+      .stage-row {
+        display: grid;
+        gap: 0.85rem;
+        grid-column: text;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        margin: 1.7rem 0 2rem;
+        width: 100%;
+      }
+
+      .stage {
+        background: var(--surface);
+        border-top: 3px solid var(--accent);
+        padding: 0.9rem 1rem;
+      }
+
+      .stage .number {
+        color: var(--accent);
+        font-size: 0.76rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .stage-title {
+        font-size: 1.02rem;
+        font-weight: 600;
+        margin: 0.25rem 0 0.45rem;
+      }
+
+      .stage p {
+        color: #4e5552;
+        font-size: 0.9rem;
+        line-height: 1.5;
+        margin: 0;
+      }
+
+      .equation-note {
+        border-left: 2px solid var(--rule);
+        color: var(--muted);
+        font-size: 0.9rem;
+        margin: -0.5rem 0 1.75rem;
+        padding-left: 0.8rem;
+      }
+
+      .step-label {
+        color: var(--accent);
+        font-size: 0.8rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-top: 2.1rem;
+        text-transform: uppercase;
+      }
+
+      .two-column {
+        display: grid;
+        gap: 1rem;
+        grid-column: text;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin: 1.5rem 0;
+        width: 100%;
+      }
+
+      .mini-card {
+        background: var(--accent-soft);
+        padding: 0.85rem 1rem;
+      }
+
+      .mini-card p {
+        font-size: 0.9rem;
+        margin: 0.3rem 0;
+      }
+
+      .page-footer {
+        border-top: 1px solid var(--rule);
+        color: var(--muted);
+        font-size: 0.86rem;
+        margin-top: 4rem;
+        padding-top: 1rem;
+      }
+
+      @media (max-width: 760px) {
+        d-title h1 {
+          font-size: 2.2rem;
+          line-height: 1.08;
+        }
+
+        .stage-row,
+        .two-column {
+          grid-template-columns: 1fr;
+        }
+
+        .symbol-table {
+          font-size: 0.9rem;
+        }
+
+        d-article d-math[block] {
+          overflow-x: auto;
+          overflow-y: hidden;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <d-title>
+      <h1>Dirichlet Thompson Tree Search</h1>
+      <p>A math-first explanation of Scacchi's lightweight tree, its bottom-up message passing, and the targets returned to the network.</p>
+    </d-title>
+
+    <d-article>
+      <d-contents></d-contents>
+
+      <p class="lead">The search represents unresolved state and action values as learned Dirichlet beliefs over loss, draw, and win. Exact terminal and solved results live in categorical outcome/distance sidecars. A simulation walks unresolved edges by Thompson sampling, evaluates one frontier edge, and repairs every node on the path back to the root.</p>
+
+      <div class="correction">
+        <p><strong>The central idea:</strong> an unresolved edge stores the latest repaired Dirichlet message; it does not keep adding leaf evidence. A separate structural count controls prior mixing. Once an edge is categorical, its exact sidecar—not an artificially concentrated alpha—owns its semantics.</p>
+      </div>
+
+      <h2 id="1-network-beliefs">1. Network beliefs</h2>
+
+      <p>At state <d-math>s</d-math>, the network predicts a policy together with one state Dirichlet and one Dirichlet for every action:</p>
+
+      <d-math block>
+\pi_\theta(a\mid s),
+\qquad
+V_s=\alpha_\theta^V(s),
+\qquad
+Q_{s,a}=\alpha_\theta^Q(s,a).
+      </d-math>
+
+      <p>A Dirichlet parameter vector <d-math>\alpha</d-math> represents uncertainty about an outcome distribution:</p>
+
+      <d-math block>
+\phi\sim\mathrm{Dirichlet}(\alpha),
+\qquad
+\mu(\alpha)=\mathbb E[\phi]
+=\frac{\alpha}{\sum_z\alpha_z}.
+      </d-math>
+
+      <p>The outcomes are ordered as <d-math>(L,W)</d-math> or <d-math>(L,D,W)</d-math>. Search compares samples with the same utility everywhere:</p>
+
+      <d-math block>
+U(\phi)=\phi_W-\phi_L.
+      </d-math>
+
+      <h3 id="1-1-player-perspective">1.1 Player perspective</h3>
+
+      <p>Values belong to the player to move at their node. Moving a value to the opponent's perspective reverses loss and win:</p>
+
+      <d-math block>
+\mathrm{flip}(x_L,x_D,x_W)
+=(x_W,x_D,x_L).
+      </d-math>
+
+      <d-math block>
+\mathrm{Align}(x;p\to q)=
+\begin{cases}
+x,&p=q,\\
+\mathrm{flip}(x),&p\ne q.
+\end{cases}
+      </d-math>
+
+      <p class="equation-note">Every child-to-parent message is aligned before it is stored.</p>
+
+      <h2 id="2-what-the-tree-remembers">2. A compact tree layout</h2>
+
+      <p>The equations use separate symbols for separate meanings, but the tree does not need one permanent array for every symbol. Its storage follows the state of each node and edge. When an unresolved object becomes categorical, information that will never be read again is overwritten in place by the exact certificate.</p>
+
+      <p>The tree has no nested <code>NodePosterior</code>. It stores the following arrays directly:</p>
+
+      <table class="symbol-table">
+        <thead>
+          <tr>
+            <th>Physical slot</th>
+            <th>Unresolved interpretation</th>
+            <th>Categorical interpretation</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><d-math>H_{s,a}</d-math> · float <d-math>[A,O]</d-math></td>
+            <td>Network <d-math>Q_{s,a}</d-math> until repaired, then the latest message <d-math>B_{s,a}</d-math></td>
+            <td>Last learned alpha, retained only while an unresolved parent needs its concentration for the numeric cache mixture</td>
+          </tr>
+          <tr>
+            <td><d-math>V_s</d-math> · float <d-math>[O]</d-math></td>
+            <td>Fixed network value prior</td>
+            <td>Unused by search after the node becomes absorbing</td>
+          </tr>
+          <tr>
+            <td><d-math>C_s</d-math> · float <d-math>[O]</d-math></td>
+            <td>Current repaired node cache</td>
+            <td>Unused; the exact node certificate owns the value</td>
+          </tr>
+          <tr>
+            <td><d-math>z_{s,a}</d-math> · int8 <d-math>[A]</d-math></td>
+            <td><d-math>\bot</d-math></td>
+            <td>Exact edge outcome <d-math>L,D,</d-math> or <d-math>W</d-math></td>
+          </tr>
+          <tr>
+            <td><d-math>d_{s,a}</d-math> · int32 <d-math>[A]</d-math></td>
+            <td>Structural count <d-math>R_{s,a}</d-math></td>
+            <td>Certified edge distance <d-math>\tau_{s,a}</d-math></td>
+          </tr>
+          <tr>
+            <td><d-math>z_s</d-math> · int8</td>
+            <td><d-math>\bot</d-math></td>
+            <td>Exact node outcome</td>
+          </tr>
+          <tr>
+            <td><d-math>d_s</d-math> · int32</td>
+            <td>Total structural support <d-math>n_s</d-math></td>
+            <td>Certified node distance <d-math>\tau_s</d-math></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>The outcome tag determines how each integer payload is decoded:</p>
+
+      <d-math block>
+d_{s,a}=
+\begin{cases}
+R_{s,a},&z_{s,a}=\bot,\\
+\tau_{s,a},&z_{s,a}\ne\bot,
+\end{cases}
+\qquad
+d_s=
+\begin{cases}
+n_s,&z_s=\bot,\\
+\tau_s,&z_s\ne\bot.
+\end{cases}
+      </d-math>
+
+      <p>An unresolved node may have <d-math>n_s=0</d-math>, so zero alone cannot mean terminal once the slots are overlaid. The redundant terminal Boolean disappears, but the exact test is</p>
+
+      <d-math block>
+\mathrm{terminal}(s)
+\iff
+z_s\ne\bot\ \land\ d_s=0.
+      </d-math>
+
+      <p>This requires root evaluation to provide an exact terminal outcome whenever the root itself can be terminal. A Boolean terminal flag without its outcome is no longer a sufficient root contract.</p>
+
+      <h3 id="2-1-effective-edge-posterior">2.1 Effective actions without duplicate posterior fields</h3>
+
+      <p>While an edge is unresolved, its integer payload is a count and its float slot changes meaning in place:</p>
+
+      <d-math block>
+A_{s,a}=
+\begin{cases}
+H_{s,a}=B_{s,a},
+&z_{s,a}=\bot\ \land\ d_{s,a}>0,\\[3pt]
+\mathrm{Align}(V_{s_a};p_{s_a}\to p_s),
+&z_{s,a}=\bot\ \land\ d_{s,a}=0\ \land\ s_a\text{ exists},\\[3pt]
+H_{s,a}=Q_{s,a},
+&z_{s,a}=\bot\ \land\ s_a\text{ does not exist}.
+\end{cases}
+      </d-math>
+
+      <p>Thus <d-math>Q</d-math> and <d-math>B</d-math> are successive contents of one float slot, while <d-math>A</d-math> is computed and never stored. The fixed <d-math>V_s</d-math> and mutable <d-math>C_s</d-math> cannot share a slot while the node is unresolved: every repair needs both at the same time.</p>
+
+      <p>Policy logits are not tree state. Legality is extracted during evaluation and stored as a compact mask. Categorical ties use the search RNG directly, so they never trigger another network evaluation.</p>
+
+      <h3 id="2-2-state-transitions">2.2 Safe integer-slot transitions</h3>
+
+      <p>The node total is maintained incrementally. For every unresolved edge-count change <d-math>r_{\mathrm{old}}\to r_{\mathrm{new}}</d-math>, update</p>
+
+      <d-math block>
+d_s\leftarrow d_s+r_{\mathrm{new}}-r_{\mathrm{old}}
+\qquad(z_s=\bot)
+      </d-math>
+
+      <p>before writing the new edge payload. The tree never recomputes <d-math>n_s</d-math> by summing a mixture of counts and distances.</p>
+
+      <p>When a child becomes categorical, publication is ordered as one transaction:</p>
+
+      <d-math block>
+\begin{aligned}
+r_{\mathrm{final}}&\leftarrow 1+n_{s_a},\\
+d_s&\leftarrow d_s+r_{\mathrm{final}}-r_{\mathrm{old}},\\
+z_{s,a}&\leftarrow \mathrm{Align}(z_{s_a};p_{s_a}\to p_s),\\
+d_{s,a}&\leftarrow \tau_{s_a}+1.
+\end{aligned}
+      </d-math>
+
+      <p>The first two lines preserve the child's final structural contribution in the unresolved parent. Only then may the edge count be overwritten by distance. Once <d-math>z_{s,a}\ne\bot</d-math>, that payload is never again read as a count.</p>
+
+      <p>When the node itself becomes categorical, first publish its final <d-math>1+n_s</d-math> contribution to its unresolved parent using the same transaction. After that value is safe in the parent total, overwrite</p>
+
+      <d-math block>
+z_s\leftarrow z_s^{\mathrm{cat}},
+\qquad
+d_s\leftarrow\tau_s.
+      </d-math>
+
+      <p>A terminal child is the base case: <d-math>\tau_{s_a}=0</d-math>, so its incoming edge receives distance one and contributes structural support one before the overwrite.</p>
+
+      <div class="correction">
+        <p><strong>Information that really is discarded:</strong> after an edge becomes categorical, its individual <d-math>R_{s,a}</d-math> no longer exists. Root summaries report structural counts only for unresolved edges, and categorical Q rows use their explicit categorical weight. The node total preserves mixing support but cannot reconstruct historical per-edge counts.</p>
+      </div>
+
+      <h3 id="2-3-native-categorical-certificates">2.3 Native categorical certificates</h3>
+
+      <p>An action is still one of two logical objects even though its count and distance share storage:</p>
+
+      <d-math block>
+Y_{s,a}=
+\begin{cases}
+\mathrm{Cat}(z_{s,a},d_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
+\mathrm{Dir}(A_{s,a}),&z_{s,a}=\bot.
+\end{cases}
+      </d-math>
+
+      <p>The categorical tag is exact and absorbing. A certified edge is pruned from traversal. One certified win solves a node; a draw or loss is proved only after every legal edge is categorical.</p>
+
+      <p>Certified wins choose a shortest winning edge and certified losses choose a longest losing edge. All certified draw edges are equivalent. Whenever more than one edge remains tied—including equal-distance win or loss edges—the engine samples uniformly among them with the existing search RNG. Policy logits, draw-distance preferences, and action order do not break categorical ties.</p>
+
+      <d-math block>
+u_{\mathrm{cat}}(L)=-1,
+\qquad
+u_{\mathrm{cat}}(D)=0,
+\qquad
+u_{\mathrm{cat}}(W)=1.
+      </d-math>
+
+      <h2 id="3-one-thompson-rule">3. One Thompson rule</h2>
+
+      <p>At every node—root or internal—the same selector assigns one utility to each native action:</p>
+
+      <d-math block>
+X(Y_{s,a})=
+\begin{cases}
+u_{\mathrm{cat}}(z_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
+U(\phi_a),\quad \phi_a\sim\mathrm{Dirichlet}(A_{s,a}),&z_{s,a}=\bot,
+\end{cases}
+      </d-math>
+
+      <p>and chooses the legal action with highest utility:</p>
+
+      <d-math block>
+a^*=\arg\max_{a\in\mathcal A(s)}X(Y_{s,a}).
+      </d-math>
+
+      <p>Repeating this same choice <d-math>M</d-math> times estimates the probability that each action is best:</p>
+
+      <d-math block>
+\widehat\pi_M(a\mid s)
+=
+\frac1M
+\sum_{j=1}^{M}
+\mathbf 1\!\left[
+a=\arg\max_b X(Y_{s,b})^{(j)}
+\right].
+      </d-math>
+
+      <d-math block>
+X(\mathrm{Cat}(z,\tau))=u_{\mathrm{cat}}(z),
+\qquad
+X(\mathrm{Dir}(A))=U(\phi),\quad
+\phi\sim\mathrm{Dirichlet}(A).
+      </d-math>
+
+      <p class="equation-note">Traversal applies this rule only to unresolved edges; mixed policy readout compares exact categorical utility with sampled Dirichlet utility. Node repair and root readout use populations of the same selector. There is no second action-selection algorithm.</p>
+
+      <h2 id="4-one-simulation">4. One simulation</h2>
+
+      <div class="stage-row">
+        <div class="stage">
+          <div class="number">Stage 1</div>
+          <div class="stage-title">Simulate</div>
+          <p>Thompson-sample at each node and follow existing children to an unexpanded, terminal, or depth-cutoff edge.</p>
+        </div>
+        <div class="stage">
+          <div class="number">Stage 2</div>
+          <div class="stage-title">Expand</div>
+          <p>Step the environment and evaluate the child. Create a node only when the selected edge is new.</p>
+        </div>
+        <div class="stage">
+          <div class="number">Stage 3</div>
+          <div class="stage-title">Repair</div>
+          <p>Walk from the deepest parent back to the root and update every node with the same posterior rule.</p>
+        </div>
+      </div>
+
+      <d-math block>
+\text{simulation}
+=
+\text{traversal}
+\longrightarrow
+\text{leaf evaluation}
+\longrightarrow
+\text{bottom-up repair}.
+      </d-math>
+
+      <h3 id="4-1-leaf-result">4.1 Tagged leaf result</h3>
+
+      <p>A non-terminal frontier contributes its complete network value prior:</p>
+
+      <d-math block>
+L_{s'}=V_{s'}.
+      </d-math>
+
+      <p>Expansion also returns one exact tag:</p>
+
+      <d-math block>
+\mathrm{terminal\_outcome}(s')=
+\begin{cases}
+z_{s'},&s'\text{ is terminal},\\
+\mathrm{NO\_OUTCOME},&s'\text{ is non-terminal}.
+\end{cases}
+      </d-math>
+
+      <p>A terminal tag creates <d-math>\mathrm{Cat}(z_{s'},0)</d-math> on the child and the aligned distance-one certificate on its incoming edge. It does not create a terminal Dirichlet. Model alphas are used as unresolved leaf messages and caches only.</p>
+
+      <h2 id="5-bottom-up-posterior-repair">5. Bottom-up posterior repair</h2>
+
+      <p>The default rule is local: it receives one node, all of its child summaries, and the final leaf only when this is the deepest path node.</p>
+
+      <div class="step-label">Step A · write the final edge</div>
+
+      <p>At the deepest node <d-math>s_d</d-math>, an unresolved selected edge increments its structural count and replaces its alpha message:</p>
+
+      <d-math block>
+R_{s_d,a_d}\leftarrow R_{s_d,a_d}+1,
+      </d-math>
+
+      <d-math block>
+B_{s_d,a_d}\leftarrow
+\mathrm{Align}(V_{s'};p_{s'}\to p_{s_d})
+\quad\text{only when }z_{s_d,a_d}=\bot.
+      </d-math>
+
+      <p class="equation-note"><d-math>B</d-math> is replaced, not added. If expansion is terminal, the engine instead folds support one into <d-math>n_{s_d}</d-math> and overwrites the edge payload with distance one; the posterior callback never reads that distance as <d-math>R</d-math>.</p>
+
+      <div class="step-label">Step B · refresh from children</div>
+
+      <p>For every expanded, unresolved child with repaired information below it, replace the parent edge by the child's current cache. Its node payload still means <d-math>n_{s_a}</d-math>:</p>
+
+      <d-math block>
+B_{s,a}
+\leftarrow
+\mathrm{Align}(C_{s_a};p_{s_a}\to p_s),
+\qquad
+R_{s,a}
+\leftarrow
+1+n_{s_a},
+\quad n_{s_a}>0.
+      </d-math>
+
+      <p>When a child becomes categorical, the engine first commits the final <d-math>1+n_{s_a}</d-math> count delta to the parent total, then overwrites the incoming edge count with distance. Categorical children are never refreshed as Dirichlet messages afterwards.</p>
+
+      <div class="step-label">Step C · form a fresh node policy</div>
+
+      <p>Recompute all effective action posteriors and estimate a fresh posterior-best policy:</p>
+
+      <d-math block>
+\pi_s
+=
+\widehat\pi_{M_{\mathrm{node}}}
+(\,\cdot\mid s;Y_s).
+      </d-math>
+
+      <p>This is not a visit distribution or a running average. It is a new mixed-native population: categorical utilities are exact and unresolved utilities are freshly Thompson-sampled.</p>
+
+      <div class="step-label">Step D · repair the node value</div>
+
+      <p>While the node is unresolved, its node payload is the incrementally maintained total structural support</p>
+
+      <d-math block>
+\gamma_s=\frac{n_s}{\kappa+n_s}.
+      </d-math>
+
+      <p>The incremental form is necessary because categorical edge payloads now contain distance, not their discarded historical count.</p>
+
+      <p>For the numeric cache mixture only, preserve each categorical edge's learned effective-alpha mass but replace its direction by the exact sidecar outcome:</p>
+
+      <d-math block>
+\widetilde A_{s,a}=
+\begin{cases}
+A_{s,a},&z_{s,a}=\bot,\\[3pt]
+\left(\sum_i A_{s,a,i}\right)e_{z_{s,a}},&z_{s,a}\ne\bot.
+\end{cases}
+      </d-math>
+
+      <p>Average these cache operands with the fresh search policy:</p>
+
+      <d-math block>
+\bar A_s
+=
+\sum_{a\in\mathcal A(s)}
+\pi_s(a)\widetilde A_{s,a}.
+      </d-math>
+
+      <p>Then interpolate between the fixed network value and the repaired descendants:</p>
+
+      <d-math block>
+\boxed{
+C_s
+=
+(1-\gamma_s)V_s
++
+\gamma_s\bar A_s
+}.
+      </d-math>
+
+      <p>If <d-math>n_s=0</d-math>, then <d-math>C_s=V_s</d-math>. The sole constant <d-math>\kappa&gt;0</d-math> is the strength of that learned value prior against repaired descendants. It is not leaf evidence or terminal confidence. The categorical projection does not mutate <d-math>A</d-math> and never replaces the exact sidecar or categorical training target.</p>
+
+      <h3 id="5-1-why-the-order-matters">5.1 Why the order matters</h3>
+
+      <p>For a selected path</p>
+
+      <d-math block>
+s_0\to s_1\to\cdots\to s_d,
+      </d-math>
+
+      <p>repair runs in the reverse order:</p>
+
+      <d-math block>
+s_d,\ s_{d-1},\ \ldots,\ s_0.
+      </d-math>
+
+      <p>When <d-math>s_i</d-math> is repaired, it therefore sees the new <d-math>C_{s_{i+1}}</d-math> computed moments earlier. This is how one local rule transports information all the way to the root.</p>
+
+      <h2 id="6-root-readout-and-training-targets">6. Root readout and training targets</h2>
+
+      <p>If the root remains unresolved, its policy is another mixed-native posterior-best population. If the root is categorical, the engine samples uniformly among tied certified actions and returns a one-hot policy on that sample:</p>
+
+      <d-math block>
+\pi_{\mathrm{search}}(a\mid s_0)
+=
+\begin{cases}
+\widehat\pi_{M_{\mathrm{root}}}(a\mid s_0;Y_{s_0}),
+&z_{s_0}=\bot,\\[3pt]
+\mathbf 1[a=a_{\mathrm{cat}}(s_0)],
+&z_{s_0}\ne\bot.
+\end{cases}
+      </d-math>
+
+      <p>The Q and V targets retain the same native tags used by search:</p>
+
+      <d-math block>
+T^Q_{s,a}=
+\begin{cases}
+\mathrm{Pad},&a\text{ illegal},\\
+\mathrm{Cat}(z_{s,a},\tau_{s,a}),&z_{s,a}\ne\bot,\\
+\mathrm{Dir}(A_{s,a}),&z_{s,a}=\bot,
+\end{cases}
+      </d-math>
+
+      <d-math block>
+T^V_s=
+\begin{cases}
+\mathrm{Cat}(z_s,\tau_s),&z_s\ne\bot,\\
+\mathrm{Dir}(C_s),&z_s=\bot.
+\end{cases}
+      </d-math>
+
+      <d-math block>
+\pi_{\mathrm{target}}(a\mid s_0)
+=
+\pi_{\mathrm{search}}(a\mid s_0).
+      </d-math>
+
+      <div class="correction">
+        <p>There is no root-only reconstruction <d-math>\beta_Q=\alpha_{\mathrm{base}}+E_Q</d-math>, and <d-math>R</d-math> is never added to Dirichlet concentration. A categorical target consumes the exact sidecar, not the numeric cache projection.</p>
+      </div>
+
+      <h3 id="6-1-losses">6.1 Losses</h3>
+
+      <p>The policy head distills the posterior-best distribution:</p>
+
+      <d-math block>
+\mathcal L_\pi
+=
+-\sum_{a\in\mathcal A(s)}
+\mathrm{stopgrad}(\pi_{\mathrm{target}}(a\mid s))
+\log\pi_\theta(a\mid s).
+      </d-math>
+
+      <p>Full Dirichlet training matches both mean and concentration:</p>
+
+      <d-math block>
+\mathcal L_{\mathrm{full}}(\beta,\alpha_\theta)
+=
+D_{\mathrm{KL}}
+\left(
+\mathrm{Dirichlet}(\mathrm{stopgrad}\beta)
+\,\|\,
+\mathrm{Dirichlet}(\alpha_\theta)
+\right).
+      </d-math>
+
+      <p>Mean-only training ignores concentration and matches normalized outcome probabilities:</p>
+
+      <d-math block>
+\mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta)
+=
+D_{\mathrm{KL}}
+\left(
+\mathrm{stopgrad}\mu(\beta)
+\,\|\,
+\mu(\alpha_\theta)
+\right).
+      </d-math>
+
+      <p>For an exact categorical outcome <d-math>z</d-math>, move the point just inside the simplex and train the predicted Dirichlet by density likelihood:</p>
+
+      <d-math block>
+\phi_z^\epsilon
+=(1-K\epsilon)e_z+\epsilon\mathbf 1,
+\qquad
+\mathcal L_{\mathrm{cat}}(\alpha_\theta,z)
+=-\log p_{\mathrm{Dirichlet}(\alpha_\theta)}
+(\phi_z^\epsilon).
+      </d-math>
+
+      <p>Thus unresolved rows use full or mean Dirichlet matching, while categorical rows use this exact-outcome density loss in either mode. The concentration is learned by the model; no terminal concentration constant is injected by search.</p>
+
+      <p>For an unresolved Q target, the loss can be weighted by structural support or by root policy. A categorical row no longer owns an <d-math>R</d-math> value and receives an explicit unit categorical weight:</p>
+
+      <d-math block>
+w_a=
+\begin{cases}
+R_{s_0,a},
+&z_{s_0,a}=\bot\ \text{and evidence-mass mode},\\
+\pi_{\mathrm{search}}(a\mid s_0),
+&z_{s_0,a}=\bot\ \text{and policy mode},\\
+1,&z_{s_0,a}\ne\bot.
+\end{cases}
+      </d-math>
+
+      <h2 id="7-simulations-are-not-tree-size">7. Simulations are not tree size</h2>
+
+      <p>With <code>num_simulations = N</code>, search allocates <d-math>N</d-math> static iterations and performs at most <d-math>N</d-math> active traversal–evaluation–repair cycles on one persistent tree:</p>
+
+      <d-math block>
+\mathcal T_0
+\xrightarrow{\text{simulation }1}
+\mathcal T_1
+\xrightarrow{\text{simulation }2}
+\cdots
+\xrightarrow{\text{simulation }N}
+\mathcal T_N.
+      </d-math>
+
+      <p>JAX allocates a static upper bound of one possible new node per simulation, plus the root:</p>
+
+      <d-math block>
+N_{\mathrm{slots}}=N+1.
+      </d-math>
+
+      <p>A revisit or depth cutoff still evaluates and repairs the path but does not initialize a new node. Therefore</p>
+
+      <d-math block>
+N_{\mathrm{real\ nodes}}\le N+1.
+      </d-math>
+
+      <p>The fixed array is capacity, not a requirement to fill every slot. Once the root is categorical, later static iterations are inactive and do not call expansion. <code>max_depth</code> separately limits one traversal's length.</p>
+
+      <h2 id="8-the-replaceable-part">8. The replaceable part</h2>
+
+      <p>The tree-search engine owns traversal, exact terminal tags, categorical sidecars, proof propagation, storage, and bottom-up order. The posterior callback owns unresolved Dirichlet repair and the cache mixture:</p>
+
+      <d-math block>
+\mathcal F_{\mathrm{posterior}}:
+(\text{key},\ \text{node},\ \text{children},\ \text{leaf})
+\longmapsto
+(H_s,\ d_s^{\mathrm{edge}},\ C_s).
+      </d-math>
+
+      <p>It is called once for every node on the selected path and returns an ephemeral update; the persistent tree remains flat. A different rule can inspect the current node embedding and all child summaries, then replace unresolved alphas, counts, and the node cache without changing traversal. The engine owns count-delta accounting and categorical payload transitions. The default callback exposes its single prior-strength choice as <d-math>\kappa</d-math> in <d-math>\gamma=n/(\kappa+n)</d-math>.</p>
+
+      <d-math block>
+\text{search mechanics}
+\quad\perp\quad
+\text{posterior mathematics}.
+      </d-math>
+
+      <p class="page-footer">For field-level contracts, concentration parameterization, action commitment modes, and the full loss definition, see <a href="math.md"><code>math.md</code></a>. The algorithm follows the message-passing logic in <code>tictactoe-demo/app.js</code> and the active <code>scacchi.dirichlet_mctx</code> backend.</p>
+    </d-article>
+  </body>
+</html>

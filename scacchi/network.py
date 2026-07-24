@@ -8,6 +8,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from .dirichlet_mctx import outcomes
+
 if TYPE_CHECKING:
     from .types import Config
 
@@ -22,48 +24,93 @@ def _dtype_from_name(name: str):
     raise ValueError(f"unknown model.compute_dtype: {name!r}")
 
 
+def _squared_softplus_concentration_logit(concentration: float) -> float:
+    """Logit whose squared-softplus transform has the requested mass."""
+
+    if concentration <= 0.0:
+        raise ValueError(f"concentration must be > 0, got {concentration}")
+    return math.log(math.expm1(math.sqrt(concentration)))
+
+
 def _unit_dirichlet_concentration_logit(num_outcomes: int) -> float:
-    """Logit whose squared softplus gives total concentration num_outcomes."""
-    return math.log(math.expm1(math.sqrt(num_outcomes)))
+    """Logit whose squared-softplus transform totals ``num_outcomes``."""
+    return _squared_softplus_concentration_logit(float(num_outcomes))
+
+
+_DIRICHLET_INITIAL_EXCESS_CONCENTRATION = 0.1
+
+
+def _smooth_dirichlet_concentration_logit(
+    concentration_floor: float,
+    concentration_clip: float | None,
+    *,
+    initial_excess: float = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION,
+) -> float:
+    """Initialize the bounded concentration just above its dumb-prior floor."""
+
+    if initial_excess <= 0:
+        raise ValueError(f"initial_excess must be > 0, got {initial_excess}")
+    if concentration_clip is None:
+        return math.log(math.expm1(initial_excess))
+    concentration_range = concentration_clip - concentration_floor
+    if concentration_range <= initial_excess:
+        raise ValueError(
+            "dirichlet_concentration_clip must exceed the dumb-prior floor "
+            f"by more than {initial_excess}; got floor={concentration_floor}, "
+            f"clip={concentration_clip}"
+        )
+    fraction = initial_excess / concentration_range
+    return math.log(fraction / (1.0 - fraction))
 
 
 def dirichlet_from_logits(
     mean_logits: jax.Array,
     concentration_logit: jax.Array,
     *,
+    concentration_floor: float | None = None,
     concentration_clip: float | None = None,
 ) -> jax.Array:
     mean_logits = mean_logits.astype(jnp.float32)
     concentration_logit = concentration_logit.astype(jnp.float32)
-    concentration = jax.nn.softplus(concentration_logit)**2
-    if concentration_clip is not None:
-        concentration = jnp.minimum(
-            concentration,
-            jnp.asarray(concentration_clip, dtype=concentration.dtype),
-        )
+    if concentration_floor is None:
+        concentration = jax.nn.softplus(concentration_logit) ** 2
+        if concentration_clip is not None:
+            concentration = jnp.minimum(
+                concentration,
+                jnp.asarray(concentration_clip, dtype=concentration.dtype),
+            )
+    else:
+        floor = jnp.asarray(concentration_floor, dtype=concentration_logit.dtype)
+        if concentration_clip is None:
+            concentration = floor + jax.nn.softplus(concentration_logit)
+        else:
+            if concentration_clip <= concentration_floor:
+                raise ValueError(
+                    "concentration_clip must be greater than concentration_floor; "
+                    f"got floor={concentration_floor}, clip={concentration_clip}"
+                )
+            concentration_range = jnp.asarray(
+                concentration_clip - concentration_floor,
+                dtype=concentration_logit.dtype,
+            )
+            concentration = floor + concentration_range * jax.nn.sigmoid(
+                concentration_logit
+            )
     return concentration[..., None] * jax.nn.softmax(mean_logits, axis=-1)
-
-
-def outcome_mean(alpha: jax.Array) -> jax.Array:
-    return alpha / jnp.sum(alpha, axis=-1, keepdims=True)
-
-
-def outcome_utility(outcome_dist: jax.Array) -> jax.Array:
-    return outcome_dist[..., -1] - outcome_dist[..., 0]
 
 
 def policy_value_from_output(output):
     if len(output) == 2:
         return output
     logits, alpha_v, _alpha_q = output
-    return logits, outcome_utility(outcome_mean(alpha_v))
+    return logits, outcomes.outcome_utility(outcomes.outcome_mean(alpha_v))
 
 
 class BlockV1(nnx.Module):
     def __init__(self, num_channels: int, *, dtype=jnp.float32, rngs: nnx.Rngs):
-        self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         self.bn1 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
-        self.conv2 = nnx.Conv(num_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv2 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         self.bn2 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
     def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
@@ -79,9 +126,9 @@ class BlockV1(nnx.Module):
 class BlockV2(nnx.Module):
     def __init__(self, num_channels: int, *, dtype=jnp.float32, rngs: nnx.Rngs):
         self.bn1 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
-        self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         self.bn2 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
-        self.conv2 = nnx.Conv(num_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv2 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
 
     def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
         residual = x
@@ -115,7 +162,7 @@ class AZNet(nnx.Module):
         self.resnet_v2 = resnet_v2
         self.dtype = dtype
 
-        self.conv = nnx.Conv(input_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv = nnx.Conv(input_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         if not resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
@@ -125,7 +172,7 @@ class AZNet(nnx.Module):
         if resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
-        self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.policy_bn = nnx.BatchNorm(2, momentum=0.9, dtype=dtype, rngs=rngs)
         self.policy_linear = nnx.Linear(
             height * width * 2,
@@ -136,7 +183,7 @@ class AZNet(nnx.Module):
             rngs=rngs,
         )
 
-        self.value_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.value_conv = nnx.Conv(num_channels, 1, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.value_bn = nnx.BatchNorm(1, momentum=0.9, dtype=dtype, rngs=rngs)
         self.value_linear = nnx.Linear(height * width, num_channels, dtype=dtype, rngs=rngs)
         self.value_out = nnx.Linear(num_channels, 1, dtype=dtype, rngs=rngs)
@@ -200,7 +247,7 @@ class AZDirichletNet(nnx.Module):
         self.dtype = dtype
         self.dirichlet_concentration_clip = dirichlet_concentration_clip
 
-        self.conv = nnx.Conv(input_channels, num_channels, kernel_size=3, padding="SAME", dtype=dtype, rngs=rngs)
+        self.conv = nnx.Conv(input_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         if not resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
@@ -210,7 +257,7 @@ class AZDirichletNet(nnx.Module):
         if resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
-        self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.policy_conv = nnx.Conv(num_channels, 2, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.policy_bn = nnx.BatchNorm(2, momentum=0.9, dtype=dtype, rngs=rngs)
         self.policy_linear = nnx.Linear(
             height * width * 2,
@@ -221,7 +268,7 @@ class AZDirichletNet(nnx.Module):
             rngs=rngs,
         )
 
-        self.value_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.value_conv = nnx.Conv(num_channels, 1, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.value_bn = nnx.BatchNorm(1, momentum=0.9, dtype=dtype, rngs=rngs)
         self.value_linear = nnx.Linear(height * width, num_channels, dtype=dtype, rngs=rngs)
         self.value_dir_out = nnx.Linear(
@@ -244,20 +291,32 @@ class AZDirichletNet(nnx.Module):
             rngs=rngs,
         )
 
-        self.q_dir_conv = nnx.Conv(num_channels, num_outcomes, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.q_dir_conv = nnx.Conv(num_channels, num_outcomes, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.q_dir_bn = nnx.BatchNorm(num_outcomes, momentum=0.9, dtype=dtype, rngs=rngs)
         self.q_dir_linear = nnx.Linear(
             height * width * num_outcomes,
+            num_channels,
+            dtype=dtype,
+            rngs=rngs,
+        )
+        self.q_dir_out = nnx.Linear(
+            num_channels,
             num_actions * num_outcomes,
             dtype=dtype,
             kernel_init=jax.nn.initializers.zeros,
             bias_init=jax.nn.initializers.zeros,
             rngs=rngs,
         )
-        self.q_conc_conv = nnx.Conv(num_channels, 1, kernel_size=1, padding="SAME", dtype=dtype, rngs=rngs)
+        self.q_conc_conv = nnx.Conv(num_channels, 1, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
         self.q_conc_bn = nnx.BatchNorm(1, momentum=0.9, dtype=dtype, rngs=rngs)
         self.q_conc_linear = nnx.Linear(
             height * width,
+            num_channels,
+            dtype=dtype,
+            rngs=rngs,
+        )
+        self.q_conc_out = nnx.Linear(
+            num_channels,
             num_actions,
             dtype=dtype,
             kernel_init=jax.nn.initializers.zeros,
@@ -307,7 +366,9 @@ class AZDirichletNet(nnx.Module):
         q_mean_logits = self.q_dir_bn(q_mean_logits, use_running_average=not train)
         q_mean_logits = jax.nn.relu(q_mean_logits)
         q_mean_logits = q_mean_logits.reshape((q_mean_logits.shape[0], -1))
-        q_mean_logits = self.q_dir_linear(q_mean_logits).reshape(
+        q_mean_logits = self.q_dir_linear(q_mean_logits)
+        q_mean_logits = jax.nn.relu(q_mean_logits)
+        q_mean_logits = self.q_dir_out(q_mean_logits).reshape(
             (x.shape[0], self.num_actions, self.num_outcomes)
         )
 
@@ -316,6 +377,8 @@ class AZDirichletNet(nnx.Module):
         q_concentration_logit = jax.nn.relu(q_concentration_logit)
         q_concentration_logit = q_concentration_logit.reshape((q_concentration_logit.shape[0], -1))
         q_concentration_logit = self.q_conc_linear(q_concentration_logit)
+        q_concentration_logit = jax.nn.relu(q_concentration_logit)
+        q_concentration_logit = self.q_conc_out(q_concentration_logit)
         alpha_q = dirichlet_from_logits(
             q_mean_logits,
             q_concentration_logit,
@@ -427,6 +490,8 @@ class BoardlawDirichletNet(nnx.Module):
         dtype=jnp.float32,
         dirichlet_concentration_clip: float | None = 8.0,
         legacy_dirichlet_head_init: bool = False,
+        dirichlet_concentration_floor: float | None = None,
+        dirichlet_initial_concentration: float | None = None,
         rezero_kernel_init: str = "variance_scaling",
         rngs: nnx.Rngs,
     ):
@@ -435,7 +500,25 @@ class BoardlawDirichletNet(nnx.Module):
         self.width = width
         self.depth = depth
         self.dtype = dtype
+        concentration_floor = (
+            None
+            if dirichlet_concentration_floor is None
+            else float(dirichlet_concentration_floor)
+        )
+        self.dirichlet_concentration_floor = (
+            None if legacy_dirichlet_head_init else concentration_floor
+        )
         self.dirichlet_concentration_clip = dirichlet_concentration_clip
+        self.dirichlet_initial_concentration = dirichlet_initial_concentration
+
+        if legacy_dirichlet_head_init and (
+            dirichlet_concentration_floor is not None
+            or dirichlet_initial_concentration is not None
+        ):
+            raise ValueError(
+                "dirichlet concentration floor/initialization cannot be combined "
+                "with legacy_dirichlet_head_init"
+            )
 
         input_dim = math.prod(observation_shape)
         self.intake = nnx.Linear(input_dim, width, dtype=dtype, rngs=rngs)
@@ -464,8 +547,46 @@ class BoardlawDirichletNet(nnx.Module):
                 bias_init=jax.nn.initializers.zeros,
                 rngs=rngs,
             )
+            if concentration_floor is None:
+                initial_concentration = (
+                    float(num_outcomes)
+                    + _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+                    if dirichlet_initial_concentration is None
+                    else float(dirichlet_initial_concentration)
+                )
+                if (
+                    self.dirichlet_concentration_clip is not None
+                    and initial_concentration
+                    >= float(self.dirichlet_concentration_clip)
+                ):
+                    raise ValueError(
+                        "dirichlet_concentration_clip must exceed "
+                        "dirichlet_initial_concentration; got "
+                        f"initial={initial_concentration}, "
+                        f"clip={self.dirichlet_concentration_clip}"
+                    )
+                concentration_logit = _squared_softplus_concentration_logit(
+                    initial_concentration
+                )
+            else:
+                initial_excess = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+                if dirichlet_initial_concentration is not None:
+                    initial_excess = (
+                        float(dirichlet_initial_concentration) - concentration_floor
+                    )
+                    if initial_excess <= 0.0:
+                        raise ValueError(
+                            "dirichlet_initial_concentration must exceed the "
+                            f"configured floor {concentration_floor}; got "
+                            f"{dirichlet_initial_concentration}"
+                        )
+                concentration_logit = _smooth_dirichlet_concentration_logit(
+                    concentration_floor,
+                    self.dirichlet_concentration_clip,
+                    initial_excess=initial_excess,
+                )
             concentration_bias_init = jax.nn.initializers.constant(
-                _unit_dirichlet_concentration_logit(num_outcomes)
+                concentration_logit
             )
             self.value_conc_head = nnx.Linear(
                 width,
@@ -507,6 +628,7 @@ class BoardlawDirichletNet(nnx.Module):
         alpha_v = dirichlet_from_logits(
             value_mean_logits,
             value_concentration_logit,
+            concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
 
@@ -517,6 +639,7 @@ class BoardlawDirichletNet(nnx.Module):
         alpha_q = dirichlet_from_logits(
             q_mean_logits,
             q_concentration_logit,
+            concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
         return logits.astype(jnp.float32), alpha_v, alpha_q
@@ -583,6 +706,12 @@ def build_model(
                 config.training.regularization.dirichlet_concentration_clip
             ),
             legacy_dirichlet_head_init=config.model.legacy_dirichlet_head_init,
+            dirichlet_concentration_floor=(
+                config.model.dirichlet_concentration_floor
+            ),
+            dirichlet_initial_concentration=(
+                config.model.dirichlet_initial_concentration
+            ),
             rezero_kernel_init=config.model.rezero_kernel_init,
             rngs=rngs,
         )

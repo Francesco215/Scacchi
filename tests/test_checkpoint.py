@@ -8,6 +8,66 @@ from scacchi import checkpoint
 from scacchi.types import CheckpointingConfig, Config, RunConfig
 
 
+def test_legacy_flat_checkpoint_config_loads_for_solved_baselines() -> None:
+    config = checkpoint._load_checkpoint_config(
+        {
+            "env_id": "hex",
+            "board_size": 5,
+            "seed": 0,
+            "max_num_iters": 300,
+            "network": "boardlaw",
+            "num_channels": 512,
+            "num_layers": 8,
+            "resnet_v2": True,
+            "selfplay_batch_size": 1024,
+            "num_simulations": 32,
+            "max_num_steps": 256,
+            "training_batch_size": 4096,
+            "learning_rate": 1e-3,
+            "log_interval": 1,
+            "eval_interval": 0,
+            "eval_batch_size": 64,
+            "wandb_enabled": True,
+            "wandb_project": "scacchi-az",
+            "ckpt_max_to_keep": 3,
+            "ckpt_save_interval_steps": 50,
+            # Removed MoHex fields in the real baseline metadata are ignored.
+            "mohex_max_memory": 207108864,
+        }
+    )
+
+    assert config.env.id == "hex"
+    assert config.env.board_size == 5
+    assert config.model.network == "boardlaw"
+    assert config.model.num_channels == 512
+    assert config.model.num_layers == 8
+    assert config.selfplay.search.kind == "gumbel"
+    assert config.selfplay.search.gumbel.num_simulations == 32
+    assert config.eval.interval == 0
+    assert config.eval.batch_size == 64
+
+
+def test_nested_checkpoint_migrates_legacy_search_blocks_to_total_simulations() -> None:
+    config = checkpoint._load_checkpoint_config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "num_simulations": 4,
+                        "num_blocks": 16,
+                    },
+                }
+            },
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.num_simulations == 64
+    assert search.max_depth == 64
+
+
 def test_rng_key_checkpoint_value_is_host_numpy_array() -> None:
     rng_key = jax.random.PRNGKey(7)
 
@@ -79,9 +139,32 @@ def test_build_checkpoint_manager_uses_multihost_orbax_options(
     assert options.max_to_keep == 3
     assert options.save_interval_steps == 7
     assert options.save_on_steps == frozenset({10})
-    assert options.single_host_load_and_broadcast is True
+    # Pod workers have private disks: process 0 saves alone, no collectives.
+    assert options.single_host_load_and_broadcast is False
     assert options.enable_async_checkpointing is True
     assert options.multiprocessing_options.primary_host == 0
+    assert options.multiprocessing_options.active_processes == {0}
+    assert options.create is False
+
+
+def test_build_checkpoint_manager_multihost_nonprimary_is_noop(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    config = Config(
+        run=RunConfig(max_num_iters=11),
+        checkpointing=CheckpointingConfig(max_to_keep=3, save_interval_steps=7),
+    )
+    monkeypatch.setattr(checkpoint.jax, "process_count", lambda: 2)
+    monkeypatch.setattr(checkpoint.jax, "process_index", lambda: 1)
+
+    def fail_if_constructed(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("non-primary processes must not build orbax managers")
+
+    monkeypatch.setattr(checkpoint.ocp, "CheckpointManager", fail_if_constructed)
+
+    manager = checkpoint.build_checkpoint_manager(config, tmp_path)
+    assert isinstance(manager, checkpoint.NoOpCheckpointManager)
 
 
 def test_disabled_checkpoint_manager_does_not_construct_orbax(

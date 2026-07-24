@@ -1,6 +1,6 @@
-# Best completed 5x5 non-Gumbel Boardlaw-Dirichlet recipe from notebook.md.
-# Mirrors W&B run azcxc9xp / hex5_dqthompson_outcome_seed9101.
-# This is dirichlet_thompson, not the removed Python wavefront backend.
+# Corrected 5x5 Boardlaw-Dirichlet Thompson recipe.  Search uses one
+# persistent 16-expansion tree; evaluation keeps the reference run's larger
+# 32-expansion candidate budget against the same four-simulation opponent.
 
 run:
   seed: 9101
@@ -15,6 +15,7 @@ model:
   network: boardlaw_dirichlet
   num_channels: 128
   num_layers: 8
+  compute_dtype: bfloat16
   resnet_v2: true
 
 selfplay:
@@ -25,27 +26,31 @@ selfplay:
     kind: dirichlet_thompson
 
     dirichlet_thompson:
-      num_simulations: 4
-      num_blocks: 8
+      num_simulations: 16
+      kappa: 4.0
+      # Final root policy population. Internal repair draws its own fresh
+      # population from each node's just-updated edge posteriors.
+      policy_samples: 32
 
-      constants:
-        kappa_leaf: 1.0
-        kappa_terminal: 8.0
 
 training:
-  batch_size: 1024
-  learning_rate: 1e-3
+  batch_size: 2048
+  learning_rate: 2e-3
   grad_clip_norm: 1.0
 
   losses:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
+    # Keep the known-stable Q balance while testing the corrected search.
+    # Changing the updater and the target weighting in the same run made the
+    # earlier short experiment impossible to interpret.
     q_dir_kl_weight: 1.0
     value_outcome_weight: 1.0
     q_outcome_weight: 0.25
     terminal_edge_targets: false
     terminal_parent_targets: false
     policy_target_mode: search
+    categorical_epsilon: 0.01
 
   regularization:
     dirichlet_concentration_clip: 8.0
@@ -54,6 +59,12 @@ eval:
   interval: 5
   batch_size: 256
   baseline: checkpoint
+  player_search:
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 32
+      kappa: 4.0
+      policy_samples: 32
   baseline_search:
     kind: gumbel
     gumbel:
@@ -66,5 +77,8 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 0
-  save_interval_steps: 50
+  max_to_keep: 1
+  # Keep recovery distance small on workstations with a GPU watchdog.
+  save_interval_steps: 10
+  # Never resume the stale checkpoint produced by an earlier implementation.
+  directory: checkpoints/asd

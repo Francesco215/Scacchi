@@ -1,4 +1,4 @@
-import inspect
+import chex
 from typing import Any, Callable, Literal, NamedTuple
 
 from flax import nnx
@@ -8,12 +8,11 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 from pgx.experimental import auto_reset
 
-from .dirichlet_tree.types import SearchDiagnostics
 from .distributed import (
     DISABLED_BATCH_PARALLEL,
     BatchParallel,
-    assert_batch_axis_sharded,
     constrain_batch_axis,
+    local_shard_map,
 )
 from .play_search import (
     PlayerOutput,
@@ -30,7 +29,7 @@ class TrainingSamples(NamedTuple):
     posterior: PosteriorTargets
     played_action: Int[Array, "batch time"]
     legal_action_mask: Bool[Array, "batch time action"]
-    search_diagnostics: SearchDiagnostics | None = None
+    psk_terminated: Bool[Array, "batch time"] | None = None
 
 
 class EvalMetrics(NamedTuple):
@@ -41,86 +40,8 @@ class EvalMetrics(NamedTuple):
     lose_rate: Float[Array, ""]
 
 
-Player = Callable[[Any, jax.Array], PlayerOutput]
+Player = Callable[[Any, chex.PRNGKey], PlayerOutput]
 PlayMode = Literal["training", "eval"]
-
-
-def _local_search_shard_map(**kwargs):
-    """Build an nnx.shard_map for local per-device search.
-
-    MCTX's local search body has varying scalar carry values inside while loops.
-    The shard-map checker is useful for proving manual axis types, but here it
-    rejects a valid local-only search before lowering. Newer JAX names the
-    checker toggle `check_vma`; older versions used `check_rep`.
-    """
-
-    parameters = inspect.signature(nnx.shard_map).parameters
-    if "check_vma" in parameters:
-        return nnx.shard_map(**kwargs, check_vma=False)
-    if "check_rep" in parameters:
-        return nnx.shard_map(**kwargs, check_rep=False)
-    return nnx.shard_map(**kwargs)
-
-
-def _replace_legal_action_mask(
-    env_state: Any,
-    legal_action_mask: Bool[Array, "*batch action"],
-) -> Any:
-    if hasattr(env_state, "replace"):
-        return env_state.replace(legal_action_mask=legal_action_mask)
-    if hasattr(env_state, "_replace"):
-        return env_state._replace(legal_action_mask=legal_action_mask)
-    raise TypeError("env_state must support replacing legal_action_mask")
-
-
-def searchable_eval_state(env_state: Any):
-    """Give completed eval rows a dummy legal action; their moves are discarded."""
-
-    dummy_legal_action_mask = (
-        jnp.zeros_like(env_state.legal_action_mask)
-        .at[..., 0]
-        .set(True)
-    )
-    legal_action_mask = jnp.where(
-        env_state.terminated[..., None],
-        dummy_legal_action_mask,
-        env_state.legal_action_mask,
-    )
-    return _replace_legal_action_mask(env_state, legal_action_mask)
-
-
-def step_active_eval_rows(
-    env: Any,
-    env_state: Any,
-    action: Int[Array, "batch"],
-) -> tuple[Any, Bool[Array, "batch"], Bool[Array, ""]]:
-    active = ~env_state.terminated
-    action = jnp.asarray(action, dtype=jnp.int32)
-    num_actions = env_state.legal_action_mask.shape[-1]
-    in_bounds = (0 <= action) & (action < num_actions)
-    safe_action = jnp.clip(action, 0, num_actions - 1)
-    selected_is_legal = jnp.take_along_axis(
-        env_state.legal_action_mask,
-        safe_action[..., None],
-        axis=-1,
-    )[..., 0]
-    invalid_action = jnp.any(active & ~(in_bounds & selected_is_legal))
-
-    def step_one(state, row_action, row_active):
-        def step_state(state):
-            return env.step(state, row_action)
-
-        should_step = row_active & ~invalid_action
-        return jax.lax.cond(should_step, step_state, lambda state: state, state)
-
-    return jax.vmap(step_one)(env_state, action, active), active, invalid_action
-
-
-def poison_eval_returns(
-    returns: Float[Array, "batch"],
-    invalid_action: Bool[Array, ""],
-) -> Float[Array, "batch"]:
-    return jnp.where(invalid_action, jnp.full_like(returns, jnp.nan), returns)
 
 
 def eval_metrics_from_returns(returns: Float[Array, "batch"]) -> EvalMetrics:
@@ -133,7 +54,7 @@ def eval_metrics_from_returns(returns: Float[Array, "batch"]) -> EvalMetrics:
     )
 
 
-def _play_eval(
+def play_eval(
     env: Any,
     player_1: Player,
     player_2: Player,
@@ -148,69 +69,23 @@ def _play_eval(
     init_keys = parallel.split(init_key, batch_size)
     env_state = jax.vmap(env.init)(init_keys)
     env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="eval env_state",
-    )
     returns = jnp.zeros_like(env_state.terminated, dtype=jnp.float32)
 
     def body_fn(val):
         key, env_state, returns = val
         key, player_1_key, player_2_key = jax.random.split(key, 3)
-        search_state = searchable_eval_state(env_state)
-        search_state = assert_batch_axis_sharded(
-            search_state,
-            parallel,
-            batch_axis=0,
-            label="eval search_state",
-        )
-        player_1_output = player_1(search_state, player_1_key)
-        player_1_output = assert_batch_axis_sharded(
-            player_1_output,
-            parallel,
-            batch_axis=0,
-            label="eval player_1_output",
-        )
-        player_2_output = player_2(search_state, player_2_key)
-        player_2_output = assert_batch_axis_sharded(
-            player_2_output,
-            parallel,
-            batch_axis=0,
-            label="eval player_2_output",
-        )
-        action = jnp.where(
-            env_state.current_player == player_1_id,
-            player_1_output.action,
-            player_2_output.action,
-        )
-        env_state, active, invalid_action = step_active_eval_rows(
-            env,
-            env_state,
-            action,
-        )
-        env_state = assert_batch_axis_sharded(
-            env_state,
-            parallel,
-            batch_axis=0,
-            label="eval stepped_env_state",
-        )
+        player_1_output = player_1(env_state, player_1_key)
+        player_2_output = player_2(env_state, player_2_key)
+        action = jnp.where(env_state.current_player == player_1_id, player_1_output.action, player_2_output.action)
+        env_state = jax.vmap(env.step)(env_state, action)
         reward = env_state.rewards[jnp.arange(batch_size), player_1_id]
-        returns = returns + jnp.where(active, reward, 0.0)
-        returns = poison_eval_returns(returns, invalid_action)
+        returns = returns + reward
         return key, env_state, returns
 
     _, _, returns = nnx.while_loop(
-        lambda x: ~(x[1].terminated.all()) & ~(jnp.isnan(x[2]).any()),
+        lambda x: ~x[1].terminated.all(),
         body_fn,
         (key, env_state, returns),
-    )
-    returns = assert_batch_axis_sharded(
-        returns,
-        parallel,
-        batch_axis=0,
-        label="eval returns",
     )
     return eval_metrics_from_returns(returns)
 
@@ -222,43 +97,38 @@ def _selfplay_step_frame(
     key: jax.Array,
     *,
     batch_size: int,
-    parallel: BatchParallel,
 ) -> tuple[Any, TrainingSamples]:
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="selfplay step input env_state",
-    )
     player_key, reset_key = jax.random.split(key, 2)
+
+    # ``pgx.experimental.auto_reset`` returns a freshly initialized position
+    # after a game ends, but deliberately carries the previous transition's
+    # terminal flags and rewards for one frame.  Those fields belong to the
+    # transition we already recorded; passing them into search makes every raw
+    # ``env.step`` in a recurrent/expand function a terminal no-op.  Clear the
+    # transition marker before asking the player to analyse the fresh board.
+    env_state = env_state.replace(
+        terminated=jnp.zeros_like(env_state.terminated),
+        truncated=jnp.zeros_like(env_state.truncated),
+        rewards=jnp.zeros_like(env_state.rewards),
+    )
     observation = env_state.observation
     legal_action_mask = env_state.legal_action_mask
     player_output = player(env_state, player_key)
-    player_output = assert_batch_axis_sharded(
-        player_output,
-        parallel,
-        batch_axis=0,
-        label="selfplay step player_output",
-    )
     if player_output.posterior is None:
         raise ValueError("self-play player must return posterior targets")
 
     actor = env_state.current_player
-    reset_keys = parallel.split(reset_key, batch_size)
-    env_state = jax.vmap(auto_reset(env.step, env.init))(
-        env_state,
-        player_output.action,
-        reset_keys,
-    )
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="selfplay step reset env_state",
-    )
+    reset_keys = jax.random.split(reset_key, batch_size)
+    env_state = jax.vmap(auto_reset(env.step, env.init))(env_state, player_output.action, reset_keys)
     reward = env_state.rewards[jnp.arange(env_state.rewards.shape[0]), actor]
     discount = -jnp.ones_like(reward)
     discount = jnp.where(env_state.terminated, 0.0, discount)
+    is_psk = getattr(getattr(env_state, "_x", None), "is_psk", None)
+    psk_terminated = (
+        jnp.zeros_like(env_state.terminated)
+        if is_psk is None
+        else env_state.terminated & is_psk
+    )
     frame = TrainingSamples(
         obs=observation,
         reward=reward,
@@ -267,18 +137,12 @@ def _selfplay_step_frame(
         discount=discount,
         posterior=player_output.posterior,
         played_action=player_output.action,
-        search_diagnostics=player_output.diagnostics,
-    )
-    frame = assert_batch_axis_sharded(
-        frame,
-        parallel,
-        batch_axis=0,
-        label="selfplay step frame",
+        psk_terminated=psk_terminated,
     )
     return env_state, frame
 
 
-def _play_training(
+def play_training(
     env: Any,
     player: Player,
     rng_key: jax.Array,
@@ -289,15 +153,9 @@ def _play_training(
 ) -> TrainingSamples:
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     rollout_rng, init_key = jax.random.split(rng_key)
-    init_keys = parallel.split(init_key, batch_size)
+    init_keys = jax.random.split(init_key, batch_size)
     env_state = jax.vmap(env.init)(init_keys)
     env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="selfplay init env_state",
-    )
 
     def step_fn(env_state: Any, key: jax.Array) -> tuple[Any, TrainingSamples]:
         return _selfplay_step_frame(
@@ -306,27 +164,15 @@ def _play_training(
             env_state,
             key,
             batch_size=batch_size,
-            parallel=parallel,
         )
 
     step_keys = jax.random.split(rollout_rng, max_num_steps)
     env_state, data = jax.lax.scan(step_fn, env_state, step_keys)
-    env_state = assert_batch_axis_sharded(
-        env_state,
-        parallel,
-        batch_axis=0,
-        label="rollout output env_state",
-    )
-    data = jax.tree_util.tree_map(
+    data = jax.tree_util.tree_map( #exchanges the batch axis with the step axis
         lambda leaf: leaf.swapaxes(0, 1) if isinstance(leaf, jax.Array) else leaf,
         data,
     )
-    return assert_batch_axis_sharded(
-        data,
-        parallel,
-        batch_axis=0,
-        label="selfplay output data",
-    )
+    return data
 
 
 def play(
@@ -346,65 +192,10 @@ def play(
             raise ValueError("training play requires identical self-play players")
         if max_num_steps is None:
             raise ValueError("training play requires max_num_steps")
-        return _play_training(
-            env,
-            player_1,
-            rng_key,
-            batch_size=batch_size,
-            max_num_steps=max_num_steps,
-            parallel=parallel,
-        )
+        return play_training(env, player_1, rng_key, batch_size=batch_size, max_num_steps=max_num_steps, parallel=parallel)
     if mode == "eval":
-        return _play_eval(
-            env,
-            player_1,
-            player_2,
-            rng_key,
-            batch_size=batch_size,
-            player_1_id=player_1_id,
-            parallel=parallel,
-        )
+        return play_eval(env, player_1, player_2, rng_key, batch_size=batch_size, player_1_id=player_1_id, parallel=parallel)
     raise ValueError(f"unknown play mode: {mode!r}")
-
-
-def play_training(
-    env: Any,
-    player: Player,
-    rng_key: jax.Array,
-    *,
-    batch_size: int,
-    max_num_steps: int,
-    parallel: BatchParallel | None = None,
-) -> TrainingSamples:
-    return _play_training(
-        env,
-        player,
-        rng_key,
-        batch_size=batch_size,
-        max_num_steps=max_num_steps,
-        parallel=parallel,
-    )
-
-
-def play_eval(
-    env: Any,
-    player_1: Player,
-    player_2: Player,
-    rng_key: jax.Array,
-    *,
-    batch_size: int,
-    player_1_id: int = 0,
-    parallel: BatchParallel | None = None,
-) -> EvalMetrics:
-    return _play_eval(
-        env,
-        player_1,
-        player_2,
-        rng_key,
-        batch_size=batch_size,
-        player_1_id=player_1_id,
-        parallel=parallel,
-    )
 
 
 def make_selfplay(env, config, parallel: BatchParallel | None = None):
@@ -419,61 +210,37 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             q_loss_weight_mode=str(config.training.losses.q_loss_weight_mode),
         )
 
-    # TODO: this part is super ugly but it works. Let's think on how to remove it safely
-    if parallel.enabled:
-        if parallel.mesh is None:
-            raise RuntimeError("batch-parallel self-play requires a mesh.")
-        if int(config.selfplay.batch_size) % parallel.device_count != 0:
-            raise ValueError(
-                "selfplay.batch_size must be divisible by the batch-parallel "
-                f"device count ({parallel.device_count})."
-            )
-        local_batch_size = int(config.selfplay.batch_size) // parallel.device_count
-        if local_batch_size < 1:
-            raise ValueError(
-                "selfplay.batch_size must be at least the batch-parallel device count."
-            )
-
-        # MCTX uses dynamic gathers/scatters over its leading batch dimension.
-        # If it sees a globally sharded [batch, ...] array, XLA inserts
-        # cross-device collectives inside the search loop. shard_map gives each
-        # device a local [local_batch, ...] search problem and stitches the
-        # resulting samples back into a global batch-sharded pytree.
-        @_local_search_shard_map(
-            mesh=parallel.mesh,
-            in_specs=(PartitionSpec(), PartitionSpec(parallel.axis_name, None)),
-            out_specs=PartitionSpec(parallel.axis_name),
+    local_batch_size = parallel.local_batch_size(int(config.selfplay.batch_size))
+    if local_batch_size == 0:
+        raise ValueError(
+            "selfplay.batch_size must be at least the batch-parallel device count."
         )
-        def local_selfplay(
-            model: nnx.Module,
-            device_rng_keys: jax.Array,
-        ) -> TrainingSamples:
-            rng_key = device_rng_keys[0]
-            return play_training(
-                env,
-                training_player(model),
-                rng_key,
-                batch_size=local_batch_size,
-                max_num_steps=int(config.selfplay.max_num_steps),
-                parallel=DISABLED_BATCH_PARALLEL,
-            )
 
-        @nnx.jit
-        def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
-            device_rng_keys = jax.random.split(rng_key, parallel.device_count)
-            return local_selfplay(model, device_rng_keys)
-
-        return selfplay
-
-    @nnx.jit
-    def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
+    # Search always receives a device-local batch.  This avoids collectives in
+    # MCTX's dynamic gather/scatter loops, and keeps local and multi-device
+    # execution on precisely the same JAX path.
+    @local_shard_map(
+        mesh=parallel.execution_mesh(),
+        in_specs=(PartitionSpec(), PartitionSpec(parallel.axis_name, None)),
+        out_specs=PartitionSpec(parallel.axis_name),
+    )
+    def local_selfplay(
+        model: nnx.Module,
+        device_rng_keys: jax.Array,
+    ) -> TrainingSamples:
+        rng_key = device_rng_keys[0]
         return play_training(
             env,
             training_player(model),
             rng_key,
-            batch_size=int(config.selfplay.batch_size),
+            batch_size=local_batch_size,
             max_num_steps=int(config.selfplay.max_num_steps),
-            parallel=parallel,
+            parallel=DISABLED_BATCH_PARALLEL,
         )
+
+    @nnx.jit
+    def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
+        device_rng_keys = jax.random.split(rng_key, parallel.device_count)
+        return local_selfplay(model, device_rng_keys)
 
     return selfplay

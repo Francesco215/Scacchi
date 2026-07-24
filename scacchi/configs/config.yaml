@@ -21,14 +21,10 @@ selfplay:
     kind: dirichlet_thompson
 
     dirichlet_thompson:
-      num_simulations: 4
-      num_blocks: 4
+      num_simulations: 16
+      kappa: 4.0
       policy_samples: 1
       policy_sample_chunk_size: 1
-
-      constants:
-        kappa_leaf: 1.0
-        kappa_terminal: 8.0
 
 training:
   batch_size: 4096
@@ -47,6 +43,7 @@ training:
     loss_mask_mode: value
     terminal_edge_targets: true
     terminal_parent_targets: true
+    categorical_epsilon: 1e-4
 
   regularization:
     dirichlet_concentration_clip: 300.0

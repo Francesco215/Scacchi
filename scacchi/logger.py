@@ -4,14 +4,160 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, Protocol, Self, TypeGuard
 
+import jax
+import numpy as np
 from tqdm import tqdm
 
+from .loss import CONCENTRATION_HISTOGRAM_BIN_EDGES, CONCENTRATION_HISTOGRAM_NUM_BINS, CONCENTRATION_HISTOGRAM_SERIES
 from .types import config_to_dict
 
 Scalar = float | int
+
+
+class PrecomputedHistogram:
+    """Backend-neutral histogram represented by bucket counts and bin edges."""
+
+    __slots__ = ("counts", "bin_edges")
+
+    counts: np.ndarray
+    bin_edges: np.ndarray
+
+    def __init__(self, counts: Any, bin_edges: Any) -> None:
+        try:
+            counts_array = np.asarray(counts, dtype=np.float64)
+            edges_array = np.asarray(bin_edges, dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise ValueError("histogram counts and bin edges must be numeric") from error
+
+        if counts_array.ndim != 1:
+            raise ValueError("histogram counts must be one-dimensional")
+        if edges_array.ndim != 1:
+            raise ValueError("histogram bin edges must be one-dimensional")
+        if counts_array.size == 0:
+            raise ValueError("a histogram must contain at least one bucket")
+        if counts_array.size > 512:
+            raise ValueError("a histogram may contain at most 512 buckets")
+        if edges_array.size != counts_array.size + 1:
+            raise ValueError("histogram bin edges must have len(counts) + 1 entries")
+
+        if not np.all(np.isfinite(counts_array)):
+            raise ValueError("histogram counts must be finite")
+        if np.any(counts_array < 0):
+            raise ValueError("histogram counts must be nonnegative")
+        rounded_counts = np.rint(counts_array)
+        if not np.array_equal(counts_array, rounded_counts):
+            raise ValueError("histogram counts must be integer-like")
+        if np.any(rounded_counts > np.iinfo(np.int64).max):
+            raise ValueError("histogram counts exceed the supported integer range")
+
+        if not np.all(np.isfinite(edges_array)):
+            raise ValueError("histogram bin edges must be finite")
+        if not np.all(np.diff(edges_array) > 0):
+            raise ValueError("histogram bin edges must be strictly increasing")
+
+        self.counts = rounded_counts.astype(np.int64)
+        self.bin_edges = edges_array
+        self.counts.setflags(write=False)
+        self.bin_edges.setflags(write=False)
+
+
+def _weighted_mean(values: Any, counts: Any) -> float:
+    values = np.asarray(jax.device_get(values), dtype=np.float64)
+    counts = np.asarray(jax.device_get(counts), dtype=np.float64)
+    total = float(np.sum(counts))
+    return 0.0 if total <= 0.0 else float(np.sum(values * counts) / total)
+
+
+def _pooled_std(means: Any, stds: Any, counts: Any) -> float:
+    means = np.asarray(jax.device_get(means), dtype=np.float64)
+    stds = np.asarray(jax.device_get(stds), dtype=np.float64)
+    counts = np.asarray(jax.device_get(counts), dtype=np.float64)
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        return 0.0
+    mean = float(np.sum(means * counts) / total)
+    second_moment = float(np.sum((np.square(stds) + np.square(means)) * counts) / total)
+    return float(np.sqrt(max(second_moment - mean * mean, 0.0)))
+
+
+def _count(values: Any) -> float:
+    return float(np.sum(np.asarray(jax.device_get(values), dtype=np.float64)))
+
+
+def _concentration_metrics(train_metrics: Any) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for head, lower in (("V", "v"), ("Q", "q")):
+        dir_count = getattr(train_metrics, f"{lower}_dirichlet_target_count")
+        cat_count = getattr(train_metrics, f"{lower}_categorical_target_count")
+        native_count = getattr(train_metrics, f"{lower}_native_target_count")
+        native_total = _count(native_count)
+        result.update({
+            f"train/alpha_{head}_concentration": _weighted_mean(getattr(train_metrics, f"alpha_{head}_concentration"), native_count),
+            f"train/alpha_{head}_concentration_std": _pooled_std(getattr(train_metrics, f"alpha_{head}_concentration"), getattr(train_metrics, f"alpha_{head}_concentration_std"), native_count),
+            f"train/{head}_C_pred_mean_dir": _weighted_mean(getattr(train_metrics, f"alpha_{head}_dirichlet_concentration"), dir_count),
+            f"train/{head}_C_pred_std_dir": _pooled_std(getattr(train_metrics, f"alpha_{head}_dirichlet_concentration"), getattr(train_metrics, f"alpha_{head}_dirichlet_concentration_std"), dir_count),
+            f"train/{head}_C_target_mean_dir": _weighted_mean(getattr(train_metrics, f"beta_{head}_concentration"), dir_count),
+            f"train/{head}_C_target_std_dir": _pooled_std(getattr(train_metrics, f"beta_{head}_concentration"), getattr(train_metrics, f"beta_{head}_concentration_std"), dir_count),
+            f"train/{head}_C_log_mae_dir": _weighted_mean(getattr(train_metrics, f"{lower}_dirichlet_log_concentration_mae"), dir_count),
+            f"train/{head}_C_at_floor_fraction_dir": _weighted_mean(getattr(train_metrics, f"alpha_{head}_dirichlet_concentration_floor_fraction"), dir_count),
+            f"train/{head}_C_at_clip_fraction_dir": _weighted_mean(getattr(train_metrics, f"alpha_{head}_dirichlet_concentration_clip_fraction"), dir_count),
+            f"train/{head}_C_pred_mean_cat": _weighted_mean(getattr(train_metrics, f"alpha_{head}_categorical_concentration"), cat_count),
+            f"train/{head}_C_at_clip_fraction_cat": _weighted_mean(getattr(train_metrics, f"alpha_{head}_categorical_concentration_clip_fraction"), cat_count),
+            f"data/{lower}_categorical_target_fraction": 0.0 if native_total <= 0.0 else _count(cat_count) / native_total,
+            f"data/{lower}_dirichlet_target_count": _count(dir_count),
+            f"data/{lower}_categorical_target_count": _count(cat_count),
+        })
+    return result
+
+
+def concentration_histograms(train_metrics: Any) -> dict[str, PrecomputedHistogram]:
+    counts = np.asarray(jax.device_get(train_metrics.dirichlet_concentration_histogram_counts), dtype=np.float64)
+    expected_tail = (len(CONCENTRATION_HISTOGRAM_SERIES), CONCENTRATION_HISTOGRAM_NUM_BINS)
+    if counts.ndim < 2 or counts.shape[-2:] != expected_tail:
+        raise ValueError(f"concentration histogram counts must end in {expected_tail}; got {counts.shape}.")
+    leading_axes = tuple(range(counts.ndim - 2))
+    pooled = np.sum(counts, axis=leading_axes) if leading_axes else counts
+    edges = np.asarray(CONCENTRATION_HISTOGRAM_BIN_EDGES, dtype=np.float64)
+    histograms: dict[str, PrecomputedHistogram] = {}
+    for index, series in enumerate(CONCENTRATION_HISTOGRAM_SERIES):
+        head, role = series.split("_", maxsplit=1)
+        histograms[f"train/{head}_C_{role}_hist_dir"] = PrecomputedHistogram(pooled[index], edges)
+    return histograms
+
+
+def training_metrics(train_metrics: Any, *, seconds: float, hours: float, frames: int, frames_this_iteration: int) -> dict[str, Metric]:
+    """Turn one iteration's device metrics into the experiment log payload."""
+
+    metrics: dict[str, Metric] = {
+        "train/policy_loss": train_metrics.policy_loss.mean().item(),
+        "train/value_loss": train_metrics.value_loss.mean().item(),
+        "train/policy_nll_loss": train_metrics.policy_nll_loss.mean().item(),
+        "train/policy_kl_hat": train_metrics.policy_kl_hat.mean().item(),
+        "train/policy_target_entropy": train_metrics.policy_target_entropy.mean().item(),
+        "train/value_dir_kl_loss": train_metrics.value_dir_kl_loss.mean().item(),
+        "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
+        "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
+        "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
+        "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
+        "data/value_mask_fraction": train_metrics.data_value_mask_fraction.mean().item(),
+        "data/pass_fraction": train_metrics.data_pass_fraction.mean().item(),
+        "data/terminations_per_row": train_metrics.data_terminations_per_row.mean().item(),
+        "data/psk_termination_fraction": train_metrics.data_psk_termination_fraction.mean().item(),
+        "train/iter_seconds": seconds,
+        "train/frames_per_second": frames_this_iteration / max(seconds, 1e-12),
+        "train/hours": hours,
+        "train/frames": frames,
+    }
+    metrics.update(_concentration_metrics(train_metrics))
+    metrics.update(concentration_histograms(train_metrics))
+    return metrics
+
+
+Metric = Scalar | PrecomputedHistogram
 
 
 def _to_scalar(value: Any) -> Scalar:
@@ -78,7 +224,7 @@ class Logger:
         self._initialized = False
         return False
 
-    def log_metrics(self, step: int, metrics: dict[str, Scalar], prefix: str) -> None:
+    def log_metrics(self, step: int, metrics: Mapping[str, Metric], prefix: str) -> None:
         pass
 
     def log_returns(
@@ -119,9 +265,12 @@ class Logger:
 
         self.log_metrics(step, clean, prefix)
 
-    def _convert_metrics(self, metrics: dict[str, Any]) -> dict[str, Scalar]:
-        clean: dict[str, Scalar] = {}
+    def _convert_metrics(self, metrics: dict[str, Any]) -> dict[str, Metric]:
+        clean: dict[str, Metric] = {}
         for key, value in metrics.items():
+            if isinstance(value, PrecomputedHistogram):
+                clean[key] = value
+                continue
             if hasattr(value, "item"):
                 value = value.item()
             if isinstance(value, (float, int)):
@@ -136,15 +285,19 @@ class Logger:
     def _update_pbar(
         self,
         pbar: tqdm[Any],
-        metrics: dict[str, Scalar],
+        metrics: Mapping[str, Metric],
         float_fmt: str,
         pbar_filter: str | None,
     ) -> None:
-        filtered = metrics
+        filtered = {
+            key: value
+            for key, value in metrics.items()
+            if isinstance(value, (float, int))
+        }
         if pbar_filter is not None:
             pattern = re.compile(pbar_filter)
             filtered = {
-                key: value for key, value in metrics.items() if pattern.search(key)
+                key: value for key, value in filtered.items() if pattern.search(key)
             }
 
         postfix = {
@@ -199,13 +352,23 @@ class WandbLogger(Logger):
     def log_metrics(
         self,
         step: int,
-        metrics: dict[str, Scalar],
+        metrics: Mapping[str, Metric],
         prefix: str = "train/",
     ) -> None:
         import wandb
 
+        payload = {
+            f"{prefix}{key}": (
+                wandb.Histogram(
+                    np_histogram=(value.counts, value.bin_edges),
+                )
+                if isinstance(value, PrecomputedHistogram)
+                else value
+            )
+            for key, value in metrics.items()
+        }
         wandb.log(
-            {f"{prefix}{key}": value for key, value in metrics.items()},
+            payload,
             step=step,
         )
 

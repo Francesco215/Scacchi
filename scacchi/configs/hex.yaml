@@ -25,12 +25,8 @@ selfplay:
     kind: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
 
     dirichlet_thompson:
-      num_simulations: 32  # Search simulations per root.
-      num_blocks: 8  # Dirichlet Thompson search blocks.
-
-      constants:
-        kappa_leaf: 1.0  # Nonterminal evidence mass used by Dirichlet-Q search.
-        kappa_terminal: 8.0  # Terminal evidence mass used by Dirichlet-Q search.
+      num_simulations: 256  # Persistent-tree simulations per root.
+      kappa: 4.0  # Prior strength in gamma = n / (kappa + n).
 
 training:
   batch_size: 1024  # Learner minibatch size; multiple updates per fresh self-play batch.
@@ -54,7 +50,6 @@ eval:
     kind: gumbel
     gumbel:
       num_simulations: 32
-      policy_sample_chunk_size: 1  # Unused for scalar baselines; keeps this explicit override from aliasing to self-play search.
 
 logging:
   interval: 1  # Log training metrics every N iterations.
