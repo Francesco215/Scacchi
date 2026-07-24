@@ -140,6 +140,62 @@ def test_draw_certificate_samples_uniformly_only_from_draw_edges():
     assert tree.node_payload[0, 0] == tree.edge_payload[0, 0, action[0]]
 
 
+def test_categorical_action_population_is_uniform_over_distance_optimal_ties():
+    invalid = jnp.asarray([[False, False, False, False]])
+
+    win_policy = action_selection.categorical_action_population(
+        jnp.asarray([2], dtype=jnp.int8),
+        jnp.asarray([[2, 2, 2, 0]], dtype=jnp.int8),
+        jnp.asarray([[2, 5, 2, 100]], dtype=jnp.int32),
+        invalid,
+        num_outcomes=3,
+    )
+    loss_policy = action_selection.categorical_action_population(
+        jnp.asarray([0], dtype=jnp.int8),
+        jnp.asarray([[0, 0, 0, 2]], dtype=jnp.int8),
+        jnp.asarray([[8, 2, 8, 100]], dtype=jnp.int32),
+        invalid,
+        num_outcomes=3,
+    )
+    draw_policy = action_selection.categorical_action_population(
+        jnp.asarray([1], dtype=jnp.int8),
+        jnp.asarray([[1, 0, 1, 2]], dtype=jnp.int8),
+        jnp.asarray([[2, 50, 7, 100]], dtype=jnp.int32),
+        invalid,
+        num_outcomes=3,
+    )
+
+    expected = jnp.asarray([[0.5, 0.0, 0.5, 0.0]])
+    assert jnp.array_equal(win_policy, expected)
+    assert jnp.array_equal(loss_policy, expected)
+    assert jnp.array_equal(draw_policy, expected)
+
+
+def test_categorical_action_population_is_permutation_equivariant():
+    node_outcome = jnp.asarray([2], dtype=jnp.int8)
+    edge_outcome = jnp.asarray([[2, 0, 2, 2]], dtype=jnp.int8)
+    edge_distance = jnp.asarray([[3, 100, 3, 8]], dtype=jnp.int32)
+    invalid = jnp.asarray([[False, False, False, False]])
+    permutation = jnp.asarray([2, 0, 3, 1])
+
+    original = action_selection.categorical_action_population(
+        node_outcome,
+        edge_outcome,
+        edge_distance,
+        invalid,
+        num_outcomes=3,
+    )
+    permuted = action_selection.categorical_action_population(
+        node_outcome,
+        edge_outcome[:, permutation],
+        edge_distance[:, permutation],
+        invalid[:, permutation],
+        num_outcomes=3,
+    )
+
+    assert jnp.array_equal(permuted, original[:, permutation])
+
+
 def test_draw_requires_every_legal_edge_to_be_draw_or_loss():
     tree, _ = _categorize_root(
         (1, 0, int(NO_OUTCOME)),

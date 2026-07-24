@@ -3,6 +3,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from omegaconf import OmegaConf
+import pytest
 
 from scacchi.dirichlet_mctx.action_selection import (
     masked_argmax,
@@ -581,6 +582,8 @@ def test_terminal_child_has_no_descendants_and_short_circuits_search():
     assert jnp.array_equal(tree.node_value_priors[0, child], jnp.array([4.0, 2.0]))
     assert tree.node_categorical_outcome[0, 0] == 1
     assert tree.node_payload[0, 0] == 1
+    assert tree.kappa_diagnostics.categorical_publication_path_count[0] == 1
+    assert tree.kappa_diagnostics.numeric_path_count[0] == 0
 
 
 def test_default_max_depth_uses_complete_simulation_budget():
@@ -760,6 +763,22 @@ def test_simulations_share_one_persistent_tree_and_posterior():
         jnp.array([[16.0 / 7.0, 1.0]]),
     )
     assert int(tree.children_index[0, 0, 0]) == 1
+
+    # Each one-edge numeric path has n_down 1, 2, then 3, hence these exact
+    # blend-only gamma factors n_down / (kappa + n_down) for kappa=4.
+    gamma = jnp.array([1.0 / 5.0, 2.0 / 6.0, 3.0 / 7.0])
+    diagnostics = tree.kappa_diagnostics
+    assert diagnostics.numeric_repair_count[0] == 3
+    assert diagnostics.numeric_path_count[0] == 3
+    assert jnp.allclose(
+        diagnostics.path_gamma_product_sum[0],
+        jnp.sum(gamma),
+    )
+    assert jnp.allclose(
+        diagnostics.path_gamma_log_attenuation_sum[0],
+        jnp.sum(-jnp.log(gamma)),
+    )
+    assert diagnostics.categorical_publication_path_count[0] == 0
 
 
 def test_custom_posterior_update_sees_children_and_runs_bottom_up():
@@ -987,6 +1006,109 @@ def test_posterior_action_helpers_respect_legal_mask():
 
     assert jnp.array_equal(best, jnp.array([0, 1], dtype=jnp.int32))
     assert bool(jnp.all(legal_action_mask[jnp.arange(2), sampled]))
+
+
+def test_posterior_sample_temperature_one_preserves_seeded_legacy_path():
+    batch_size = 1_024
+    policy_target = jnp.broadcast_to(
+        jnp.asarray([0.0, 0.2, 0.7, 0.1], dtype=jnp.float32),
+        (batch_size, 4),
+    )
+    legal_action_mask = jnp.broadcast_to(
+        jnp.asarray([True, True, True, False]),
+        policy_target.shape,
+    )
+    key = jax.random.PRNGKey(41)
+    legacy_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
+    legacy_logits = jnp.where(
+        legal_action_mask,
+        legacy_logits,
+        jnp.finfo(legacy_logits.dtype).min,
+    )
+    legacy = jax.random.categorical(key, legacy_logits).astype(jnp.int32)
+
+    default = posterior_sample_action(
+        key,
+        policy_target,
+        legal_action_mask,
+    )
+    explicit = posterior_sample_action(
+        key,
+        policy_target,
+        legal_action_mask,
+        temperature=1.0,
+    )
+
+    assert jnp.array_equal(default, legacy)
+    assert jnp.array_equal(explicit, legacy)
+
+
+def test_posterior_sample_temperature_matches_power_law_empirically():
+    batch_size = 65_536
+    policy_target = jnp.broadcast_to(
+        jnp.asarray([0.2, 0.8], dtype=jnp.float32),
+        (batch_size, 2),
+    )
+    legal_action_mask = jnp.ones_like(policy_target, dtype=jnp.bool_)
+
+    sampled = posterior_sample_action(
+        jax.random.PRNGKey(42),
+        policy_target,
+        legal_action_mask,
+        temperature=0.5,
+    )
+
+    # 0.8**2 / (0.2**2 + 0.8**2) = 16/17.
+    assert jnp.mean(sampled == 1) == pytest.approx(16.0 / 17.0, abs=0.005)
+
+
+def test_posterior_sample_temperature_preserves_ranking_and_floored_support():
+    batch_size = 131_072
+    policy_target = jnp.broadcast_to(
+        jnp.asarray([0.5, 0.25, 0.0, 0.9], dtype=jnp.float32),
+        (batch_size, 4),
+    )
+    legal_action_mask = jnp.broadcast_to(
+        jnp.asarray([True, True, True, False]),
+        policy_target.shape,
+    )
+    temperature = 8.0
+
+    sampled = posterior_sample_action(
+        jax.random.PRNGKey(43),
+        policy_target,
+        legal_action_mask,
+        temperature=temperature,
+    )
+    frequencies = jnp.mean(
+        jax.nn.one_hot(sampled, 4, dtype=jnp.float32),
+        axis=0,
+    )
+    weights = jnp.power(
+        jnp.asarray([0.5, 0.25, 1e-8], dtype=jnp.float32),
+        1.0 / temperature,
+    )
+    expected = weights / jnp.sum(weights)
+
+    assert frequencies[0] > frequencies[1] > frequencies[2] > 0
+    assert frequencies[3] == 0
+    assert jnp.allclose(frequencies[:3], expected, atol=0.005)
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [0.0, -1.0, float("nan"), float("inf"), -float("inf")],
+)
+def test_posterior_sample_action_rejects_invalid_temperature(
+    temperature: float,
+):
+    with pytest.raises(ValueError, match="temperature must be finite and > 0"):
+        posterior_sample_action(
+            jax.random.PRNGKey(44),
+            jnp.asarray([[0.5, 0.5]], dtype=jnp.float32),
+            jnp.asarray([[True, True]]),
+            temperature=temperature,
+        )
 
 
 def test_q_loss_weights_support_policy_and_evidence_mass_modes():

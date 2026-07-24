@@ -6,7 +6,11 @@ import jax.numpy as jnp
 from omegaconf import OmegaConf
 import pgx
 
-from scacchi.evaluations import baseline_search_config, make_mcts_evaluate
+from scacchi.evaluations import (
+    baseline_search_config,
+    make_mcts_evaluate,
+    seat_conditioned_evaluation_metrics,
+)
 from scacchi.network import BoardlawNet
 from scacchi.play import (
     EvalMetrics,
@@ -57,6 +61,13 @@ class ToyEnv:
         )
 
 
+class PlayerOneStartsToyEnv(ToyEnv):
+    def init(self, key: jax.Array) -> ToyState:
+        return super().init(key)._replace(
+            current_player=jnp.array(1, dtype=jnp.int32)
+        )
+
+
 def winning_player(env_state: ToyState, key: jax.Array) -> PlayerOutput:
     del key
     return PlayerOutput(
@@ -85,6 +96,89 @@ def test_play_eval_runs_two_player_loop_until_all_rows_done():
     assert jnp.array_equal(metrics.returns, jnp.ones((3,), dtype=jnp.float32))
     assert jnp.allclose(metrics.avg_return, 1.0)
     assert jnp.allclose(metrics.win_rate, 1.0)
+
+
+def test_play_eval_accepts_per_row_player_ids():
+    metrics = play_eval(
+        ToyEnv(),
+        winning_player,
+        losing_player,
+        jax.random.PRNGKey(0),
+        batch_size=3,
+        player_1_id=jnp.array([0, 1, 0], dtype=jnp.int32),
+    )
+
+    assert jnp.array_equal(
+        metrics.returns,
+        jnp.array([1.0, 10.0, 1.0], dtype=jnp.float32),
+    )
+
+
+def test_play_eval_can_alternate_seats_independently_of_player_ids():
+    metrics = play_eval(
+        ToyEnv(),
+        winning_player,
+        losing_player,
+        jax.random.PRNGKey(0),
+        batch_size=4,
+        player_1_id=None,
+    )
+
+    assert jnp.array_equal(
+        metrics.returns,
+        jnp.array([1.0, 10.0, 1.0, 10.0], dtype=jnp.float32),
+    )
+    swapped_ids = play_eval(
+        PlayerOneStartsToyEnv(),
+        winning_player,
+        losing_player,
+        jax.random.PRNGKey(0),
+        batch_size=4,
+        player_1_id=None,
+    )
+    assert jnp.array_equal(
+        swapped_ids.returns,
+        jnp.array([-1.0, -10.0, -1.0, -10.0], dtype=jnp.float32),
+    )
+
+
+def test_seat_conditioned_evaluation_metrics_use_unweighted_seat_mean():
+    metrics = seat_conditioned_evaluation_metrics(
+        jnp.array([1.0, -1.0, -1.0, 1.0, 1.0]),
+        env_id="hex",
+    )
+
+    assert metrics["eval/vs_baseline/first_seat_games"] == 3
+    assert metrics["eval/vs_baseline/second_seat_games"] == 2
+    assert metrics["eval/vs_baseline/first_seat_wins"] == 2
+    assert metrics["eval/vs_baseline/second_seat_wins"] == 1
+    assert metrics["eval/vs_baseline/both_seats_observed"] == 1
+    assert jnp.isclose(
+        metrics["eval/vs_baseline/first_seat_win_rate"],
+        2.0 / 3.0,
+    )
+    assert jnp.isclose(
+        metrics["eval/vs_baseline/second_seat_win_rate"],
+        0.5,
+    )
+    assert jnp.isclose(
+        metrics["eval/vs_baseline/seat_balanced_win_rate"],
+        7.0 / 12.0,
+    )
+    assert jnp.isclose(
+        metrics["eval/vs_baseline/seat_optimal_error"],
+        5.0 / 12.0,
+    )
+    assert (
+        metrics["eval/vs_baseline/seat_balanced_win_rate_stratified95_low"]
+        <= metrics["eval/vs_baseline/seat_balanced_win_rate"]
+        <= metrics["eval/vs_baseline/seat_balanced_win_rate_stratified95_high"]
+    )
+    assert (
+        metrics["eval/vs_baseline/seat_optimal_error_stratified95_low"]
+        <= metrics["eval/vs_baseline/seat_optimal_error"]
+        <= metrics["eval/vs_baseline/seat_optimal_error_stratified95_high"]
+    )
 
 
 def test_play_dispatches_eval_mode():

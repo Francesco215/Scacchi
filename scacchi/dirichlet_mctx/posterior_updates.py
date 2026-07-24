@@ -16,7 +16,11 @@ from .estimator_diagnostics import (
     binary_posterior_best_policy_prefix_quadrature,
 )
 from .outcomes import NO_OUTCOME, align_outcome
-from .tree import PosteriorUpdate, PosteriorUpdateContext
+from .tree import (
+    PosteriorUpdate,
+    PosteriorUpdateContext,
+    PosteriorUpdateDiagnostics,
+)
 
 
 DEFAULT_KAPPA = 4.0
@@ -236,6 +240,112 @@ def update_posterior_with_estimator(
         snapshot.n_down,
         kappa=kappa,
     )
+    # Instrument the exact operands consumed by the cache mix.  These values
+    # are returned only as diagnostics; no search decision reads them.
+    weighted_alpha = jnp.sum(
+        search_policy[..., None] * snapshot.cache_alpha,
+        axis=-2,
+    )
+    innovation = weighted_alpha - snapshot.value_prior
+    value_concentration = jnp.sum(
+        snapshot.value_prior,
+        axis=-1,
+        keepdims=True,
+    )
+    weighted_concentration = jnp.sum(
+        weighted_alpha,
+        axis=-1,
+        keepdims=True,
+    )
+    positive_concentration = (
+        (value_concentration[..., 0] > 0)
+        & (weighted_concentration[..., 0] > 0)
+    )
+    semantic_innovation = (
+        weighted_alpha
+        / jnp.where(
+            weighted_concentration > 0,
+            weighted_concentration,
+            jnp.ones_like(weighted_concentration),
+        )
+        - snapshot.value_prior
+        / jnp.where(
+            value_concentration > 0,
+            value_concentration,
+            jnp.ones_like(value_concentration),
+        )
+    )
+    dcache_dlogkappa = (
+        -snapshot.gamma * (1.0 - snapshot.gamma)
+    )[..., None] * innovation
+    repaired_concentration = jnp.sum(
+        repaired_value,
+        axis=-1,
+        keepdims=True,
+    )
+    repaired_mean = repaired_value / jnp.where(
+        repaired_concentration > 0,
+        repaired_concentration,
+        jnp.ones_like(repaired_concentration),
+    )
+    mean_dcache_dlogkappa = (
+        dcache_dlogkappa
+        - repaired_mean
+        * jnp.sum(
+            dcache_dlogkappa,
+            axis=-1,
+            keepdims=True,
+        )
+    ) / jnp.where(
+        repaired_concentration > 0,
+        repaired_concentration,
+        jnp.ones_like(repaired_concentration),
+    )
+    finite = (
+        jnp.all(jnp.isfinite(weighted_alpha), axis=-1)
+        & jnp.all(jnp.isfinite(snapshot.value_prior), axis=-1)
+        & jnp.all(jnp.isfinite(innovation), axis=-1)
+        & jnp.all(jnp.isfinite(semantic_innovation), axis=-1)
+        & jnp.isfinite(weighted_concentration[..., 0])
+        & jnp.isfinite(value_concentration[..., 0])
+        & jnp.all(jnp.isfinite(mean_dcache_dlogkappa), axis=-1)
+        & (repaired_concentration[..., 0] > 0)
+        & jnp.isfinite(snapshot.gamma)
+    )
+    numeric = (
+        snapshot.active
+        & (snapshot.n_down > 0)
+        & positive_concentration
+        & finite
+    )
+    raw_innovation_l2 = jnp.linalg.vector_norm(innovation, axis=-1)
+    semantic_innovation_l2 = jnp.linalg.vector_norm(
+        semantic_innovation,
+        axis=-1,
+    )
+    concentration_innovation_abs = jnp.abs(
+        weighted_concentration[..., 0] - value_concentration[..., 0]
+    )
+    raw_dcache_dlogkappa_l2 = jnp.linalg.vector_norm(
+        dcache_dlogkappa,
+        axis=-1,
+    )
+    mean_dcache_dlogkappa_l2 = jnp.linalg.vector_norm(
+        mean_dcache_dlogkappa,
+        axis=-1,
+    )
+    log_concentration_dcache_dlogkappa_abs = jnp.abs(
+        jnp.sum(dcache_dlogkappa, axis=-1)
+        / jnp.where(
+            repaired_concentration[..., 0] > 0,
+            repaired_concentration[..., 0],
+            jnp.ones_like(repaired_concentration[..., 0]),
+        )
+    )
+
+    def numeric_value(value: jax.Array) -> jax.Array:
+        return jnp.where(numeric, value, jnp.zeros_like(value))
+
     has_message = snapshot.n_down > 0
     value_alpha = jnp.where(
         (snapshot.active & has_message)[..., None],
@@ -246,6 +356,26 @@ def update_posterior_with_estimator(
         edge_alpha=edge_alpha,
         edge_payload=edge_payload,
         value_alpha=value_alpha,
+        diagnostics=PosteriorUpdateDiagnostics(
+            numeric=numeric,
+            gamma=numeric_value(snapshot.gamma),
+            raw_innovation_l2=numeric_value(raw_innovation_l2),
+            semantic_innovation_l2=numeric_value(
+                semantic_innovation_l2
+            ),
+            concentration_innovation_abs=numeric_value(
+                concentration_innovation_abs
+            ),
+            raw_dcache_dlogkappa_l2=numeric_value(
+                raw_dcache_dlogkappa_l2
+            ),
+            mean_dcache_dlogkappa_l2=numeric_value(
+                mean_dcache_dlogkappa_l2
+            ),
+            log_concentration_dcache_dlogkappa_abs=numeric_value(
+                log_concentration_dcache_dlogkappa_abs
+            ),
+        ),
     )
 
 

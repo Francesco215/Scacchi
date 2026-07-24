@@ -27,7 +27,12 @@ from tqdm import tqdm
 from .checkpoint import build_checkpoint_manager, maybe_save, restore
 from .distributed import initialize_distributed, make_batch_parallel
 from .envs import make_env
-from .evaluations import evaluation_metrics, load_eval_baseline, make_mcts_evaluate
+from .evaluations import (
+    evaluation_metrics,
+    load_eval_baseline,
+    make_mcts_evaluate,
+    seat_conditioned_evaluation_metrics,
+)
 from .logger import Metric, build_logger, returns_metrics, training_metrics
 from .network import build_model
 from .pipeline import make_training_iteration, optimizer_updates_per_iteration
@@ -176,6 +181,12 @@ def _evaluate(
         returns = evaluate(rng_key, model)
     metrics: dict[str, Metric] = {}
     metrics.update(returns_metrics("eval/vs_baseline", returns))
+    metrics.update(
+        seat_conditioned_evaluation_metrics(
+            returns,
+            env_id=str(config.env.id),
+        )
+    )
     metrics.update(evaluation_metrics(returns, history))
     metrics.update(
         {

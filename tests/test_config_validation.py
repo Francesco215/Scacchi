@@ -1,3 +1,4 @@
+from copy import deepcopy
 import math
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from omegaconf.errors import ConfigKeyError, ValidationError
 
 from scacchi.envs import make_env
 from scacchi.evaluations import load_eval_baseline
-from scacchi.types import Config, load_config
+from scacchi.types import Config, config_to_dict, load_config
 
 
 def _config(values: dict) -> Config:
@@ -39,6 +40,14 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.selfplay.search.dirichlet_thompson.policy_samples == 1
     assert config.selfplay.search.dirichlet_thompson.policy_sample_chunk_size == 1
     assert config.selfplay.search.dirichlet_thompson.kappa == 4.0
+    assert (
+        config.selfplay.search.dirichlet_thompson.root_policy_target_estimator
+        == "winner_mc"
+    )
+    assert (
+        config.selfplay.search.dirichlet_thompson.root_action_estimator
+        == "winner_mc"
+    )
     assert config.eval.player_search.kind == "dirichlet_thompson"
     assert config.eval.baseline_search.kind == "dirichlet_thompson"
     assert config.search.kind == "dirichlet_thompson"
@@ -249,6 +258,76 @@ def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
     assert config.eval.baseline == "checkpoint"
     assert config.eval.baseline_search.kind == "gumbel"
     assert config.eval.baseline_search.gumbel.num_simulations == eval_simulations
+
+
+def test_hex6_q21_posterior_sample_experiment_config_is_isolated_and_exact():
+    cfg_path = (
+        Path(__file__).parents[1]
+        / "scacchi"
+        / "configs"
+        / "hex6_q21_posterior_sample.yaml"
+    )
+    config = load_config(OmegaConf.load(cfg_path))
+
+    assert config.run.seed == 0
+    assert config.run.max_num_iters == 126
+    assert config.selfplay.action_commitment_type == "posterior_sample"
+
+    selfplay_search = config.selfplay.search.dirichlet_thompson
+    assert selfplay_search.posterior_policy_estimator == "prefix_cdf"
+    assert selfplay_search.root_policy_target_estimator == "prefix_cdf"
+    assert selfplay_search.root_action_estimator == "prefix_cdf"
+    assert selfplay_search.prefix_cdf_half_width == 10
+
+    assert config.eval.player_action_commitment_type == "posterior_argmax"
+    eval_search = config.eval.player_search.dirichlet_thompson
+    assert eval_search.root_action_estimator == "prefix_cdf"
+    assert eval_search.prefix_cdf_half_width == 10
+
+    assert config.logging.jsonl_path == (
+        "experiments/e10/hex6_q21_posterior_sample_s0/metrics.jsonl"
+    )
+    assert config.logging.wandb.enabled is False
+    assert config.checkpointing.save_interval_steps == 25
+    assert config.checkpointing.directory == (
+        "checkpoints/hex6_q21_posterior_sample_s0"
+    )
+
+
+def test_hex6_q21_plurality32_experiment_changes_only_registered_fields():
+    root = Path(__file__).parents[1] / "scacchi" / "configs"
+    e10 = load_config(
+        OmegaConf.load(root / "hex6_q21_posterior_sample.yaml")
+    )
+    e11 = load_config(
+        OmegaConf.load(root / "hex6_q21_posterior_plurality32.yaml")
+    )
+
+    assert e11.run.seed == 0
+    assert e11.run.max_num_iters == 201
+    assert e11.selfplay.action_commitment_type == "posterior_plurality"
+    assert e11.selfplay.search.posterior_plurality_samples == 32
+    assert e11.logging.wandb.enabled is False
+    assert e11.logging.jsonl_path == (
+        "experiments/e11/hex6_q21_posterior_plurality32_s0/metrics.jsonl"
+    )
+    assert e11.checkpointing.directory == (
+        "checkpoints/hex6_q21_posterior_plurality32_s0"
+    )
+
+    expected = config_to_dict(e10)
+    actual = deepcopy(config_to_dict(e11))
+    # These are the preregistered causal field, the longer fixed horizon, and
+    # the two output namespaces needed to keep artifacts disjoint.
+    actual["selfplay"]["action_commitment_type"] = expected["selfplay"][
+        "action_commitment_type"
+    ]
+    actual["run"]["max_num_iters"] = expected["run"]["max_num_iters"]
+    actual["logging"]["jsonl_path"] = expected["logging"]["jsonl_path"]
+    actual["checkpointing"]["directory"] = expected["checkpointing"][
+        "directory"
+    ]
+    assert actual == expected
 
 
 def test_hex7_uses_full_learned_concentration_head():
@@ -601,6 +680,101 @@ def test_dirichlet_thompson_accepts_binary_prefix_cdf_repair_estimator():
     assert search.prefix_cdf_half_width == 20
 
 
+def test_dirichlet_thompson_accepts_binary_prefix_cdf_root_policy_target():
+    config = _config(
+        {
+            "env": {"id": "hex", "board_size": 6, "num_outcomes": 2},
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "root_policy_target_estimator": "prefix_cdf",
+                        "prefix_cdf_half_width": 10,
+                    },
+                },
+            },
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.root_policy_target_estimator == "prefix_cdf"
+    assert search.root_action_estimator == "winner_mc"
+    assert search.prefix_cdf_half_width == 10
+
+
+def test_prefix_cdf_root_policy_target_rejects_three_outcome_chess():
+    with pytest.raises(
+        ValueError,
+        match="prefix_cdf.*requires env.num_outcomes=2",
+    ):
+        _config(
+            {
+                "env": {
+                    "id": "gardner_chess",
+                    "board_size": 5,
+                    "num_outcomes": 3,
+                },
+                "model": {"network": "boardlaw_dirichlet"},
+                "selfplay": {
+                    "search": {
+                        "kind": "dirichlet_thompson",
+                        "dirichlet_thompson": {
+                            "root_policy_target_estimator": "prefix_cdf",
+                        },
+                    },
+                },
+            }
+        )
+
+
+def test_dirichlet_thompson_accepts_binary_prefix_cdf_root_action_estimator():
+    config = _config(
+        {
+            "env": {"id": "hex", "board_size": 6, "num_outcomes": 2},
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "root_action_estimator": "prefix_cdf",
+                        "prefix_cdf_half_width": 10,
+                    },
+                },
+            },
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.root_action_estimator == "prefix_cdf"
+    assert search.root_policy_target_estimator == "winner_mc"
+
+
+def test_prefix_cdf_root_action_estimator_rejects_three_outcome_chess():
+    with pytest.raises(
+        ValueError,
+        match="prefix_cdf.*requires env.num_outcomes=2",
+    ):
+        _config(
+            {
+                "env": {
+                    "id": "gardner_chess",
+                    "board_size": 5,
+                    "num_outcomes": 3,
+                },
+                "model": {"network": "boardlaw_dirichlet"},
+                "selfplay": {
+                    "search": {
+                        "kind": "dirichlet_thompson",
+                        "dirichlet_thompson": {
+                            "root_action_estimator": "prefix_cdf",
+                        },
+                    },
+                },
+            }
+        )
+
+
 def test_prefix_cdf_repair_rejects_three_outcome_chess():
     with pytest.raises(
         ValueError,
@@ -702,6 +876,139 @@ def test_posterior_sample_action_commitment_type_is_valid():
     )
 
     assert config.selfplay.action_commitment_type == "posterior_sample"
+
+
+def test_posterior_sample_temperature_round_trips():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "action_commitment_type": "posterior_sample",
+                "search": {"posterior_sample_temperature": 0.25},
+            },
+        }
+    )
+
+    assert config.selfplay.search.posterior_sample_temperature == 0.25
+    serialized = config_to_dict(config)
+    assert (
+        serialized["selfplay"]["search"]["posterior_sample_temperature"]
+        == 0.25
+    )
+    restored = _config(serialized)
+    assert config_to_dict(restored) == serialized
+
+
+def test_posterior_sample_temperature_defaults_to_one():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {"action_commitment_type": "posterior_sample"},
+        }
+    )
+
+    assert config.selfplay.search.posterior_sample_temperature == 1.0
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [0.0, -1.0, float("nan"), float("inf"), -float("inf")],
+)
+def test_posterior_sample_temperature_must_be_finite_and_positive(
+    temperature: float,
+):
+    with pytest.raises(
+        ValueError,
+        match="search.posterior_sample_temperature",
+    ):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "selfplay": {
+                    "action_commitment_type": "posterior_sample",
+                    "search": {
+                        "posterior_sample_temperature": temperature,
+                    },
+                },
+            }
+        )
+
+
+def test_posterior_plurality_config_round_trips_with_sample_budget():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "action_commitment_type": "posterior_plurality",
+                "search": {"posterior_plurality_samples": 17},
+            },
+        }
+    )
+
+    assert config.selfplay.action_commitment_type == "posterior_plurality"
+    assert config.selfplay.search.posterior_plurality_samples == 17
+
+    serialized = config_to_dict(config)
+    assert (
+        serialized["selfplay"]["action_commitment_type"]
+        == "posterior_plurality"
+    )
+    assert serialized["selfplay"]["search"]["posterior_plurality_samples"] == 17
+    restored = _config(serialized)
+    assert config_to_dict(restored) == serialized
+
+
+def test_uniform_tie_plurality_action_commitment_type_is_valid():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "action_commitment_type": (
+                    "posterior_plurality_uniform_ties"
+                ),
+                "search": {"posterior_plurality_samples": 17},
+            },
+        }
+    )
+
+    assert (
+        config.selfplay.action_commitment_type
+        == "posterior_plurality_uniform_ties"
+    )
+    assert config.selfplay.search.posterior_plurality_samples == 17
+    serialized = config_to_dict(config)
+    assert (
+        serialized["selfplay"]["action_commitment_type"]
+        == "posterior_plurality_uniform_ties"
+    )
+    assert config_to_dict(_config(serialized)) == serialized
+
+
+def test_posterior_plurality_sample_budget_defaults_to_32():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {"action_commitment_type": "posterior_plurality"},
+        }
+    )
+
+    assert config.selfplay.search.posterior_plurality_samples == 32
+
+
+def test_posterior_plurality_sample_budget_must_be_positive():
+    with pytest.raises(
+        ValueError,
+        match="search.posterior_plurality_samples",
+    ):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "selfplay": {
+                    "action_commitment_type": "posterior_plurality",
+                    "search": {"posterior_plurality_samples": 0},
+                },
+            }
+        )
 
 
 def test_legacy_action_source_is_rejected():

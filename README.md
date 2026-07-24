@@ -38,6 +38,18 @@ The Thompson tree-search backend lives in `scacchi/dirichlet_mctx/`;
 `scacchi/dirichlet_q_search.py` contains the shared leaf expansion,
 terminal-outcome extraction, and posterior-target helpers.
 
+## Self-play trajectory diagnostics
+
+Each training iteration logs compact generation diagnostics through the same
+local JSONL and optional W&B path as the losses. The `data/` series include
+first/second-player win rates and first-player score, completed-game length
+mean/std/p10/p50/p90, opening-action entropy/effective support/max share, and
+action-marginal entropy for plies 0--5. These are reductions of one
+game-length histogram and one six-by-action count table; observations and full
+trajectories are never copied to the logger. In auto-reset rollouts, game
+lengths use terminal boundaries and seat outcomes use the pre-transition
+actor, so multiple games in one row remain distinct.
+
 ## Codebase Structure
 
 - `scacchi/`: main Python package.
@@ -56,6 +68,17 @@ terminal-outcome extraction, and posterior-target helpers.
 - `scripts/`: benchmarks, sweeps, and plotting utilities.
 - `tests/`: unit tests for config validation, losses, network behavior, and
   search utilities.
+
+## Root commitment configuration
+
+`posterior_sample_temperature` belongs to each search configuration, for
+example `selfplay.search.posterior_sample_temperature` or
+`eval.player_search.posterior_sample_temperature`. It defaults to `1.0` and is
+used only when the corresponding action commitment mode is
+`posterior_sample`. It transforms the ephemeral completed-root action law; it
+does not change search, replay targets, or training losses. See
+[`math.md`](math.md#95-power-temperature-posterior-sampling) for the exact
+definition and its distinction from finite-vote plurality.
 
 ## Common Commands
 

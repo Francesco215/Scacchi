@@ -30,6 +30,7 @@ class TrainingSamples(NamedTuple):
     played_action: Int[Array, "batch time"]
     legal_action_mask: Bool[Array, "batch time action"]
     psk_terminated: Bool[Array, "batch time"] | None = None
+    actor: Int[Array, "batch time"] | None = None
 
 
 class EvalMetrics(NamedTuple):
@@ -61,7 +62,7 @@ def play_eval(
     rng_key: jax.Array,
     *,
     batch_size: int,
-    player_1_id: int = 0,
+    player_1_id: int | Int[Array, "batch"] | None = 0,
     parallel: BatchParallel | None = None,
 ) -> EvalMetrics:
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
@@ -70,15 +71,39 @@ def play_eval(
     env_state = jax.vmap(env.init)(init_keys)
     env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
     returns = jnp.zeros_like(env_state.terminated, dtype=jnp.float32)
+    if player_1_id is None:
+        # Exactly alternate the evaluated player's *seat*, independently of
+        # environment-specific random player-id assignment.  Even rows move
+        # first; odd rows move second.
+        first_player_ids = env_state.current_player.astype(jnp.int32)
+        player_1_ids = jnp.where(
+            jnp.arange(batch_size, dtype=jnp.int32) % 2 == 0,
+            first_player_ids,
+            1 - first_player_ids,
+        )
+    else:
+        player_1_ids = jnp.broadcast_to(
+            jnp.asarray(player_1_id, dtype=jnp.int32),
+            (batch_size,),
+        )
+    player_1_ids = constrain_batch_axis(
+        player_1_ids,
+        parallel,
+        batch_axis=0,
+    )
 
     def body_fn(val):
         key, env_state, returns = val
         key, player_1_key, player_2_key = jax.random.split(key, 3)
         player_1_output = player_1(env_state, player_1_key)
         player_2_output = player_2(env_state, player_2_key)
-        action = jnp.where(env_state.current_player == player_1_id, player_1_output.action, player_2_output.action)
+        action = jnp.where(
+            env_state.current_player == player_1_ids,
+            player_1_output.action,
+            player_2_output.action,
+        )
         env_state = jax.vmap(env.step)(env_state, action)
-        reward = env_state.rewards[jnp.arange(batch_size), player_1_id]
+        reward = env_state.rewards[jnp.arange(batch_size), player_1_ids]
         returns = returns + reward
         return key, env_state, returns
 
@@ -138,6 +163,11 @@ def _selfplay_step_frame(
         posterior=player_output.posterior,
         played_action=player_output.action,
         psk_terminated=psk_terminated,
+        # Capture the pre-transition player.  ``auto_reset`` has already
+        # replaced the state by the time generation metrics are reduced, so
+        # this small integer tensor is the only exact way to attribute a
+        # terminal reward to the first or second player.
+        actor=actor.astype(jnp.int8),
     )
     return env_state, frame
 
@@ -184,7 +214,7 @@ def play(
     mode: PlayMode,
     batch_size: int,
     max_num_steps: int | None = None,
-    player_1_id: int = 0,
+    player_1_id: int | Int[Array, "batch"] | None = 0,
     parallel: BatchParallel | None = None,
 ) -> TrainingSamples | EvalMetrics:
     if mode == "training":

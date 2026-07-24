@@ -132,24 +132,211 @@ def backward(rng_key: base.PRNGKey, tree: Tree, simulation: base.Simulation, ste
     active = simulation.active
     node_index = jnp.where(active, simulation.parent_index, Tree.ROOT_INDEX)
     leaf_active = active
+    metric_dtype = tree.node_value_alpha.dtype
+    path_log_attenuation = jnp.zeros(active.shape, dtype=metric_dtype)
+    path_numeric = active
+    # Terminal expansion publishes an exact categorical edge before backward
+    # begins.  Node certificates published during backward are added below.
+    path_categorical_publication = active & (
+        step.terminal_outcome != int(NO_OUTCOME)
+    )
 
     def cond_fn(state: base._BackwardState) -> Bool[Array, ""]:
         return jnp.any(state[3])
 
     def body_fn(state: base._BackwardState) -> base._BackwardState:
-        key, tree, node_index, active, leaf_active = state
+        (
+            key,
+            tree,
+            node_index,
+            active,
+            leaf_active,
+            path_log_attenuation,
+            path_numeric,
+            path_categorical_publication,
+        ) = state
         key, update_key, tie_break_key = jax.random.split(key, 3)
         leaf = LeafView(action=simulation.action, value_alpha=step.value, to_play=step.to_play, active=leaf_active)
         context = PosteriorUpdateContext(node=utils._gather_node(tree, node_index), children=utils._gather_children(tree, node_index), leaf=leaf, active=active)
         update = posterior_update(update_key, context)
+        update_diagnostics = update.diagnostics
+        if update_diagnostics is None:
+            numeric = jnp.zeros_like(active)
+            gamma = jnp.ones_like(path_log_attenuation)
+            raw_innovation_l2 = jnp.zeros_like(path_log_attenuation)
+            semantic_innovation_l2 = jnp.zeros_like(path_log_attenuation)
+            concentration_innovation_abs = jnp.zeros_like(
+                path_log_attenuation
+            )
+            raw_dcache_dlogkappa_l2 = jnp.zeros_like(
+                path_log_attenuation
+            )
+            mean_dcache_dlogkappa_l2 = jnp.zeros_like(
+                path_log_attenuation
+            )
+            log_concentration_dcache_dlogkappa_abs = jnp.zeros_like(
+                path_log_attenuation
+            )
+        else:
+            numeric = active & update_diagnostics.numeric
+            gamma = update_diagnostics.gamma
+            raw_innovation_l2 = update_diagnostics.raw_innovation_l2
+            semantic_innovation_l2 = (
+                update_diagnostics.semantic_innovation_l2
+            )
+            concentration_innovation_abs = (
+                update_diagnostics.concentration_innovation_abs
+            )
+            raw_dcache_dlogkappa_l2 = (
+                update_diagnostics.raw_dcache_dlogkappa_l2
+            )
+            mean_dcache_dlogkappa_l2 = (
+                update_diagnostics.mean_dcache_dlogkappa_l2
+            )
+            log_concentration_dcache_dlogkappa_abs = (
+                update_diagnostics.log_concentration_dcache_dlogkappa_abs
+            )
+        safe_gamma = jnp.maximum(
+            gamma,
+            jnp.asarray(jnp.finfo(metric_dtype).tiny, dtype=metric_dtype),
+        )
+        next_path_log_attenuation = path_log_attenuation + jnp.where(
+            numeric,
+            -jnp.log(safe_gamma),
+            jnp.zeros_like(path_log_attenuation),
+        )
+        next_path_numeric = path_numeric & (~active | numeric)
         tree = utils._set_node_update(tree, node_index, update, active)
         tree = utils._categorize_node_and_publish(tie_break_key, tree, node_index, active)
+        node_outcome_after = tree.node_categorical_outcome[batch, node_index]
+        # Every node on an active traversal path is unresolved on entry.
+        published_node = active & (
+            node_outcome_after != int(NO_OUTCOME)
+        )
+        next_path_categorical_publication = (
+            path_categorical_publication | published_node
+        )
+        completed_path = active & (node_index == int(Tree.ROOT_INDEX))
+        completed_numeric_path = (
+            completed_path
+            & next_path_numeric
+            & ~next_path_categorical_publication
+        )
+        accumulator = tree.kappa_diagnostics
+        tree = replace(
+            tree,
+            kappa_diagnostics=accumulator._replace(
+                numeric_repair_count=(
+                    accumulator.numeric_repair_count
+                    + numeric.astype(jnp.int32)
+                ),
+                raw_innovation_l2_sum=(
+                    accumulator.raw_innovation_l2_sum
+                    + jnp.where(
+                        numeric,
+                        raw_innovation_l2,
+                        jnp.zeros_like(raw_innovation_l2),
+                    )
+                ),
+                semantic_innovation_l2_sum=(
+                    accumulator.semantic_innovation_l2_sum
+                    + jnp.where(
+                        numeric,
+                        semantic_innovation_l2,
+                        jnp.zeros_like(semantic_innovation_l2),
+                    )
+                ),
+                concentration_innovation_abs_sum=(
+                    accumulator.concentration_innovation_abs_sum
+                    + jnp.where(
+                        numeric,
+                        concentration_innovation_abs,
+                        jnp.zeros_like(concentration_innovation_abs),
+                    )
+                ),
+                raw_dcache_dlogkappa_l2_sum=(
+                    accumulator.raw_dcache_dlogkappa_l2_sum
+                    + jnp.where(
+                        numeric,
+                        raw_dcache_dlogkappa_l2,
+                        jnp.zeros_like(raw_dcache_dlogkappa_l2),
+                    )
+                ),
+                mean_dcache_dlogkappa_l2_sum=(
+                    accumulator.mean_dcache_dlogkappa_l2_sum
+                    + jnp.where(
+                        numeric,
+                        mean_dcache_dlogkappa_l2,
+                        jnp.zeros_like(mean_dcache_dlogkappa_l2),
+                    )
+                ),
+                log_concentration_dcache_dlogkappa_abs_sum=(
+                    accumulator.log_concentration_dcache_dlogkappa_abs_sum
+                    + jnp.where(
+                        numeric,
+                        log_concentration_dcache_dlogkappa_abs,
+                        jnp.zeros_like(
+                            log_concentration_dcache_dlogkappa_abs
+                        ),
+                    )
+                ),
+                numeric_path_count=(
+                    accumulator.numeric_path_count
+                    + completed_numeric_path.astype(jnp.int32)
+                ),
+                path_gamma_product_sum=(
+                    accumulator.path_gamma_product_sum
+                    + jnp.where(
+                        completed_numeric_path,
+                        jnp.exp(-next_path_log_attenuation),
+                        jnp.zeros_like(next_path_log_attenuation),
+                    )
+                ),
+                path_gamma_log_attenuation_sum=(
+                    accumulator.path_gamma_log_attenuation_sum
+                    + jnp.where(
+                        completed_numeric_path,
+                        next_path_log_attenuation,
+                        jnp.zeros_like(next_path_log_attenuation),
+                    )
+                ),
+                categorical_publication_path_count=(
+                    accumulator.categorical_publication_path_count
+                    + (
+                        completed_path
+                        & next_path_categorical_publication
+                    ).astype(jnp.int32)
+                ),
+            ),
+        )
         continue_up = active & (node_index != Tree.ROOT_INDEX)
         parent = tree.parents[batch, node_index]
         next_node = jnp.where(continue_up, parent, Tree.ROOT_INDEX)
-        return (key, tree, next_node, continue_up, jnp.zeros_like(leaf_active))
+        return (
+            key,
+            tree,
+            next_node,
+            continue_up,
+            jnp.zeros_like(leaf_active),
+            next_path_log_attenuation,
+            next_path_numeric,
+            next_path_categorical_publication,
+        )
 
-    _, tree, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, (rng_key, tree, node_index, active, leaf_active))
+    _, tree, _, _, _, _, _, _ = jax.lax.while_loop(
+        cond_fn,
+        body_fn,
+        (
+            rng_key,
+            tree,
+            node_index,
+            active,
+            leaf_active,
+            path_log_attenuation,
+            path_numeric,
+            path_categorical_publication,
+        ),
+    )
     return tree
 
 

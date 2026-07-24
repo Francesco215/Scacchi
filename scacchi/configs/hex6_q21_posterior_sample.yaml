@@ -1,6 +1,7 @@
 run:
   seed: 0
-  max_num_iters: 201
+  # The training loop visits steps 0 through 125 inclusive.
+  max_num_iters: 126
 
 env:
   id: hex
@@ -19,7 +20,9 @@ model:
 selfplay:
   batch_size: 8192
   max_num_steps: 36
-  action_commitment_type: posterior_argmax
+  # E10 changes only E9's action selection rule: sample from the same true
+  # Q21 commitment distribution instead of taking its argmax.
+  action_commitment_type: posterior_sample
   search:
     kind: dirichlet_thompson
 
@@ -30,14 +33,9 @@ selfplay:
       policy_samples: 32
       posterior_policy_samples: null
       policy_sample_chunk_size: 32
-      # Guarded Q21 is used for internal repair and the root training target.
-      # Training commitment deliberately keeps the stochastic native M32
-      # readout: E8 shows that Q21 is a much better deployed evaluator, while
-      # E9 shows that deterministic argmax(Q21) self-play collapses the
-      # trajectory distribution despite stronger local transfer metrics.
       posterior_policy_estimator: prefix_cdf
       root_policy_target_estimator: prefix_cdf
-      root_action_estimator: winner_mc
+      root_action_estimator: prefix_cdf
       prefix_cdf_half_width: 10
       prefix_cdf_tail_scale: 8.0
       prefix_cdf_min_half_range: 6.0
@@ -97,15 +95,12 @@ eval:
 
 logging:
   interval: 1
-  jsonl_path: experiments/hex6_q21_target_m32_selfplay_s0/metrics.jsonl
+  jsonl_path: experiments/e10/hex6_q21_posterior_sample_s0/metrics.jsonl
   wandb:
-    # Keep external export disabled until the workspace's private-metric
-    # warning is explicitly acknowledged; the finalized import script is
-    # ready for either offline logging or a later approved sync.
     enabled: false
     project: scacchi-az
 
 checkpointing:
   max_to_keep: 9
   save_interval_steps: 25
-  directory: checkpoints/hex6_q21_target_m32_selfplay_s0
+  directory: checkpoints/hex6_q21_posterior_sample_s0

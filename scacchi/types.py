@@ -29,6 +29,8 @@ class OptimizerType(StrEnum):
 
 class ActionCommitmentType(StrEnum):
     posterior_argmax = "posterior_argmax"
+    posterior_plurality = "posterior_plurality"
+    posterior_plurality_uniform_ties = "posterior_plurality_uniform_ties"
     posterior_sample = "posterior_sample"
     search_action = "search_action"
 
@@ -165,9 +167,21 @@ class DirichletThompsonSearchConfig:
     posterior_policy_samples: int | None = None
     policy_sample_chunk_size: int | None = 32
     # Estimator used only for the policy inside bottom-up cache repair.
-    # Traversal remains native Thompson sampling, and the public root readout
-    # continues to use ``policy_samples``.
+    # Traversal and the native root commitment readout remain Thompson
+    # sampling with ``policy_samples``.
     posterior_policy_estimator: PosteriorPolicyEstimator = (
+        PosteriorPolicyEstimator.winner_mc
+    )
+    # Estimator used only for the completed root's policy-loss target.
+    # Native winner-MC remains the action-commitment policy, search_action,
+    # and policy-mode Q-loss weight.
+    root_policy_target_estimator: PosteriorPolicyEstimator = (
+        PosteriorPolicyEstimator.winner_mc
+    )
+    # Estimator used only for unresolved-root posterior_argmax, either
+    # posterior_plurality tie rule, or posterior_sample action commitment.
+    # Solved categorical commitment and search_action stay native.
+    root_action_estimator: PosteriorPolicyEstimator = (
         PosteriorPolicyEstimator.winner_mc
     )
     prefix_cdf_half_width: int = 20
@@ -237,9 +251,31 @@ class DirichletThompsonSearchConfig:
 @dataclass
 class SearchConfig:
     kind: SearchKind = SearchKind.gumbel
+    # Used only when action_commitment_type=posterior_plurality.  This root
+    # readout budget never affects traversal, repair, targets, or replay.
+    posterior_plurality_samples: int = 32
+    # Used only when action_commitment_type=posterior_sample.  This transforms
+    # the ephemeral root policy at commitment time and never affects search,
+    # targets, or replay.
+    posterior_sample_temperature: float = 1.0
     policy: PolicySearchConfig = field(default_factory=PolicySearchConfig)
     gumbel: GumbelSearchConfig = field(default_factory=GumbelSearchConfig)
     dirichlet_thompson: DirichletThompsonSearchConfig = field(default_factory=DirichletThompsonSearchConfig)
+
+    def __post_init__(self) -> None:
+        _require_ge(
+            "search.posterior_plurality_samples",
+            self.posterior_plurality_samples,
+            1,
+        )
+        if (
+            not math.isfinite(self.posterior_sample_temperature)
+            or self.posterior_sample_temperature <= 0.0
+        ):
+            raise ValueError(
+                "search.posterior_sample_temperature must be finite and > 0; "
+                f"got {self.posterior_sample_temperature}."
+            )
 
     def active(self) -> PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig:
         return cast(
@@ -436,14 +472,18 @@ class TrainConfig:
                     "model.network='aznet_dirichlet' or "
                     "model.network='boardlaw_dirichlet'."
                 )
-                if (
+                prefix_estimator_enabled = (
                     search.dirichlet_thompson.posterior_policy_estimator
                     == PosteriorPolicyEstimator.prefix_cdf
-                    and self.env.num_outcomes != 2
-                ):
+                    or search.dirichlet_thompson.root_policy_target_estimator
+                    == PosteriorPolicyEstimator.prefix_cdf
+                    or search.dirichlet_thompson.root_action_estimator
+                    == PosteriorPolicyEstimator.prefix_cdf
+                )
+                if prefix_estimator_enabled and self.env.num_outcomes != 2:
                     raise ValueError(
-                        f"{name}.dirichlet_thompson."
-                        "posterior_policy_estimator='prefix_cdf' requires "
+                        f"{name}.dirichlet_thompson prefix_cdf "
+                        "posterior/root-policy estimator requires "
                         "env.num_outcomes=2; use winner_mc for "
                         "three-outcome chess."
                     )

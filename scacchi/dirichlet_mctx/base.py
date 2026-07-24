@@ -45,7 +45,16 @@ class _SimulationState(NamedTuple):
     is_continuing: Bool[Array, ""]
 
 
-type _BackwardState = tuple[PRNGKey, Tree, Int32[Array, "batch"], Bool[Array, "batch"], Bool[Array, "batch"]]
+type _BackwardState = tuple[
+    PRNGKey,
+    Tree,
+    Int32[Array, "batch"],
+    Bool[Array, "batch"],
+    Bool[Array, "batch"],
+    Float[Array, "batch"],
+    Bool[Array, "batch"],
+    Bool[Array, "batch"],
+]
 type _SearchState = tuple[PRNGKey, Tree]
 
 

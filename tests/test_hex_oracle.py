@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import lru_cache
 import math
 from pathlib import Path
+import random
 import runpy
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +27,7 @@ from scacchi.hex_oracle import (
     compare_policies_against_oracle,
     hex_has_connection,
     hex_oracle_cache_info,
+    hex_oracle_value_cache_info,
     load_frozen_hex_corpus,
     position_from_pgx_state,
     sample_late_game_hex_corpus,
@@ -132,19 +136,135 @@ def test_solver_matches_brute_force_pgx_on_every_reachable_size_two_state():
             )
 
 
+def _reference_solve_hex(position: HexPosition) -> HexOracleResult:
+    """Former exhaustive recurrence, kept here as an independent reference."""
+
+    @lru_cache(maxsize=None)
+    def solve(
+        cells: tuple[int, ...],
+        current_color: int,
+    ) -> HexOracleResult:
+        color_0_wins = hex_has_connection(
+            cells,
+            size=position.size,
+            color=0,
+        )
+        color_1_wins = hex_has_connection(
+            cells,
+            size=position.size,
+            color=1,
+        )
+        if color_0_wins and color_1_wins:
+            raise ValueError("invalid Hex position")
+        if color_0_wins:
+            outcome = 1 if current_color == 0 else -1
+            return HexOracleResult(outcome, (), ())
+        if color_1_wins:
+            outcome = 1 if current_color == 1 else -1
+            return HexOracleResult(outcome, (), ())
+
+        legal_actions = tuple(
+            action
+            for action, cell in enumerate(cells)
+            if cell == EMPTY
+        )
+        if not legal_actions:
+            return HexOracleResult(0, (), ())
+
+        values = []
+        for action in legal_actions:
+            child = list(cells)
+            child[action] = current_color + 1
+            child_cells = tuple(child)
+            if hex_has_connection(
+                child_cells,
+                size=position.size,
+                color=current_color,
+            ):
+                value = 1
+            else:
+                value = -solve(child_cells, 1 - current_color).outcome
+            values.append((action, value))
+        best = max(value for _, value in values)
+        return HexOracleResult(
+            outcome=best,
+            optimal_actions=tuple(
+                action for action, value in values if value == best
+            ),
+            action_values=tuple(values),
+        )
+
+    return solve(position.cells, position.current_color)
+
+
+def test_bitmask_value_solver_matches_exhaustive_reference_action_vectors():
+    rng = random.Random(819245)
+    positions: list[HexPosition] = []
+    for size, empty_count, count in (
+        (3, 9, 1),
+        (3, 6, 3),
+        (3, 3, 3),
+        (4, 8, 3),
+        (4, 6, 3),
+        (4, 4, 3),
+    ):
+        occupied_count = size * size - empty_count
+        color_0_count = (occupied_count + 1) // 2
+        while sum(
+            position.size == size
+            and position.empty_count == empty_count
+            for position in positions
+        ) < count:
+            actions = list(range(size * size))
+            rng.shuffle(actions)
+            cells = [EMPTY] * (size * size)
+            for action in actions[:color_0_count]:
+                cells[action] = COLOR_0
+            for action in actions[color_0_count:occupied_count]:
+                cells[action] = COLOR_1
+            cell_tuple = tuple(cells)
+            if hex_has_connection(cell_tuple, size=size, color=0):
+                continue
+            if hex_has_connection(cell_tuple, size=size, color=1):
+                continue
+            positions.append(
+                HexPosition(
+                    size=size,
+                    cells=cell_tuple,
+                    current_color=occupied_count % 2,
+                )
+            )
+
+    clear_hex_oracle_cache()
+    for position in positions:
+        assert solve_hex(position) == _reference_solve_hex(position)
+
+
 def test_solver_cache_is_used_for_repeated_positions():
     clear_hex_oracle_cache()
+    assert hex_oracle_cache_info().currsize == 0
+    assert hex_oracle_value_cache_info().currsize == 0
     position = HexPosition(
-        size=2,
-        cells=(EMPTY, EMPTY, EMPTY, EMPTY),
+        size=3,
+        cells=(EMPTY,) * 9,
         current_color=0,
     )
     first = solve_hex(position)
     after_first = hex_oracle_cache_info()
+    value_after_first = hex_oracle_value_cache_info()
+    assert value_after_first.currsize > 0
     second = solve_hex(position)
     after_second = hex_oracle_cache_info()
+    value_after_second = hex_oracle_value_cache_info()
     assert first == second
     assert after_second.hits == after_first.hits + 1
+    assert value_after_second == value_after_first
+
+    clear_hex_oracle_cache()
+    assert hex_oracle_cache_info().currsize == 0
+    assert hex_oracle_cache_info().hits == 0
+    assert hex_oracle_value_cache_info().currsize == 0
+    assert hex_oracle_value_cache_info().hits == 0
 
 
 def test_policy_regret_and_proper_scores_reward_oracle_improvement():
@@ -300,6 +420,60 @@ def test_checkpoint_oracle_cli_accepts_and_documents_exact_step():
     )
     checkpoint_parser = subparser_action.choices["checkpoint"]
     assert "--checkpoint-step" in checkpoint_parser.format_help()
+
+
+def test_checkpoint_oracle_accepts_up_to_fifteen_empty_cells():
+    harness = runpy.run_path(
+        str(
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "hex_oracle_harness.py"
+        )
+    )
+    assert harness["MAX_CHECKPOINT_ORACLE_EMPTY_CELLS"] == 15
+    predict = harness["_predict_checkpoint"]
+    args = SimpleNamespace(
+        policy_readouts=2,
+        batch_size=1,
+        checkpoint=Path("checkpoints/run"),
+        checkpoint_step=0,
+    )
+
+    too_early = SimpleNamespace(
+        max_empty=16,
+        positions=(
+            SimpleNamespace(position=SimpleNamespace(empty_count=16)),
+        ),
+    )
+    try:
+        predict(args, too_early)
+    except ValueError as error:
+        assert "at most 15 empty cells" in str(error)
+    else:
+        raise AssertionError("16-empty checkpoint corpus was not rejected")
+
+    class ReachedCheckpointLoad(Exception):
+        pass
+
+    def stop_at_checkpoint_load(*args, **kwargs):
+        del args, kwargs
+        raise ReachedCheckpointLoad
+
+    predict.__globals__["_load_checkpoint_config_and_step"] = (
+        stop_at_checkpoint_load
+    )
+    boundary = SimpleNamespace(
+        max_empty=15,
+        positions=(
+            SimpleNamespace(position=SimpleNamespace(empty_count=15)),
+        ),
+    )
+    try:
+        predict(args, boundary)
+    except ReachedCheckpointLoad:
+        pass
+    else:
+        raise AssertionError("15-empty checkpoint corpus did not pass guard")
 
 
 def test_checkpoint_oracle_validates_step_and_reads_its_compute_counters(

@@ -72,6 +72,92 @@ class SearchDiagnostics(NamedTuple):
     search_policy_support_sum: Float[Array, "batch"]
     search_policy_ess_sum: Float[Array, "batch"]
     search_policy_top1_agreement_count: Float[Array, "batch"]
+    search_root_policy_target_enabled_count: Float[Array, "batch"]
+    search_root_policy_target_categorical_population_count: Float[
+        Array,
+        "batch",
+    ]
+    search_root_policy_target_prefix_eligible_count: Float[Array, "batch"]
+    search_root_policy_target_prefix_accepted_count: Float[Array, "batch"]
+    search_root_policy_target_prefix_fallback_count: Float[Array, "batch"]
+    search_root_policy_target_prefix_tail_clipped_count: Float[Array, "batch"]
+    search_root_policy_target_prefix_density_guard_count: Float[Array, "batch"]
+    search_root_policy_target_prefix_nonfinite_count: Float[Array, "batch"]
+    search_root_policy_target_prefix_density_abs_sum: Float[Array, "batch"]
+    search_root_policy_target_native_l1_sum: Float[Array, "batch"]
+    search_root_policy_target_native_l2_sq_sum: Float[Array, "batch"]
+    search_root_policy_target_native_top1_agreement_count: Float[
+        Array,
+        "batch",
+    ]
+    search_root_action_estimator_enabled_count: Float[Array, "batch"]
+    search_root_action_prefix_eligible_count: Float[Array, "batch"]
+    search_root_action_prefix_accepted_count: Float[Array, "batch"]
+    search_root_action_prefix_fallback_count: Float[Array, "batch"]
+    search_root_action_prefix_tail_clipped_count: Float[Array, "batch"]
+    search_root_action_prefix_density_guard_count: Float[Array, "batch"]
+    search_root_action_prefix_nonfinite_count: Float[Array, "batch"]
+    search_root_action_prefix_density_abs_sum: Float[Array, "batch"]
+    search_root_action_native_l1_sum: Float[Array, "batch"]
+    search_root_action_native_l2_sq_sum: Float[Array, "batch"]
+    search_root_action_native_top1_agreement_count: Float[Array, "batch"]
+    search_kappa_numeric_repair_count: Float[Array, "batch"]
+    search_kappa_raw_innovation_l2_sum: Float[Array, "batch"]
+    search_kappa_semantic_innovation_l2_sum: Float[Array, "batch"]
+    search_kappa_concentration_innovation_abs_sum: Float[Array, "batch"]
+    search_kappa_raw_dcache_dlogkappa_l2_sum: Float[Array, "batch"]
+    search_kappa_mean_dcache_dlogkappa_l2_sum: Float[Array, "batch"]
+    search_kappa_log_concentration_dcache_dlogkappa_abs_sum: Float[
+        Array,
+        "batch",
+    ]
+    search_kappa_numeric_path_count: Float[Array, "batch"]
+    search_kappa_path_gamma_product_sum: Float[Array, "batch"]
+    search_kappa_path_gamma_log_attenuation_sum: Float[Array, "batch"]
+    search_kappa_categorical_publication_path_count: Float[Array, "batch"]
+    search_root_policy_top2_margin_sum: Float[Array, "batch"]
+    search_root_policy_top2_margin_count: Float[Array, "batch"]
+    search_root_policy_top2_margin_tie_count: Float[Array, "batch"]
+    search_root_policy_top2_margin_below_reference_count: Float[
+        Array,
+        "batch",
+    ]
+    search_root_policy_top2_margin_reference_scale_sum: Float[
+        Array,
+        "batch",
+    ]
+    search_root_plurality_commitment_count: Float[Array, "batch"]
+    search_root_plurality_max_count_tie_count: Float[Array, "batch"]
+    search_root_plurality_tie_multiplicity_sum: Float[Array, "batch"]
+    search_root_plurality_lowest_uniform_disagreement_count: Float[
+        Array,
+        "batch",
+    ]
+    search_root_plurality_expected_disagreement_sum: Float[Array, "batch"]
+
+
+class RootPolicyTargetDiagnostics(NamedTuple):
+    """Per-root diagnostics for optional target and action readouts."""
+
+    target_enabled: Bool[Array, "batch"]
+    categorical_population: Bool[Array, "batch"]
+    prefix_eligible: Bool[Array, "batch"]
+    prefix_accepted: Bool[Array, "batch"]
+    prefix_fallback: Bool[Array, "batch"]
+    prefix_tail_clipped: Bool[Array, "batch"]
+    prefix_density_guard: Bool[Array, "batch"]
+    prefix_nonfinite: Bool[Array, "batch"]
+    prefix_density_abs: Float[Array, "batch"]
+    native_l1: Float[Array, "batch"]
+    native_l2_sq: Float[Array, "batch"]
+    native_top1_agreement: Bool[Array, "batch"]
+    action_enabled: Bool[Array, "batch"]
+    action_prefix_eligible: Bool[Array, "batch"]
+    action_prefix_accepted: Bool[Array, "batch"]
+    action_prefix_fallback: Bool[Array, "batch"]
+    action_native_l1: Float[Array, "batch"]
+    action_native_l2_sq: Float[Array, "batch"]
+    action_native_top1_agreement: Bool[Array, "batch"]
 
 
 class DistillationDiscrepancy(NamedTuple):
@@ -468,6 +554,7 @@ def root_search_diagnostics(
     legal_action_mask: Bool[Array, "batch action"],
     tree: Tree,
     summary: SearchSummary,
+    root_policy_target_diagnostics: RootPolicyTargetDiagnostics | None = None,
 ) -> SearchDiagnostics:
     """Build additive root diagnostics from one completed DT search."""
 
@@ -586,6 +673,30 @@ def root_search_diagnostics(
         jnp.argmax(masked_prior_logits, axis=-1)
         == jnp.argmax(normalized_target_policy, axis=-1)
     )
+    if root_policy_target_diagnostics is None:
+        root_policy_target_diagnostics = RootPolicyTargetDiagnostics(
+            target_enabled=jnp.zeros_like(valid_policy),
+            categorical_population=jnp.zeros_like(valid_policy),
+            prefix_eligible=jnp.zeros_like(valid_policy),
+            prefix_accepted=jnp.zeros_like(valid_policy),
+            prefix_fallback=jnp.zeros_like(valid_policy),
+            prefix_tail_clipped=jnp.zeros_like(valid_policy),
+            prefix_density_guard=jnp.zeros_like(valid_policy),
+            prefix_nonfinite=jnp.zeros_like(valid_policy),
+            prefix_density_abs=jnp.zeros_like(policy_kl),
+            native_l1=jnp.zeros_like(policy_kl),
+            native_l2_sq=jnp.zeros_like(policy_kl),
+            native_top1_agreement=jnp.zeros_like(valid_policy),
+            action_enabled=jnp.zeros_like(valid_policy),
+            action_prefix_eligible=jnp.zeros_like(valid_policy),
+            action_prefix_accepted=jnp.zeros_like(valid_policy),
+            action_prefix_fallback=jnp.zeros_like(valid_policy),
+            action_native_l1=jnp.zeros_like(policy_kl),
+            action_native_l2_sq=jnp.zeros_like(policy_kl),
+            action_native_top1_agreement=jnp.zeros_like(valid_policy),
+        )
+    target_diagnostics = root_policy_target_diagnostics
+    prefix_eligible = target_diagnostics.prefix_eligible
 
     return SearchDiagnostics(
         search_policy_kl_sum=masked_value(policy_kl, policy_metric_mask),
@@ -668,12 +779,158 @@ def root_search_diagnostics(
         search_policy_top1_agreement_count=count(
             policy_top1_agreement & policy_metric_mask
         ),
+        search_root_policy_target_enabled_count=count(
+            target_diagnostics.target_enabled
+        ),
+        search_root_policy_target_categorical_population_count=count(
+            target_diagnostics.categorical_population
+        ),
+        search_root_policy_target_prefix_eligible_count=count(
+            prefix_eligible
+        ),
+        search_root_policy_target_prefix_accepted_count=count(
+            target_diagnostics.prefix_accepted
+        ),
+        search_root_policy_target_prefix_fallback_count=count(
+            target_diagnostics.prefix_fallback
+        ),
+        search_root_policy_target_prefix_tail_clipped_count=count(
+            target_diagnostics.prefix_tail_clipped & prefix_eligible
+        ),
+        search_root_policy_target_prefix_density_guard_count=count(
+            target_diagnostics.prefix_density_guard & prefix_eligible
+        ),
+        search_root_policy_target_prefix_nonfinite_count=count(
+            target_diagnostics.prefix_nonfinite & prefix_eligible
+        ),
+        search_root_policy_target_prefix_density_abs_sum=masked_value(
+            target_diagnostics.prefix_density_abs,
+            prefix_eligible,
+        ),
+        search_root_policy_target_native_l1_sum=masked_value(
+            target_diagnostics.native_l1,
+            target_diagnostics.target_enabled,
+        ),
+        search_root_policy_target_native_l2_sq_sum=masked_value(
+            target_diagnostics.native_l2_sq,
+            target_diagnostics.target_enabled,
+        ),
+        search_root_policy_target_native_top1_agreement_count=count(
+            target_diagnostics.native_top1_agreement
+            & target_diagnostics.target_enabled
+        ),
+        search_root_action_estimator_enabled_count=count(
+            target_diagnostics.action_enabled
+        ),
+        search_root_action_prefix_eligible_count=count(
+            target_diagnostics.action_prefix_eligible
+        ),
+        search_root_action_prefix_accepted_count=count(
+            target_diagnostics.action_prefix_accepted
+        ),
+        search_root_action_prefix_fallback_count=count(
+            target_diagnostics.action_prefix_fallback
+        ),
+        search_root_action_prefix_tail_clipped_count=count(
+            target_diagnostics.prefix_tail_clipped
+            & target_diagnostics.action_prefix_eligible
+        ),
+        search_root_action_prefix_density_guard_count=count(
+            target_diagnostics.prefix_density_guard
+            & target_diagnostics.action_prefix_eligible
+        ),
+        search_root_action_prefix_nonfinite_count=count(
+            target_diagnostics.prefix_nonfinite
+            & target_diagnostics.action_prefix_eligible
+        ),
+        search_root_action_prefix_density_abs_sum=masked_value(
+            target_diagnostics.prefix_density_abs,
+            target_diagnostics.action_prefix_eligible,
+        ),
+        search_root_action_native_l1_sum=masked_value(
+            target_diagnostics.action_native_l1,
+            target_diagnostics.action_enabled,
+        ),
+        search_root_action_native_l2_sq_sum=masked_value(
+            target_diagnostics.action_native_l2_sq,
+            target_diagnostics.action_enabled,
+        ),
+        search_root_action_native_top1_agreement_count=count(
+            target_diagnostics.action_native_top1_agreement
+            & target_diagnostics.action_enabled
+        ),
+        search_kappa_numeric_repair_count=(
+            tree.kappa_diagnostics.numeric_repair_count.astype(dtype)
+        ),
+        search_kappa_raw_innovation_l2_sum=(
+            tree.kappa_diagnostics.raw_innovation_l2_sum.astype(dtype)
+        ),
+        search_kappa_semantic_innovation_l2_sum=(
+            tree.kappa_diagnostics.semantic_innovation_l2_sum.astype(dtype)
+        ),
+        search_kappa_concentration_innovation_abs_sum=(
+            tree.kappa_diagnostics.concentration_innovation_abs_sum.astype(
+                dtype
+            )
+        ),
+        search_kappa_raw_dcache_dlogkappa_l2_sum=(
+            tree.kappa_diagnostics.raw_dcache_dlogkappa_l2_sum.astype(dtype)
+        ),
+        search_kappa_mean_dcache_dlogkappa_l2_sum=(
+            tree.kappa_diagnostics.mean_dcache_dlogkappa_l2_sum.astype(
+                dtype
+            )
+        ),
+        search_kappa_log_concentration_dcache_dlogkappa_abs_sum=(
+            tree.kappa_diagnostics
+            .log_concentration_dcache_dlogkappa_abs_sum.astype(dtype)
+        ),
+        search_kappa_numeric_path_count=(
+            tree.kappa_diagnostics.numeric_path_count.astype(dtype)
+        ),
+        search_kappa_path_gamma_product_sum=(
+            tree.kappa_diagnostics.path_gamma_product_sum.astype(dtype)
+        ),
+        search_kappa_path_gamma_log_attenuation_sum=(
+            tree.kappa_diagnostics.path_gamma_log_attenuation_sum.astype(
+                dtype
+            )
+        ),
+        search_kappa_categorical_publication_path_count=(
+            tree.kappa_diagnostics.categorical_publication_path_count.astype(
+                dtype
+            )
+        ),
+        # Filled after search by the player wrapper, which knows the actual
+        # ephemeral policy supplied to the selected action mode.
+        search_root_policy_top2_margin_sum=jnp.zeros_like(root_count),
+        search_root_policy_top2_margin_count=jnp.zeros_like(root_count),
+        search_root_policy_top2_margin_tie_count=jnp.zeros_like(root_count),
+        search_root_policy_top2_margin_below_reference_count=jnp.zeros_like(
+            root_count
+        ),
+        search_root_policy_top2_margin_reference_scale_sum=jnp.zeros_like(
+            root_count
+        ),
+        # Filled after commitment from the realized, root-only vote
+        # histogram. These fields are diagnostic and are never read by
+        # search, targets, losses, or action selection.
+        search_root_plurality_commitment_count=jnp.zeros_like(root_count),
+        search_root_plurality_max_count_tie_count=jnp.zeros_like(root_count),
+        search_root_plurality_tie_multiplicity_sum=jnp.zeros_like(root_count),
+        search_root_plurality_lowest_uniform_disagreement_count=(
+            jnp.zeros_like(root_count)
+        ),
+        search_root_plurality_expected_disagreement_sum=jnp.zeros_like(
+            root_count
+        ),
     )
 
 
 __all__ = [
     "DistillationDiscrepancy",
     "NativeDisplacement",
+    "RootPolicyTargetDiagnostics",
     "SearchDiagnostics",
     "dirichlet_kl",
     "distillation_discrepancy",

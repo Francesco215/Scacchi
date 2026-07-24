@@ -34,6 +34,7 @@ EMPTY = 0
 COLOR_0 = 1
 COLOR_1 = 2
 FROZEN_CORPUS_FORMAT = "scacchi.hex_oracle.v1"
+_VALUE_CACHE_MAX_SIZE = 1_048_576
 
 
 @dataclass(frozen=True)
@@ -303,6 +304,129 @@ def _terminal_outcome(
     return None
 
 
+@lru_cache(maxsize=None)
+def _bitmask_geometry(
+    size: int,
+) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...]]:
+    """Return neighbour lists and a deterministic internal move ordering."""
+
+    neighbours = tuple(
+        tuple(_neighbours(action, size))
+        for action in range(size * size)
+    )
+    center = (size - 1) / 2.0
+    move_order = tuple(
+        sorted(
+            range(size * size),
+            key=lambda action: (
+                abs(action // size - center)
+                + abs(action % size - center),
+                action,
+            ),
+        )
+    )
+    return neighbours, move_order
+
+
+def _cells_to_bitmasks(cells: Sequence[int]) -> tuple[int, int]:
+    masks = [0, 0]
+    for action, cell in enumerate(cells):
+        if cell != EMPTY:
+            masks[cell - 1] |= 1 << action
+    return masks[0], masks[1]
+
+
+def _bitmask_has_connection(
+    mask: int,
+    *,
+    size: int,
+    color: int,
+) -> bool:
+    neighbours, _ = _bitmask_geometry(size)
+    if color == 0:
+        frontier = [
+            column
+            for column in range(size)
+            if mask & (1 << column)
+        ]
+
+        def is_target(action: int) -> bool:
+            return action // size == size - 1
+
+    else:
+        frontier = [
+            row * size
+            for row in range(size)
+            if mask & (1 << (row * size))
+        ]
+
+        def is_target(action: int) -> bool:
+            return action % size == size - 1
+
+    visited = 0
+    for action in frontier:
+        visited |= 1 << action
+    while frontier:
+        action = frontier.pop()
+        if is_target(action):
+            return True
+        for neighbour in neighbours[action]:
+            bit = 1 << neighbour
+            if mask & bit and not visited & bit:
+                visited |= bit
+                frontier.append(neighbour)
+    return False
+
+
+@lru_cache(maxsize=_VALUE_CACHE_MAX_SIZE)
+def _solve_value_cached(
+    size: int,
+    color_0_mask: int,
+    color_1_mask: int,
+    current_color: int,
+) -> int:
+    """Return exact minimax value without constructing internal Q vectors.
+
+    The entry invariant is that neither colour has already connected.  The
+    caller checks every move for a connection before recursing, so it remains
+    true inductively.  This is proof-equivalent to the former exhaustive
+    recurrence, but a node stops as soon as one winning continuation is
+    proved.  Full action values are still computed at the public root.
+    """
+
+    occupied = color_0_mask | color_1_mask
+    full_mask = (1 << (size * size)) - 1
+    if occupied == full_mask:
+        # Defensive totality for an invalid full board with no connection.
+        return 0
+
+    _, move_order = _bitmask_geometry(size)
+    best_outcome = -2
+    for action in move_order:
+        bit = 1 << action
+        if occupied & bit:
+            continue
+        next_masks = [color_0_mask, color_1_mask]
+        next_masks[current_color] |= bit
+        if _bitmask_has_connection(
+            next_masks[current_color],
+            size=size,
+            color=current_color,
+        ):
+            value = 1
+        else:
+            value = -_solve_value_cached(
+                size,
+                next_masks[0],
+                next_masks[1],
+                1 - current_color,
+            )
+        if value == 1:
+            return 1
+        best_outcome = max(best_outcome, value)
+    return best_outcome
+
+
 @lru_cache(maxsize=262_144)
 def _solve_cached(
     size: int,
@@ -325,23 +449,27 @@ def _solve_cached(
         # total on defensive/test inputs.
         return HexOracleResult(outcome=0, optimal_actions=(), action_values=())
 
+    color_0_mask, color_1_mask = _cells_to_bitmasks(cells)
     best_outcome = -2
     optimal_actions: list[int] = []
     action_values: list[tuple[int, int]] = []
-    stone = current_color + 1
     for action in legal_actions:
-        child_cells_list = list(cells)
-        child_cells_list[action] = stone
-        child_cells = tuple(child_cells_list)
-        if hex_has_connection(
-            child_cells,
+        bit = 1 << action
+        next_masks = [color_0_mask, color_1_mask]
+        next_masks[current_color] |= bit
+        if _bitmask_has_connection(
+            next_masks[current_color],
             size=size,
             color=current_color,
         ):
             value = 1
         else:
-            child = _solve_cached(size, child_cells, 1 - current_color)
-            value = -child.outcome
+            value = -_solve_value_cached(
+                size,
+                next_masks[0],
+                next_masks[1],
+                1 - current_color,
+            )
         action_values.append((action, value))
         if value > best_outcome:
             best_outcome = value
@@ -367,15 +495,22 @@ def solve_hex(position: HexPosition) -> HexOracleResult:
 
 
 def hex_oracle_cache_info():
-    """Expose cache statistics for runtime/memory diagnostics."""
+    """Expose public root-result cache statistics."""
 
     return _solve_cached.cache_info()
+
+
+def hex_oracle_value_cache_info():
+    """Expose internal value-only recurrence cache statistics."""
+
+    return _solve_value_cached.cache_info()
 
 
 def clear_hex_oracle_cache() -> None:
     """Clear all memoized positions, useful between large corpora."""
 
     _solve_cached.cache_clear()
+    _solve_value_cached.cache_clear()
 
 
 def position_from_pgx_state(state: Any) -> HexPosition:

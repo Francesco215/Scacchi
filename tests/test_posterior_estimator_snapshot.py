@@ -1,3 +1,5 @@
+import math
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -194,6 +196,162 @@ def test_update_consumes_the_exposed_operands_without_changing_semantics():
         jnp.array([[1, 3, 9], [0, 4, 0]], dtype=jnp.int32),
     )
     assert jnp.array_equal(update.value_alpha, expected_value)
+
+
+def test_update_reports_exact_kappa_innovation_and_local_leverage():
+    context = _mixed_context()
+    snapshot = posterior_estimator_snapshot(context, kappa=4.0)
+    policy = jnp.asarray(
+        [[0.25, 0.75, 0.0], [0.5, 0.0, 0.5]],
+        dtype=jnp.float32,
+    )
+
+    update = update_posterior_with_estimator(
+        jax.random.PRNGKey(31),
+        context,
+        lambda _key, _snapshot: policy,
+        kappa=4.0,
+    )
+
+    diagnostics = update.diagnostics
+    assert diagnostics is not None
+    assert jnp.array_equal(
+        diagnostics.numeric,
+        jnp.asarray([True, False]),
+    )
+    weighted = jnp.sum(
+        policy[..., None] * snapshot.cache_alpha,
+        axis=-2,
+    )
+    innovation = weighted - snapshot.value_prior
+    expected_raw = jnp.linalg.vector_norm(innovation, axis=-1)
+    weighted_mean = weighted / jnp.sum(weighted, axis=-1, keepdims=True)
+    prior_mean = snapshot.value_prior / jnp.sum(
+        snapshot.value_prior,
+        axis=-1,
+        keepdims=True,
+    )
+    expected_semantic = jnp.linalg.vector_norm(
+        weighted_mean - prior_mean,
+        axis=-1,
+    )
+    expected_concentration = jnp.abs(
+        jnp.sum(weighted, axis=-1)
+        - jnp.sum(snapshot.value_prior, axis=-1)
+    )
+    assert jnp.allclose(diagnostics.raw_innovation_l2[0], expected_raw[0])
+    assert jnp.allclose(
+        diagnostics.semantic_innovation_l2[0],
+        expected_semantic[0],
+    )
+    assert jnp.allclose(
+        diagnostics.concentration_innovation_abs[0],
+        expected_concentration[0],
+    )
+
+    exact_leverage = jnp.linalg.vector_norm(
+        (
+            -snapshot.gamma * (1.0 - snapshot.gamma)
+        )[..., None] * innovation,
+        axis=-1,
+    )
+    assert jnp.allclose(
+        diagnostics.raw_dcache_dlogkappa_l2[0],
+        exact_leverage[0],
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    cache = update.value_alpha
+    cache_mean = cache / jnp.sum(cache, axis=-1, keepdims=True)
+    cache_mass = jnp.sum(cache, axis=-1, keepdims=True)
+    exact_mean_leverage = (
+        (
+            -snapshot.gamma * (1.0 - snapshot.gamma)
+        )[..., None]
+        * innovation
+    )
+    exact_mean_leverage = (
+        exact_mean_leverage
+        - cache_mean
+        * jnp.sum(exact_mean_leverage, axis=-1, keepdims=True)
+    ) / cache_mass
+    assert jnp.allclose(
+        diagnostics.mean_dcache_dlogkappa_l2[0],
+        jnp.linalg.vector_norm(exact_mean_leverage, axis=-1)[0],
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    exact_log_concentration_leverage = jnp.abs(
+        jnp.sum(
+            (
+                -snapshot.gamma * (1.0 - snapshot.gamma)
+            )[..., None]
+            * innovation,
+            axis=-1,
+        )
+        / jnp.sum(cache, axis=-1)
+    )
+    assert jnp.allclose(
+        diagnostics.log_concentration_dcache_dlogkappa_abs[0],
+        exact_log_concentration_leverage[0],
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
+    epsilon = 1e-2
+    plus = mix_value_prior(
+        snapshot.value_prior,
+        snapshot.cache_alpha,
+        policy,
+        snapshot.n_down,
+        kappa=4.0 * math.exp(epsilon),
+    )
+    minus = mix_value_prior(
+        snapshot.value_prior,
+        snapshot.cache_alpha,
+        policy,
+        snapshot.n_down,
+        kappa=4.0 * math.exp(-epsilon),
+    )
+    finite_difference = (plus - minus) / (2.0 * epsilon)
+    expected_leverage = jnp.linalg.vector_norm(
+        finite_difference,
+        axis=-1,
+    )
+    assert jnp.allclose(
+        diagnostics.raw_dcache_dlogkappa_l2[0],
+        expected_leverage[0],
+        rtol=1e-3,
+        atol=2e-5,
+    )
+    plus_mean = plus / jnp.sum(plus, axis=-1, keepdims=True)
+    minus_mean = minus / jnp.sum(minus, axis=-1, keepdims=True)
+    finite_mean_difference = (plus_mean - minus_mean) / (
+        2.0 * epsilon
+    )
+    assert jnp.allclose(
+        diagnostics.mean_dcache_dlogkappa_l2[0],
+        jnp.linalg.vector_norm(finite_mean_difference, axis=-1)[0],
+        rtol=1e-3,
+        atol=2e-5,
+    )
+    finite_log_concentration_difference = (
+        jnp.log(jnp.sum(plus, axis=-1))
+        - jnp.log(jnp.sum(minus, axis=-1))
+    ) / (2.0 * epsilon)
+    assert jnp.allclose(
+        diagnostics.log_concentration_dcache_dlogkappa_abs[0],
+        jnp.abs(finite_log_concentration_difference[0]),
+        rtol=1e-3,
+        atol=2e-5,
+    )
+    assert jnp.all(diagnostics.gamma[1:] == 0)
+    assert jnp.all(diagnostics.raw_innovation_l2[1:] == 0)
+    assert jnp.all(diagnostics.semantic_innovation_l2[1:] == 0)
+    assert jnp.all(diagnostics.mean_dcache_dlogkappa_l2[1:] == 0)
+    assert jnp.all(
+        diagnostics.log_concentration_dcache_dlogkappa_abs[1:] == 0
+    )
 
 
 def test_estimator_hook_prepares_once_and_passes_original_key(monkeypatch):

@@ -140,6 +140,27 @@ def _search_metrics(train_metrics: Any) -> dict[str, float]:
         "search_executed_simulation_row_count"
     )
     policy_count = total("search_policy_kl_count")
+    root_target_count = total("search_root_policy_target_enabled_count")
+    prefix_eligible_count = total(
+        "search_root_policy_target_prefix_eligible_count"
+    )
+    root_action_count = total("search_root_action_estimator_enabled_count")
+    action_prefix_eligible_count = total(
+        "search_root_action_prefix_eligible_count"
+    )
+    kappa_numeric_repair_count = total(
+        "search_kappa_numeric_repair_count"
+    )
+    kappa_numeric_path_count = total("search_kappa_numeric_path_count")
+    top2_margin_count = total(
+        "search_root_policy_top2_margin_count"
+    )
+    plurality_commitment_count = total(
+        "search_root_plurality_commitment_count"
+    )
+    plurality_tie_count = total(
+        "search_root_plurality_max_count_tie_count"
+    )
     return {
         "search/policy_displacement_kl_nats": mean(
             "search_policy_kl_sum",
@@ -222,6 +243,11 @@ def _search_metrics(train_metrics: Any) -> dict[str, float]:
             if root_count <= 0.0
             else total("search_solved_root_count") / root_count
         ),
+        "search/kappa_solved_bypass_fraction": (
+            0.0
+            if root_count <= 0.0
+            else total("search_solved_root_count") / root_count
+        ),
         "search/expanded_nodes_mean": (
             0.0
             if root_count <= 0.0
@@ -296,6 +322,275 @@ def _search_metrics(train_metrics: Any) -> dict[str, float]:
             else total("search_policy_top1_agreement_count")
             / policy_count
         ),
+        "search/root_policy_target_enabled_count": root_target_count,
+        "search/root_policy_target_categorical_population_fraction": (
+            0.0
+            if root_target_count <= 0.0
+            else total(
+                "search_root_policy_target_categorical_population_count"
+            )
+            / root_target_count
+        ),
+        "search/root_policy_target_prefix_eligible_count": (
+            prefix_eligible_count
+        ),
+        "search/root_policy_target_prefix_acceptance_fraction": (
+            0.0
+            if prefix_eligible_count <= 0.0
+            else total(
+                "search_root_policy_target_prefix_accepted_count"
+            )
+            / prefix_eligible_count
+        ),
+        "search/root_policy_target_prefix_fallback_fraction": (
+            0.0
+            if prefix_eligible_count <= 0.0
+            else total(
+                "search_root_policy_target_prefix_fallback_count"
+            )
+            / prefix_eligible_count
+        ),
+        "search/root_policy_target_prefix_tail_clipped_fraction": (
+            0.0
+            if prefix_eligible_count <= 0.0
+            else total(
+                "search_root_policy_target_prefix_tail_clipped_count"
+            )
+            / prefix_eligible_count
+        ),
+        "search/root_policy_target_prefix_density_guard_fraction": (
+            0.0
+            if prefix_eligible_count <= 0.0
+            else total(
+                "search_root_policy_target_prefix_density_guard_count"
+            )
+            / prefix_eligible_count
+        ),
+        "search/root_policy_target_prefix_nonfinite_fraction": (
+            0.0
+            if prefix_eligible_count <= 0.0
+            else total(
+                "search_root_policy_target_prefix_nonfinite_count"
+            )
+            / prefix_eligible_count
+        ),
+        "search/root_policy_target_prefix_density_abs_mean": (
+            0.0
+            if prefix_eligible_count <= 0.0
+            else total(
+                "search_root_policy_target_prefix_density_abs_sum"
+            )
+            / prefix_eligible_count
+        ),
+        "search/root_policy_target_vs_native_m32_l1": (
+            0.0
+            if root_target_count <= 0.0
+            else total("search_root_policy_target_native_l1_sum")
+            / root_target_count
+        ),
+        "search/root_policy_target_vs_native_m32_l2_sq": (
+            0.0
+            if root_target_count <= 0.0
+            else total("search_root_policy_target_native_l2_sq_sum")
+            / root_target_count
+        ),
+        "search/root_policy_target_vs_native_m32_top1_agreement": (
+            0.0
+            if root_target_count <= 0.0
+            else total(
+                "search_root_policy_target_native_top1_agreement_count"
+            )
+            / root_target_count
+        ),
+        "search/root_action_estimator_enabled_count": root_action_count,
+        "search/root_action_prefix_eligible_count": (
+            action_prefix_eligible_count
+        ),
+        "search/root_action_prefix_acceptance_fraction": (
+            0.0
+            if action_prefix_eligible_count <= 0.0
+            else total("search_root_action_prefix_accepted_count")
+            / action_prefix_eligible_count
+        ),
+        "search/root_action_prefix_fallback_fraction": (
+            0.0
+            if action_prefix_eligible_count <= 0.0
+            else total("search_root_action_prefix_fallback_count")
+            / action_prefix_eligible_count
+        ),
+        "search/root_action_prefix_tail_clipped_fraction": (
+            0.0
+            if action_prefix_eligible_count <= 0.0
+            else total("search_root_action_prefix_tail_clipped_count")
+            / action_prefix_eligible_count
+        ),
+        "search/root_action_prefix_density_guard_fraction": (
+            0.0
+            if action_prefix_eligible_count <= 0.0
+            else total("search_root_action_prefix_density_guard_count")
+            / action_prefix_eligible_count
+        ),
+        "search/root_action_prefix_nonfinite_fraction": (
+            0.0
+            if action_prefix_eligible_count <= 0.0
+            else total("search_root_action_prefix_nonfinite_count")
+            / action_prefix_eligible_count
+        ),
+        "search/root_action_prefix_density_abs_mean": (
+            0.0
+            if action_prefix_eligible_count <= 0.0
+            else total("search_root_action_prefix_density_abs_sum")
+            / action_prefix_eligible_count
+        ),
+        "search/root_action_vs_native_m32_l1": (
+            0.0
+            if root_action_count <= 0.0
+            else total("search_root_action_native_l1_sum")
+            / root_action_count
+        ),
+        "search/root_action_vs_native_m32_l2_sq": (
+            0.0
+            if root_action_count <= 0.0
+            else total("search_root_action_native_l2_sq_sum")
+            / root_action_count
+        ),
+        "search/root_action_vs_native_m32_top1_agreement": (
+            0.0
+            if root_action_count <= 0.0
+            else total(
+                "search_root_action_native_top1_agreement_count"
+            )
+            / root_action_count
+        ),
+        "search/kappa_numeric_repair_count": kappa_numeric_repair_count,
+        "search/kappa_raw_innovation_l2_mean": (
+            0.0
+            if kappa_numeric_repair_count <= 0.0
+            else total("search_kappa_raw_innovation_l2_sum")
+            / kappa_numeric_repair_count
+        ),
+        "search/kappa_semantic_innovation_l2_mean": (
+            0.0
+            if kappa_numeric_repair_count <= 0.0
+            else total("search_kappa_semantic_innovation_l2_sum")
+            / kappa_numeric_repair_count
+        ),
+        "search/kappa_concentration_innovation_abs_mean": (
+            0.0
+            if kappa_numeric_repair_count <= 0.0
+            else total("search_kappa_concentration_innovation_abs_sum")
+            / kappa_numeric_repair_count
+        ),
+        "search/kappa_dcache_dlogkappa_raw_l2_mean": (
+            0.0
+            if kappa_numeric_repair_count <= 0.0
+            else total("search_kappa_raw_dcache_dlogkappa_l2_sum")
+            / kappa_numeric_repair_count
+        ),
+        "search/kappa_dmean_dlogkappa_l2_mean": (
+            0.0
+            if kappa_numeric_repair_count <= 0.0
+            else total("search_kappa_mean_dcache_dlogkappa_l2_sum")
+            / kappa_numeric_repair_count
+        ),
+        "search/kappa_dlog_concentration_dlogkappa_abs_mean": (
+            0.0
+            if kappa_numeric_repair_count <= 0.0
+            else total(
+                "search_kappa_log_concentration_dcache_dlogkappa_abs_sum"
+            )
+            / kappa_numeric_repair_count
+        ),
+        "search/kappa_numeric_path_count": kappa_numeric_path_count,
+        "search/kappa_numeric_path_gamma_product_mean": (
+            0.0
+            if kappa_numeric_path_count <= 0.0
+            else total("search_kappa_path_gamma_product_sum")
+            / kappa_numeric_path_count
+        ),
+        "search/kappa_numeric_path_gamma_log_attenuation_mean": (
+            0.0
+            if kappa_numeric_path_count <= 0.0
+            else total("search_kappa_path_gamma_log_attenuation_sum")
+            / kappa_numeric_path_count
+        ),
+        "search/kappa_categorical_publication_path_count": total(
+            "search_kappa_categorical_publication_path_count"
+        ),
+        "search/kappa_categorical_publication_path_fraction": (
+            0.0
+            if active_simulation_rows <= 0.0
+            else total(
+                "search_kappa_categorical_publication_path_count"
+            )
+            / active_simulation_rows
+        ),
+        "search/root_policy_top2_margin_mean": (
+            0.0
+            if top2_margin_count <= 0.0
+            else total("search_root_policy_top2_margin_sum")
+            / top2_margin_count
+        ),
+        "search/root_policy_top2_margin_tie_fraction": (
+            0.0
+            if top2_margin_count <= 0.0
+            else total("search_root_policy_top2_margin_tie_count")
+            / top2_margin_count
+        ),
+        "search/root_policy_top2_margin_below_reference_fraction": (
+            0.0
+            if top2_margin_count <= 0.0
+            else total(
+                "search_root_policy_top2_margin_below_reference_count"
+            )
+            / top2_margin_count
+        ),
+        "search/root_policy_top2_margin_reference_scale": (
+            0.0
+            if top2_margin_count <= 0.0
+            else total(
+                "search_root_policy_top2_margin_reference_scale_sum"
+            )
+            / top2_margin_count
+        ),
+        "search/root_policy_top2_margin_count": top2_margin_count,
+        "search/root_plurality_commitment_count": plurality_commitment_count,
+        "search/root_plurality_max_count_tie_count": plurality_tie_count,
+        "search/root_plurality_max_count_tie_fraction": (
+            0.0
+            if plurality_commitment_count <= 0.0
+            else plurality_tie_count / plurality_commitment_count
+        ),
+        "search/root_plurality_tied_max_multiplicity_mean": (
+            0.0
+            if plurality_tie_count <= 0.0
+            else total("search_root_plurality_tie_multiplicity_sum")
+            / plurality_tie_count
+        ),
+        "search/root_plurality_lowest_uniform_disagreement_fraction": (
+            0.0
+            if plurality_commitment_count <= 0.0
+            else total(
+                "search_root_plurality_lowest_uniform_disagreement_count"
+            )
+            / plurality_commitment_count
+        ),
+        (
+            "search/root_plurality_lowest_uniform_disagreement_given_tie"
+        ): (
+            0.0
+            if plurality_tie_count <= 0.0
+            else total(
+                "search_root_plurality_lowest_uniform_disagreement_count"
+            )
+            / plurality_tie_count
+        ),
+        "search/root_plurality_expected_disagreement_fraction": (
+            0.0
+            if plurality_commitment_count <= 0.0
+            else total("search_root_plurality_expected_disagreement_sum")
+            / plurality_commitment_count
+        ),
     }
 
 
@@ -366,6 +661,178 @@ def _capture_metrics(train_metrics: Any) -> dict[str, float]:
     return result
 
 
+def _finite_nonnegative_counts(values: Any) -> np.ndarray:
+    counts = np.asarray(jax.device_get(values), dtype=np.float64)
+    return np.where(np.isfinite(counts) & (counts > 0.0), counts, 0.0)
+
+
+def _categorical_count_stats(
+    counts: np.ndarray,
+) -> tuple[float, float, float, int, float]:
+    """Return entropy, effective support, max share, unique count, and total."""
+
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        return 0.0, 0.0, 0.0, 0, 0.0
+    probability = counts / total
+    positive = probability > 0.0
+    entropy = float(
+        -np.sum(probability[positive] * np.log(probability[positive]))
+    )
+    return (
+        entropy,
+        float(np.exp(entropy)),
+        float(np.max(probability)),
+        int(np.count_nonzero(positive)),
+        total,
+    )
+
+
+def _trajectory_metrics(train_metrics: Any) -> dict[str, float | int]:
+    """Reduce compact generation sufficient statistics into finite scalars."""
+
+    first_wins = float(
+        np.sum(
+            _finite_nonnegative_counts(
+                train_metrics.data_first_player_win_count
+            )
+        )
+    )
+    second_wins = float(
+        np.sum(
+            _finite_nonnegative_counts(
+                train_metrics.data_second_player_win_count
+            )
+        )
+    )
+    draws = float(
+        np.sum(_finite_nonnegative_counts(train_metrics.data_draw_count))
+    )
+    outcome_count = first_wins + second_wins + draws
+    outcome_denominator = max(outcome_count, 1.0)
+
+    game_histogram = _finite_nonnegative_counts(
+        train_metrics.data_game_length_histogram_counts
+    )
+    if game_histogram.ndim > 1:
+        game_histogram = np.sum(
+            game_histogram,
+            axis=tuple(range(game_histogram.ndim - 1)),
+        )
+    game_histogram = game_histogram.reshape(-1).copy()
+    if game_histogram.size > 0:
+        # Length zero is only a padding bucket for ``jnp.bincount``.
+        game_histogram[0] = 0.0
+    completed_games = float(np.sum(game_histogram))
+    lengths = np.arange(game_histogram.size, dtype=np.float64)
+    if completed_games > 0.0:
+        game_length_mean = float(
+            np.sum(lengths * game_histogram) / completed_games
+        )
+        game_length_variance = float(
+            np.sum(
+                np.square(lengths - game_length_mean) * game_histogram
+            )
+            / completed_games
+        )
+        cumulative = np.cumsum(game_histogram)
+
+        def quantile(probability: float) -> float:
+            index = int(
+                np.searchsorted(
+                    cumulative,
+                    probability * completed_games,
+                    side="left",
+                )
+            )
+            return float(min(index, game_histogram.size - 1))
+
+        game_length_std = float(np.sqrt(max(game_length_variance, 0.0)))
+        game_length_p10 = quantile(0.10)
+        game_length_p50 = quantile(0.50)
+        game_length_p90 = quantile(0.90)
+    else:
+        game_length_mean = 0.0
+        game_length_std = 0.0
+        game_length_p10 = 0.0
+        game_length_p50 = 0.0
+        game_length_p90 = 0.0
+
+    early_counts = _finite_nonnegative_counts(
+        train_metrics.data_early_ply_action_counts
+    )
+    if early_counts.ndim < 2:
+        early_counts = np.zeros((6, 0), dtype=np.float64)
+    elif early_counts.ndim > 2:
+        early_counts = np.sum(
+            early_counts,
+            axis=tuple(range(early_counts.ndim - 2)),
+        )
+    per_ply = [
+        _categorical_count_stats(early_counts[ply])
+        if ply < early_counts.shape[0]
+        else (0.0, 0.0, 0.0, 0, 0.0)
+        for ply in range(6)
+    ]
+    opening_entropy, opening_support, opening_max_share, opening_unique, opening_count = (
+        per_ply[0]
+    )
+    active_ply = [stats for stats in per_ply if stats[4] > 0.0]
+    active_ply_count = len(active_ply)
+
+    def active_mean(index: int) -> float:
+        if not active_ply:
+            return 0.0
+        return float(np.mean([stats[index] for stats in active_ply]))
+
+    action_count = early_counts.shape[-1]
+    result: dict[str, float | int] = {
+        "data/selfplay_outcome_count": outcome_count,
+        "data/first_player_win_rate": (
+            first_wins / outcome_denominator if outcome_count > 0.0 else 0.0
+        ),
+        "data/second_player_win_rate": (
+            second_wins / outcome_denominator if outcome_count > 0.0 else 0.0
+        ),
+        "data/selfplay_draw_rate": (
+            draws / outcome_denominator if outcome_count > 0.0 else 0.0
+        ),
+        "data/first_player_score": (
+            (first_wins + 0.5 * draws) / outcome_denominator
+            if outcome_count > 0.0
+            else 0.0
+        ),
+        "data/game_length_mean": game_length_mean,
+        "data/game_length_std": game_length_std,
+        "data/game_length_p10": game_length_p10,
+        "data/game_length_p50": game_length_p50,
+        "data/game_length_p90": game_length_p90,
+        "data/opening_action_sample_count": opening_count,
+        "data/opening_action_entropy_nats": opening_entropy,
+        "data/opening_action_effective_support": opening_support,
+        "data/opening_action_max_share": opening_max_share,
+        "data/opening_action_unique_count": opening_unique,
+        "data/opening_action_space_coverage": (
+            opening_unique / action_count if action_count > 0 else 0.0
+        ),
+        "data/early_ply_active_count": active_ply_count,
+        "data/early_ply_action_entropy_mean_nats": active_mean(0),
+        "data/early_ply_action_effective_support_mean": active_mean(1),
+        "data/early_ply_action_max_share_mean": active_mean(2),
+        "data/early_ply_action_unique_count_mean": active_mean(3),
+        "data/early_ply_action_space_coverage_mean": (
+            active_mean(3) / action_count if action_count > 0 else 0.0
+        ),
+    }
+    result.update(
+        {
+            f"data/early_ply_{ply}_action_entropy_nats": per_ply[ply][0]
+            for ply in range(6)
+        }
+    )
+    return result
+
+
 def concentration_histograms(train_metrics: Any) -> dict[str, PrecomputedHistogram]:
     counts = np.asarray(jax.device_get(train_metrics.dirichlet_concentration_histogram_counts), dtype=np.float64)
     expected_tail = (len(CONCENTRATION_HISTOGRAM_SERIES), CONCENTRATION_HISTOGRAM_NUM_BINS)
@@ -429,6 +896,7 @@ def training_metrics(
     metrics.update(_concentration_metrics(train_metrics))
     metrics.update(_search_metrics(train_metrics))
     metrics.update(_capture_metrics(train_metrics))
+    metrics.update(_trajectory_metrics(train_metrics))
     metrics.update(concentration_histograms(train_metrics))
     if optimizer_updates is not None:
         metrics["train/optimizer_updates"] = optimizer_updates

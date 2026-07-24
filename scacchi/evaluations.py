@@ -94,6 +94,131 @@ def evaluation_metrics(returns: jax.Array, history: list[float]) -> dict[str, fl
     }
 
 
+def seat_conditioned_evaluation_metrics(
+    returns: jax.Array,
+    *,
+    env_id: str,
+) -> dict[str, float | int]:
+    """Summarize the alternating candidate-seat layout used by evaluation.
+
+    Even rows assign the candidate to PGX player 0 (the first seat), and odd
+    rows assign it to player 1.  The unweighted seat-balanced rate remains
+    exact when an odd batch gives the first seat one extra row.
+    """
+
+    first_returns = returns[0::2]
+    second_returns = returns[1::2]
+
+    def win_summary(
+        values: jax.Array,
+    ) -> tuple[int, int, float, float, float]:
+        """Return games, wins, rate, and a Wilson 95% interval."""
+
+        if values.size == 0:
+            return 0, 0, 0.0, 0.0, 1.0
+        games = int(values.size)
+        wins = int(jax.device_get(jnp.sum(values > 0)))
+        rate = wins / games
+        z = 1.959963984540054
+        denominator = 1.0 + z * z / games
+        center = (rate + z * z / (2.0 * games)) / denominator
+        half_width = (
+            z
+            * np.sqrt(
+                rate * (1.0 - rate) / games
+                + z * z / (4.0 * games * games)
+            )
+            / denominator
+        )
+        return (
+            games,
+            wins,
+            rate,
+            max(0.0, center - half_width),
+            min(1.0, center + half_width),
+        )
+
+    (
+        first_games,
+        first_wins,
+        first_win_rate,
+        first_wilson_low,
+        first_wilson_high,
+    ) = win_summary(first_returns)
+    (
+        second_games,
+        second_wins,
+        second_win_rate,
+        second_wilson_low,
+        second_wilson_high,
+    ) = win_summary(second_returns)
+    seat_balanced_win_rate = 0.5 * (
+        first_win_rate + second_win_rate
+    )
+    both_seats_observed = first_games > 0 and second_games > 0
+    if both_seats_observed:
+        seat_balanced_se = 0.5 * np.sqrt(
+            first_win_rate * (1.0 - first_win_rate) / first_games
+            + second_win_rate * (1.0 - second_win_rate) / second_games
+        )
+        # Averaging the two component Wilson bounds is conservative near
+        # p=0/1 and remains useful when a plug-in normal variance vanishes.
+        seat_balanced_low = 0.5 * (
+            first_wilson_low + second_wilson_low
+        )
+        seat_balanced_high = 0.5 * (
+            first_wilson_high + second_wilson_high
+        )
+    else:
+        seat_balanced_se = 0.0
+        seat_balanced_low = 0.0
+        seat_balanced_high = 1.0
+    metrics: dict[str, float | int] = {
+        "eval/vs_baseline/first_seat_games": first_games,
+        "eval/vs_baseline/second_seat_games": second_games,
+        "eval/vs_baseline/first_seat_wins": first_wins,
+        "eval/vs_baseline/second_seat_wins": second_wins,
+        "eval/vs_baseline/first_seat_win_rate": first_win_rate,
+        "eval/vs_baseline/first_seat_win_rate_wilson95_low": (
+            first_wilson_low
+        ),
+        "eval/vs_baseline/first_seat_win_rate_wilson95_high": (
+            first_wilson_high
+        ),
+        "eval/vs_baseline/second_seat_win_rate": second_win_rate,
+        "eval/vs_baseline/second_seat_win_rate_wilson95_low": (
+            second_wilson_low
+        ),
+        "eval/vs_baseline/second_seat_win_rate_wilson95_high": (
+            second_wilson_high
+        ),
+        "eval/vs_baseline/seat_balanced_win_rate": seat_balanced_win_rate,
+        "eval/vs_baseline/seat_balanced_win_rate_se": seat_balanced_se,
+        "eval/vs_baseline/seat_balanced_win_rate_stratified95_low": (
+            seat_balanced_low
+        ),
+        "eval/vs_baseline/seat_balanced_win_rate_stratified95_high": (
+            seat_balanced_high
+        ),
+        "eval/vs_baseline/both_seats_observed": int(both_seats_observed),
+        "eval/vs_baseline/first_minus_second_win_rate": (
+            first_win_rate - second_win_rate
+        ),
+    }
+    if env_id == "hex":
+        seat_optimal_error = 0.5 * (
+            (1.0 - first_win_rate) + second_win_rate
+        )
+        metrics["eval/vs_baseline/seat_optimal_error"] = seat_optimal_error
+        metrics["eval/vs_baseline/seat_optimal_error_stratified95_low"] = (
+            0.5 * ((1.0 - first_wilson_high) + second_wilson_low)
+        )
+        metrics["eval/vs_baseline/seat_optimal_error_stratified95_high"] = (
+            0.5 * ((1.0 - first_wilson_low) + second_wilson_high)
+        )
+    return metrics
+
+
 def baseline_search_config(config) -> SearchConfig:
     search_config = config.eval.baseline_search
     if config.eval.baseline != EvalBaseline.pgx:
@@ -134,7 +259,7 @@ def make_mcts_evaluate(
 
     @nnx.jit
     def evaluate(rng_key: jax.Array, model: nnx.Module):
-        """MCTS evaluation: model search vs pretrained opponent."""
+        """MCTS evaluation with exact alternating candidate seats."""
         metrics = play_eval(
             env,
             search_player(model, player_search_config, player_action_commitment_type),
@@ -145,6 +270,10 @@ def make_mcts_evaluate(
             ),
             rng_key,
             batch_size=eval_batch_size,
+            # ``None`` means even rows take the environment's initial
+            # player ID and odd rows take the other ID.  Hex randomizes
+            # player IDs, so alternating IDs here would not balance seats.
+            player_1_id=None,
             parallel=parallel,
         )
         return assert_batch_axis_sharded(

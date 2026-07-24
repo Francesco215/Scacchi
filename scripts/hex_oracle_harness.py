@@ -16,7 +16,8 @@ Score policies and optional value-head probabilities stored in JSON::
       --output /tmp/hex6_oracle_scores.json
 
 Score a Scacchi checkpoint directly, using the checkpoint's self-play
-Dirichlet-Thompson configuration::
+Dirichlet-Thompson configuration.  Exact checkpoint scoring is conservatively
+limited to positions with at most 15 empty cells::
 
     JAX_PLATFORMS=cuda,cpu uv run python scripts/hex_oracle_harness.py checkpoint \
       --corpus experiments/hex6_oracle.json \
@@ -74,6 +75,9 @@ from scacchi.hex_oracle import (
     sample_late_game_hex_corpus,
     write_frozen_hex_corpus,
 )
+
+
+MAX_CHECKPOINT_ORACLE_EMPTY_CELLS = 15
 
 
 def _sample(args: argparse.Namespace) -> None:
@@ -711,12 +715,13 @@ def _predict_checkpoint(
         raise ValueError("--policy-readouts must be at least 2")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be positive")
-    if corpus.max_empty > 6 or any(
-        frozen.position.empty_count > 6 for frozen in corpus.positions
+    if corpus.max_empty > MAX_CHECKPOINT_ORACLE_EMPTY_CELLS or any(
+        frozen.position.empty_count > MAX_CHECKPOINT_ORACLE_EMPTY_CELLS
+        for frozen in corpus.positions
     ):
         raise ValueError(
             "checkpoint oracle evaluation is restricted to positions with "
-            "at most six empty cells"
+            f"at most {MAX_CHECKPOINT_ORACLE_EMPTY_CELLS} empty cells"
         )
 
     (
@@ -923,7 +928,7 @@ def _parser() -> argparse.ArgumentParser:
         "checkpoint",
         help=(
             "score a Scacchi checkpoint directly with fixed-tree repeated "
-            "Dirichlet-Thompson readouts"
+            "Dirichlet-Thompson readouts (at most 15 empty cells)"
         ),
     )
     checkpoint.add_argument("--corpus", type=Path, required=True)

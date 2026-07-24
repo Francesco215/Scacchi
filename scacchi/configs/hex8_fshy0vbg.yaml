@@ -1,0 +1,90 @@
+# Current-schema reproduction of W&B run pal/scacchi-az/fshy0vbg
+# (hex8_solved_16k). Its matching historical config is at
+# be76e6604178f3aaf6abf365a02c00774d7d9d97.
+# The retired Dirichlet-Thompson num_blocks and per-node constants do not have
+# equivalents in the current persistent-tree implementation, so they are
+# intentionally omitted. All active, comparable run parameters are retained.
+
+run:
+  seed: 0
+  max_num_iters: 2000
+
+env:
+  id: hex
+  board_size: 8
+  num_outcomes: 2
+
+model:
+  network: boardlaw_dirichlet
+  num_channels: 1024
+  num_layers: 8
+  compute_dtype: float32
+  resnet_v2: true
+  rezero_kernel_init: orthogonal
+  legacy_dirichlet_head_init: true
+
+selfplay:
+  batch_size: 16384
+  max_num_steps: 64
+  action_commitment_type: posterior_sample
+  search:
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 4
+      max_depth: 4
+      policy_samples: 32
+      policy_sample_chunk_size: 32
+
+training:
+  batch_size: 8192
+  max_updates_per_iter: null
+  learning_rate: 1e-3
+  lr_decay_after_iters: null
+  lr_decay_factor: 1.0
+  grad_clip_norm: 1.0
+  losses:
+    policy_weight: 1.0
+    value_dir_kl_weight: 1.0
+    q_dir_kl_weight: 1.0
+    value_outcome_weight: 0.25
+    q_outcome_weight: 0.1
+    q_loss_weight_mode: evidence_mass
+    q_dir_kl_reduction: masked_mean
+    loss_mask_mode: value
+    terminal_edge_targets: true
+    terminal_parent_targets: true
+    policy_target_mode: search
+  regularization:
+    dirichlet_concentration_clip: 100.0
+
+eval:
+  interval: 5
+  batch_size: 1024
+  baseline: checkpoint
+  baseline_id: null
+  checkpoint_path: null
+  player_action_commitment_type: posterior_argmax
+  baseline_action_commitment_type: posterior_argmax
+  player_search:
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 4
+      max_depth: 4
+      policy_samples: 32
+      policy_sample_chunk_size: 32
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 4
+      gumbel_scale: 1.0
+
+logging:
+  interval: 1
+  wandb:
+    enabled: true
+    project: scacchi-az
+
+checkpointing:
+  directory: null
+  max_to_keep: 0
+  save_interval_steps: 100

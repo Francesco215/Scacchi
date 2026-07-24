@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -43,6 +45,7 @@ from scacchi.types import (
     EnvConfig,
     ModelConfig,
     Network,
+    QLossWeightMode,
     SearchConfig,
     SearchKind,
     SelfplayConfig,
@@ -289,6 +292,108 @@ def test_additive_diagnostics_pool_before_logging_ratios() -> None:
         search_policy_top1_agreement_count=jnp.array(
             [[1.0, 0.0], [1.0, 1.0]]
         ),
+        search_root_policy_target_enabled_count=jnp.ones(shape),
+        search_root_policy_target_categorical_population_count=jnp.array(
+            [[1.0, 0.0], [0.0, 0.0]]
+        ),
+        search_root_policy_target_prefix_eligible_count=jnp.ones(shape),
+        search_root_policy_target_prefix_accepted_count=jnp.array(
+            [[1.0, 1.0], [1.0, 0.0]]
+        ),
+        search_root_policy_target_prefix_fallback_count=jnp.array(
+            [[0.0, 0.0], [0.0, 1.0]]
+        ),
+        search_root_policy_target_prefix_tail_clipped_count=jnp.array(
+            [[0.0, 0.0], [0.0, 1.0]]
+        ),
+        search_root_policy_target_prefix_density_abs_sum=jnp.full(
+            shape,
+            0.002,
+        ),
+        search_root_policy_target_native_l1_sum=jnp.full(shape, 0.1),
+        search_root_policy_target_native_l2_sq_sum=jnp.full(
+            shape,
+            0.01,
+        ),
+        search_root_policy_target_native_top1_agreement_count=jnp.array(
+            [[1.0, 1.0], [1.0, 0.0]]
+        ),
+        search_root_action_estimator_enabled_count=jnp.ones(shape),
+        search_root_action_prefix_eligible_count=jnp.ones(shape),
+        search_root_action_prefix_accepted_count=jnp.array(
+            [[1.0, 1.0], [1.0, 0.0]]
+        ),
+        search_root_action_prefix_fallback_count=jnp.array(
+            [[0.0, 0.0], [0.0, 1.0]]
+        ),
+        search_root_action_prefix_tail_clipped_count=jnp.array(
+            [[0.0, 0.0], [0.0, 1.0]]
+        ),
+        search_root_action_prefix_density_abs_sum=jnp.full(
+            shape,
+            0.004,
+        ),
+        search_root_action_native_l1_sum=jnp.full(shape, 0.2),
+        search_root_action_native_l2_sq_sum=jnp.full(shape, 0.02),
+        search_root_action_native_top1_agreement_count=jnp.array(
+            [[1.0, 0.0], [1.0, 0.0]]
+        ),
+        search_solved_root_count=jnp.array(
+            [[1.0, 0.0], [0.0, 0.0]]
+        ),
+        search_kappa_numeric_repair_count=jnp.full(shape, 2.0),
+        search_kappa_raw_innovation_l2_sum=jnp.full(shape, 4.0),
+        search_kappa_semantic_innovation_l2_sum=jnp.full(shape, 2.0),
+        search_kappa_concentration_innovation_abs_sum=jnp.full(
+            shape,
+            6.0,
+        ),
+        search_kappa_raw_dcache_dlogkappa_l2_sum=jnp.ones(shape),
+        search_kappa_mean_dcache_dlogkappa_l2_sum=jnp.full(
+            shape,
+            0.5,
+        ),
+        search_kappa_log_concentration_dcache_dlogkappa_abs_sum=(
+            jnp.full(shape, 0.25)
+        ),
+        search_kappa_numeric_path_count=jnp.ones(shape),
+        search_kappa_path_gamma_product_sum=jnp.full(shape, 0.25),
+        search_kappa_path_gamma_log_attenuation_sum=jnp.full(
+            shape,
+            0.5,
+        ),
+        search_kappa_categorical_publication_path_count=jnp.array(
+            [[1.0, 0.0], [0.0, 1.0]]
+        ),
+        search_root_policy_top2_margin_sum=jnp.array(
+            [[0.1, 0.2], [0.3, 0.4]]
+        ),
+        search_root_policy_top2_margin_count=jnp.ones(shape),
+        search_root_policy_top2_margin_tie_count=jnp.array(
+            [[1.0, 0.0], [0.0, 0.0]]
+        ),
+        search_root_policy_top2_margin_below_reference_count=jnp.array(
+            [[1.0, 1.0], [0.0, 0.0]]
+        ),
+        search_root_policy_top2_margin_reference_scale_sum=jnp.full(
+            shape,
+            0.125,
+        ),
+        search_root_plurality_commitment_count=jnp.array(
+            [[1.0, 1.0], [1.0, 0.0]]
+        ),
+        search_root_plurality_max_count_tie_count=jnp.array(
+            [[1.0, 0.0], [1.0, 0.0]]
+        ),
+        search_root_plurality_tie_multiplicity_sum=jnp.array(
+            [[2.0, 0.0], [3.0, 0.0]]
+        ),
+        search_root_plurality_lowest_uniform_disagreement_count=jnp.array(
+            [[1.0, 0.0], [1.0, 0.0]]
+        ),
+        search_root_plurality_expected_disagreement_sum=jnp.array(
+            [[0.5, 0.0], [2.0 / 3.0, 0.0]]
+        ),
     )
     diagnostics = SearchDiagnostics(**fields)
     base_metrics = _zero_train_metrics_like(jnp.asarray(0.0))._replace(
@@ -318,6 +423,29 @@ def test_additive_diagnostics_pool_before_logging_ratios() -> None:
     assert logged["search/executed_recurrent_rows_total"] == 16.0
     assert logged["search/recurrent_row_utilization"] == 0.75
     assert logged["search/max_depth_mean"] == 2.0
+    assert logged["search/root_plurality_commitment_count"] == 3.0
+    assert logged["search/root_plurality_max_count_tie_count"] == 2.0
+    assert (
+        logged["search/root_plurality_max_count_tie_fraction"]
+        == pytest.approx(2.0 / 3.0)
+    )
+    assert (
+        logged["search/root_plurality_tied_max_multiplicity_mean"] == 2.5
+    )
+    assert (
+        logged["search/root_plurality_lowest_uniform_disagreement_fraction"]
+        == pytest.approx(2.0 / 3.0)
+    )
+    assert (
+        logged[
+            "search/root_plurality_lowest_uniform_disagreement_given_tie"
+        ]
+        == 1.0
+    )
+    assert (
+        logged["search/root_plurality_expected_disagreement_fraction"]
+        == pytest.approx(7.0 / 18.0)
+    )
     assert logged["search/q_semantic_displacement_kl_nats"] == 0.4
     assert (
         logged[
@@ -334,6 +462,99 @@ def test_additive_diagnostics_pool_before_logging_ratios() -> None:
     assert logged["search/policy_support_mean"] == 3.0
     assert logged["search/policy_ess_mean"] == 2.0
     assert logged["search/policy_prior_target_top1_agreement"] == 0.75
+    assert (
+        logged["search/root_policy_target_categorical_population_fraction"]
+        == 0.25
+    )
+    assert (
+        logged["search/root_policy_target_prefix_acceptance_fraction"]
+        == 0.75
+    )
+    assert (
+        logged["search/root_policy_target_prefix_fallback_fraction"]
+        == 0.25
+    )
+    assert (
+        logged["search/root_policy_target_prefix_tail_clipped_fraction"]
+        == 0.25
+    )
+    assert jnp.allclose(
+        cast(
+            float,
+            logged["search/root_policy_target_prefix_density_abs_mean"],
+        ),
+        0.002,
+    )
+    assert jnp.allclose(
+        cast(float, logged["search/root_policy_target_vs_native_m32_l1"]),
+        0.1,
+    )
+    assert (
+        logged[
+            "search/root_policy_target_vs_native_m32_top1_agreement"
+        ]
+        == 0.75
+    )
+    assert logged["search/root_action_prefix_acceptance_fraction"] == 0.75
+    assert logged["search/root_action_prefix_fallback_fraction"] == 0.25
+    assert (
+        logged["search/root_action_prefix_tail_clipped_fraction"] == 0.25
+    )
+    assert jnp.allclose(
+        cast(float, logged["search/root_action_prefix_density_abs_mean"]),
+        0.004,
+    )
+    assert jnp.allclose(
+        cast(float, logged["search/root_action_vs_native_m32_l1"]),
+        0.2,
+    )
+    assert (
+        logged["search/root_action_vs_native_m32_top1_agreement"] == 0.5
+    )
+    assert logged["search/kappa_solved_bypass_fraction"] == 0.25
+    assert logged["search/kappa_numeric_repair_count"] == 8.0
+    assert logged["search/kappa_raw_innovation_l2_mean"] == 2.0
+    assert logged["search/kappa_semantic_innovation_l2_mean"] == 1.0
+    assert logged["search/kappa_concentration_innovation_abs_mean"] == 3.0
+    assert logged["search/kappa_dcache_dlogkappa_raw_l2_mean"] == 0.5
+    assert logged["search/kappa_dmean_dlogkappa_l2_mean"] == 0.25
+    assert (
+        logged[
+            "search/kappa_dlog_concentration_dlogkappa_abs_mean"
+        ]
+        == 0.125
+    )
+    assert logged["search/kappa_numeric_path_count"] == 4.0
+    assert (
+        logged["search/kappa_numeric_path_gamma_product_mean"] == 0.25
+    )
+    assert (
+        logged[
+            "search/kappa_numeric_path_gamma_log_attenuation_mean"
+        ]
+        == 0.5
+    )
+    assert logged["search/kappa_categorical_publication_path_count"] == 2.0
+    assert jnp.allclose(
+        cast(
+            float,
+            logged["search/kappa_categorical_publication_path_fraction"],
+        ),
+        1.0 / 6.0,
+    )
+    assert jnp.allclose(
+        cast(float, logged["search/root_policy_top2_margin_mean"]),
+        0.25,
+    )
+    assert logged["search/root_policy_top2_margin_tie_fraction"] == 0.25
+    assert (
+        logged["search/root_policy_top2_margin_below_reference_fraction"]
+        == 0.5
+    )
+    assert (
+        logged["search/root_policy_top2_margin_reference_scale"] == 0.125
+    )
+    assert logged["search/root_policy_top2_margin_count"] == 4.0
     assert logged["data/terminal_events_per_1k_frames"] == 40.0
     assert logged["train/optimizer_updates"] == 12
     assert logged["train/optimizer_updates_this_iteration"] == 3
@@ -496,6 +717,11 @@ def test_training_iteration_measures_same_probe_before_and_after_updates() -> No
             losses=TrainingLossConfig(
                 value_dir_kl_weight=0.1,
                 q_dir_kl_weight=0.1,
+                # With zero simulations, evidence-mass weighting correctly
+                # has no Q population.  This test needs a nonempty Q probe to
+                # exercise before/after capture, so opt into the public-policy
+                # population explicitly.
+                q_loss_weight_mode=QLossWeightMode.policy,
             ),
         ),
     )

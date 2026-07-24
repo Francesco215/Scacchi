@@ -604,6 +604,61 @@ C_s
       </d-math>
 
       <p>If <d-math>n_s=0</d-math>, then <d-math>C_s=V_s</d-math>. The sole constant <d-math>\kappa&gt;0</d-math> is the strength of that learned value prior against repaired descendants. It is not leaf evidence or terminal confidence. The categorical projection does not mutate <d-math>A</d-math> and never replaces the exact sidecar or categorical training target.</p>
+      <p>For the blend-only envelope of the unresolved numeric-cache channel, define <d-math>g_d=\prod_{i=1}^{d}\gamma_i</d-math>. If structural support were constant, <d-math>n_i=n</d-math>, this becomes</p>
+      <d-math block>
+g_d=\left(\frac{n}{\kappa+n}\right)^d
+    =\exp(-d/\ell),
+\qquad
+\ell(n,\kappa)=\frac{1}{\log(1+\kappa/n)}.
+      </d-math>
+      <p>This is not yet the coefficient of one descendant edge. Holding each node-local policy fixed, a perturbation traveling along selected actions <d-math>a_1,\ldots,a_d</d-math> instead has branch coefficient</p>
+      <d-math block>
+w_P^{\mathrm{fixed}}
+=\prod_{i=1}^{d}\gamma_i\pi_i(a_i)
+\leq g_d.
+      </d-math>
+      <p>The policies themselves depend on repaired posteriors, so their Jacobians contribute to a full perturbation, and a rerun may even change topology. The logged product <d-math>\prod_i\gamma_i</d-math> is therefore a cache-mix attenuation envelope, not realized information transmission. The effective length describes only that envelope. It is not a reward horizon: exact terminal and solved outcomes propagate through categorical sidecars without this attenuation.</p>
+      <p>The local sensitivity makes the distinction precise. Let <d-math>\Delta_s=\bar A_s-V_s</d-math>. Holding the realized <d-math>n_s,V_s,\bar A_s</d-math> fixed,</p>
+      <d-math block>
+C_s=V_s+\gamma_s\Delta_s,
+\qquad
+\left.
+\frac{\partial C_s}{\partial\log\kappa}
+\right|_{n_s,V_s,\bar A_s}
+=-\gamma_s(1-\gamma_s)\Delta_s,
+\qquad
+\left\|
+\frac{\partial C_s}{\partial\log\kappa}
+\right\|_2
+\leq \frac14\|\bar A_s-V_s\|_2.
+      </d-math>
+      <p>Because raw Dirichlet alpha distance mixes direction and mass, also let <d-math>c_s=\mathbf 1^\top C_s</d-math>, <d-math>p_s=C_s/c_s</d-math>, and <d-math>G_s=\partial C_s/\partial\log\kappa</d-math>. Then the exact local semantic and relative-concentration sensitivities are</p>
+      <d-math block>
+\frac{\partial p_s}{\partial\log\kappa}
+=
+\frac{G_s-p_s(\mathbf 1^\top G_s)}{c_s},
+\qquad
+\frac{\partial\log c_s}{\partial\log\kappa}
+=
+\frac{\mathbf 1^\top G_s}{c_s}.
+      </d-math>
+      <p>A large change in <d-math>\ell</d-math> can therefore have little local effect for two different reasons: the mixture is saturated (<d-math>n_s\ll\kappa</d-math> or <d-math>n_s\gg\kappa</d-math>), or the learned prior already agrees with the repaired aggregate (<d-math>\bar A_s\approx V_s</d-math>). The latter is exactly the fixed point encouraged by search-based self-distillation: if <d-math>\bar A_s=V_s</d-math>, then <d-math>C_s=V_s</d-math> for every <d-math>\kappa</d-math>. This can indicate successful assimilation, but not correctness, because prior and search may share the same bias.</p>
+      <p>For a heterogeneous unresolved numeric path <d-math>P</d-math>, holding its supports fixed,</p>
+      <d-math block>
+-\log g_P
+=\sum_{i\in P}-\log\gamma_i
+=\sum_{i\in P}\log\left(1+\frac{\kappa}{n_i}\right),
+\qquad
+\frac{\partial\log g_P}{\partial\log\kappa}
+=-\sum_{i\in P}(1-\gamma_i).
+      </d-math>
+      <p>Thus the observed gamma product and its log attenuation are a more faithful blend-only envelope than a root-local constant-support <d-math>\ell</d-math>. Even a cache change must then reach a root edge posterior and cross a commitment boundary. Paired reruns, rather than this envelope, measure the deployed effect. If <d-math>q_\kappa</d-math> has unique top-two margin <d-math>m_\kappa=q_{\kappa,(1)}-q_{\kappa,(2)}</d-math>, a deterministic argmax can change only if</p>
+      <d-math block>
+\|q_{\kappa'}-q_\kappa\|_\infty
+\geq
+\frac{m_\kappa}{2}.
+      </d-math>
+      <p>For plurality commitment the margin remains diagnostic, but this hard condition does not apply because the finite vote is random. The implementation also reports the fraction of policies whose top-two margin is at most <d-math>1/M</d-math>. That one-vote spacing is a descriptive reference scale for an <d-math>M</d-math>-sample empirical policy, not a decision threshold for argmax, plurality, or posterior sampling. Finally, an action flip need not change strength: it may select an outcome-equivalent move, occur on a rarely visited state, or be irrelevant against the chosen opponent. The direct final-edge message is also installed before the cache mix, and completed root action readout ranks root edge posteriors rather than the root's mixed value cache.</p>
 
       <h3 id="5-1-why-the-order-matters">5.1 Why the order matters</h3>
 
@@ -623,20 +678,70 @@ s_d,\ s_{d-1},\ \ldots,\ s_0.
 
       <h2 id="6-root-readout-and-training-targets">6. Root readout and training targets</h2>
 
-      <p>If the root remains unresolved, its policy is another mixed-native posterior-best population. If the root is categorical, the engine samples uniformly among tied certified actions and returns a one-hot policy on that sample:</p>
+      <p>Search first completes the tree and constructs its native winner-count readout. At an unresolved root it is a fresh population of <d-math>M</d-math> native Thompson winners; the standard <d-math>M=32</d-math> setting is abbreviated M32:</p>
 
       <d-math block>
-\pi_{\mathrm{search}}(a\mid s_0)
+\pi_M^{\mathrm{nat}}(a\mid s_0)
 =
 \begin{cases}
-\widehat\pi_{M_{\mathrm{root}}}(a\mid s_0;Y_{s_0}),
+\widehat\pi_M(a\mid s_0;Y_{s_0}),
 &z_{s_0}=\bot,\\[3pt]
-\mathbf 1[a=a_{\mathrm{cat}}(s_0)],
+e_{A_{\mathrm{cat}}}(a),
 &z_{s_0}\ne\bot.
 \end{cases}
+\qquad
+A_{\mathrm{cat}}\sim\mathrm{Uniform}(\mathcal B(s_0)).
       </d-math>
 
-      <p>The Q and V targets retain the same native tags used by search:</p>
+      <p>Here <d-math>\mathcal B(s_0)</d-math> is the distance-optimal certified tie set: shortest wins, longest losses, or all certified draws. This native random tie-break, the native backend action, and the completed tree always exist before the optional readouts below.</p>
+
+      <div class="correction">
+        <p><strong>Readout is not search:</strong> selecting a different completed-root target or commitment estimator does not rerun or mutate traversal, expansion, bottom-up repair, proof propagation, certificates, or the tree. A different committed action can change only the subsequent game trajectory.</p>
+      </div>
+
+      <h3 id="6-1-guarded-root-estimators">6.1 Guarded target and commitment estimators</h3>
+
+      <p>For an unresolved binary root, let <d-math>x_a</d-math> be action <d-math>a</d-math>'s Beta-distributed win probability. Since binary utility is monotone in <d-math>x_a</d-math>, the population probability that <d-math>a</d-math> is best is</p>
+
+      <d-math block>
+q_a^\star
+=\Pr(x_a=\max_b x_b)
+=\int_0^1 f_a(x)\prod_{b\ne a}F_b(x)\,dx.
+      </d-math>
+
+      <p>The adaptive prefix-CDF estimator approximates all these integrals together on <d-math>Q=2h+1</d-math> sinh-logit grid points; Q21 is <d-math>h=10</d-math>. Prefix sums produce every CDF, and each increment of the maximum CDF is distributed among actions by its local nonnegative winner contribution. This is permutation equivariant, costs <d-math>O(AQ)</d-math>, and conserves policy mass up to roundoff.</p>
+
+      <d-math block>
+T=\mathrm{clip}\left(
+\mathrm{asinh}\left(
+\frac{\mathrm{tail\_scale}}
+{\min_{a:\,z_{s_0,a}=\bot,\ z}\alpha_{a,z}}
+\right),
+T_{\min},T_{\max}
+\right).
+      </d-math>
+
+      <p>An unresolved root accepts the estimate only when the adaptive tail range is not clipped, all values are finite, and the maximum absolute pre-normalization log density-integral error is at most <d-math>0.01</d-math>. An unsafe lane falls back to its already computed native M32 policy; safe lanes in the same batch remain usable. Prefix-CDF root readout is binary-only.</p>
+
+      <p><code>root_policy_target_estimator</code> and <code>root_action_estimator</code> independently choose <code>winner_mc</code> or <code>prefix_cdf</code>; both default to <code>winner_mc</code>. If either requests prefix-CDF, one quadrature is computed and shared. These root fields are separate from <code>posterior_policy_estimator</code>, which controls node-local cache repair while the tree is being built. Define the exact solved population</p>
+
+      <d-math block>
+\pi^{\mathrm{cat}}(a\mid s_0)
+=\frac{\mathbf 1[a\in\mathcal B(s_0)]}{|\mathcal B(s_0)|}.
+      </d-math>
+
+      <div class="two-column">
+        <div class="mini-card">
+          <p><strong>Training target</strong></p>
+          <p><code>winner_mc</code> stores <d-math>\pi_M^{\mathrm{nat}}</d-math>. Safe prefix mode stores <d-math>\widetilde q_Q</d-math> at an unresolved root and <d-math>\pi^{\mathrm{cat}}</d-math> at a solved root; an unsafe unresolved root stores native M32.</p>
+        </div>
+        <div class="mini-card">
+          <p><strong>Action commitment</strong></p>
+          <p>Safe prefix mode supplies <d-math>\widetilde q_Q</d-math> only to unresolved-root <code>posterior_argmax</code>, <code>posterior_plurality</code>, or <code>posterior_sample</code>. The last mode draws from its configured power-temperature transform. Solved commitment stays the native random distance-optimal one-hot. <code>search_action</code> always stays native.</p>
+        </div>
+      </div>
+
+      <p>The commitment policy is ephemeral and is not copied into replay. The Q and V targets retain the native tagged objects used by the completed search:</p>
 
       <d-math block>
 T^Q_{s,a}=
@@ -655,27 +760,119 @@ T^V_s=
 \end{cases}
       </d-math>
 
+      <p>Structural counts, these Q/V targets, and the policy-mode Q-loss weight all remain native. In particular, policy-mode Q reduction uses <d-math>\pi_M^{\mathrm{nat}}</d-math>, never the optional policy target or commitment policy. There is no root-only reconstruction <d-math>\beta_Q=\alpha_{\mathrm{base}}+E_Q</d-math>, and <d-math>R</d-math> is never added to Dirichlet concentration.</p>
+
+      <h3 id="6-2-finite-population-plurality">6.2 Finite-population plurality commitment</h3>
+
+      <p><code>posterior_plurality</code> draws <d-math>M=</d-math> <code>posterior_plurality_samples</code> categorical votes from the legal commitment population (default 32), then commits the lowest-index action among the largest counts:</p>
+
       <d-math block>
-\pi_{\mathrm{target}}(a\mid s_0)
-=
-\pi_{\mathrm{search}}(a\mid s_0).
+A_M=\min\arg\max_a C_a,
+\qquad
+[g_M(q)]_a
+=\sum_{\substack{c\in\mathbb N^L,\ \sum_i c_i=M\\
+c_a&gt;c_j\ (j&lt;a),\ c_a\ge c_j\ (j&gt;a)}}
+\frac{M!}{\prod_i c_i!}\prod_i q_i^{c_i}.
       </d-math>
+
+      <p>This finite-population operator satisfies <d-math>g_1(q)=q</d-math> and converges to the deterministic mode when that mode is unique. It is not a temperature transform; at finite <d-math>M</d-math>, count ties preserve the stated lowest-index bias.</p>
+
+      <p>The implementation zeros illegal, non-finite, and non-positive entries and renormalizes before drawing. Zero legal mass falls back to the uniform legal population, with action zero as the no-legal-action sentinel. Exact one-hot policies bypass resampling.</p>
+
+      <p>Conditional on one fixed, completed, unresolved tree <d-math>T</d-math>, let <d-math>q^{\mathrm{impl}}(T)</d-math> be the winner distribution of one production Thompson draw. Native winner-MC produces <d-math>C=M\pi_M^{\mathrm{nat}}\sim\mathrm{Multinomial}(M,q^{\mathrm{impl}}(T))</d-math>, hence</p>
+
+      <d-math block>
+\mathcal L\!\left(
+\min\arg\max_a\pi_M^{\mathrm{nat}}(a)\mid T
+\right)
+=g_M\!\left(q^{\mathrm{impl}}(T)\right).
+      </d-math>
+
+      <p>Accordingly, accepted Q21 followed by plurality-32 has law <d-math>g_{32}(\widetilde q_{21}(T))</d-math>. It exactly matches native M32 plus <code>posterior_argmax</code> only if <d-math>\widetilde q_{21}=q^{\mathrm{impl}}</d-math> and both use the same count-tie rule. Q21 quadrature error and the native Gamma sampler's rare bounded-work bias relative to the ideal <d-math>q^\star</d-math> must remain distinct. If the Q21 guard fails, plurality bypasses its new vote draw and returns the native histogram's lowest-index argmax. Explicitly applying <d-math>K</d-math> plurality votes to a winner-MC histogram would instead have conditional law <d-math>g_K(\pi_M^{\mathrm{nat}})</d-math> and is a two-stage transform. Solved roots also remain outside plurality: their exact one-hot policies preserve the native uniformly sampled distance-optimal categorical action.</p>
 
       <div class="correction">
-        <p>There is no root-only reconstruction <d-math>\beta_Q=\alpha_{\mathrm{base}}+E_Q</d-math>, and <d-math>R</d-math> is never added to Dirichlet concentration. A categorical target consumes the exact sidecar, not the numeric cache projection.</p>
+        <p><strong>Why the intermediate transform matters:</strong> sampling <d-math>q</d-math> directly is the <d-math>M=1</d-math> endpoint and can turn a broad epistemic posterior into overly diffuse behavior. Taking <d-math>\arg\max q</d-math> discards every margin, is discontinuous at ties, and can amplify small asymmetries into collapsed coverage. Finite <d-math>g_M</d-math> aggregates repeated winner draws while retaining controlled randomness; away from close count ties its unique-mode concentration suppresses low-mass alternatives. The equality above is conditional on the same tree only; different committed actions produce different later states, trees, training data, and eventually weights.</p>
       </div>
 
-      <h3 id="6-1-losses">6.1 Losses</h3>
+      <h3 id="6-3-power-temperature-posterior-sampling">6.3 Power-temperature posterior sampling</h3>
 
-      <p>The policy head distills the posterior-best distribution:</p>
+      <p>For a nonempty legal set, <code>posterior_sample</code> uses <d-math>T=</d-math> <code>posterior_sample_temperature</code> and <d-math>\epsilon=10^{-8}</d-math>:</p>
 
       <d-math block>
-\mathcal L_\pi
-=
--\sum_{a\in\mathcal A(s)}
-\mathrm{stopgrad}(\pi_{\mathrm{target}}(a\mid s))
-\log\pi_\theta(a\mid s).
+\bar q_a
+=\mathbf 1[a\in\mathcal A_{\mathrm{legal}}]\,
+\mathrm{clip}(q_a,\epsilon,1),
+\qquad
+[\tau_T(q)]_a
+=\frac{\bar q_a^{1/T}}
+{\sum_{b\in\mathcal A_{\mathrm{legal}}}\bar q_b^{1/T}},
+\qquad T&gt;0.
       </d-math>
+
+      <p>At <d-math>T=1</d-math> this is exactly the existing direct sampler, including its numerical floor. If the floored legal population has a unique maximizer <d-math>a^\star</d-math>, then <d-math>\tau_T(q)\to e_{a^\star}</d-math> as <d-math>T\downarrow0</d-math>. This is an ephemeral commitment transform only: it does not alter traversal, repair, the completed tree, policy or Q/V targets, replay, or the current search weights.</p>
+
+      <d-math block>
+\frac{[\tau_T(q)]_a}{[\tau_T(q)]_b}
+=
+\left(
+\frac{\mathrm{clip}(q_a,\epsilon,1)}
+{\mathrm{clip}(q_b,\epsilon,1)}
+\right)^{1/T}.
+      </d-math>
+
+      <p>Therefore temperature preserves the clipped weak ranking—strictly unless the floor collapses two coordinates—and satisfies IIA because the odds of <d-math>a</d-math> against <d-math>b</d-math> do not depend on another action. Finite plurality does neither under the production lowest-index count-tie rule. For every finite <d-math>M\ge2</d-math> with at least three full-support actions, a symmetric population has positive-probability maximum-count ties; choosing the lowest index breaks permutation symmetry and, by continuity, creates nearby rank reversals. Writing <d-math>\Phi_M=g_M</d-math>, the concrete two-vote law is</p>
+
+      <d-math block>
+[\Phi_2(q)]_0=2q_0-q_0^2,
+\qquad
+[\Phi_2(q)]_1=q_1^2+2q_1q_2.
+      </d-math>
+
+      <p>For <d-math>q=(0.34,0.35,0.31)</d-math>, the input ranks action 1 above action 0, but <d-math>[\Phi_2(q)]_0=0.5644&gt;0.3395=[\Phi_2(q)]_1</d-math>. Along <d-math>q=(x,x,1-2x)</d-math>, their output odds are <d-math>(2-x)/(2-3x)</d-math>, which change with the third coordinate although <d-math>q_0/q_1=1</d-math>. The same finite maximum-count ties create literal lowest-index bias.</p>
+
+      <div class="correction">
+        <p><strong>Intervention, not equivalence:</strong> temperature sampling can replace plurality as a simpler one-parameter causal intervention while holding the completed tree and commitment population fixed. It is not an exact law-equivalent substitution for multiclass <d-math>\Phi_M</d-math>; matching entropy, top-action mass, or game strength does not make the action distributions identical, and a temperature fitted at one root is not an identity at other roots. Unsafe prefix-CDF action lanes, and solved roots whose action readout requested prefix-CDF, bypass both stochastic rereadouts and preserve the native commitment argmax exactly.</p>
+      </div>
+
+      <h3 id="6-4-losses-and-gradient-error">6.4 Losses and target-induced gradient error</h3>
+
+      <p>The policy head distills the independently selected policy target:</p>
+
+      <d-math block>
+\mathcal L_\pi(q)
+=-\sum_{a\in\mathcal A(s)}q_a\log p_{\theta,a},
+\qquad
+\nabla_r\mathcal L_\pi(q)=p_\theta-q.
+      </d-math>
+
+      <p>Consequently target error is exactly policy-logit-gradient error:</p>
+
+      <d-math block>
+\nabla_r\mathcal L_\pi(\widetilde q)
+-\nabla_r\mathcal L_\pi(q)
+=q-\widetilde q,
+\qquad
+\|\Delta\nabla_r\mathcal L_\pi\|_2^2
+=\|\widetilde q-q\|_2^2.
+      </d-math>
+
+      <p>For <d-math>M</d-math> independent winner draws, let <d-math>q^{\mathrm{impl}}</d-math> be the winner distribution induced by the production sampling primitive. The native unresolved policy is a multinomial proportion:</p>
+
+      <d-math block>
+M\widehat q_M
+\sim\mathrm{Multinomial}(M,q^{\mathrm{impl}}),
+\qquad
+\mathrm{Cov}(\widehat q_M)
+=\frac{
+\mathrm{Diag}(q^{\mathrm{impl}})
+-q^{\mathrm{impl}}(q^{\mathrm{impl}})^\top
+}{M},
+\qquad
+\mathbb E\|\widehat q_M-q^{\mathrm{impl}}\|_2^2
+=\frac{1-\|q^{\mathrm{impl}}\|_2^2}{M}.
+      </d-math>
+
+      <p>This finite-<d-math>M</d-math> target MSE is also its expected squared logit-gradient error relative to the implemented population. The production Gamma sampler's rare bounded-work fallback can add bias relative to the ideal exact-Beta population. Prefix quadrature trades sampling variance for deterministic discretization bias, so both must be checked against a high-precision exact-Beta reference.</p>
 
       <p>Full Dirichlet training matches both mean and concentration:</p>
 
@@ -716,18 +913,48 @@ D_{\mathrm{KL}}
 
       <p>Thus unresolved rows use full or mean Dirichlet matching, while categorical rows use this exact-outcome density loss in either mode. The concentration is learned by the model; no terminal concentration constant is injected by search.</p>
 
-      <p>For an unresolved Q target, the loss can be weighted by structural support or by root policy. A categorical row no longer owns an <d-math>R</d-math> value and receives an explicit unit categorical weight:</p>
+      <p>For an unresolved Q target, the loss can be weighted by native structural support or native root policy. A categorical row no longer owns an <d-math>R</d-math> value and receives an explicit unit categorical weight:</p>
 
       <d-math block>
 w_a=
 \begin{cases}
 R_{s_0,a},
 &z_{s_0,a}=\bot\ \text{and evidence-mass mode},\\
-\pi_{\mathrm{search}}(a\mid s_0),
+\pi_M^{\mathrm{nat}}(a\mid s_0),
 &z_{s_0,a}=\bot\ \text{and policy mode},\\
 1,&z_{s_0,a}\ne\bot.
 \end{cases}
       </d-math>
+
+      <h3 id="6-4-measuring-information-transfer">6.4 Measuring information transfer</h3>
+
+      <p>For one fixed target, cross-entropy minus target entropy is a measurable displacement in nats:</p>
+
+      <d-math block>
+\mathrm{CE}(q,p_\theta)-H(q)
+=D_{\mathrm{KL}}(q\|p_\theta).
+      </d-math>
+
+      <p>To measure how much of that discrepancy enters the weights, evaluate the same target, legal mask, and probe population before and after an update window:</p>
+
+      <d-math block>
+\Delta_{\mathrm{capture}}
+=D_{\mathrm{before}}-D_{\mathrm{after}},
+\qquad
+f_{\mathrm{capture}}
+=\frac{D_{\mathrm{before}}-D_{\mathrm{after}}}
+{D_{\mathrm{before}}}.
+      </d-math>
+
+      <p>Positive capture means the fixed-target gap shrank; negative capture means it grew. Always log the raw before/after gaps, their difference, and both population counts alongside the fraction. The fraction is unstable for a tiny initial gap and is undefined if the compared populations differ.</p>
+
+      <p>Useful companion measurements are V/Q semantic and full-Dirichlet capture, loss-weighted Q capture, target entropy/support/effective sample size, every prefix guard and fallback rate, L1 and squared-L2 distance from native M32, and top-one agreement. These diagnose target production and assimilation, but they do not prove game strength.</p>
+
+      <p>A flat arena response should be localized through the full causal funnel. At numeric repairs, report raw innovation <d-math>\|\bar A-V\|_2</d-math>, normalized semantic innovation, concentration innovation, and the raw-alpha, normalized-mean, and relative-concentration derivatives with respect to <d-math>\log\kappa</d-math>. Along completed unresolved numeric paths, report the blend-envelope quantities <d-math>\prod_i\gamma_i</d-math> and <d-math>\sum_i-\log\gamma_i</d-math>, together with categorical and solved bypass rates. At the root, report paired policy distance, top-two margin, top-action flips, and occupancy-weighted exact-oracle regret. Means should be accompanied by stage/support strata and upper quantiles so rare decisive states are not averaged away. Only after these measurements should seat-balanced pairwise games be summarized; one opponent or a one-dimensional Elo projection cannot identify a global strength effect in a non-transitive league.</p>
+
+      <div class="correction">
+        <p><strong>Interpretation:</strong> search displacement is target-prior discrepancy, not Bayesian information gain or mutual information. M32 disagreement is not accuracy because M32 is noisy. Capture on a fixed probe does not measure later retention or assign causal credit among simultaneous losses. Arena, seat-stratified, and exact-oracle metrics remain separate.</p>
+      </div>
 
       <h2 id="7-simulations-are-not-tree-size">7. Simulations are not tree size</h2>
 

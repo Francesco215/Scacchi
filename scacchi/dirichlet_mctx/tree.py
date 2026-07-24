@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Protocol
+from typing import ClassVar, NamedTuple, Protocol
 
 import chex
 import jax
@@ -11,6 +11,35 @@ from jaxtyping import Array, Bool, Float, Int8, Int32, Shaped
 
 from .base import RecurrentState, RootFnOutput, StoredRecurrentState, UnbatchedRecurrentState
 from .outcomes import NO_DISTANCE, NO_OUTCOME, align_outcome
+
+
+class PosteriorUpdateDiagnostics(NamedTuple):
+    """Ephemeral κ-channel measurements for one numeric cache repair."""
+
+    numeric: Bool[Array, "batch"]
+    gamma: Float[Array, "batch"]
+    raw_innovation_l2: Float[Array, "batch"]
+    semantic_innovation_l2: Float[Array, "batch"]
+    concentration_innovation_abs: Float[Array, "batch"]
+    raw_dcache_dlogkappa_l2: Float[Array, "batch"]
+    mean_dcache_dlogkappa_l2: Float[Array, "batch"]
+    log_concentration_dcache_dlogkappa_abs: Float[Array, "batch"]
+
+
+class KappaSearchAccumulator(NamedTuple):
+    """Per-lane additive κ diagnostics; never consumed by search."""
+
+    numeric_repair_count: Int32[Array, "batch"]
+    raw_innovation_l2_sum: Float[Array, "batch"]
+    semantic_innovation_l2_sum: Float[Array, "batch"]
+    concentration_innovation_abs_sum: Float[Array, "batch"]
+    raw_dcache_dlogkappa_l2_sum: Float[Array, "batch"]
+    mean_dcache_dlogkappa_l2_sum: Float[Array, "batch"]
+    log_concentration_dcache_dlogkappa_abs_sum: Float[Array, "batch"]
+    numeric_path_count: Int32[Array, "batch"]
+    path_gamma_product_sum: Float[Array, "batch"]
+    path_gamma_log_attenuation_sum: Float[Array, "batch"]
+    categorical_publication_path_count: Int32[Array, "batch"]
 
 
 @chex.dataclass(frozen=True)
@@ -25,6 +54,7 @@ class PosteriorUpdate:
     edge_alpha: Float[Array, "batch action outcome"]
     edge_payload: Int32[Array, "batch action"]
     value_alpha: Float[Array, "batch outcome"]
+    diagnostics: PosteriorUpdateDiagnostics | None = None
 
 
 @chex.dataclass(frozen=True)
@@ -119,6 +149,7 @@ class UnbatchedTree(Protocol):
     invalid_actions: Bool[Array, "node action"]
     simulation_active_count: Int32[Array, ""]
     executed_simulation_call_count: Int32[Array, ""]
+    kappa_diagnostics: KappaSearchAccumulator
     embeddings: UnbatchedRecurrentState
 
     ROOT_INDEX: ClassVar[int]
@@ -169,6 +200,7 @@ class Tree:
     # expansion, posterior repair, or action commitment.
     simulation_active_count: Int32[Array, "batch"]
     executed_simulation_call_count: Int32[Array, "batch"]
+    kappa_diagnostics: KappaSearchAccumulator
     embeddings: StoredRecurrentState
 
     ROOT_INDEX: ClassVar[int] = 0
@@ -269,6 +301,8 @@ def instantiate_tree_from_root(root: RootFnOutput, num_simulations: int, root_in
 
     edge_alpha = jnp.ones((*batch_node_action, num_outcomes), dtype=root.action_values.dtype).at[:, Tree.ROOT_INDEX].set(root.action_values)
     node_value_alpha = jnp.ones((*batch_node, num_outcomes), dtype=root.value.dtype).at[:, Tree.ROOT_INDEX].set(root.value)
+    integer_zeros = jnp.zeros((batch_size,), dtype=jnp.int32)
+    metric_zeros = jnp.zeros((batch_size,), dtype=root.value.dtype)
     return Tree(
         parents=jnp.full(batch_node, Tree.NO_PARENT, dtype=jnp.int32),
         children_index=jnp.full(batch_node_action, Tree.UNVISITED, dtype=jnp.int32),
@@ -285,6 +319,19 @@ def instantiate_tree_from_root(root: RootFnOutput, num_simulations: int, root_in
         executed_simulation_call_count=jnp.zeros(
             (batch_size,),
             dtype=jnp.int32,
+        ),
+        kappa_diagnostics=KappaSearchAccumulator(
+            numeric_repair_count=integer_zeros,
+            raw_innovation_l2_sum=metric_zeros,
+            semantic_innovation_l2_sum=metric_zeros,
+            concentration_innovation_abs_sum=metric_zeros,
+            raw_dcache_dlogkappa_l2_sum=metric_zeros,
+            mean_dcache_dlogkappa_l2_sum=metric_zeros,
+            log_concentration_dcache_dlogkappa_abs_sum=metric_zeros,
+            numeric_path_count=integer_zeros,
+            path_gamma_product_sum=metric_zeros,
+            path_gamma_log_attenuation_sum=metric_zeros,
+            categorical_publication_path_count=integer_zeros,
         ),
         embeddings=jax.tree.map(allocate_embedding, root.embedding),
     )

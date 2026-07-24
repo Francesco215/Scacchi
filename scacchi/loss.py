@@ -88,6 +88,28 @@ class _NativeTargetFields(NamedTuple):
 
 _NATIVE_TARGET_FIELD_NAMES = _NativeTargetFields._fields
 
+
+class CaptureLifecycleDiagnostics(NamedTuple):
+    """Fixed-target gaps at the stages needed to separate fit from forgetting.
+
+    ``update_before`` and ``update_after`` bracket the selected probe
+    minibatch's own optimizer update.  ``age1_before`` and ``age1_after``
+    bracket the following iteration's complete fresh-data optimizer scan.
+    The existing flat ``capture_*_before/after`` fields in :class:`TrainMetrics`
+    remain the current probe's scan-start and scan-end measurements.
+
+    ``age1_valid`` is zero for the first iteration after process start or
+    checkpoint restore because this diagnostic deliberately keeps no
+    training-history state in checkpoints.
+    """
+
+    update_before: DistillationDiscrepancy
+    update_after: DistillationDiscrepancy
+    age1_before: DistillationDiscrepancy
+    age1_after: DistillationDiscrepancy
+    age1_valid: Float[Array, ""]
+
+
 class TrainMetrics(NamedTuple):
     policy_loss: Float[Array, "*batch"]
     value_loss: Float[Array, "*batch"]
@@ -166,6 +188,74 @@ class TrainMetrics(NamedTuple):
     search_policy_support_sum: Float[Array, "*batch"]
     search_policy_ess_sum: Float[Array, "*batch"]
     search_policy_top1_agreement_count: Float[Array, "*batch"]
+    search_root_policy_target_enabled_count: Float[Array, "*batch"]
+    search_root_policy_target_categorical_population_count: Float[
+        Array,
+        "*batch",
+    ]
+    search_root_policy_target_prefix_eligible_count: Float[Array, "*batch"]
+    search_root_policy_target_prefix_accepted_count: Float[Array, "*batch"]
+    search_root_policy_target_prefix_fallback_count: Float[Array, "*batch"]
+    search_root_policy_target_prefix_tail_clipped_count: Float[
+        Array,
+        "*batch",
+    ]
+    search_root_policy_target_prefix_density_guard_count: Float[
+        Array,
+        "*batch",
+    ]
+    search_root_policy_target_prefix_nonfinite_count: Float[Array, "*batch"]
+    search_root_policy_target_prefix_density_abs_sum: Float[Array, "*batch"]
+    search_root_policy_target_native_l1_sum: Float[Array, "*batch"]
+    search_root_policy_target_native_l2_sq_sum: Float[Array, "*batch"]
+    search_root_policy_target_native_top1_agreement_count: Float[
+        Array,
+        "*batch",
+    ]
+    search_root_action_estimator_enabled_count: Float[Array, "*batch"]
+    search_root_action_prefix_eligible_count: Float[Array, "*batch"]
+    search_root_action_prefix_accepted_count: Float[Array, "*batch"]
+    search_root_action_prefix_fallback_count: Float[Array, "*batch"]
+    search_root_action_prefix_tail_clipped_count: Float[Array, "*batch"]
+    search_root_action_prefix_density_guard_count: Float[Array, "*batch"]
+    search_root_action_prefix_nonfinite_count: Float[Array, "*batch"]
+    search_root_action_prefix_density_abs_sum: Float[Array, "*batch"]
+    search_root_action_native_l1_sum: Float[Array, "*batch"]
+    search_root_action_native_l2_sq_sum: Float[Array, "*batch"]
+    search_root_action_native_top1_agreement_count: Float[Array, "*batch"]
+    search_kappa_numeric_repair_count: Float[Array, "*batch"]
+    search_kappa_raw_innovation_l2_sum: Float[Array, "*batch"]
+    search_kappa_semantic_innovation_l2_sum: Float[Array, "*batch"]
+    search_kappa_concentration_innovation_abs_sum: Float[Array, "*batch"]
+    search_kappa_raw_dcache_dlogkappa_l2_sum: Float[Array, "*batch"]
+    search_kappa_mean_dcache_dlogkappa_l2_sum: Float[Array, "*batch"]
+    search_kappa_log_concentration_dcache_dlogkappa_abs_sum: Float[
+        Array,
+        "*batch",
+    ]
+    search_kappa_numeric_path_count: Float[Array, "*batch"]
+    search_kappa_path_gamma_product_sum: Float[Array, "*batch"]
+    search_kappa_path_gamma_log_attenuation_sum: Float[Array, "*batch"]
+    search_kappa_categorical_publication_path_count: Float[Array, "*batch"]
+    search_root_policy_top2_margin_sum: Float[Array, "*batch"]
+    search_root_policy_top2_margin_count: Float[Array, "*batch"]
+    search_root_policy_top2_margin_tie_count: Float[Array, "*batch"]
+    search_root_policy_top2_margin_below_reference_count: Float[
+        Array,
+        "*batch",
+    ]
+    search_root_policy_top2_margin_reference_scale_sum: Float[
+        Array,
+        "*batch",
+    ]
+    search_root_plurality_commitment_count: Float[Array, "*batch"]
+    search_root_plurality_max_count_tie_count: Float[Array, "*batch"]
+    search_root_plurality_tie_multiplicity_sum: Float[Array, "*batch"]
+    search_root_plurality_lowest_uniform_disagreement_count: Float[
+        Array,
+        "*batch",
+    ]
+    search_root_plurality_expected_disagreement_sum: Float[Array, "*batch"]
     capture_policy_before_sum: Float[Array, "*batch"]
     capture_policy_before_count: Float[Array, "*batch"]
     capture_policy_after_sum: Float[Array, "*batch"]
@@ -194,12 +284,18 @@ class TrainMetrics(NamedTuple):
     capture_q_weighted_dirichlet_before_weight: Float[Array, "*batch"]
     capture_q_weighted_dirichlet_after_sum: Float[Array, "*batch"]
     capture_q_weighted_dirichlet_after_weight: Float[Array, "*batch"]
+    capture_lifecycle: CaptureLifecycleDiagnostics
     data_value_mask_fraction: Float[Array, "*batch"]
     data_frame_count: Float[Array, "*batch"]
     data_termination_count: Float[Array, "*batch"]
     data_pass_fraction: Float[Array, "*batch"]
     data_terminations_per_row: Float[Array, "*batch"]
     data_psk_termination_fraction: Float[Array, "*batch"]
+    data_first_player_win_count: Float[Array, "*batch"]
+    data_second_player_win_count: Float[Array, "*batch"]
+    data_draw_count: Float[Array, "*batch"]
+    data_game_length_histogram_counts: Float[Array, "game_length"]
+    data_early_ply_action_counts: Float[Array, "early_ply action"]
 
 def _num_outcomes_for_config(config: Any) -> int:
     num_outcomes = config.env.num_outcomes
@@ -624,6 +720,20 @@ def evaluate_distillation_discrepancy(
 
 def _zero_train_metrics_like(reference: jax.Array, **values: jax.Array) -> TrainMetrics:
     fields = {field: jnp.zeros_like(reference) for field in TrainMetrics._fields}
+    zero = jnp.zeros((), dtype=reference.dtype)
+    zero_discrepancy = DistillationDiscrepancy(
+        **{
+            field: zero
+            for field in DistillationDiscrepancy._fields
+        }
+    )
+    fields["capture_lifecycle"] = CaptureLifecycleDiagnostics(
+        update_before=zero_discrepancy,
+        update_after=zero_discrepancy,
+        age1_before=zero_discrepancy,
+        age1_after=zero_discrepancy,
+        age1_valid=zero,
+    )
     fields["dirichlet_concentration_histogram_counts"] = jnp.zeros(
         (len(CONCENTRATION_HISTOGRAM_SERIES), CONCENTRATION_HISTOGRAM_NUM_BINS),
         dtype=reference.dtype,
