@@ -738,6 +738,80 @@ policy population. The separation is retained so all search backends share one
 self-play interface. At a categorical root the policy is one-hot, so all three
 commitment modes choose the same certified action.
 
+### 9.2 Guarded binary prefix-CDF readout
+
+For a two-outcome head, let \(X_a\) be the win probability represented by the
+independent action posterior
+
+$$
+X_a\sim\operatorname{Beta}(\alpha_{a,\mathrm{win}},
+                           \alpha_{a,\mathrm{loss}}).
+$$
+
+Let \(\mathcal U\) be the unresolved legal actions. The exact posterior-best
+probability of \(a\in\mathcal U\) is
+
+$$
+q(a)=\Pr(X_a=\max_b X_b)
+    =\int_0^1 f_a(x)
+       \prod_{b\in\mathcal U\setminus\{a\}}F_b(x)\,dx.
+$$
+
+Categorical actions are compared through their exact outcome/distance
+semantics rather than inserted into this Beta product.
+
+The `prefix_cdf` estimator evaluates all \(F_a\) on one adaptive transformed
+grid
+
+$$
+x=\sigma(\sinh t),\qquad Q=2h+1.
+$$
+
+`prefix_cdf_half_width=10` therefore means Q21. Prefix products make the
+calculation \(O(AQ)\), and interval increments of the joint maximum CDF are
+allocated among their nonnegative action contributions. Those increments
+telescope, so the raw action mass is conserved up to floating-point error.
+
+The estimator is guarded by finite-value, adaptive-tail, and density-integral
+checks. These guards catch specified numerical failures, but do not certify a
+universal Q21 approximation-error bound outside the Hex6 envelope on which
+Q21 was selected. An unsafe internal node uses the unchanged
+winner-Monte-Carlo repair for the entire batch and the identical RNG key. An
+unsafe root falls back per lane. The three choices are deliberately
+independent:
+
+- `posterior_policy_estimator` controls the policy inside cache repair;
+- `root_policy_target_estimator` controls the policy stored for replay;
+- `root_action_estimator` controls an ephemeral policy used only to play.
+
+Changing the replay policy does not change the native search-derived Q-loss
+weight. At a solved root, the Q21 replay target is uniform over all
+distance-optimal certified actions, while commitment keeps the backend's
+native sampled certified action. Thus exact tie semantics are preserved
+without storing a second policy tensor in replay.
+
+### 9.3 Power-temperature commitment
+
+For `posterior_sample`, the optional commitment temperature acts only on the
+selected ephemeral root policy \(q\):
+
+$$
+q_T(a)=
+\frac{\mathbf 1_{\{a\ \mathrm{legal},\ q(a)>0\}}
+      \operatorname{clip}(q(a),10^{-8},1)^{1/T}}
+     {\sum_{b\ \mathrm{legal},\ q(b)>0}
+      \operatorname{clip}(q(b),10^{-8},1)^{1/T}},
+\qquad T>0,\ T\ne1.
+$$
+
+One action is sampled from \(q_T\). In particular, \(T=1/3\) is the cubic
+law \(q_T(a)\propto q(a)^3\), a permutation-equivariant sharpening that
+requires no second vote population. The implementation retains a separate
+`T=1` branch with the original clipped operation order, preserving seeded
+legacy behavior; non-unit transforms preserve exact zero support. Unsafe Q21
+action rows and solved roots bypass temperature resampling and use the backend
+action.
+
 ---
 
 ## 10. Simulations, capacity, and depth

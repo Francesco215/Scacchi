@@ -38,6 +38,36 @@ The Thompson tree-search backend lives in `scacchi/dirichlet_mctx/`;
 `scacchi/dirichlet_q_search.py` contains the shared leaf expansion,
 terminal-outcome extraction, and posterior-target helpers.
 
+## Guarded Q21 mode
+
+For binary games such as Hex, the optional `prefix_cdf` estimator computes
+posterior-best action probabilities on an adaptive 21-point grid. It can be
+selected independently for internal cache repair, the replay policy target,
+and the ephemeral action policy:
+
+```yaml
+search:
+  posterior_sample_temperature: 0.3333333333333333
+  dirichlet_thompson:
+    posterior_policy_estimator: prefix_cdf
+    root_policy_target_estimator: prefix_cdf
+    root_action_estimator: prefix_cdf
+    prefix_cdf_half_width: 10  # Q = 2 * half_width + 1 = 21
+```
+
+Numerically unsafe estimates fall back to the unchanged winner-sampling path.
+Internal repair falls back for the whole batch; root readouts fall back per
+game. The action-only policy is not written to replay. With
+`posterior_sample`, non-unit temperature \(T\) samples on the positive support
+from \(q_T(a)\propto\operatorname{clip}(q(a),10^{-8},1)^{1/T}\); exact zeros
+stay zero. `T=1` preserves the original clipped seeded path exactly.
+Prefix-CDF requires a two-outcome head.
+The Hex6 integration recipe enables Q21, cubic (`T=1/3`) commitment, and W&B
+logging while retaining the `mctx` branch's other training defaults; it is not
+an exact reproduction of the historical E12 optimizer/hyperparameter stack.
+The numerical guards detect specified integration failures, not arbitrary
+quadrature error outside the Hex6 envelope used to select Q21.
+
 ## Codebase Structure
 
 - `scacchi/`: main Python package.
