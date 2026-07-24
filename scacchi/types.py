@@ -32,6 +32,11 @@ class SearchKind(StrEnum):
     dirichlet_thompson = "dirichlet_thompson"
 
 
+class PosteriorPolicyEstimator(StrEnum):
+    winner_mc = "winner_mc"
+    prefix_cdf = "prefix_cdf"
+
+
 class QLossWeightMode(StrEnum):
     policy = "policy"
     evidence_mass = "evidence_mass"
@@ -152,6 +157,22 @@ class DirichletThompsonSearchConfig:
     # the full root readout budget.
     posterior_policy_samples: int | None = None
     policy_sample_chunk_size: int | None = 32
+    # Keep the three estimator choices independent: cache repair, the replay
+    # policy target, and the ephemeral policy used to commit a root action.
+    posterior_policy_estimator: PosteriorPolicyEstimator = (
+        PosteriorPolicyEstimator.winner_mc
+    )
+    root_policy_target_estimator: PosteriorPolicyEstimator = (
+        PosteriorPolicyEstimator.winner_mc
+    )
+    root_action_estimator: PosteriorPolicyEstimator = (
+        PosteriorPolicyEstimator.winner_mc
+    )
+    prefix_cdf_half_width: int = 10
+    prefix_cdf_tail_scale: float = 8.0
+    prefix_cdf_min_half_range: float = 6.0
+    prefix_cdf_max_half_range: float = 11.0
+
     def __post_init__(self) -> None:
         _require_ge(
             "search.dirichlet_thompson.num_simulations",
@@ -183,6 +204,34 @@ class DirichletThompsonSearchConfig:
             self.policy_sample_chunk_size,
             1,
         )
+        _require_ge(
+            "search.dirichlet_thompson.prefix_cdf_half_width",
+            self.prefix_cdf_half_width,
+            1,
+        )
+        for name, value in (
+            (
+                "search.dirichlet_thompson.prefix_cdf_tail_scale",
+                self.prefix_cdf_tail_scale,
+            ),
+            (
+                "search.dirichlet_thompson.prefix_cdf_min_half_range",
+                self.prefix_cdf_min_half_range,
+            ),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0; got {value}.")
+        if (
+            not math.isfinite(self.prefix_cdf_max_half_range)
+            or self.prefix_cdf_max_half_range
+            < self.prefix_cdf_min_half_range
+        ):
+            raise ValueError(
+                "search.dirichlet_thompson.prefix_cdf_max_half_range "
+                "must be finite and >= prefix_cdf_min_half_range; got "
+                f"{self.prefix_cdf_max_half_range} and "
+                f"{self.prefix_cdf_min_half_range}."
+            )
 
 
 @dataclass
@@ -191,6 +240,18 @@ class SearchConfig:
     policy: PolicySearchConfig = field(default_factory=PolicySearchConfig)
     gumbel: GumbelSearchConfig = field(default_factory=GumbelSearchConfig)
     dirichlet_thompson: DirichletThompsonSearchConfig = field(default_factory=DirichletThompsonSearchConfig)
+    # Applied only to posterior-sample action commitment.
+    posterior_sample_temperature: float = 1.0
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.posterior_sample_temperature)
+            or self.posterior_sample_temperature <= 0.0
+        ):
+            raise ValueError(
+                "search.posterior_sample_temperature must be finite and > 0; "
+                f"got {self.posterior_sample_temperature}."
+            )
 
     def active(self) -> PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig:
         return cast(
@@ -375,6 +436,28 @@ class TrainConfig:
                     f"{name}.kind={search.kind!r} requires "
                     "model.network='aznet_dirichlet' or "
                     "model.network='boardlaw_dirichlet'."
+                )
+        for name, search in (
+            ("selfplay.search", self.selfplay.search),
+            ("eval.player_search", self.eval.player_search),
+            ("eval.baseline_search", self.eval.baseline_search),
+        ):
+            if search.kind != SearchKind.dirichlet_thompson:
+                continue
+            dirichlet = search.dirichlet_thompson
+            prefix_cdf_selected = any(
+                estimator == PosteriorPolicyEstimator.prefix_cdf
+                for estimator in (
+                    dirichlet.posterior_policy_estimator,
+                    dirichlet.root_policy_target_estimator,
+                    dirichlet.root_action_estimator,
+                )
+            )
+            if prefix_cdf_selected and self.env.num_outcomes != 2:
+                raise ValueError(
+                    f"{name}.dirichlet_thompson prefix_cdf estimator "
+                    "requires env.num_outcomes=2; use winner_mc for "
+                    "non-binary outcome heads."
                 )
         losses = self.training.losses
         search_emits_categorical = (

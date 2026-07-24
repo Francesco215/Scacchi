@@ -233,6 +233,34 @@ def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
     assert config.eval.baseline_search.gumbel.num_simulations == eval_simulations
 
 
+def test_hex6_recipe_uses_q21_cubic_commitment_and_wandb():
+    cfg_path = (
+        Path(__file__).parents[1]
+        / "scacchi"
+        / "configs"
+        / "hex6.yaml"
+    )
+    config = load_config(OmegaConf.load(cfg_path))
+
+    assert config.run.max_num_iters == 201
+    assert config.env.num_outcomes == 2
+    assert config.selfplay.action_commitment_type == "posterior_sample"
+    assert config.selfplay.search.posterior_sample_temperature == pytest.approx(
+        1.0 / 3.0
+    )
+    selfplay_search = config.selfplay.search.dirichlet_thompson
+    assert selfplay_search.posterior_policy_estimator == "prefix_cdf"
+    assert selfplay_search.root_policy_target_estimator == "prefix_cdf"
+    assert selfplay_search.root_action_estimator == "prefix_cdf"
+    assert selfplay_search.prefix_cdf_half_width == 10
+    eval_search = config.eval.player_search.dirichlet_thompson
+    assert eval_search.posterior_policy_estimator == "prefix_cdf"
+    assert eval_search.root_policy_target_estimator == "prefix_cdf"
+    assert eval_search.root_action_estimator == "prefix_cdf"
+    assert config.logging.wandb.enabled
+    assert config.checkpointing.max_to_keep == 9
+
+
 def test_hex7_uses_full_learned_concentration_head():
     cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex7.yaml"
     config = load_config(OmegaConf.load(cfg_path))
@@ -559,6 +587,167 @@ def test_dirichlet_thompson_accepts_separate_posterior_policy_budget():
     assert search.posterior_policy_samples == 1
 
 
+@pytest.mark.parametrize(
+    "estimator_field",
+    [
+        "posterior_policy_estimator",
+        "root_policy_target_estimator",
+        "root_action_estimator",
+    ],
+)
+def test_dirichlet_thompson_prefix_cdf_estimators_are_independent(
+    estimator_field: str,
+):
+    config = _config(
+        {
+            "env": {"id": "hex", "board_size": 6, "num_outcomes": 2},
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        estimator_field: "prefix_cdf",
+                    },
+                },
+            },
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert getattr(search, estimator_field) == "prefix_cdf"
+    for other_field in {
+        "posterior_policy_estimator",
+        "root_policy_target_estimator",
+        "root_action_estimator",
+    } - {estimator_field}:
+        assert getattr(search, other_field) == "winner_mc"
+    assert search.prefix_cdf_half_width == 10
+
+
+@pytest.mark.parametrize(
+    "estimator_field",
+    [
+        "posterior_policy_estimator",
+        "root_policy_target_estimator",
+        "root_action_estimator",
+    ],
+)
+def test_prefix_cdf_estimators_require_binary_outcomes(estimator_field: str):
+    with pytest.raises(
+        ValueError,
+        match="prefix_cdf estimator requires env.num_outcomes=2",
+    ):
+        _config(
+            {
+                "env": {
+                    "id": "gardner_chess",
+                    "board_size": 5,
+                    "num_outcomes": 3,
+                },
+                "model": {"network": "boardlaw_dirichlet"},
+                "selfplay": {
+                    "search": {
+                        "kind": "dirichlet_thompson",
+                        "dirichlet_thompson": {
+                            estimator_field: "prefix_cdf",
+                        },
+                    },
+                },
+            }
+        )
+
+
+def test_winner_mc_estimators_allow_non_binary_outcomes():
+    config = _config(
+        {
+            "env": {
+                "id": "gardner_chess",
+                "board_size": 5,
+                "num_outcomes": 3,
+            },
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {"kind": "dirichlet_thompson"},
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.posterior_policy_estimator == "winner_mc"
+    assert search.root_policy_target_estimator == "winner_mc"
+    assert search.root_action_estimator == "winner_mc"
+
+
+def test_inactive_prefix_cdf_config_does_not_require_binary_outcomes():
+    config = _config(
+        {
+            "env": {"num_outcomes": 3},
+            "search": {
+                "kind": "gumbel",
+                "dirichlet_thompson": {
+                    "posterior_policy_estimator": "prefix_cdf",
+                },
+            },
+        }
+    )
+
+    assert config.selfplay.search.kind == "gumbel"
+    assert (
+        config.selfplay.search.dirichlet_thompson.posterior_policy_estimator
+        == "prefix_cdf"
+    )
+
+
+def test_dirichlet_thompson_prefix_cdf_parameters_are_configurable():
+    config = _config(
+        {
+            "search": {
+                "dirichlet_thompson": {
+                    "prefix_cdf_half_width": 11,
+                    "prefix_cdf_tail_scale": 7.0,
+                    "prefix_cdf_min_half_range": 5.0,
+                    "prefix_cdf_max_half_range": 9.0,
+                },
+            },
+        }
+    )
+
+    search = config.search.dirichlet_thompson
+    assert search.prefix_cdf_half_width == 11
+    assert search.prefix_cdf_tail_scale == 7.0
+    assert search.prefix_cdf_min_half_range == 5.0
+    assert search.prefix_cdf_max_half_range == 9.0
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("prefix_cdf_half_width", 0),
+        ("prefix_cdf_tail_scale", 0.0),
+        ("prefix_cdf_tail_scale", math.nan),
+        ("prefix_cdf_tail_scale", math.inf),
+        ("prefix_cdf_min_half_range", 0.0),
+        ("prefix_cdf_min_half_range", math.nan),
+        ("prefix_cdf_min_half_range", math.inf),
+        ("prefix_cdf_max_half_range", 5.0),
+        ("prefix_cdf_max_half_range", math.nan),
+        ("prefix_cdf_max_half_range", math.inf),
+    ],
+)
+def test_dirichlet_thompson_prefix_cdf_parameters_are_validated(
+    parameter: str,
+    value: float,
+):
+    with pytest.raises(ValueError, match=parameter):
+        _config(
+            {
+                "search": {
+                    "dirichlet_thompson": {
+                        parameter: value,
+                    },
+                },
+            }
+        )
+
+
 def test_dirichlet_thompson_posterior_policy_budget_must_be_positive():
     with pytest.raises(
         ValueError,
@@ -635,6 +824,54 @@ def test_posterior_sample_action_commitment_type_is_valid():
     )
 
     assert config.selfplay.action_commitment_type == "posterior_sample"
+
+
+def test_posterior_sample_temperature_is_configurable():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "action_commitment_type": "posterior_sample",
+                "search": {"posterior_sample_temperature": 1.0 / 3.0},
+            },
+        }
+    )
+
+    assert config.selfplay.search.posterior_sample_temperature == 1.0 / 3.0
+    assert config.search.posterior_sample_temperature == 1.0 / 3.0
+
+
+def test_posterior_sample_temperature_defaults_to_one():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {"action_commitment_type": "posterior_sample"},
+        }
+    )
+
+    assert config.selfplay.search.posterior_sample_temperature == 1.0
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [0.0, -1.0, math.nan, math.inf, -math.inf],
+)
+def test_posterior_sample_temperature_must_be_finite_and_positive(
+    temperature: float,
+):
+    with pytest.raises(
+        ValueError,
+        match="search.posterior_sample_temperature",
+    ):
+        _config(
+            {
+                "selfplay": {
+                    "search": {
+                        "posterior_sample_temperature": temperature,
+                    },
+                },
+            }
+        )
 
 
 def test_legacy_action_source_is_rejected():

@@ -3,6 +3,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from omegaconf import OmegaConf
+import pytest
 
 from scacchi import dirichlet_mctx
 from scacchi.dirichlet_mctx.outcomes import NO_OUTCOME
@@ -958,6 +959,94 @@ def test_posterior_action_helpers_respect_legal_mask():
 
     assert jnp.array_equal(best, jnp.array([0, 1], dtype=jnp.int32))
     assert bool(jnp.all(legal_action_mask[jnp.arange(2), sampled]))
+
+
+def test_posterior_sample_temperature_one_preserves_seeded_path():
+    policy_target = jnp.array(
+        [[0.05, 0.15, 0.8], [0.6, 0.3, 0.1]],
+        dtype=jnp.float32,
+    )
+    legal_action_mask = jnp.array(
+        [[True, True, True], [True, False, True]]
+    )
+    key = jax.random.PRNGKey(123)
+
+    default = posterior_sample_action(key, policy_target, legal_action_mask)
+    explicit_one = posterior_sample_action(
+        key,
+        policy_target,
+        legal_action_mask,
+        temperature=1.0,
+    )
+    legacy_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
+    legacy_logits = jnp.where(
+        legal_action_mask,
+        legacy_logits,
+        jnp.finfo(legacy_logits.dtype).min,
+    )
+    legacy = jax.random.categorical(key, legacy_logits).astype(jnp.int32)
+
+    assert jnp.array_equal(explicit_one, default)
+    assert jnp.array_equal(explicit_one, legacy)
+
+
+def test_posterior_sample_temperature_matches_power_transform():
+    policy_target = jnp.array(
+        [[0.1, 0.3, 0.6], [0.7, 0.2, 0.1]],
+        dtype=jnp.float32,
+    )
+    legal_action_mask = jnp.array(
+        [[True, True, True], [True, False, True]]
+    )
+    key = jax.random.PRNGKey(7)
+    temperature = 0.5
+    expected_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
+    expected_logits = expected_logits / temperature
+    expected_logits = jnp.where(
+        legal_action_mask,
+        expected_logits,
+        jnp.finfo(expected_logits.dtype).min,
+    )
+
+    sampled = posterior_sample_action(
+        key,
+        policy_target,
+        legal_action_mask,
+        temperature=temperature,
+    )
+
+    assert jnp.array_equal(
+        sampled,
+        jax.random.categorical(key, expected_logits).astype(jnp.int32),
+    )
+
+
+def test_nonunit_temperature_preserves_exact_zero_support():
+    policy_target = jnp.asarray([[0.0, 0.2, 0.8]], dtype=jnp.float32)
+    legal_action_mask = jnp.ones_like(policy_target, dtype=jnp.bool_)
+    keys = jax.random.split(jax.random.PRNGKey(8), 512)
+
+    samples = jax.vmap(
+        lambda key: posterior_sample_action(
+            key,
+            policy_target,
+            legal_action_mask,
+            temperature=8.0,
+        )[0]
+    )(keys)
+
+    assert bool(jnp.all(samples != 0))
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf")])
+def test_posterior_sample_rejects_invalid_temperature(temperature):
+    with pytest.raises(ValueError, match="finite and > 0"):
+        posterior_sample_action(
+            jax.random.PRNGKey(0),
+            jnp.array([[0.25, 0.75]], dtype=jnp.float32),
+            jnp.array([[True, True]]),
+            temperature=temperature,
+        )
 
 
 def test_q_loss_weights_support_policy_and_evidence_mass_modes():

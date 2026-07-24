@@ -1,14 +1,17 @@
-# From-scratch Hex6 persistent-tree speedrun. Every trial uses a unique empty
-# checkpoint directory: warm starts and continuation runs do not count.
+# From-scratch Hex6 integration recipe for guarded Q21 plus cubic commitment.
+# It keeps the mctx branch's other training defaults to isolate this code path;
+# it is not an exact reproduction of the historical E12/Muon experiment.
 
 run:
   seed: 9105
-  max_num_iters: 200
+  # Include step 200 and retain enough checkpoints for a real learning curve.
+  max_num_iters: 201
 
 env:
   id: hex
   board_size: 6
-  num_outcomes: 3
+  # Hex has no draw, which enables the guarded binary prefix-CDF estimator.
+  num_outcomes: 2
 
 model:
   network: boardlaw_dirichlet
@@ -16,7 +19,7 @@ model:
   num_layers: 8
   compute_dtype: bfloat16
   resnet_v2: true
-  # Start at the uninformative Dirichlet [1, 1, 1], then learn evidence mass.
+  # Start from a symmetric low-evidence binary prior, then learn its mass.
   # Unlike the old calibrated runs, this is a low floor rather than a fixed C.
   dirichlet_concentration_floor: 3.0
   dirichlet_initial_concentration: 3.1
@@ -29,6 +32,8 @@ selfplay:
   action_commitment_type: posterior_sample
   search:
     kind: dirichlet_thompson
+    # Sample once from q(a)^3 instead of running a second vote population.
+    posterior_sample_temperature: 0.3333333333333333
     dirichlet_thompson:
       # Keep the corrected persistent tree small enough for a true speedrun.
       # The DT128 trial learned, but was ~11x slower per iteration than the
@@ -36,10 +41,18 @@ selfplay:
       num_simulations: 32
       kappa: 4.0
       policy_samples: 32
-      # The node-local estimator remains unbiased; eight draws amortize the
-      # every-node posterior repair without reverting to root-only updates.
+      # Q21 is primary; this budget is used only by the native safety fallback.
       posterior_policy_samples: 8
       policy_sample_chunk_size: 32
+      # Q21 is used independently for cache repair, the replay target, and
+      # the ephemeral action policy. Every unsafe estimate falls back native.
+      posterior_policy_estimator: prefix_cdf
+      root_policy_target_estimator: prefix_cdf
+      root_action_estimator: prefix_cdf
+      prefix_cdf_half_width: 10
+      prefix_cdf_tail_scale: 8.0
+      prefix_cdf_min_half_range: 6.0
+      prefix_cdf_max_half_range: 11.0
 
 training:
   batch_size: 1024
@@ -80,6 +93,13 @@ eval:
       policy_samples: 32
       posterior_policy_samples: 32
       policy_sample_chunk_size: 32
+      posterior_policy_estimator: prefix_cdf
+      root_policy_target_estimator: prefix_cdf
+      root_action_estimator: prefix_cdf
+      prefix_cdf_half_width: 10
+      prefix_cdf_tail_scale: 8.0
+      prefix_cdf_min_half_range: 6.0
+      prefix_cdf_max_half_range: 11.0
   baseline_search:
     kind: gumbel
     gumbel:
@@ -88,10 +108,11 @@ eval:
 logging:
   interval: 1
   wandb:
+    # All training runs from this recipe are logged externally.
     enabled: true
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 1
-  save_interval_steps: 10
-  directory: checkpoints/hex6_nativecat_fullc_c16_dt32p8_psample_seed9105_v4
+  max_to_keep: 9
+  save_interval_steps: 25
+  directory: checkpoints/hex6_q21_temperature3_seed9105

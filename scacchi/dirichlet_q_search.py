@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import chex
@@ -82,8 +83,31 @@ def posterior_sample_action(
     rng_key: chex.PRNGKey,
     policy_target: jax.Array,
     legal_action_mask: jax.Array,
+    temperature: float = 1.0,
 ) -> jax.Array:
+    """Sample from a power-temperature transform of a root policy.
+
+    Non-unit temperatures preserve exact zero support. The temperature-one
+    branch deliberately retains the original clipped operation sequence so
+    existing seeded runs remain reproducible.
+    """
+
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(
+            "posterior sample temperature must be finite and > 0; "
+            f"got {temperature}."
+        )
+
     logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
+    if temperature != 1.0:
+        logits = logits / jnp.asarray(temperature, dtype=logits.dtype)
+        # A genuine power transform preserves exact zero support. The
+        # temperature-one branch above intentionally keeps the legacy floor.
+        logits = jnp.where(
+            policy_target > 0.0,
+            logits,
+            jnp.finfo(logits.dtype).min,
+        )
     logits = jnp.where(
         legal_action_mask,
         logits,

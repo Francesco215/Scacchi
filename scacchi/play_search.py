@@ -1,4 +1,5 @@
 import functools
+import math
 from typing import Any, Callable, NamedTuple, cast
 
 import chex
@@ -10,13 +11,17 @@ import mctx
 import pgx
 
 from . import dirichlet_mctx
+from .dirichlet_mctx.action_selection import categorical_action_population
 from .dirichlet_mctx.native_targets import (
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
     TARGET_PAD,
 )
 from .dirichlet_mctx.outcomes import NO_OUTCOME, outcome_mean, outcome_utility
-from .dirichlet_mctx.posterior_updates import DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
+from .dirichlet_mctx.posterior_updates import (
+    DEFAULT_POLICY_SAMPLE_CHUNK_SIZE,
+    DEFAULT_PREFIX_DENSITY_LOG_INTEGRAL_TOLERANCE,
+)
 from .dirichlet_q_search import (
     make_dirichlet_expand_fn,
     posterior_best_action,
@@ -30,6 +35,7 @@ from .types import (
     DirichletThompsonSearchConfig,
     GumbelSearchConfig,
     PolicySearchConfig,
+    PosteriorPolicyEstimator,
     SearchConfig,
     SearchKind,
 )
@@ -70,12 +76,22 @@ class PosteriorTargets(NamedTuple):
 
 class SearchOutput(NamedTuple):
     posterior: PosteriorTargets
+    # Used only while choosing the played move; it is never stored in replay.
+    commitment_policy: Float[Array, "*batch action"] | None = None
+    # Unsafe Q21 and solved roots retain the backend's native commitment.
+    commitment_resampling_bypass: Bool[Array, "*batch"] | None = None
 Search = Callable[[pgx.State, chex.PRNGKey], SearchOutput]
 
 
 class PlayerOutput(NamedTuple):
     action: Int[Array, "*batch"]
     posterior: PosteriorTargets | None = None
+
+
+class _RootPolicyReadout(NamedTuple):
+    policy: Float[Array, "batch action"]
+    commitment_policy: Float[Array, "batch action"] | None
+    commitment_resampling_bypass: Bool[Array, "batch"] | None
 
 
 def evaluator_output_from_model_output(model_output: Any) -> EvaluatorOutput:
@@ -144,6 +160,106 @@ def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
     return jnp.sum(action_weights, axis=-1) > 0
 
 
+def _dirichlet_root_policy_readouts(
+    native_policy: jax.Array,
+    *,
+    summary: Any,
+    legal_action_mask: jax.Array,
+    search_cfg: DirichletThompsonSearchConfig,
+) -> _RootPolicyReadout:
+    """Build independent replay-target and action-only root readouts."""
+
+    target_prefix = (
+        search_cfg.root_policy_target_estimator
+        == PosteriorPolicyEstimator.prefix_cdf
+    )
+    action_prefix = (
+        search_cfg.root_action_estimator
+        == PosteriorPolicyEstimator.prefix_cdf
+    )
+    if not target_prefix and not action_prefix:
+        return _RootPolicyReadout(native_policy, None, None)
+
+    invalid_actions = ~legal_action_mask
+    estimate = (
+        dirichlet_mctx.binary_posterior_best_policy_prefix_quadrature(
+            summary.alpha,
+            invalid_actions,
+            summary.q_categorical_outcome,
+            half_width=int(search_cfg.prefix_cdf_half_width),
+            tail_scale=float(search_cfg.prefix_cdf_tail_scale),
+            min_half_range=float(search_cfg.prefix_cdf_min_half_range),
+            max_half_range=float(search_cfg.prefix_cdf_max_half_range),
+        )
+    )
+    density_error = jnp.max(
+        jnp.abs(estimate.density_log_integral),
+        axis=-1,
+    )
+    unsafe = (
+        estimate.tail_range_clipped
+        | ~estimate.finite
+        | (
+            density_error
+            > DEFAULT_PREFIX_DENSITY_LOG_INTEGRAL_TOLERANCE
+        )
+    )
+
+    has_legal_action = jnp.any(legal_action_mask, axis=-1)
+    root_is_categorical = (
+        summary.v_categorical_outcome != int(NO_OUTCOME)
+    )
+    unresolved_root = has_legal_action & ~root_is_categorical
+    accepted = unresolved_root & ~unsafe
+
+    target_policy = native_policy
+    if target_prefix:
+        target_policy = jnp.where(
+            accepted[:, None],
+            estimate.policy,
+            native_policy,
+        )
+        categorical_policy = categorical_action_population(
+            summary.v_categorical_outcome,
+            summary.q_categorical_outcome,
+            summary.q_categorical_distance,
+            invalid_actions,
+            num_outcomes=summary.alpha.shape[-1],
+            dtype=native_policy.dtype,
+        )
+        has_categorical_candidate = (
+            jnp.sum(categorical_policy, axis=-1) > 0
+        )
+        use_categorical_population = (
+            root_is_categorical
+            & has_legal_action
+            & has_categorical_candidate
+        )
+        target_policy = jnp.where(
+            use_categorical_population[:, None],
+            categorical_policy,
+            target_policy,
+        )
+
+    commitment_policy = native_policy
+    commitment_resampling_bypass = None
+    if action_prefix:
+        commitment_policy = jnp.where(
+            accepted[:, None],
+            estimate.policy,
+            native_policy,
+        )
+        commitment_resampling_bypass = has_legal_action & (
+            root_is_categorical | (unresolved_root & unsafe)
+        )
+
+    return _RootPolicyReadout(
+        target_policy,
+        commitment_policy,
+        commitment_resampling_bypass,
+    )
+
+
 def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_loss_weight_mode: str) -> SearchOutput:
     value = _required_output(prediction.value, "value")
     root = mctx.RootFnOutput(prior_logits=prediction.logits, value=value, embedding=env_state)
@@ -204,16 +320,32 @@ def _run_dirichlet_thompson_search(
         if search_cfg.posterior_policy_samples is None
         else int(search_cfg.posterior_policy_samples)
     )
-    posterior_update = functools.partial(
-        dirichlet_mctx.update_posterior,
-        kappa=float(search_cfg.kappa),
-        policy_samples=max(1, posterior_policy_samples),
-        policy_sample_chunk_size=(
-            max(1, int(search_cfg.policy_sample_chunk_size))
-            if search_cfg.policy_sample_chunk_size is not None
-            else DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
-        ),
+    posterior_chunk_size = (
+        max(1, int(search_cfg.policy_sample_chunk_size))
+        if search_cfg.policy_sample_chunk_size is not None
+        else DEFAULT_POLICY_SAMPLE_CHUNK_SIZE
     )
+    if (
+        search_cfg.posterior_policy_estimator
+        == PosteriorPolicyEstimator.prefix_cdf
+    ):
+        posterior_update = functools.partial(
+            dirichlet_mctx.update_posterior_prefix_cdf,
+            kappa=float(search_cfg.kappa),
+            half_width=int(search_cfg.prefix_cdf_half_width),
+            tail_scale=float(search_cfg.prefix_cdf_tail_scale),
+            min_half_range=float(search_cfg.prefix_cdf_min_half_range),
+            max_half_range=float(search_cfg.prefix_cdf_max_half_range),
+            fallback_policy_samples=max(1, posterior_policy_samples),
+            fallback_policy_sample_chunk_size=posterior_chunk_size,
+        )
+    else:
+        posterior_update = functools.partial(
+            dirichlet_mctx.update_posterior,
+            kappa=float(search_cfg.kappa),
+            policy_samples=max(1, posterior_policy_samples),
+            policy_sample_chunk_size=posterior_chunk_size,
+        )
     policy_output = dirichlet_mctx.dirichlet_thompson_policy(
         params=(),
         rng_key=rng_key,
@@ -226,10 +358,17 @@ def _run_dirichlet_thompson_search(
         policy_samples=int(search_cfg.policy_samples),
         policy_sample_chunk_size=search_cfg.policy_sample_chunk_size,
     )
-    policy_target = policy_output.action_weights
+    native_policy = policy_output.action_weights
     search_action = policy_output.action
     tree = policy_output.search_tree
     summary = tree.summary()
+    root_policy_readout = _dirichlet_root_policy_readouts(
+        native_policy,
+        summary=summary,
+        legal_action_mask=env_state.legal_action_mask,
+        search_cfg=search_cfg,
+    )
+    policy_target = root_policy_readout.policy
     # These are the actual replacement-style B/cache posteriors exposed by
     # search. Unresolved R remains structural metadata; categorical payloads
     # hold distance. Neither changes Dirichlet concentration.
@@ -256,7 +395,7 @@ def _run_dirichlet_thompson_search(
     q_loss_weight = q_loss_weight_from_mode(
         q_loss_weight_mode,
         q_search_count,
-        policy_target,
+        native_policy,
     )
     # Every exact legal action target is useful supervision, even when a
     # one-hot solved policy or a sampled posterior gives that action no mass.
@@ -287,7 +426,11 @@ def _run_dirichlet_thompson_search(
         v_target_distance=summary.v_categorical_distance,
     )
     return SearchOutput(
-        PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
+        PosteriorTargets(prediction=posterior_prediction, metadata=metadata),
+        commitment_policy=root_policy_readout.commitment_policy,
+        commitment_resampling_bypass=(
+            root_policy_readout.commitment_resampling_bypass
+        ),
     )
 
 
@@ -360,21 +503,64 @@ def make_search(env, evaluator: Evaluator, search_cfg: SearchConfig, q_loss_weig
     return _make_search_function(env, evaluator, active_search_cfg, q_loss_weight_mode)  # ty:ignore[invalid-argument-type]
 
 
-def make_action_committer(action_commitment_type: str):
-    def action_committer(posterior: PosteriorTargets, legal_action_mask: jax.Array, rng_key: jax.Array) -> jax.Array:
+def make_action_committer(
+    action_commitment_type: str,
+    posterior_sample_temperature: float = 1.0,
+):
+    if (
+        not math.isfinite(posterior_sample_temperature)
+        or posterior_sample_temperature <= 0.0
+    ):
+        raise ValueError(
+            "posterior_sample_temperature must be finite and > 0; "
+            f"got {posterior_sample_temperature}."
+        )
+
+    def action_committer(
+        posterior: PosteriorTargets,
+        legal_action_mask: jax.Array,
+        rng_key: jax.Array,
+        commitment_policy: jax.Array | None = None,
+        commitment_resampling_bypass: jax.Array | None = None,
+    ) -> jax.Array:
         metadata = posterior.metadata
         search_action = None if metadata is None else metadata.search_action
-        policy = posterior.prediction.policy
-        
+        policy = (
+            posterior.prediction.policy
+            if commitment_policy is None
+            else commitment_policy
+        )
+
         if action_commitment_type == "posterior_argmax":
-            return posterior_best_action(policy, legal_action_mask)
+            action = posterior_best_action(policy, legal_action_mask)
         elif action_commitment_type == "posterior_sample":
-            return posterior_sample_action(rng_key, policy, legal_action_mask)
+            action = posterior_sample_action(
+                rng_key,
+                policy,
+                legal_action_mask,
+                temperature=posterior_sample_temperature,
+            )
         elif action_commitment_type == "search_action":
             if search_action is None:
                 raise ValueError("search_action commitment requires a backend action")
             return search_action
-        raise ValueError(f"unknown action_commitment_type: {action_commitment_type!r}")
+        else:
+            raise ValueError(
+                "unknown action_commitment_type: "
+                f"{action_commitment_type!r}"
+            )
+
+        if commitment_resampling_bypass is not None:
+            if search_action is None:
+                raise ValueError(
+                    "commitment bypass requires a backend search action"
+                )
+            action = jnp.where(
+                commitment_resampling_bypass,
+                search_action,
+                action,
+            )
+        return action
 
     return action_committer
 
@@ -385,6 +571,8 @@ def commit_action(
     policy: jax.Array,
     legal_action_mask: jax.Array,
     search_action: jax.Array | None = None,
+    posterior_sample_temperature: float = 1.0,
+    commitment_resampling_bypass: jax.Array | None = None,
 ) -> jax.Array:
     """Compatibility boundary for committing an already-computed policy."""
 
@@ -392,21 +580,34 @@ def commit_action(
         prediction=PosteriorPrediction(policy=policy),
         metadata=TargetMetadata(search_action=search_action),
     )
-    return make_action_committer(action_commitment_type)(
+    return make_action_committer(
+        action_commitment_type,
+        posterior_sample_temperature,
+    )(
         posterior,
         legal_action_mask,
         rng_key,
+        commitment_resampling_bypass=commitment_resampling_bypass,
     )
 
 
 def make_search_player(env, model: Any, search_cfg: SearchConfig, action_commitment_type: ActionCommitmentType, q_loss_weight_mode: str = "policy"):
     search = make_search(env, make_evaluator(model), search_cfg, q_loss_weight_mode)
-    action_committer = make_action_committer(str(action_commitment_type))
+    action_committer = make_action_committer(
+        str(action_commitment_type),
+        float(search_cfg.posterior_sample_temperature),
+    )
 
     def player(env_state: pgx.State, rng_key: jax.Array) -> PlayerOutput:
         search_key, action_key = jax.random.split(rng_key)
         search_output = search(env_state, search_key)
-        action = action_committer(search_output.posterior, env_state.legal_action_mask, action_key)
+        action = action_committer(
+            search_output.posterior,
+            env_state.legal_action_mask,
+            action_key,
+            search_output.commitment_policy,
+            search_output.commitment_resampling_bypass,
+        )
         return PlayerOutput(action=action, posterior=search_output.posterior)
 
     return player

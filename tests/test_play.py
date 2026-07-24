@@ -23,7 +23,9 @@ from scacchi.play_search import (
     PosteriorPrediction,
     PosteriorTargets,
     TargetMetadata,
+    _dirichlet_root_policy_readouts,
     commit_action,
+    make_action_committer,
     make_search,
     make_search_player,
 )
@@ -36,6 +38,7 @@ from scacchi.types import (
     ModelConfig,
     Network,
     PolicySearchConfig,
+    PosteriorPolicyEstimator,
     SearchConfig,
     SearchKind,
     SelfplayConfig,
@@ -261,7 +264,265 @@ def test_dirichlet_thompson_prior_only_search_preserves_rng_and_targets():
     assert jnp.array_equal(metadata.mask, jnp.ones((2,), dtype=jnp.bool_))
 
 
-def test_dirichlet_thompson_tree_search_builds_legal_targets():
+def test_q21_root_target_and_action_readouts_are_independent():
+    env_state = _toy_dirichlet_state()
+    native_config = SearchConfig(
+        kind=SearchKind.dirichlet_thompson,
+        dirichlet_thompson=DirichletThompsonSearchConfig(
+            num_simulations=0,
+            policy_samples=8,
+            policy_sample_chunk_size=2,
+        ),
+    )
+    target_config = SearchConfig(
+        kind=SearchKind.dirichlet_thompson,
+        dirichlet_thompson=DirichletThompsonSearchConfig(
+            num_simulations=0,
+            policy_samples=8,
+            policy_sample_chunk_size=2,
+            root_policy_target_estimator=(
+                PosteriorPolicyEstimator.prefix_cdf
+            ),
+        ),
+    )
+    both_config = SearchConfig(
+        kind=SearchKind.dirichlet_thompson,
+        dirichlet_thompson=DirichletThompsonSearchConfig(
+            num_simulations=0,
+            policy_samples=8,
+            policy_sample_chunk_size=2,
+            root_policy_target_estimator=(
+                PosteriorPolicyEstimator.prefix_cdf
+            ),
+            root_action_estimator=PosteriorPolicyEstimator.prefix_cdf,
+        ),
+    )
+    key = jax.random.PRNGKey(91)
+    native = make_search(
+        _ToySearchEnv(),
+        _toy_dirichlet_evaluator,
+        native_config,
+        q_loss_weight_mode="policy",
+    )(env_state, key)
+    target = make_search(
+        _ToySearchEnv(),
+        _toy_dirichlet_evaluator,
+        target_config,
+        q_loss_weight_mode="policy",
+    )(env_state, key)
+    both = make_search(
+        _ToySearchEnv(),
+        _toy_dirichlet_evaluator,
+        both_config,
+        q_loss_weight_mode="policy",
+    )(env_state, key)
+
+    native_metadata = native.posterior.metadata
+    target_metadata = target.posterior.metadata
+    assert native_metadata is not None
+    assert target_metadata is not None
+    assert native_metadata.q_weight is not None
+    assert target_metadata.q_weight is not None
+    assert target.commitment_policy is not None
+    assert both.commitment_policy is not None
+    assert jnp.array_equal(
+        target.commitment_policy,
+        native.posterior.prediction.policy,
+    )
+    assert not jnp.array_equal(
+        target.posterior.prediction.policy,
+        native.posterior.prediction.policy,
+    )
+    assert jnp.array_equal(
+        target_metadata.q_weight,
+        native_metadata.q_weight,
+    )
+    assert jnp.allclose(
+        both.posterior.prediction.policy,
+        both.commitment_policy,
+    )
+
+
+def test_search_player_composes_q21_action_with_cubic_sampling():
+    env_state = _toy_dirichlet_state()
+    search_config = SearchConfig(
+        kind=SearchKind.dirichlet_thompson,
+        posterior_sample_temperature=1.0 / 3.0,
+        dirichlet_thompson=DirichletThompsonSearchConfig(
+            num_simulations=0,
+            policy_samples=8,
+            policy_sample_chunk_size=2,
+            posterior_policy_estimator=PosteriorPolicyEstimator.prefix_cdf,
+            root_policy_target_estimator=(
+                PosteriorPolicyEstimator.prefix_cdf
+            ),
+            root_action_estimator=PosteriorPolicyEstimator.prefix_cdf,
+        ),
+    )
+    player_key = jax.random.PRNGKey(911)
+    search_key, action_key = jax.random.split(player_key)
+    search_output = make_search(
+        _ToySearchEnv(),
+        _toy_dirichlet_evaluator,
+        search_config,
+    )(env_state, search_key)
+    assert search_output.commitment_policy is not None
+    assert search_output.commitment_resampling_bypass is not None
+    assert not bool(jnp.any(search_output.commitment_resampling_bypass))
+    expected = posterior_sample_action(
+        action_key,
+        search_output.commitment_policy,
+        env_state.legal_action_mask,
+        temperature=1.0 / 3.0,
+    )
+
+    output = make_search_player(
+        _ToySearchEnv(),
+        _toy_dirichlet_evaluator,
+        search_config,
+        ActionCommitmentType.posterior_sample,
+    )(env_state, player_key)
+
+    assert jnp.array_equal(output.action, expected)
+
+
+def test_q21_solved_target_is_uniform_but_commitment_stays_native():
+    class Summary(NamedTuple):
+        alpha: jax.Array
+        q_categorical_outcome: jax.Array
+        q_categorical_distance: jax.Array
+        v_categorical_outcome: jax.Array
+
+    native_policy = jnp.asarray([[0.0, 1.0, 0.0]], dtype=jnp.float32)
+    readout = _dirichlet_root_policy_readouts(
+        native_policy,
+        summary=Summary(
+            alpha=jnp.ones((1, 3, 2), dtype=jnp.float32),
+            q_categorical_outcome=jnp.asarray([[1, 1, 0]], dtype=jnp.int8),
+            q_categorical_distance=jnp.asarray([[2, 2, 5]], dtype=jnp.int32),
+            v_categorical_outcome=jnp.asarray([1], dtype=jnp.int8),
+        ),
+        legal_action_mask=jnp.asarray([[True, True, True]]),
+        search_cfg=DirichletThompsonSearchConfig(
+            root_policy_target_estimator=(
+                PosteriorPolicyEstimator.prefix_cdf
+            ),
+            root_action_estimator=PosteriorPolicyEstimator.prefix_cdf,
+        ),
+    )
+
+    assert jnp.array_equal(
+        readout.policy,
+        jnp.asarray([[0.5, 0.5, 0.0]], dtype=jnp.float32),
+    )
+    assert jnp.array_equal(readout.commitment_policy, native_policy)
+    assert readout.commitment_resampling_bypass is not None
+    assert bool(jnp.all(readout.commitment_resampling_bypass))
+
+
+def test_search_player_preserves_solved_native_action_under_temperature():
+    env_state = _toy_dirichlet_state()
+    search_config = SearchConfig(
+        kind=SearchKind.dirichlet_thompson,
+        posterior_sample_temperature=8.0,
+        dirichlet_thompson=DirichletThompsonSearchConfig(
+            num_simulations=4,
+            policy_samples=4,
+            root_policy_target_estimator=(
+                PosteriorPolicyEstimator.prefix_cdf
+            ),
+            root_action_estimator=PosteriorPolicyEstimator.prefix_cdf,
+        ),
+    )
+    player_key = jax.random.PRNGKey(912)
+    search_key, _ = jax.random.split(player_key)
+    search_output = make_search(
+        _TerminalToySearchEnv(),
+        _toy_dirichlet_evaluator,
+        search_config,
+    )(env_state, search_key)
+    metadata = search_output.posterior.metadata
+    assert metadata is not None
+    assert metadata.search_action is not None
+    assert search_output.commitment_resampling_bypass is not None
+    assert bool(jnp.all(search_output.commitment_resampling_bypass))
+
+    output = make_search_player(
+        _TerminalToySearchEnv(),
+        _toy_dirichlet_evaluator,
+        search_config,
+        ActionCommitmentType.posterior_sample,
+    )(env_state, player_key)
+
+    assert jnp.array_equal(output.action, metadata.search_action)
+
+
+def test_unsafe_q21_action_readout_preserves_native_search_commitment():
+    env_state = _toy_dirichlet_state()
+
+    def extreme_evaluator(obs: jax.Array) -> EvaluatorOutput:
+        batch_size = obs.shape[0]
+        return EvaluatorOutput(
+            logits=jnp.zeros((batch_size, 3), dtype=obs.dtype),
+            alpha_v=jnp.ones((batch_size, 2), dtype=obs.dtype),
+            alpha_q=jnp.broadcast_to(
+                jnp.asarray(
+                    [
+                        [1e-8, 1.0],
+                        [1.0, 1e-8],
+                        [1.0, 1.0],
+                    ],
+                    dtype=obs.dtype,
+                ),
+                (batch_size, 3, 2),
+            ),
+        )
+
+    search = make_search(
+        _ToySearchEnv(),
+        extreme_evaluator,
+        SearchConfig(
+            kind=SearchKind.dirichlet_thompson,
+            dirichlet_thompson=DirichletThompsonSearchConfig(
+                num_simulations=0,
+                policy_samples=8,
+                policy_sample_chunk_size=2,
+                root_action_estimator=PosteriorPolicyEstimator.prefix_cdf,
+            ),
+        ),
+    )
+    output = search(env_state, jax.random.PRNGKey(92))
+    metadata = output.posterior.metadata
+    assert metadata is not None
+    assert metadata.search_action is not None
+    assert output.commitment_policy is not None
+    assert output.commitment_resampling_bypass is not None
+    assert bool(jnp.all(output.commitment_resampling_bypass))
+
+    committed = make_action_committer(
+        "posterior_sample",
+        posterior_sample_temperature=8.0,
+    )(
+        output.posterior,
+        env_state.legal_action_mask,
+        jax.random.PRNGKey(123),
+        output.commitment_policy,
+        output.commitment_resampling_bypass,
+    )
+
+    assert jnp.array_equal(committed, metadata.search_action)
+
+
+@pytest.mark.parametrize(
+    "posterior_estimator",
+    [
+        PosteriorPolicyEstimator.winner_mc,
+        PosteriorPolicyEstimator.prefix_cdf,
+    ],
+)
+def test_dirichlet_thompson_tree_search_builds_legal_targets(
+    posterior_estimator: PosteriorPolicyEstimator,
+):
     env_state = _toy_dirichlet_state()
     search = make_search(
         _ToySearchEnv(),
@@ -274,6 +535,7 @@ def test_dirichlet_thompson_tree_search_builds_legal_targets():
                 policy_samples=8,
                 posterior_policy_samples=1,
                 policy_sample_chunk_size=2,
+                posterior_policy_estimator=posterior_estimator,
             ),
         ),
     )
@@ -453,6 +715,94 @@ def test_commit_action_samples_posterior_target():
     expected = posterior_sample_action(key, action_weights, legal_action_mask)
     assert jnp.array_equal(played_action, expected)
     assert not jnp.array_equal(played_action, search_action)
+
+
+def test_search_player_threads_posterior_sample_temperature():
+    batch_size = 128
+    num_actions = 3
+    env_state = _ToySearchState(
+        observation=jnp.zeros((batch_size, 1), dtype=jnp.float32),
+        legal_action_mask=jnp.ones(
+            (batch_size, num_actions),
+            dtype=jnp.bool_,
+        ),
+        current_player=jnp.zeros((batch_size,), dtype=jnp.int32),
+        rewards=jnp.zeros((batch_size, 2), dtype=jnp.float32),
+        terminated=jnp.zeros((batch_size,), dtype=jnp.bool_),
+    )
+
+    def logits_only_model(obs: jax.Array) -> jax.Array:
+        return jnp.broadcast_to(
+            jnp.asarray([0.0, 0.2, -0.1], dtype=obs.dtype),
+            (obs.shape[0], num_actions),
+        )
+
+    search_config = SearchConfig(
+        kind=SearchKind.policy,
+        posterior_sample_temperature=0.25,
+        policy=PolicySearchConfig(temperature=1.0),
+    )
+    key = jax.random.PRNGKey(20)
+    player = make_search_player(
+        _ToySearchEnv(),
+        logits_only_model,
+        search_config,
+        ActionCommitmentType.posterior_sample,
+    )
+
+    output = player(env_state, key)
+
+    assert output.posterior is not None
+    _, action_key = jax.random.split(key)
+    expected = posterior_sample_action(
+        action_key,
+        output.posterior.prediction.policy,
+        env_state.legal_action_mask,
+        temperature=0.25,
+    )
+    assert jnp.array_equal(output.action, expected)
+
+
+def test_commit_action_uses_configured_posterior_sample_temperature():
+    key = jax.random.PRNGKey(21)
+    policy = jnp.broadcast_to(
+        jnp.asarray([0.2, 0.8], dtype=jnp.float32),
+        (128, 2),
+    )
+    legal = jnp.ones_like(policy, dtype=jnp.bool_)
+
+    played_action = commit_action(
+        "posterior_sample",
+        key,
+        policy,
+        legal,
+        posterior_sample_temperature=0.5,
+    )
+
+    expected = posterior_sample_action(
+        key,
+        policy,
+        legal,
+        temperature=0.5,
+    )
+    assert jnp.array_equal(played_action, expected)
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [0.0, -1.0, float("nan"), float("inf"), -float("inf")],
+)
+def test_action_committer_rejects_invalid_posterior_sample_temperature(
+    temperature: float,
+):
+    with pytest.raises(
+        ValueError,
+        match="posterior_sample_temperature must be finite and > 0",
+    ):
+        make_action_committer(
+            "posterior_sample",
+            posterior_sample_temperature=temperature,
+        )
 
 
 def test_commit_action_can_use_search_action():
