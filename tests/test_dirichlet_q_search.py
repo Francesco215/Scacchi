@@ -8,10 +8,10 @@ import pytest
 from scacchi import dirichlet_mctx
 from scacchi.dirichlet_mctx.outcomes import NO_OUTCOME
 from scacchi.dirichlet_q_search import (
+    build_q_supervision,
     make_dirichlet_expand_fn,
     posterior_best_action,
     posterior_sample_action,
-    q_loss_weight_from_mode,
     terminal_outcome_from_reward,
 )
 from scacchi.types import load_config
@@ -568,7 +568,9 @@ def test_default_max_depth_uses_complete_simulation_budget():
                     "dirichlet_thompson": {
                         "num_simulations": 6,
                         "max_depth": None,
-                        "policy_samples": 0,
+                        "posterior_update": {
+                            "monte_carlo": {"policy_samples": 1},
+                        },
                     },
                 }
             }
@@ -961,7 +963,7 @@ def test_posterior_action_helpers_respect_legal_mask():
     assert bool(jnp.all(legal_action_mask[jnp.arange(2), sampled]))
 
 
-def test_posterior_sample_temperature_one_preserves_seeded_path():
+def test_posterior_sample_temperature_one_matches_power_transform():
     policy_target = jnp.array(
         [[0.05, 0.15, 0.8], [0.6, 0.3, 0.1]],
         dtype=jnp.float32,
@@ -978,16 +980,16 @@ def test_posterior_sample_temperature_one_preserves_seeded_path():
         legal_action_mask,
         temperature=1.0,
     )
-    legacy_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
-    legacy_logits = jnp.where(
+    expected_logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
+    expected_logits = jnp.where(
         legal_action_mask,
-        legacy_logits,
-        jnp.finfo(legacy_logits.dtype).min,
+        expected_logits,
+        jnp.finfo(expected_logits.dtype).min,
     )
-    legacy = jax.random.categorical(key, legacy_logits).astype(jnp.int32)
+    expected = jax.random.categorical(key, expected_logits).astype(jnp.int32)
 
     assert jnp.array_equal(explicit_one, default)
-    assert jnp.array_equal(explicit_one, legacy)
+    assert jnp.array_equal(explicit_one, expected)
 
 
 def test_posterior_sample_temperature_matches_power_transform():
@@ -1021,7 +1023,8 @@ def test_posterior_sample_temperature_matches_power_transform():
     )
 
 
-def test_nonunit_temperature_preserves_exact_zero_support():
+@pytest.mark.parametrize("temperature", [1.0, 8.0])
+def test_temperature_preserves_exact_zero_support(temperature: float):
     policy_target = jnp.asarray([[0.0, 0.2, 0.8]], dtype=jnp.float32)
     legal_action_mask = jnp.ones_like(policy_target, dtype=jnp.bool_)
     keys = jax.random.split(jax.random.PRNGKey(8), 512)
@@ -1031,7 +1034,7 @@ def test_nonunit_temperature_preserves_exact_zero_support():
             key,
             policy_target,
             legal_action_mask,
-            temperature=8.0,
+            temperature=temperature,
         )[0]
     )(keys)
 
@@ -1049,17 +1052,40 @@ def test_posterior_sample_rejects_invalid_temperature(temperature):
         )
 
 
-def test_q_loss_weights_support_policy_and_evidence_mass_modes():
+def test_q_supervision_separates_selection_from_legacy_source_weighting():
     counts = jnp.array([[[2.0], [2.0], [0.0]]])
     policy = jnp.array([[0.25, 0.75, 0.0]])
+    legal = jnp.ones_like(policy, dtype=jnp.bool_)
+    solved = jnp.array([[False, False, True]])
 
-    assert jnp.array_equal(
-        q_loss_weight_from_mode("policy", counts, policy),
+    uniform = build_q_supervision(
+        "positive_search_evidence_or_solved",
+        "mean_over_selected_state_action_pairs",
+        counts,
         policy,
+        solved,
+        legal,
     )
-    assert jnp.allclose(
-        q_loss_weight_from_mode("evidence_mass", counts, policy),
-        jnp.array([[2.0, 2.0, 0.0]]),
+    assert jnp.array_equal(
+        uniform.selected,
+        jnp.array([[True, True, True]]),
+    )
+    assert jnp.array_equal(
+        uniform.pair_weight,
+        jnp.ones_like(policy),
+    )
+
+    legacy = build_q_supervision(
+        "positive_search_evidence_or_solved",
+        "legacy_normalized_source_weighted_mean",
+        counts,
+        policy,
+        solved,
+        legal,
+    )
+    assert jnp.array_equal(
+        legacy.pair_weight,
+        jnp.array([[2.0, 2.0, 1.0]]),
     )
 
 

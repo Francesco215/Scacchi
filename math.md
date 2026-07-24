@@ -688,14 +688,18 @@ $$
 Y_a^{\mathrm{root}}=Y_{s_0,a}.
 $$
 
-If the root remains unresolved, the public target is another fresh mixed-native
-population:
+If the root remains unresolved, the public target is computed by the selected
+posterior-update estimator from the root action posteriors:
 
 $$
 \pi_{\mathrm{search}}(a\mid s_0)
-=\widehat\pi_{M_{\mathrm{root}}}
+=\operatorname{PosteriorPolicy}
 (a\mid s_0;Y^{\mathrm{root}}).
 $$
+
+For Monte Carlo updates this is a fresh mixed-native population. For numerical
+updates it is the guarded prefix-CDF quadrature result, with the configured
+winner-sampling fallback.
 
 If the root is categorical, sample its certified action $a_{\mathrm{cat}}(s_0)$
 uniformly among equally good tagged edge certificates, then return
@@ -720,23 +724,29 @@ $$
 
 and the completed tree.
 
-$M_{\mathrm{node}}$ (`posterior_policy_samples`) and $M_{\mathrm{root}}$
-(`policy_samples`) estimate the same quantity but may use different Monte
-Carlo budgets. The internal budget affects the stochastic cache repair; the
-root budget affects the variance of the public policy and training target.
+The selected posterior-update configuration is used unchanged at internal
+nodes and at the root. In Monte Carlo mode, `policy_samples` and
+`policy_sample_chunk_size` therefore control both cache repair and the public
+root policy. In numerical mode, the same quadrature parameters and guarded
+Monte Carlo fallback budget are used in both places.
 
 ### 9.1 Committed self-play action
 
-Search output and game action are separate. Scacchi can commit by:
+Search output and game action are separate. For Dirichlet search, the player
+selects a posterior updater through
+`action_commitment.posterior_update`. That updater computes a fresh commitment
+policy \(q_{\mathrm{commit}}\) from the searched root action posteriors. A null
+selection reuses the updater selected by search. Scacchi then commits by:
 
-- `posterior_argmax`: $\arg\max_a\pi_{\mathrm{search}}(a)$;
-- `posterior_sample`: a categorical draw from $\pi_{\mathrm{search}}$;
+- `posterior_argmax`: $\arg\max_a q_{\mathrm{commit}}(a)$;
+- `posterior_sample`: a categorical draw from \(q_{\mathrm{commit}}\);
 - `search_action`: the backend action returned with the policy output.
 
-For this backend, `search_action` is also the masked argmax of the same public
-policy population. The separation is retained so all search backends share one
-self-play interface. At a categorical root the policy is one-hot, so all three
-commitment modes choose the same certified action.
+The search and commitment selectors use the same Monte Carlo and numerical
+parameter blocks but may choose different variants. The commitment policy is
+ephemeral and is not written to replay. At a categorical root it is the
+backend's certified one-hot action, so all three commitment modes preserve the
+exact solved action.
 
 ### 9.2 Guarded binary prefix-CDF readout
 
@@ -767,28 +777,27 @@ $$
 x=\sigma(\sinh t),\qquad Q=2h+1.
 $$
 
-`prefix_cdf_half_width=10` therefore means Q21. Prefix products make the
-calculation \(O(AQ)\), and interval increments of the joint maximum CDF are
-allocated among their nonnegative action contributions. Those increments
-telescope, so the raw action mass is conserved up to floating-point error.
+`posterior_update.numerical.half_width=10` therefore means Q21. Prefix products
+make the calculation \(O(AQ)\), and interval increments of the joint maximum
+CDF are allocated among their nonnegative action contributions. Those
+increments telescope, so the raw action mass is conserved up to floating-point
+error.
 
 The estimator is guarded by finite-value, adaptive-tail, and density-integral
 checks. These guards catch specified numerical failures, but do not certify a
 universal Q21 approximation-error bound outside the Hex6 envelope on which
 Q21 was selected. An unsafe internal node uses the unchanged
 winner-Monte-Carlo repair for the entire batch and the identical RNG key. An
-unsafe root falls back per lane. The three choices are deliberately
-independent:
-
-- `posterior_policy_estimator` controls the policy inside cache repair;
-- `root_policy_target_estimator` controls the policy stored for replay;
-- `root_action_estimator` controls an ephemeral policy used only to play.
+unsafe root uses the same whole-batch fallback. `posterior_update.kind` is the
+search estimator selection: it controls cache repair and the policy stored for
+replay. `action_commitment.posterior_update` independently selects the
+estimator used only to play.
 
 Changing the replay policy does not change the native search-derived Q-loss
 weight. At a solved root, the Q21 replay target is uniform over all
-distance-optimal certified actions, while commitment keeps the backend's
-native sampled certified action. Thus exact tie semantics are preserved
-without storing a second policy tensor in replay.
+distance-optimal certified actions, while commitment uses the backend's native
+sampled certified action. Thus exact tie semantics are preserved without
+storing a second policy tensor in replay.
 
 ### 9.3 Power-temperature commitment
 
@@ -801,16 +810,15 @@ q_T(a)=
       \operatorname{clip}(q(a),10^{-8},1)^{1/T}}
      {\sum_{b\ \mathrm{legal},\ q(b)>0}
       \operatorname{clip}(q(b),10^{-8},1)^{1/T}},
-\qquad T>0,\ T\ne1.
+\qquad T>0.
 $$
 
 One action is sampled from \(q_T\). In particular, \(T=1/3\) is the cubic
 law \(q_T(a)\propto q(a)^3\), a permutation-equivariant sharpening that
-requires no second vote population. The implementation retains a separate
-`T=1` branch with the original clipped operation order, preserving seeded
-legacy behavior; non-unit transforms preserve exact zero support. Unsafe Q21
-action rows and solved roots bypass temperature resampling and use the backend
-action.
+requires no second vote population. The transform preserves exact zero
+support. An unsafe numerical commitment policy first uses its configured
+Monte Carlo fallback and is then committed normally. Solved roots remain the
+backend's certified one-hot action.
 
 ---
 
@@ -891,29 +899,51 @@ $$
 and no addition of $R$ to Dirichlet concentration. Doing either would train
 the network on a posterior different from the one search actually used.
 
-The Q-loss reduction weight is configurable:
+The default Q-supervision action set is explicit:
 
 $$
-w_a^{\mathrm{reduce}}=
-\begin{cases}
-R_{s_0,a}, & z_{s_0,a}=\bot\text{ and evidence-mass mode},\\
-\pi_{\mathrm{search}}(a\mid s_0),
-& z_{s_0,a}=\bot\text{ and policy mode},\\
-1,&z_{s_0,a}\ne\bot.
-\end{cases}
+M_{s,a}
+=
+\mathbf 1\!\left[
+\operatorname{legal}(s,a)
+\land
+\left(
+\operatorname{evidence}_{s,a}>0
+\lor
+\operatorname{solved}_{s,a}
+\right)
+\right].
 $$
 
-Here the name `evidence_mass` is historical: in this backend it receives the
-structural edge count $R$ only while that edge is unresolved, not added
-Dirichlet pseudo-count mass. Every legal categorical Q edge is given unit
-effective weight even if a
-one-hot solved policy assigns it zero probability, so exact alternative moves
-are not silently discarded.
+Here `evidence` is the structural root edge count $R$, not additional
+Dirichlet pseudo-count mass. Every legal categorical Q edge is selected even
+if it has zero evidence or a one-hot posterior policy gives it zero mass, so
+exact alternative moves are not silently discarded. The alternative
+`positive_posterior_policy_or_solved` action set replaces the positive-evidence
+condition with $\pi_{\mathrm{search}}(a\mid s)>0$ while retaining explicit
+solved-action inclusion.
 
-This reduction weight is distinct from replay's `q_target_weight`. The latter
-is a native-target validity/scale field and is one for every legal emitted Q
-row (zero for padding). The former is stored as `q_loss_weight` and determines
-how legal Q rows are combined by the configured Q-loss reduction.
+The default reduction is
+
+$$
+\mathcal L_Q
+=
+\frac{\sum_{s,a}M_{s,a}\ell_{s,a}}
+{\sum_{s,a}M_{s,a}}.
+$$
+
+Search evidence determines whether an action receives Q supervision. Its
+magnitude does not scale the loss. This is a mean over selected state-action
+pairs, not a mean over states; a state with more selected actions therefore
+contributes more pairs. The deprecated
+`legacy_normalized_source_weighted_mean` reduction exists only to reproduce
+historical configurations and checkpoints that normalized raw evidence or
+policy source weights.
+
+Q supervision is distinct from replay's `q_target_weight`. The latter is a
+native-target validity/scale field and is one for every legal emitted Q row
+(zero for padding). Replay stores Q selection and the numerical multiplier
+separately; the default multiplier is one for every selected pair.
 
 ### 11.1 Policy loss
 
@@ -1082,7 +1112,7 @@ DIRICHLET-THOMPSON-POLICY(root, N, posterior_update):
         root_policy <- one_hot(root_action)
     else:
         root_native <- categorical edges plus effective Dirichlet edges
-        root_policy <- repeated native utility samples from root_native
+        root_policy <- configured posterior policy from root_native
     return argmax(root_policy), root_policy, tree
 ```
 

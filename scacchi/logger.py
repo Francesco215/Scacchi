@@ -142,7 +142,24 @@ def training_metrics(train_metrics: Any, *, seconds: float, hours: float, frames
         "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
         "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
         "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
-        "train/q_loss_weight_mean": train_metrics.q_loss_weight_mean.mean().item(),
+        "train/q_supervised_actions_per_row": (
+            train_metrics.q_supervised_actions_per_row.mean().item()
+        ),
+        "data/q_positive_evidence_action_count": _count(
+            train_metrics.q_positive_evidence_action_count
+        ),
+        "data/q_positive_policy_action_count": _count(
+            train_metrics.q_positive_policy_action_count
+        ),
+        "data/q_solved_action_count": _count(
+            train_metrics.q_solved_action_count
+        ),
+        "data/q_supervised_action_count": _count(
+            train_metrics.q_supervised_action_count
+        ),
+        "data/q_supervised_action_fraction": (
+            train_metrics.q_supervised_action_fraction.mean().item()
+        ),
         "data/value_mask_fraction": train_metrics.data_value_mask_fraction.mean().item(),
         "data/pass_fraction": train_metrics.data_pass_fraction.mean().item(),
         "data/terminations_per_row": train_metrics.data_terminations_per_row.mean().item(),

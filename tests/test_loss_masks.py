@@ -24,6 +24,7 @@ from scacchi.loss import (
 from scacchi.pipeline import make_minibatches
 from scacchi.play import TrainingSamples
 from scacchi.play_search import PosteriorPrediction, PosteriorTargets, TargetMetadata
+from scacchi.dirichlet_q_search import QSupervision
 from scacchi.types import (
     Config,
     ModelConfig,
@@ -78,7 +79,11 @@ def _sample_posterior_fields(num_rows: int, num_actions: int = 2, num_outcomes: 
     return {
         "beta_Q_target": jnp.ones((num_rows, num_actions, num_outcomes)),
         "beta_V_target": jnp.ones((num_rows, num_outcomes)),
-        "q_loss_weight": jnp.zeros((num_rows, num_actions)),
+        "q_pair_weight": jnp.zeros((num_rows, num_actions)),
+        "q_supervised_pair_mask": jnp.zeros(
+            (num_rows, num_actions),
+            dtype=jnp.bool_,
+        ),
     }
 
 
@@ -92,7 +97,7 @@ def _training_samples(
     legal_action_mask,
     beta_Q_target,
     beta_V_target,
-    q_loss_weight,
+    q_pair_weight,
     discount,
     search_loss_mask=None,
 ) -> TrainingSamples:
@@ -109,7 +114,10 @@ def _training_samples(
             ),
             metadata=TargetMetadata(
                 mask=search_loss_mask,
-                q_weight=q_loss_weight,
+                q_supervision=QSupervision(
+                    selected=q_pair_weight > 0,
+                    pair_weight=q_pair_weight,
+                ),
             ),
         ),
         played_action=played_action,
@@ -150,7 +158,7 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
         ),
         beta_Q_target=jnp.ones((2, 3, 4, 2)),
         beta_V_target=jnp.ones((2, 3, 2)),
-        q_loss_weight=jnp.array(
+        q_pair_weight=jnp.array(
             [
                 [
                     [1.0, 0.0, 0.0, 0.0],
@@ -175,13 +183,20 @@ def test_compute_loss_input_preserves_root_legal_action_mask():
     assert metadata is not None
     assert alpha_q is not None
     assert alpha_v is not None
-    assert metadata.q_weight is not None
+    assert metadata.q_supervision is not None
 
     assert jnp.array_equal(sample.policy_mask, data.legal_action_mask)
     assert jnp.array_equal(sample.played_action, data.played_action)
     assert jnp.array_equal(sample.beta_Q_target, alpha_q)
     assert jnp.array_equal(sample.beta_V_target, alpha_v)
-    assert jnp.array_equal(sample.q_loss_weight, metadata.q_weight)
+    assert jnp.array_equal(
+        sample.q_pair_weight,
+        metadata.q_supervision.pair_weight,
+    )
+    assert jnp.array_equal(
+        sample.q_supervised_pair_mask,
+        metadata.q_supervision.selected,
+    )
     assert jnp.array_equal(
         sample.value_mask,
         jnp.array(
@@ -211,7 +226,10 @@ def test_compute_loss_input_accepts_training_samples():
             ),
             metadata=TargetMetadata(
                 mask=jnp.array([[True]]),
-                q_weight=q_weight,
+                q_supervision=QSupervision(
+                    selected=q_weight > 0,
+                    pair_weight=q_weight,
+                ),
             ),
         ),
         played_action=jnp.array([[1]]),
@@ -224,7 +242,7 @@ def test_compute_loss_input_accepts_training_samples():
     assert jnp.array_equal(sample.policy_tgt, policy)
     assert jnp.array_equal(sample.beta_Q_target, beta_q)
     assert jnp.array_equal(sample.beta_V_target, beta_v)
-    assert jnp.array_equal(sample.q_loss_weight, q_weight)
+    assert jnp.array_equal(sample.q_pair_weight, q_weight)
     assert jnp.array_equal(sample.search_loss_mask, jnp.array([[True]]))
 
 
@@ -242,7 +260,7 @@ def test_compute_loss_input_preserves_sample_batch_sharding():
         legal_action_mask=jnp.ones((batch_size, 2, 3), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((batch_size, 2, 3, 2), dtype=jnp.float32),
         beta_V_target=jnp.ones((batch_size, 2, 2), dtype=jnp.float32),
-        q_loss_weight=jnp.zeros((batch_size, 2, 3), dtype=jnp.float32),
+        q_pair_weight=jnp.zeros((batch_size, 2, 3), dtype=jnp.float32),
         discount=-jnp.ones((batch_size, 2), dtype=jnp.float32),
     )
     data = jax.tree_util.tree_map(
@@ -293,7 +311,7 @@ def test_compute_loss_input_trains_root_search_targets_before_terminal_result():
         legal_action_mask=jnp.ones((3, 2, 4), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((3, 2, 4, 3)),
         beta_V_target=jnp.ones((3, 2, 3)),
-        q_loss_weight=jnp.ones((3, 2, 4)) / 4.0,
+        q_pair_weight=jnp.ones((3, 2, 4)) / 4.0,
         discount=-jnp.ones((3, 2)),
     )
     config = _loss_config(max_num_steps=2)
@@ -330,7 +348,10 @@ def test_compute_loss_input_preserves_search_native_target_metadata():
             ),
             metadata=TargetMetadata(
                 mask=jnp.ones((1, 1), dtype=jnp.bool_),
-                q_weight=jnp.ones((1, 1, 2)),
+                q_supervision=QSupervision(
+                    selected=jnp.ones((1, 1, 2), dtype=jnp.bool_),
+                    pair_weight=jnp.ones((1, 1, 2)),
+                ),
                 q_target_kind=q_target_kind,
                 q_target_weight=q_target_weight,
                 q_target_outcome=q_target_outcome,
@@ -367,7 +388,7 @@ def test_compute_loss_input_can_mark_played_terminal_edge_categorical():
         legal_action_mask=jnp.ones((1, 2, 3), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((1, 2, 3, 3)),
         beta_V_target=jnp.ones((1, 2, 3)),
-        q_loss_weight=jnp.zeros((1, 2, 3)),
+        q_pair_weight=jnp.zeros((1, 2, 3)),
         discount=jnp.array([[-1.0, 0.0]]),
     )
     config = _loss_config(max_num_steps=2, terminal_edge_targets=True)
@@ -377,7 +398,7 @@ def test_compute_loss_input_can_mark_played_terminal_edge_categorical():
     assert sample.q_target_kind[0, 1, 2] == int(TARGET_CATEGORICAL)
     assert sample.q_target_outcome[0, 1, 2] == 2
     assert sample.q_target_distance[0, 1, 2] == 1
-    assert sample.q_loss_weight[0, 1, 2] == 1.0
+    assert sample.q_pair_weight[0, 1, 2] == 1.0
     assert not bool(jnp.any(sample.q_target_kind[0, 0] == int(TARGET_CATEGORICAL)))
     assert not bool(jnp.any(sample.q_target_kind[0, 1, :2] == int(TARGET_CATEGORICAL)))
 
@@ -392,7 +413,7 @@ def test_compute_loss_input_can_mark_terminal_winning_parent_categorical():
         legal_action_mask=jnp.ones((1, 2, 3), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((1, 2, 3, 3)),
         beta_V_target=jnp.ones((1, 2, 3)),
-        q_loss_weight=jnp.zeros((1, 2, 3)),
+        q_pair_weight=jnp.zeros((1, 2, 3)),
         discount=jnp.array([[-1.0, 0.0]]),
     )
     config = _loss_config(max_num_steps=2, terminal_parent_targets=True)
@@ -431,7 +452,11 @@ def _minibatch_sample(num_steps: int, batch_size: int) -> Sample:
         value_mask=jnp.ones((batch_size, num_steps), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((batch_size, num_steps, 2, 2)),
         beta_V_target=jnp.ones((batch_size, num_steps, 2)),
-        q_loss_weight=jnp.zeros((batch_size, num_steps, 2)),
+        q_supervised_pair_mask=jnp.zeros(
+            (batch_size, num_steps, 2),
+            dtype=jnp.bool_,
+        ),
+        q_pair_weight=jnp.zeros((batch_size, num_steps, 2)),
     )
 
 
@@ -739,7 +764,8 @@ def test_concentration_floor_metric_tolerance_is_independent_of_clip(
         value_mask=jnp.ones((3,), dtype=jnp.bool_),
         beta_Q_target=alpha_q,
         beta_V_target=alpha_v,
-        q_loss_weight=jnp.ones((3, 1)),
+        q_supervised_pair_mask=jnp.ones((3, 1), dtype=jnp.bool_),
+        q_pair_weight=jnp.ones((3, 1)),
     )
     config = _loss_config()
     config.model.dirichlet_concentration_floor = 2.0
@@ -776,7 +802,8 @@ def test_mean_dirichlet_loss_mode_does_not_penalize_fixed_evidence_mass():
         value_mask=jnp.array([True]),
         beta_Q_target=jnp.array([[[2.0, 8.0], [8.0, 2.0]]]),
         beta_V_target=jnp.array([[2.0, 8.0]]),
-        q_loss_weight=jnp.array([[1.0, 1.0]]),
+        q_supervised_pair_mask=jnp.ones((1, 2), dtype=jnp.bool_),
+        q_pair_weight=jnp.array([[1.0, 1.0]]),
     )
     logits = jnp.zeros((1, 2))
     alpha_v = jnp.array([[20.0, 80.0]])
@@ -826,7 +853,10 @@ def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
             ]
         ),
         beta_V_target=jnp.array([[1.0, 2.0], [1000.0, 1.0]]),
-        q_loss_weight=jnp.array([[0.0, 0.0, 1.0], [1.0, 1.0, 1.0]]),
+        q_supervised_pair_mask=jnp.array(
+            [[False, False, True], [True, True, True]]
+        ),
+        q_pair_weight=jnp.array([[0.0, 0.0, 1.0], [1.0, 1.0, 1.0]]),
         search_loss_mask=jnp.array([True, False]),
     )
     logits = jnp.zeros((2, 3))
@@ -848,7 +878,7 @@ def test_dirichlet_kl_losses_use_value_policy_and_q_evidence_masks():
     expected_q = _dirichlet_kl(data.beta_Q_target[0, 2], alpha_q[0, 2])
     assert jnp.allclose(metrics.value_dir_kl_loss, 0.0, atol=1e-6)
     assert jnp.allclose(metrics.q_dir_kl_loss, expected_q, atol=1e-6)
-    assert jnp.allclose(metrics.q_loss_weight_mean, 1.0)
+    assert jnp.allclose(metrics.q_supervised_actions_per_row, 1.0)
 
 
 def test_dirichlet_kl_losses_ignore_huge_and_nonfinite_terms():
@@ -879,7 +909,8 @@ def test_dirichlet_kl_losses_ignore_huge_and_nonfinite_terms():
                 [jnp.nan, 1.0],
             ]
         ),
-        q_loss_weight=jnp.ones((3, 3)),
+        q_supervised_pair_mask=jnp.ones((3, 3), dtype=jnp.bool_),
+        q_pair_weight=jnp.ones((3, 3)),
     )
     logits = jnp.zeros((3, 3))
     alpha_v = jnp.array([[2.0, 3.0], [1.0, 1e6], [1.0, 1.0]])
@@ -927,7 +958,7 @@ def test_terminal_edge_uses_native_categorical_loss_not_compatibility_alpha():
         legal_action_mask=jnp.ones((1, 1, 1), dtype=jnp.bool_),
         beta_Q_target=arbitrary_beta[None, None, None, :],
         beta_V_target=jnp.ones((1, 1, 3)),
-        q_loss_weight=jnp.ones((1, 1, 1)),
+        q_pair_weight=jnp.ones((1, 1, 1)),
         discount=jnp.zeros((1, 1)),
         search_loss_mask=jnp.ones((1, 1), dtype=jnp.bool_),
     )
@@ -981,7 +1012,8 @@ def test_policy_kl_hat_is_nll_minus_sampled_target_entropy():
         value_mask=jnp.array([True]),
         beta_Q_target=jnp.ones((1, 2, 2)),
         beta_V_target=jnp.ones((1, 2)),
-        q_loss_weight=jnp.zeros((1, 2)),
+        q_supervised_pair_mask=jnp.zeros((1, 2), dtype=jnp.bool_),
+        q_pair_weight=jnp.zeros((1, 2)),
     )
     logits = jnp.array([[0.0, 0.0]])
     alpha_v = jnp.ones((1, 2))
@@ -1018,7 +1050,8 @@ def test_native_categorical_targets_use_dirichlet_density_nll(
         value_mask=jnp.array([True]),
         beta_Q_target=jnp.full((1, 2, 3), jnp.nan),
         beta_V_target=jnp.full((1, 3), jnp.nan),
-        q_loss_weight=jnp.array([[1.0, 0.0]]),
+        q_supervised_pair_mask=jnp.array([[True, False]]),
+        q_pair_weight=jnp.array([[1.0, 0.0]]),
         q_target_kind=jnp.array([[int(TARGET_CATEGORICAL), 0]], dtype=jnp.int8),
         q_target_weight=jnp.ones((1, 2), dtype=jnp.float32),
         q_target_outcome=jnp.array([[2, -1]], dtype=jnp.int8),
@@ -1071,7 +1104,8 @@ def test_categorical_density_nll_is_not_removed_by_dirichlet_kl_cutoff():
         value_mask=jnp.ones((2,), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((2, 1, 3)),
         beta_V_target=jnp.ones((2, 3)),
-        q_loss_weight=jnp.ones((2, 1)),
+        q_supervised_pair_mask=jnp.ones((2, 1), dtype=jnp.bool_),
+        q_pair_weight=jnp.ones((2, 1)),
         q_target_kind=jnp.full(
             (2, 1),
             int(TARGET_CATEGORICAL),
@@ -1134,7 +1168,8 @@ def test_invalid_categorical_target_outcome_is_not_clipped_to_a_class():
         value_mask=jnp.ones((1,), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((1, 1, 3)),
         beta_V_target=jnp.ones((1, 3)),
-        q_loss_weight=jnp.ones((1, 1)),
+        q_supervised_pair_mask=jnp.ones((1, 1), dtype=jnp.bool_),
+        q_pair_weight=jnp.ones((1, 1)),
         q_target_kind=jnp.full(
             (1, 1),
             int(TARGET_CATEGORICAL),
@@ -1178,7 +1213,8 @@ def test_zero_weight_losses_cannot_poison_policy_objective_with_nan():
         value_mask=jnp.ones((1,), dtype=jnp.bool_),
         beta_Q_target=jnp.ones((1, 2, 3)),
         beta_V_target=jnp.ones((1, 3)),
-        q_loss_weight=jnp.ones((1, 2)),
+        q_supervised_pair_mask=jnp.ones((1, 2), dtype=jnp.bool_),
+        q_pair_weight=jnp.ones((1, 2)),
     )
     config = _loss_config(
         policy_loss_weight=1.0,
@@ -1212,7 +1248,8 @@ def test_debug_outcome_losses_use_dirichlet_mean_nll_not_density():
         outcome_mask=jnp.array([True]),
         beta_Q_target=jnp.ones((1, 2, 3)),
         beta_V_target=jnp.ones((1, 3)),
-        q_loss_weight=jnp.array([[1.0, 0.0]]),
+        q_supervised_pair_mask=jnp.array([[True, False]]),
+        q_pair_weight=jnp.array([[1.0, 0.0]]),
     )
     logits = jnp.zeros((1, 2))
     alpha_v = jnp.array([[0.2, 0.2, 0.6]])

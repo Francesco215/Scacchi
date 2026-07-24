@@ -21,16 +21,18 @@ model:
 selfplay:
   batch_size: 8192
   max_num_steps: 25
-  action_commitment_type: posterior_argmax
+  action_commitment:
+    kind: posterior_argmax
+    posterior_update: monte_carlo
   search:
     kind: dirichlet_thompson
 
     dirichlet_thompson:
       num_simulations: 16
-      kappa: 4.0
-      # Final root policy population. Internal repair draws its own fresh
-      # population from each node's just-updated edge posteriors.
-      policy_samples: 32
+      posterior_update:
+        kind: monte_carlo
+        monte_carlo:
+          kappa: 4.0
 
 
 training:
@@ -63,8 +65,10 @@ eval:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
-      kappa: 4.0
-      policy_samples: 32
+      posterior_update:
+        kind: monte_carlo
+        monte_carlo:
+          kappa: 4.0
   baseline_search:
     kind: gumbel
     gumbel:

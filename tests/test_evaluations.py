@@ -15,6 +15,7 @@ from scacchi.play import (
 )
 from scacchi.play_search import PlayerOutput
 from scacchi.types import (
+    ActionCommitmentConfig,
     ActionCommitmentType,
     Config,
     EvalConfig,
@@ -252,8 +253,12 @@ def test_policy_eval_accepts_logits_only_baseline_smoke():
             batch_size=2,
             player_search=search,
             baseline_search=search,
-            player_action_commitment_type=ActionCommitmentType.posterior_argmax,
-            baseline_action_commitment_type=ActionCommitmentType.posterior_argmax,
+            player_action_commitment=ActionCommitmentConfig(
+                kind=ActionCommitmentType.posterior_argmax,
+            ),
+            baseline_action_commitment=ActionCommitmentConfig(
+                kind=ActionCommitmentType.posterior_argmax,
+            ),
         ),
     )
     model = BoardlawNet(
