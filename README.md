@@ -78,11 +78,14 @@ The search selection controls internal repair and the replay target. The
 action-commitment selection builds a fresh action-only policy from the searched
 root posteriors; `null` reuses the search selection. Both selectors use the
 Monte Carlo and numerical parameter blocks under the Dirichlet search config.
-Numerically unsafe estimates fall back to the unchanged winner-sampling path
-for the whole batch. The action-only policy is not written to replay. With
+Each numerically unsafe batch lane falls back to the unchanged winner-sampling
+path while safe lanes remain on Q21. The action-only policy is not written to
+replay. With
 `posterior_sample`, temperature \(T\) samples on the positive support
 from \(q_T(a)\propto\operatorname{clip}(q(a),10^{-8},1)^{1/T}\); exact zeros
-stay zero. Prefix-CDF requires a two-outcome head.
+stay zero whenever the legal policy has positive support. An all-zero legal
+policy falls back to uniform legal sampling. Prefix-CDF requires a two-outcome
+head.
 The Hex6 recipe enables Q21, cubic (`T=1/3`) commitment, and W&B logging.
 The numerical guards detect specified integration failures, not arbitrary
 quadrature error outside the Hex6 envelope used to select Q21.

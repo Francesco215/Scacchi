@@ -370,7 +370,7 @@ def test_safe_prefix_repair_is_deterministic_and_uses_q21_policy():
     assert jnp.array_equal(first.value_alpha, second.value_alpha)
 
 
-def test_one_unsafe_lane_triggers_exact_native_fallback_for_whole_batch():
+def test_one_unsafe_lane_falls_back_without_changing_safe_lane():
     context = _context(
         jnp.asarray(
             [
@@ -401,14 +401,25 @@ def test_one_unsafe_lane_triggers_exact_native_fallback_for_whole_batch():
         policy_samples=samples,
         policy_sample_chunk_size=chunk_size,
     )
+    expected_prefix_value = mix_value_prior(
+        context.node.value_prior,
+        context.node.edge_alpha,
+        estimate.policy,
+        context.node.node_payload,
+    )
 
     assert jnp.array_equal(
         estimate.tail_range_clipped,
         jnp.asarray([False, True]),
     )
-    assert jax.tree.all(
-        jax.tree.map(jnp.array_equal, guarded, native)
+    assert jnp.allclose(
+        guarded.value_alpha[0],
+        expected_prefix_value[0],
+        atol=1e-6,
     )
+    assert jnp.array_equal(guarded.value_alpha[1], native.value_alpha[1])
+    assert jnp.array_equal(guarded.edge_alpha, native.edge_alpha)
+    assert jnp.array_equal(guarded.edge_payload, native.edge_payload)
 
 
 def test_prefix_repair_projects_categorical_cache_without_mutating_edge():

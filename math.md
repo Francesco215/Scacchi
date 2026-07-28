@@ -786,12 +786,13 @@ error.
 The estimator is guarded by finite-value, adaptive-tail, and density-integral
 checks. These guards catch specified numerical failures, but do not certify a
 universal Q21 approximation-error bound outside the Hex6 envelope on which
-Q21 was selected. An unsafe internal node uses the unchanged
-winner-Monte-Carlo repair for the entire batch and the identical RNG key. An
-unsafe root uses the same whole-batch fallback. `posterior_update.kind` is the
-search estimator selection: it controls cache repair and the policy stored for
-replay. `action_commitment.posterior_update` independently selects the
-estimator used only to play.
+Q21 was selected. An unsafe batch lane uses the unchanged
+winner-Monte-Carlo repair with the identical RNG key while safe lanes remain
+on Q21. Root readout uses the same per-lane fallback.
+`posterior_update.kind` is the search estimator selection: it controls cache
+repair and the policy stored for replay.
+`action_commitment.posterior_update` independently selects the estimator used
+only to play.
 
 Changing the replay policy does not change the native search-derived Q-loss
 weight. At a solved root, the Q21 replay target is uniform over all
@@ -816,9 +817,10 @@ $$
 One action is sampled from \(q_T\). In particular, \(T=1/3\) is the cubic
 law \(q_T(a)\propto q(a)^3\), a permutation-equivariant sharpening that
 requires no second vote population. The transform preserves exact zero
-support. An unsafe numerical commitment policy first uses its configured
-Monte Carlo fallback and is then committed normally. Solved roots remain the
-backend's certified one-hot action.
+support whenever at least one legal action has positive mass; an all-zero legal
+policy falls back to uniform legal sampling. An unsafe numerical commitment
+policy first uses its configured Monte Carlo fallback and is then committed
+normally. Solved roots remain the backend's certified one-hot action.
 
 ---
 

@@ -604,7 +604,7 @@ def test_unsafe_q21_action_update_uses_its_monte_carlo_fallback():
     assert jnp.array_equal(numerical, native)
 
 
-def test_one_unsafe_q21_root_lane_triggers_native_fallback_for_whole_batch():
+def test_one_unsafe_q21_root_lane_does_not_change_safe_lane():
     class Summary(NamedTuple):
         alpha: jax.Array
         q_categorical_outcome: jax.Array
@@ -616,21 +616,23 @@ def test_one_unsafe_q21_root_lane_triggers_native_fallback_for_whole_batch():
         dtype=jnp.float32,
     )
     no_outcome = int(NO_OUTCOME)
+    alpha = jnp.asarray(
+        [
+            [[2.0, 3.0], [4.0, 1.0], [1.0, 2.0]],
+            [[1e-5, 1.0], [2.0, 1.0], [1.0, 3.0]],
+        ],
+        dtype=jnp.float32,
+    )
+    categorical_outcome = jnp.full(
+        (2, 3),
+        no_outcome,
+        dtype=jnp.int8,
+    )
     readout = _dirichlet_root_policy_readout(
         native_policy,
         summary=Summary(
-            alpha=jnp.asarray(
-                [
-                    [[2.0, 3.0], [4.0, 1.0], [1.0, 2.0]],
-                    [[1e-5, 1.0], [2.0, 1.0], [1.0, 3.0]],
-                ],
-                dtype=jnp.float32,
-            ),
-            q_categorical_outcome=jnp.full(
-                (2, 3),
-                no_outcome,
-                dtype=jnp.int8,
-            ),
+            alpha=alpha,
+            q_categorical_outcome=categorical_outcome,
             q_categorical_distance=jnp.zeros(
                 (2, 3),
                 dtype=jnp.int32,
@@ -648,8 +650,20 @@ def test_one_unsafe_q21_root_lane_triggers_native_fallback_for_whole_batch():
             ),
         ),
     )
+    estimate = (
+        dirichlet_mctx.binary_posterior_best_policy_prefix_quadrature(
+            alpha,
+            jnp.zeros((2, 3), dtype=jnp.bool_),
+            categorical_outcome,
+        )
+    )
 
-    assert jnp.array_equal(readout, native_policy)
+    assert jnp.array_equal(
+        estimate.tail_range_clipped,
+        jnp.asarray([False, True]),
+    )
+    assert jnp.allclose(readout[0], estimate.policy[0], atol=1e-6)
+    assert jnp.array_equal(readout[1], native_policy[1])
 
 
 @pytest.mark.parametrize(

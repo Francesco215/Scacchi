@@ -184,7 +184,7 @@ def _numerical_policy_readout(
         jnp.abs(estimate.density_log_integral),
         axis=-1,
     )
-    unsafe = jnp.any(
+    unsafe = (
         estimate.tail_range_clipped
         | ~estimate.finite
         | (

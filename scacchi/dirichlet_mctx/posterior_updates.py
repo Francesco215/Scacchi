@@ -240,10 +240,11 @@ def update_posterior_prefix_cdf(
     """Repair a binary cache with guarded, mass-conserving prefix-CDF Q21.
 
     Only the fresh posterior-best population used by the existing cache
-    mixture changes.  If any batch lane clips its adaptive range, produces a
-    non-finite estimate, or exceeds the density-integral tolerance, the whole
-    batch falls back to :func:`update_posterior` with the original key. The
-    default winner-MC path and all persistent tree semantics are unchanged.
+    mixture changes. A lane that clips its adaptive range, produces a
+    non-finite estimate, or exceeds the density-integral tolerance falls back
+    to :func:`update_posterior` with the original key. Safe lanes remain on
+    Q21. The default winner-MC path and all persistent tree semantics are
+    unchanged.
     """
 
     _validate_kappa(kappa)
@@ -291,8 +292,17 @@ def update_posterior_prefix_cdf(
         | (density_error > density_log_integral_tolerance)
     )
 
-    def native_fallback(_: None) -> PosteriorUpdate:
-        return update_posterior(
+    prefix_update = _repair_from_policy(
+        context,
+        prepared,
+        estimate.policy,
+        kappa=kappa,
+    )
+
+    def mixed_fallback(
+        accepted: PosteriorUpdate,
+    ) -> PosteriorUpdate:
+        native = update_posterior(
             rng_key,
             context,
             kappa=kappa,
@@ -301,20 +311,29 @@ def update_posterior_prefix_cdf(
                 fallback_policy_sample_chunk_size
             ),
         )
-
-    def accepted_prefix(_: None) -> PosteriorUpdate:
-        return _repair_from_policy(
-            context,
-            prepared,
-            estimate.policy,
-            kappa=kappa,
+        return PosteriorUpdate(
+            edge_alpha=jnp.where(
+                unsafe[:, None, None],
+                native.edge_alpha,
+                accepted.edge_alpha,
+            ),
+            edge_payload=jnp.where(
+                unsafe[:, None],
+                native.edge_payload,
+                accepted.edge_payload,
+            ),
+            value_alpha=jnp.where(
+                unsafe[:, None],
+                native.value_alpha,
+                accepted.value_alpha,
+            ),
         )
 
     return jax.lax.cond(
         jnp.any(unsafe),
-        native_fallback,
-        accepted_prefix,
-        operand=None,
+        mixed_fallback,
+        lambda accepted: accepted,
+        operand=prefix_update,
     )
 
 

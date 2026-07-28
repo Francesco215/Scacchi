@@ -145,10 +145,7 @@ class TrainMetrics(NamedTuple):
     data_psk_termination_fraction: Float[Array, "*batch"]
 
 def _num_outcomes_for_config(config: Any) -> int:
-    num_outcomes = config.env.num_outcomes
-    if num_outcomes is None:
-        return 2 if config.env.id == "hex" else 3
-    return int(num_outcomes)
+    return config.env.resolved_num_outcomes()
 
 
 def _empty_posterior_targets(

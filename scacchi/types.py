@@ -110,6 +110,12 @@ class EnvConfig:
     board_size: int | None = None
     num_outcomes: int | None = None
 
+    def resolved_num_outcomes(self) -> int:
+        if self.num_outcomes is not None:
+            return int(self.num_outcomes)
+        return 2 if self.id == "hex" else 3
+
+
 @dataclass
 class ModelConfig:
     network: Network = Network.aznet
@@ -185,12 +191,6 @@ class MonteCarloPosteriorUpdateConfig:
             "policy_sample_chunk_size",
             self.policy_sample_chunk_size,
             1,
-        )
-        warnings.warn(
-            "Monte Carlo posterior updates are usually sub-optimal; use them "
-            "when their lower computational cost is worth the approximation.",
-            UserWarning,
-            stacklevel=2,
         )
 
 
@@ -513,6 +513,7 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         dirichlet_networks = {Network.aznet_dirichlet, Network.boardlaw_dirichlet}
+        num_outcomes = self.env.resolved_num_outcomes()
         active_weights = self.training.losses.active_dirichlet_weights()
         if self.model.network not in dirichlet_networks and active_weights:
             weights = ", ".join(active_weights)
@@ -543,7 +544,7 @@ class TrainConfig:
             numerical_update_selected = (
                 dirichlet.posterior_update.kind == PosteriorUpdateKind.numerical
             )
-            if numerical_update_selected and self.env.num_outcomes != 2:
+            if numerical_update_selected and num_outcomes != 2:
                 raise ValueError(
                     f"{name}.dirichlet_thompson numerical posterior update "
                     "requires env.num_outcomes=2; use monte_carlo for "
@@ -583,7 +584,7 @@ class TrainConfig:
             )
             if (
                 selected_update == PosteriorUpdateKind.numerical
-                and self.env.num_outcomes != 2
+                and num_outcomes != 2
             ):
                 raise ValueError(
                     f"{name} numerical posterior update requires "

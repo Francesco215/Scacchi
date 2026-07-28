@@ -238,6 +238,35 @@ def test_q21_agrees_with_closed_form_and_converges_toward_q81() -> None:
     assert float(q81_error) < 2e-3
 
 
+def test_q21_hex6_sized_readout_tracks_dense_reference() -> None:
+    action = jnp.arange(36, dtype=jnp.float32)
+    mean_logit = jnp.sin(1.7 * action) + 0.5 * jnp.cos(0.83 * action)
+    mean = jax.nn.sigmoid(mean_logit)
+    concentration = 8.0 + 4.0 * jax.nn.sigmoid(
+        jnp.sin(0.41 * action)
+    )
+    alpha = jnp.stack(
+        (concentration * (1.0 - mean), concentration * mean),
+        axis=-1,
+    )[None]
+    invalid = jnp.zeros((1, 36), dtype=jnp.bool_)
+
+    q21 = binary_posterior_best_policy_prefix_quadrature(
+        alpha,
+        invalid,
+        half_width=10,
+    )
+    q321 = binary_posterior_best_policy_prefix_quadrature(
+        alpha,
+        invalid,
+        half_width=160,
+    )
+
+    assert not bool(q21.tail_range_clipped[0])
+    assert float(jnp.max(jnp.abs(q21.density_log_integral))) < 0.01
+    assert float(jnp.sum(jnp.abs(q21.policy - q321.policy))) < 0.1
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

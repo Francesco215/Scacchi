@@ -7,6 +7,7 @@ from scacchi import dirichlet_mctx
 from scacchi.dirichlet_mctx import action_selection
 from scacchi.dirichlet_mctx.outcomes import NO_DISTANCE, NO_OUTCOME
 from scacchi.dirichlet_mctx.search import simulate
+from scacchi.dirichlet_mctx.tree import instantiate_tree_from_root
 from scacchi.dirichlet_mctx.utils import _categorize_node_and_publish
 
 
@@ -46,7 +47,7 @@ def _categorize_root(
     if invalid_actions is None:
         invalid_actions = (False,) * num_actions
     invalid = jnp.asarray([invalid_actions], dtype=bool)
-    tree = dirichlet_mctx.instantiate_tree_from_root(
+    tree = instantiate_tree_from_root(
         _root(num_actions),
         num_simulations=0,
         root_invalid_actions=invalid,
@@ -168,7 +169,7 @@ def test_categorical_certificates_are_absorbing():
 
 def test_simulation_masks_categorical_edges_for_custom_selectors():
     invalid = jnp.asarray([[False, False]])
-    tree = dirichlet_mctx.instantiate_tree_from_root(
+    tree = instantiate_tree_from_root(
         _root(2),
         num_simulations=0,
         root_invalid_actions=invalid,

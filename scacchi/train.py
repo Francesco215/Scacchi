@@ -86,7 +86,8 @@ def _evaluate(iteration: int, rng_key: jax.Array, model: nnx.Module, evaluate, p
         print(f"Iteration {iteration}: evaluation starting", flush=True)
     with parallel.mesh_context():
         returns = evaluate(rng_key, model)
-    metrics: dict[str, Metric] = returns_metrics("eval/vs_baseline", returns)
+    metrics: dict[str, Metric] = {}
+    metrics.update(returns_metrics("eval/vs_baseline", returns))
     metrics.update(evaluation_metrics(returns, history))
     return metrics
 

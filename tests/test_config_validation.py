@@ -280,6 +280,7 @@ def test_hex6_recipe_uses_q21_cubic_commitment_and_wandb():
     )
     config = load_config(OmegaConf.load(cfg_path))
 
+    assert config.run.seed == 9105
     assert config.run.max_num_iters == 201
     assert config.env.num_outcomes == 2
     assert config.selfplay.action_commitment.kind == "posterior_sample"
@@ -293,10 +294,14 @@ def test_hex6_recipe_uses_q21_cubic_commitment_and_wandb():
     selfplay_search = config.selfplay.search.dirichlet_thompson
     assert selfplay_search.posterior_update.kind == "numerical"
     assert selfplay_search.posterior_update.numerical.half_width == 10
+    assert (
+        selfplay_search.posterior_update.numerical.fallback_policy_samples
+        == 8
+    )
     eval_search = config.eval.player_search.dirichlet_thompson
     assert eval_search.posterior_update.kind == "numerical"
     assert config.logging.wandb.enabled
-    assert config.checkpointing.max_to_keep == 9
+    assert config.checkpointing.max_to_keep == 0
 
 
 def test_hex7_uses_full_learned_concentration_head():
@@ -634,6 +639,26 @@ def test_numerical_update_selects_numerical_root_readouts():
         NumericalPosteriorUpdateConfig,
     )
     assert search.posterior_update.numerical.half_width == 10
+
+
+def test_numerical_update_infers_binary_outcomes_for_hex():
+    config = _config(
+        {
+            "env": {"id": "hex", "board_size": 6},
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "posterior_update": {"kind": "numerical"},
+                    },
+                },
+            },
+        }
+    )
+
+    assert config.env.num_outcomes is None
+    assert config.env.resolved_num_outcomes() == 2
 
 
 def test_numerical_update_requires_binary_outcomes():

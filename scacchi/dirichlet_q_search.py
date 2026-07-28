@@ -100,15 +100,16 @@ def posterior_sample_action(
             f"got {temperature}."
         )
 
+    positive_legal = legal_action_mask & (policy_target > 0.0)
+    eligible = jnp.where(
+        jnp.any(positive_legal, axis=-1, keepdims=True),
+        positive_legal,
+        legal_action_mask,
+    )
     logits = jnp.log(jnp.clip(policy_target, 1e-8, 1.0))
     logits = logits / jnp.asarray(temperature, dtype=logits.dtype)
     logits = jnp.where(
-        policy_target > 0.0,
-        logits,
-        jnp.finfo(logits.dtype).min,
-    )
-    logits = jnp.where(
-        legal_action_mask,
+        eligible,
         logits,
         jnp.finfo(logits.dtype).min,
     )

@@ -1,6 +1,7 @@
 # Hex6 training with numerical posterior updates and cubic commitment.
 
 run:
+  seed: 9105
   max_num_iters: 201
 
 env:
@@ -38,13 +39,13 @@ selfplay:
         kind: numerical
         numerical:
           kappa: 4.0
-          half_width: 10 # computational budjet. a half width of 10 means 20 samples per simulation.
+          half_width: 10  # Q = 2 * half_width + 1 = 21 grid points.
           tail_scale: 8.0
           min_half_range: 6.0
           max_half_range: 11.0
           # Q21 is primary; this budget is used only by the native safety
           # fallback.
-          fallback_policy_samples: hex6_q21_temperature3_seed91058
+          fallback_policy_samples: 8
           fallback_policy_sample_chunk_size: 32
 
 training:
@@ -59,7 +60,7 @@ training:
     q_outcome_weight: 1.0
     q_supervision:
       # Train each selected (state, action) pair equally. Evidence determines
-      # inclusion, not gradient magnitudehex6_q21_temperature3_seed9105.
+      # inclusion, not gradient magnitude.
       action_set: positive_search_evidence_or_solved
       reduction: mean_over_selected_state_action_pairs
     # Full KL is intentional: mean-only KL has exactly zero concentration
@@ -115,4 +116,3 @@ checkpointing:
   max_to_keep: 0
   save_interval_steps: 25
   directory: checkpoints/asd
-hex6_q21_temperature3_seed9105
