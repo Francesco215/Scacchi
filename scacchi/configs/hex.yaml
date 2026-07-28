@@ -20,13 +20,18 @@ model:
 selfplay:
   batch_size: 4096  # Number of games advanced in parallel.
   max_num_steps: 25  # 5x5 Hex has at most 25 placements.
-  action_commitment_type: posterior_sample  # Self-play commitment: posterior_argmax, posterior_sample, or search_action.
+  action_commitment:
+    kind: posterior_sample
+    posterior_update: monte_carlo
   search:
     kind: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
 
     dirichlet_thompson:
       num_simulations: 256  # Persistent-tree simulations per root.
-      kappa: 4.0  # Prior strength in gamma = n / (kappa + n).
+      posterior_update:
+        kind: monte_carlo
+        monte_carlo:
+          kappa: 4.0  # Prior strength in gamma = n / (kappa + n).
 
 training:
   batch_size: 1024  # Learner minibatch size; multiple updates per fresh self-play batch.

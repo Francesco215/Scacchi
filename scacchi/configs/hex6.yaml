@@ -1,14 +1,14 @@
-# From-scratch Hex6 persistent-tree speedrun. Every trial uses a unique empty
-# checkpoint directory: warm starts and continuation runs do not count.
+# Hex6 training with numerical posterior updates and cubic commitment.
 
 run:
   seed: 9105
-  max_num_iters: 200
+  max_num_iters: 201
 
 env:
   id: hex
   board_size: 6
-  num_outcomes: 3
+  # Hex has no draw, which enables the guarded binary prefix-CDF estimator.
+  num_outcomes: 2
 
 model:
   network: boardlaw_dirichlet
@@ -16,30 +16,37 @@ model:
   num_layers: 8
   compute_dtype: bfloat16
   resnet_v2: true
-  # Start at the uninformative Dirichlet [1, 1, 1], then learn evidence mass.
-  # Unlike the old calibrated runs, this is a low floor rather than a fixed C.
+  # Start from a symmetric low-evidence binary prior, then learn its mass.
   dirichlet_concentration_floor: 3.0
   dirichlet_initial_concentration: 3.1
 
 selfplay:
   batch_size: 4096
   max_num_steps: 64
-  # Sample the searched posterior policy during self-play so independent games
-  # keep exploring; evaluation still commits its deterministic argmax below.
-  action_commitment_type: posterior_sample
+  # Build and sample a fresh numerical posterior policy during self-play so
+  # independent games keep exploring; evaluation commits its argmax below.
+  action_commitment:
+    kind: posterior_sample
+    posterior_update: numerical
+    posterior_sample_temperature: 0.3333333333333333
   search:
     kind: dirichlet_thompson
     dirichlet_thompson:
-      # Keep the corrected persistent tree small enough for a true speedrun.
-      # The DT128 trial learned, but was ~11x slower per iteration than the
-      # old 32-expansion reference and therefore spent its compute poorly.
       num_simulations: 32
-      kappa: 4.0
-      policy_samples: 32
-      # The node-local estimator remains unbiased; eight draws amortize the
-      # every-node posterior repair without reverting to root-only updates.
-      posterior_policy_samples: 8
-      policy_sample_chunk_size: 32
+      # Q21 drives cache repair and the replay target. Action commitment
+      # independently selects the same numerical variant above.
+      posterior_update:
+        kind: numerical
+        numerical:
+          kappa: 4.0
+          half_width: 10  # Q = 2 * half_width + 1 = 21 grid points.
+          tail_scale: 8.0
+          min_half_range: 6.0
+          max_half_range: 11.0
+          # Q21 is primary; this budget is used only by the native safety
+          # fallback.
+          fallback_policy_samples: 8
+          fallback_policy_sample_chunk_size: 32
 
 training:
   batch_size: 1024
@@ -51,8 +58,11 @@ training:
     q_dir_kl_weight: 1.0
     value_outcome_weight: 1.0
     q_outcome_weight: 1.0
-    q_loss_weight_mode: evidence_mass
-    q_dir_kl_reduction: masked_mean
+    q_supervision:
+      # Train each selected (state, action) pair equally. Evidence determines
+      # inclusion, not gradient magnitude.
+      action_set: positive_search_evidence_or_solved
+      reduction: mean_over_selected_state_action_pairs
     # Full KL is intentional: mean-only KL has exactly zero concentration
     # gradient on unresolved Dirichlet targets.
     dirichlet_loss_mode: full
@@ -70,16 +80,26 @@ eval:
   interval: 5
   batch_size: 512
   baseline: checkpoint
-  player_action_commitment_type: posterior_argmax
-  baseline_action_commitment_type: posterior_argmax
+  checkpoint_path: checkpoints/6_solved
+  player_action_commitment:
+    kind: posterior_argmax
+    posterior_update: numerical
+  baseline_action_commitment:
+    kind: posterior_argmax
   player_search:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
-      kappa: 4.0
-      policy_samples: 32
-      posterior_policy_samples: 32
-      policy_sample_chunk_size: 32
+      posterior_update:
+        kind: numerical
+        numerical:
+          kappa: 4.0
+          half_width: 10
+          tail_scale: 8.0
+          min_half_range: 6.0
+          max_half_range: 11.0
+          fallback_policy_samples: 32
+          fallback_policy_sample_chunk_size: 32
   baseline_search:
     kind: gumbel
     gumbel:
@@ -88,10 +108,11 @@ eval:
 logging:
   interval: 1
   wandb:
+    # All training runs from this recipe are logged externally.
     enabled: true
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 1
-  save_interval_steps: 10
-  directory: checkpoints/hex6_nativecat_fullc_c16_dt32p8_psample_seed9105_v4
+  max_to_keep: 0
+  save_interval_steps: 25
+  directory: checkpoints/asd

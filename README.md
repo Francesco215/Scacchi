@@ -22,8 +22,24 @@ the search-improved policy compares their exact utility with Thompson samples
 from unresolved branches. Value/Q heads use posterior KL for unresolved targets
 and epsilon-interior Dirichlet density NLL for categorical targets.
 
-The native search has one scalar posterior-repair constant, `kappa`, used only
-in the structural mixing weight
+Q supervision selects legal actions with positive search evidence, together
+with legal solved actions:
+
+\[
+M_{s,a}=\mathbf 1[\operatorname{legal}(s,a)\land
+(\operatorname{evidence}_{s,a}>0\lor\operatorname{solved}_{s,a})].
+\]
+
+The default Q loss is the mean over those selected state-action pairs,
+\[
+L_Q=\frac{\sum_{s,a}M_{s,a}\ell_{s,a}}{\sum_{s,a}M_{s,a}}.
+\]
+Search evidence determines whether an action receives Q supervision. Its
+magnitude does not scale the loss. The mean is over selected state-action
+pairs, not states, so states with more selected actions contribute more pairs.
+
+Each posterior-update variant has one scalar repair constant, `kappa`, used
+only in the structural mixing weight
 `gamma = n_down / (kappa + n_down)`. Terminal expansion instead returns an
 exact `terminal_outcome` tag. It does not manufacture a terminal Dirichlet or
 inject a fixed concentration: model alphas remain the learned representation
@@ -37,6 +53,42 @@ nor used as a categorical target.
 The Thompson tree-search backend lives in `scacchi/dirichlet_mctx/`;
 `scacchi/dirichlet_q_search.py` contains the shared leaf expansion,
 terminal-outcome extraction, and posterior-target helpers.
+
+## Guarded Q21 mode
+
+For binary games such as Hex, the optional `prefix_cdf` estimator computes
+posterior-best action probabilities on an adaptive 21-point grid. Search and
+action commitment select their posterior updater independently:
+
+```yaml
+selfplay:
+  action_commitment:
+    kind: posterior_sample
+    posterior_update: numerical
+    posterior_sample_temperature: 0.3333333333333333
+  search:
+    dirichlet_thompson:
+      posterior_update:
+        kind: numerical
+        numerical:
+          half_width: 10  # Q = 2 * half_width + 1 = 21
+```
+
+The search selection controls internal repair and the replay target. The
+action-commitment selection builds a fresh action-only policy from the searched
+root posteriors; `null` reuses the search selection. Both selectors use the
+Monte Carlo and numerical parameter blocks under the Dirichlet search config.
+Each numerically unsafe batch lane falls back to the unchanged winner-sampling
+path while safe lanes remain on Q21. The action-only policy is not written to
+replay. With
+`posterior_sample`, temperature \(T\) samples on the positive support
+from \(q_T(a)\propto\operatorname{clip}(q(a),10^{-8},1)^{1/T}\); exact zeros
+stay zero whenever the legal policy has positive support. An all-zero legal
+policy falls back to uniform legal sampling. Prefix-CDF requires a two-outcome
+head.
+The Hex6 recipe enables Q21, cubic (`T=1/3`) commitment, and W&B logging.
+The numerical guards detect specified integration failures, not arbitrary
+quadrature error outside the Hex6 envelope used to select Q21.
 
 ## Codebase Structure
 

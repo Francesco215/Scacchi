@@ -56,7 +56,10 @@ class Sample(NamedTuple):
     value_mask: Bool[Array, "*batch"]
     beta_Q_target: Float[Array, "*batch action outcome"]
     beta_V_target: Float[Array, "*batch outcome"]
-    q_loss_weight: Float[Array, "*batch action"]
+    q_supervised_pair_mask: Bool[Array, "*batch action"]
+    q_pair_weight: Float[Array, "*batch action"]
+    q_positive_evidence_action_mask: Bool[Array, "*batch action"] | None = None
+    q_positive_policy_action_mask: Bool[Array, "*batch action"] | None = None
     policy_loss_mask: Bool[Array, "*batch"] | None = None
     value_loss_mask: Bool[Array, "*batch"] | None = None
     search_loss_mask: Bool[Array, "*batch"] | None = None
@@ -130,34 +133,40 @@ class TrainMetrics(NamedTuple):
     q_categorical_target_count: Float[Array, "*batch"]
     v_native_target_count: Float[Array, "*batch"]
     q_native_target_count: Float[Array, "*batch"]
-    q_loss_weight_mean: Float[Array, "*batch"]
+    q_supervised_actions_per_row: Float[Array, "*batch"]
+    q_positive_evidence_action_count: Float[Array, "*batch"]
+    q_positive_policy_action_count: Float[Array, "*batch"]
+    q_solved_action_count: Float[Array, "*batch"]
+    q_supervised_action_count: Float[Array, "*batch"]
+    q_supervised_action_fraction: Float[Array, "*batch"]
     data_value_mask_fraction: Float[Array, "*batch"]
     data_pass_fraction: Float[Array, "*batch"]
     data_terminations_per_row: Float[Array, "*batch"]
     data_psk_termination_fraction: Float[Array, "*batch"]
 
 def _num_outcomes_for_config(config: Any) -> int:
-    num_outcomes = config.env.num_outcomes
-    if num_outcomes is None:
-        return 2 if config.env.id == "hex" else 3
-    return int(num_outcomes)
+    return config.env.resolved_num_outcomes()
 
 
 def _empty_posterior_targets(
     policy_target: jax.Array,
     num_outcomes: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    q_loss_weight = policy_target * jnp.asarray(0.0, dtype=policy_target.dtype)
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    q_pair_weight = policy_target * jnp.asarray(
+        0.0,
+        dtype=policy_target.dtype,
+    )
+    q_supervised_pair_mask = jnp.zeros_like(policy_target, dtype=jnp.bool_)
     beta_q = jnp.broadcast_to(
-        q_loss_weight[..., None],
+        q_pair_weight[..., None],
         policy_target.shape + (num_outcomes,),
     )
-    beta_v_seed = jnp.sum(q_loss_weight, axis=-1, keepdims=True)
+    beta_v_seed = jnp.sum(q_pair_weight, axis=-1, keepdims=True)
     beta_v = jnp.broadcast_to(
         beta_v_seed,
         policy_target.shape[:-1] + (num_outcomes,),
     )
-    return beta_q, beta_v, q_loss_weight
+    return beta_q, beta_v, q_supervised_pair_mask, q_pair_weight
 
 
 def make_compute_input_for_lossfn(
@@ -182,11 +191,39 @@ def make_compute_input_for_lossfn(
         policy = prediction.policy
         beta_q_target = prediction.alpha_q
         beta_v_target = prediction.alpha_v
-        q_loss_weight = metadata_value("q_weight")
-        if beta_q_target is None or beta_v_target is None or q_loss_weight is None:
-            beta_q_target, beta_v_target, q_loss_weight = _empty_posterior_targets(
+        q_supervision = metadata_value("q_supervision")
+        if (
+            beta_q_target is None
+            or beta_v_target is None
+            or q_supervision is None
+        ):
+            (
+                beta_q_target,
+                beta_v_target,
+                q_supervised_pair_mask,
+                q_pair_weight,
+            ) = _empty_posterior_targets(
                 policy,
                 _num_outcomes_for_config(config),
+            )
+        else:
+            q_supervised_pair_mask = q_supervision.selected
+            q_pair_weight = q_supervision.pair_weight
+        q_positive_evidence_action_mask = metadata_value(
+            "q_positive_evidence_action"
+        )
+        if q_positive_evidence_action_mask is None:
+            q_positive_evidence_action_mask = jnp.zeros_like(
+                policy,
+                dtype=jnp.bool_,
+            )
+        q_positive_policy_action_mask = metadata_value(
+            "q_positive_policy_action"
+        )
+        if q_positive_policy_action_mask is None:
+            q_positive_policy_action_mask = jnp.zeros_like(
+                policy,
+                dtype=jnp.bool_,
             )
 
         def assert_native_targets(
@@ -301,10 +338,26 @@ def make_compute_input_for_lossfn(
                     native_targets.q_target_distance,
                 ),
             )
-            q_loss_weight = jnp.where(
+            q_supervised_pair_mask = (
+                q_supervised_pair_mask | terminal_action_mask
+            )
+            if (
+                config.training.losses.q_supervision.reduction
+                == "legacy_normalized_source_weighted_mean"
+            ):
+                terminal_pair_weight = jnp.maximum(
+                    q_pair_weight,
+                    jnp.ones((), dtype=q_pair_weight.dtype),
+                )
+            else:
+                terminal_pair_weight = jnp.ones(
+                    (),
+                    dtype=q_pair_weight.dtype,
+                )
+            q_pair_weight = jnp.where(
                 terminal_action_mask,
-                jnp.maximum(q_loss_weight, jnp.ones((), dtype=q_loss_weight.dtype)),
-                q_loss_weight,
+                terminal_pair_weight,
+                q_pair_weight,
             )
             native_targets = assert_native_targets(
                 "loss native_targets after terminal_edge_targets",
@@ -362,7 +415,12 @@ def make_compute_input_for_lossfn(
             value_mask=value_mask,
             beta_Q_target=beta_q_target,
             beta_V_target=beta_v_target,
-            q_loss_weight=q_loss_weight,
+            q_supervised_pair_mask=q_supervised_pair_mask,
+            q_pair_weight=q_pair_weight,
+            q_positive_evidence_action_mask=(
+                q_positive_evidence_action_mask
+            ),
+            q_positive_policy_action_mask=q_positive_policy_action_mask,
             policy_loss_mask=policy_loss_mask,
             value_loss_mask=value_loss_mask,
             search_loss_mask=search_loss_mask,
@@ -772,43 +830,51 @@ def _compute_dirichlet_losses(
         if config.training.losses.loss_mask_mode == "value"
         else search_loss_mask
     )
-    q_weights = jnp.where(
-        data.policy_mask & q_row_mask[..., None],
-        data.q_loss_weight,
+    q_supervised_pair_mask = (
+        data.q_supervised_pair_mask
+        & data.policy_mask
+        & q_row_mask[..., None]
+    )
+    q_pair_weights = jnp.where(
+        q_supervised_pair_mask,
+        data.q_pair_weight,
         0.0,
     )
-    q_metric_mask = q_weights > 0
     q_dir_kl_mask = _native_loss_mask(
         q_dir_kl,
-        q_metric_mask,
+        q_supervised_pair_mask,
         native_fields.q_target_kind,
     )
-    q_dir_kl_reduction = config.training.losses.q_dir_kl_reduction
-    if q_dir_kl_reduction == "masked_mean":
+    q_pair_reduction = config.training.losses.q_supervision.reduction
+    if q_pair_reduction == "mean_over_selected_state_action_pairs":
         q_dir_kl_loss = _native_masked_mean(
             q_dir_kl,
-            q_metric_mask,
+            q_supervised_pair_mask,
             native_fields.q_target_kind,
         )
-    elif q_dir_kl_reduction == "weighted":
-        q_weights = jnp.where(q_dir_kl_mask, q_weights, 0.0)
+    elif q_pair_reduction == "legacy_normalized_source_weighted_mean":
+        q_pair_weights = jnp.where(
+            q_dir_kl_mask,
+            q_pair_weights,
+            0.0,
+        )
         q_dir_kl = jnp.where(
             q_dir_kl_mask,
             jnp.nan_to_num(q_dir_kl),
             jnp.zeros_like(q_dir_kl),
         )
         q_eps = jnp.asarray(jnp.finfo(q_dir_kl.dtype).eps, dtype=q_dir_kl.dtype)
-        q_dir_kl_loss = jnp.sum(q_weights * q_dir_kl) / jnp.maximum(
-            jnp.sum(q_weights),
+        q_dir_kl_loss = jnp.sum(q_pair_weights * q_dir_kl) / jnp.maximum(
+            jnp.sum(q_pair_weights),
             q_eps,
         )
         q_dir_kl_loss = jnp.where(
-            jnp.any(q_metric_mask) & ~jnp.any(q_dir_kl_mask),
+            jnp.any(q_supervised_pair_mask) & ~jnp.any(q_dir_kl_mask),
             jnp.asarray(jnp.nan, dtype=q_dir_kl_loss.dtype),
             q_dir_kl_loss,
         )
     else:
-        raise ValueError(f"unknown q_dir_kl_reduction: {q_dir_kl_reduction!r}")
+        raise ValueError(f"unknown Q pair reduction: {q_pair_reduction!r}")
 
     outcome_mask = _mask_or(data.outcome_mask, data.value_mask)
     outcome_index = _outcome_index(data.value_tgt, alpha_v.shape[-1])
@@ -835,13 +901,13 @@ def _compute_dirichlet_losses(
     v_dirichlet_mask = value_loss_mask & (
         native_fields.v_target_kind == int(TARGET_DIRICHLET)
     )
-    q_dirichlet_mask = q_metric_mask & (
+    q_dirichlet_mask = q_supervised_pair_mask & (
         native_fields.q_target_kind == int(TARGET_DIRICHLET)
     )
     v_categorical_mask = value_loss_mask & (
         native_fields.v_target_kind == int(TARGET_CATEGORICAL)
     )
-    q_categorical_mask = q_metric_mask & (
+    q_categorical_mask = q_supervised_pair_mask & (
         native_fields.q_target_kind == int(TARGET_CATEGORICAL)
     )
     # Keep each prior/posterior pair on exactly the same population.  This is
@@ -879,9 +945,15 @@ def _compute_dirichlet_losses(
         axis=0,
     )
     alpha_v_concentration = _masked_mean(alpha_v_mass, value_loss_mask)
-    alpha_q_concentration = _masked_mean(alpha_q_mass, q_metric_mask)
+    alpha_q_concentration = _masked_mean(
+        alpha_q_mass,
+        q_supervised_pair_mask,
+    )
     alpha_v_concentration_std = _masked_std(alpha_v_mass, value_loss_mask)
-    alpha_q_concentration_std = _masked_std(alpha_q_mass, q_metric_mask)
+    alpha_q_concentration_std = _masked_std(
+        alpha_q_mass,
+        q_supervised_pair_mask,
+    )
     alpha_v_dirichlet_concentration = _masked_mean(
         alpha_v_mass,
         v_dirichlet_mask,
@@ -930,7 +1002,7 @@ def _compute_dirichlet_losses(
     v_native_mask = value_loss_mask & (
         native_fields.v_target_kind != int(TARGET_PAD)
     )
-    q_native_mask = q_metric_mask & (
+    q_native_mask = q_supervised_pair_mask & (
         native_fields.q_target_kind != int(TARGET_PAD)
     )
     count_dtype = alpha_v_mass.dtype
@@ -1015,7 +1087,7 @@ def _compute_dirichlet_losses(
         )
         alpha_q_concentration_clip_fraction = _masked_mean(
             (alpha_q_mass >= clip_threshold).astype(alpha_q_mass.dtype),
-            q_metric_mask,
+            q_supervised_pair_mask,
         )
         alpha_v_dirichlet_concentration_clip_fraction = _masked_mean(
             (alpha_v_mass >= clip_threshold).astype(alpha_v_mass.dtype),
@@ -1033,7 +1105,47 @@ def _compute_dirichlet_losses(
             (alpha_q_mass >= clip_threshold).astype(alpha_q_mass.dtype),
             q_categorical_mask,
         )
-    q_loss_weight_mean = _masked_mean(data.q_loss_weight, q_metric_mask)
+    q_supervised_actions_per_row = _masked_mean(
+        jnp.sum(q_supervised_pair_mask.astype(count_dtype), axis=-1),
+        q_row_mask,
+    )
+    q_population_mask = data.policy_mask & q_row_mask[..., None]
+    q_positive_evidence_action_mask = (
+        _mask_or(
+            data.q_positive_evidence_action_mask,
+            jnp.zeros_like(q_population_mask),
+        )
+        & q_population_mask
+    )
+    q_positive_policy_action_mask = (
+        _mask_or(
+            data.q_positive_policy_action_mask,
+            jnp.zeros_like(q_population_mask),
+        )
+        & q_population_mask
+    )
+    q_solved_action_mask = q_population_mask & (
+        native_fields.q_target_kind == int(TARGET_CATEGORICAL)
+    )
+    q_positive_evidence_action_count = jnp.sum(
+        q_positive_evidence_action_mask.astype(count_dtype)
+    )
+    q_positive_policy_action_count = jnp.sum(
+        q_positive_policy_action_mask.astype(count_dtype)
+    )
+    q_solved_action_count = jnp.sum(
+        q_solved_action_mask.astype(count_dtype)
+    )
+    q_supervised_action_count = jnp.sum(
+        q_supervised_pair_mask.astype(count_dtype)
+    )
+    q_population_action_count = jnp.sum(
+        q_population_mask.astype(count_dtype)
+    )
+    q_supervised_action_fraction = q_supervised_action_count / jnp.maximum(
+        q_population_action_count,
+        jnp.ones((), dtype=count_dtype),
+    )
 
     total_loss = sum(
         (
@@ -1127,7 +1239,12 @@ def _compute_dirichlet_losses(
         q_categorical_target_count=q_categorical_target_count,
         v_native_target_count=v_native_target_count,
         q_native_target_count=q_native_target_count,
-        q_loss_weight_mean=q_loss_weight_mean,
+        q_supervised_actions_per_row=q_supervised_actions_per_row,
+        q_positive_evidence_action_count=q_positive_evidence_action_count,
+        q_positive_policy_action_count=q_positive_policy_action_count,
+        q_solved_action_count=q_solved_action_count,
+        q_supervised_action_count=q_supervised_action_count,
+        q_supervised_action_fraction=q_supervised_action_fraction,
     )
     return total_loss, metrics
 

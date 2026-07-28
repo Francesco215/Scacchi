@@ -177,7 +177,87 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
                 # the implementation used the app.js default of four.
                 settings.pop("constants", None)
                 settings.pop("categorical_draw_rule", None)
-                settings.setdefault("kappa", 4.0)
+
+                root_samples = settings.pop(
+                    "policy_samples",
+                    32,
+                )
+                root_chunk_size = settings.pop(
+                    "policy_sample_chunk_size",
+                    32,
+                )
+
+                posterior_update = settings.get("posterior_update")
+                posterior_update_kind = (
+                    posterior_update.get("kind")
+                    if isinstance(posterior_update, dict)
+                    else None
+                )
+                current_posterior_update = (
+                    isinstance(posterior_update, dict)
+                    and posterior_update_kind in {"monte_carlo", "numerical"}
+                    and isinstance(
+                        posterior_update.get(posterior_update_kind),
+                        dict,
+                    )
+                )
+                if not current_posterior_update:
+                    flat_update = (
+                        posterior_update
+                        if isinstance(posterior_update, dict)
+                        else {}
+                    )
+                    kappa = settings.pop(
+                        "kappa",
+                        flat_update.pop("kappa", 4.0),
+                    )
+                    policy_samples = settings.pop(
+                        "posterior_policy_samples",
+                        flat_update.pop("policy_samples", None),
+                    )
+                    if policy_samples is None:
+                        policy_samples = max(
+                            1,
+                            int(root_samples),
+                        )
+                    chunk_size = flat_update.pop(
+                        "policy_sample_chunk_size",
+                        root_chunk_size,
+                    )
+                    estimator = settings.pop(
+                        "posterior_policy_estimator",
+                        flat_update.pop("estimator", "winner_mc"),
+                    )
+                    numerical: dict[str, Any] = {
+                        "kappa": kappa,
+                        "fallback_policy_samples": policy_samples,
+                        "fallback_policy_sample_chunk_size": chunk_size,
+                    }
+                    for old_name, new_name in (
+                        ("prefix_cdf_half_width", "half_width"),
+                        ("prefix_cdf_tail_scale", "tail_scale"),
+                        ("prefix_cdf_min_half_range", "min_half_range"),
+                        ("prefix_cdf_max_half_range", "max_half_range"),
+                    ):
+                        value = settings.pop(
+                            old_name,
+                            flat_update.pop(old_name, None),
+                        )
+                        if value is not None:
+                            numerical[new_name] = value
+                    settings["posterior_update"] = {
+                        "kind": (
+                            "numerical"
+                            if estimator == "prefix_cdf"
+                            else "monte_carlo"
+                        ),
+                        "monte_carlo": {
+                            "kappa": kappa,
+                            "policy_samples": policy_samples,
+                            "policy_sample_chunk_size": chunk_size,
+                        },
+                        "numerical": numerical,
+                    }
             gumbel = search.get("gumbel")
             if isinstance(gumbel, dict):
                 for stale in (
@@ -243,6 +323,13 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
             "save_interval_steps": raw.get("ckpt_save_interval_steps", 50),
         },
     }
+    legacy_q_losses = {
+        name: raw[name]
+        for name in ("q_loss_weight_mode", "q_dir_kl_reduction")
+        if name in raw
+    }
+    if legacy_q_losses:
+        legacy_sections["training"]["losses"] = legacy_q_losses
     return load_config(OmegaConf.create(legacy_sections))
 
 

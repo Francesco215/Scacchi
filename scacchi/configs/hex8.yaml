@@ -26,15 +26,19 @@ model:
 selfplay:
   batch_size: 4096
   max_num_steps: 64
-  action_commitment_type: posterior_sample
+  action_commitment:
+    kind: posterior_sample
+    posterior_update: monte_carlo
   search:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
-      kappa: 4.0
-      policy_samples: 32
-      posterior_policy_samples: 32
-      policy_sample_chunk_size: 32
+      posterior_update:
+        kind: monte_carlo
+        monte_carlo:
+          kappa: 4.0
+          policy_samples: 32
+          policy_sample_chunk_size: 32
 
 training:
   batch_size: 1024
@@ -46,8 +50,11 @@ training:
     q_dir_kl_weight: 1.0
     value_outcome_weight: 0.25
     q_outcome_weight: 0.1
-    q_loss_weight_mode: evidence_mass
-    q_dir_kl_reduction: masked_mean
+    q_supervision:
+      # Train each selected (state, action) pair equally. Evidence determines
+      # inclusion, not gradient magnitude.
+      action_set: positive_search_evidence_or_solved
+      reduction: mean_over_selected_state_action_pairs
     dirichlet_loss_mode: full
     loss_mask_mode: value
     terminal_edge_targets: true
@@ -61,16 +68,21 @@ eval:
   interval: 5
   batch_size: 512
   baseline: checkpoint
-  player_action_commitment_type: posterior_argmax
-  baseline_action_commitment_type: search_action
+  player_action_commitment:
+    kind: posterior_argmax
+    posterior_update: monte_carlo
+  baseline_action_commitment:
+    kind: search_action
   player_search:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
-      kappa: 4.0
-      policy_samples: 32
-      posterior_policy_samples: 32
-      policy_sample_chunk_size: 32
+      posterior_update:
+        kind: monte_carlo
+        monte_carlo:
+          kappa: 4.0
+          policy_samples: 32
+          policy_sample_chunk_size: 32
   baseline_search:
     kind: gumbel
     gumbel:

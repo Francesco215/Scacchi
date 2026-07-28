@@ -206,8 +206,8 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             env,
             model,
             config.selfplay.search,
-            config.selfplay.action_commitment_type,
-            q_loss_weight_mode=str(config.training.losses.q_loss_weight_mode),
+            config.selfplay.action_commitment,
+            q_supervision_config=config.training.losses.q_supervision,
         )
 
     local_batch_size = parallel.local_batch_size(int(config.selfplay.batch_size))

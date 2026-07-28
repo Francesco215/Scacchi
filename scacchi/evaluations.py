@@ -119,17 +119,17 @@ def make_mcts_evaluate(
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     eval_batch_size = int(config.eval.batch_size)
     player_search_config = config.eval.player_search
-    player_action_commitment_type = config.eval.player_action_commitment_type
+    player_action_commitment = config.eval.player_action_commitment
     opponent_search_config = baseline_search_config(config)
-    opponent_action_commitment_type = config.eval.baseline_action_commitment_type
+    opponent_action_commitment = config.eval.baseline_action_commitment
 
-    def search_player(model, search_config, action_commitment_type):
+    def search_player(model, search_config, action_commitment):
         return make_search_player(
             env,
             model,
             search_config,
-            action_commitment_type,
-            q_loss_weight_mode=str(config.training.losses.q_loss_weight_mode),
+            action_commitment,
+            q_supervision_config=config.training.losses.q_supervision,
         )
 
     @nnx.jit
@@ -137,11 +137,11 @@ def make_mcts_evaluate(
         """MCTS evaluation: model search vs pretrained opponent."""
         metrics = play_eval(
             env,
-            search_player(model, player_search_config, player_action_commitment_type),
+            search_player(model, player_search_config, player_action_commitment),
             search_player(
                 baseline_model,
                 opponent_search_config,
-                opponent_action_commitment_type,
+                opponent_action_commitment,
             ),
             rng_key,
             batch_size=eval_batch_size,

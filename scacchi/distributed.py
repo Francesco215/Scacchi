@@ -93,7 +93,7 @@ def local_shard_map(**kwargs):
     if "check_vma" in parameters:
         return nnx.shard_map(**kwargs, check_vma=False)
     if "check_rep" in parameters:
-        return nnx.shard_map(**kwargs, check_rep=False)
+        return nnx.shard_map(**kwargs, check_rep=False)  # ty: ignore[no-matching-overload]
     return nnx.shard_map(**kwargs)
 
 

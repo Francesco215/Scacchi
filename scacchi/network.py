@@ -654,12 +654,6 @@ def build_model(
 ) -> nnx.Module:
     compute_dtype = _dtype_from_name(config.model.compute_dtype)
 
-    def dirichlet_num_outcomes() -> int:
-        num_outcomes = config.env.num_outcomes
-        if num_outcomes is None:
-            return 2 if config.env.id == "hex" else 3
-        return num_outcomes
-
     if config.model.network == "aznet":
         return AZNet(
             num_actions=num_actions,
@@ -674,7 +668,7 @@ def build_model(
         return AZDirichletNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
-            num_outcomes=dirichlet_num_outcomes(),
+            num_outcomes=config.env.resolved_num_outcomes(),
             num_channels=config.model.num_channels,
             num_blocks=config.model.num_layers,
             resnet_v2=config.model.resnet_v2,
@@ -698,7 +692,7 @@ def build_model(
         return BoardlawDirichletNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
-            num_outcomes=dirichlet_num_outcomes(),
+            num_outcomes=config.env.resolved_num_outcomes(),
             width=config.model.num_channels,
             depth=config.model.num_layers,
             dtype=compute_dtype,

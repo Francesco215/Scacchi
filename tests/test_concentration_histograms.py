@@ -93,7 +93,7 @@ def test_dirichlet_histograms_compare_prior_and_posterior_on_same_masks():
         [TARGET_DIRICHLET, TARGET_CATEGORICAL, TARGET_DIRICHLET],
         dtype=jnp.int8,
     )
-    q_loss_weight = jnp.asarray([[1.0, 1.0], [0.0, 1.0], [1.0, 1.0]])
+    q_pair_weight = jnp.asarray([[1.0, 1.0], [0.0, 1.0], [1.0, 1.0]])
     data = Sample(
         obs=jnp.zeros((3, 1)),
         policy_tgt=jnp.full((3, 2), 0.5),
@@ -103,7 +103,8 @@ def test_dirichlet_histograms_compare_prior_and_posterior_on_same_masks():
         value_mask=jnp.ones((3,), dtype=jnp.bool_),
         beta_Q_target=beta_q,
         beta_V_target=beta_v,
-        q_loss_weight=q_loss_weight,
+        q_supervised_pair_mask=q_pair_weight > 0,
+        q_pair_weight=q_pair_weight,
         q_target_kind=q_target_kind,
         q_target_weight=jnp.ones((3, 2)),
         q_target_outcome=jnp.zeros((3, 2), dtype=jnp.int8),
