@@ -214,6 +214,30 @@ def test_az_dirichlet_net_shapes_and_unit_alphas():
     assert jnp.allclose(alpha_q, jnp.ones_like(alpha_q))
 
 
+def test_az_dirichlet_heads_honor_configured_floor_and_initial_concentration():
+    model = AZDirichletNet(
+        num_actions=10,
+        observation_shape=(3, 3, 4),
+        num_outcomes=2,
+        num_channels=8,
+        num_blocks=1,
+        dirichlet_concentration_clip=16.0,
+        dirichlet_concentration_floor=3.0,
+        dirichlet_initial_concentration=3.1,
+        rngs=nnx.Rngs(0),
+    )
+    obs = jnp.ones((2, 3, 3, 4))
+
+    _, alpha_v, alpha_q = model(obs, train=False)
+
+    assert model.dirichlet_concentration_floor == 3.0
+    assert model.dirichlet_initial_concentration == 3.1
+    assert jnp.allclose(jnp.sum(alpha_v, axis=-1), 3.1)
+    assert jnp.allclose(jnp.sum(alpha_q, axis=-1), 3.1)
+    assert jnp.allclose(outcome_mean(alpha_v), 0.5)
+    assert jnp.allclose(outcome_mean(alpha_q), 0.5)
+
+
 def test_az_dirichlet_q_heads_use_az_style_flattened_board_hidden_layer():
     model = AZDirichletNet(
         num_actions=10,
@@ -250,6 +274,36 @@ def test_build_model_supports_az_dirichlet_for_go_wdl3():
 
     assert isinstance(model, AZDirichletNet)
     assert model.num_outcomes == 3
+
+
+def test_build_model_passes_az_dirichlet_concentration_configuration():
+    config = Config(
+        env=EnvConfig(
+            id="go_9x9_white_wins_draw",
+            board_size=9,
+            num_outcomes=2,
+        ),
+        model=ModelConfig(
+            network=Network.aznet_dirichlet,
+            num_channels=8,
+            num_layers=1,
+            dirichlet_concentration_floor=3.0,
+            dirichlet_initial_concentration=3.1,
+        ),
+        search=SearchConfig(kind=SearchKind.dirichlet_thompson),
+    )
+    config.training.regularization.dirichlet_concentration_clip = 16.0
+
+    model = build_model(
+        config,
+        num_actions=82,
+        observation_shape=(9, 9, 17),
+        rngs=nnx.Rngs(0),
+    )
+
+    assert isinstance(model, AZDirichletNet)
+    assert model.dirichlet_concentration_floor == 3.0
+    assert model.dirichlet_initial_concentration == 3.1
 
 
 def test_dirichlet_thompson_null_hex_outcomes_builds_legacy_two_outcome_head():

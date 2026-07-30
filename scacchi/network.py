@@ -236,6 +236,8 @@ class AZDirichletNet(nnx.Module):
         resnet_v2: bool = True,
         dtype=jnp.float32,
         dirichlet_concentration_clip: float | None = 8.0,
+        dirichlet_concentration_floor: float | None = None,
+        dirichlet_initial_concentration: float | None = None,
         rngs: nnx.Rngs,
     ):
         height, width, input_channels = observation_shape
@@ -245,7 +247,53 @@ class AZDirichletNet(nnx.Module):
         self.num_blocks = num_blocks
         self.resnet_v2 = resnet_v2
         self.dtype = dtype
+        self.dirichlet_concentration_floor = (
+            None
+            if dirichlet_concentration_floor is None
+            else float(dirichlet_concentration_floor)
+        )
         self.dirichlet_concentration_clip = dirichlet_concentration_clip
+        self.dirichlet_initial_concentration = dirichlet_initial_concentration
+
+        if self.dirichlet_concentration_floor is None:
+            initial_concentration = (
+                float(num_outcomes)
+                if dirichlet_initial_concentration is None
+                else float(dirichlet_initial_concentration)
+            )
+            if (
+                self.dirichlet_concentration_clip is not None
+                and initial_concentration
+                >= float(self.dirichlet_concentration_clip)
+            ):
+                raise ValueError(
+                    "dirichlet_concentration_clip must exceed "
+                    "dirichlet_initial_concentration; got "
+                    f"initial={initial_concentration}, "
+                    f"clip={self.dirichlet_concentration_clip}"
+                )
+            concentration_logit = _squared_softplus_concentration_logit(
+                initial_concentration
+            )
+        else:
+            initial_excess = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+            if dirichlet_initial_concentration is not None:
+                initial_excess = (
+                    float(dirichlet_initial_concentration)
+                    - self.dirichlet_concentration_floor
+                )
+                if initial_excess <= 0.0:
+                    raise ValueError(
+                        "dirichlet_initial_concentration must exceed the "
+                        f"configured floor "
+                        f"{self.dirichlet_concentration_floor}; got "
+                        f"{dirichlet_initial_concentration}"
+                    )
+            concentration_logit = _smooth_dirichlet_concentration_logit(
+                self.dirichlet_concentration_floor,
+                self.dirichlet_concentration_clip,
+                initial_excess=initial_excess,
+            )
 
         self.conv = nnx.Conv(input_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         if not resnet_v2:
@@ -280,7 +328,7 @@ class AZDirichletNet(nnx.Module):
             rngs=rngs,
         )
         concentration_bias_init = jax.nn.initializers.constant(
-            _unit_dirichlet_concentration_logit(num_outcomes)
+            concentration_logit
         )
         self.value_conc_out = nnx.Linear(
             num_channels,
@@ -359,6 +407,7 @@ class AZDirichletNet(nnx.Module):
         alpha_v = dirichlet_from_logits(
             self.value_dir_out(value_features),
             self.value_conc_out(value_features).reshape((value_features.shape[0],)),
+            concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
 
@@ -382,6 +431,7 @@ class AZDirichletNet(nnx.Module):
         alpha_q = dirichlet_from_logits(
             q_mean_logits,
             q_concentration_logit,
+            concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
         return logits.astype(jnp.float32), alpha_v, alpha_q
@@ -675,6 +725,12 @@ def build_model(
             dtype=compute_dtype,
             dirichlet_concentration_clip=(
                 config.training.regularization.dirichlet_concentration_clip
+            ),
+            dirichlet_concentration_floor=(
+                config.model.dirichlet_concentration_floor
+            ),
+            dirichlet_initial_concentration=(
+                config.model.dirichlet_initial_concentration
             ),
             rngs=rngs,
         )
