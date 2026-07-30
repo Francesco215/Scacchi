@@ -26,6 +26,7 @@ from scacchi.play_search import (
     TargetMetadata,
     _dirichlet_commitment_policy,
     _dirichlet_root_policy_readout,
+    _normalize_policy_on_support,
     commit_action,
     make_action_committer,
     make_search,
@@ -48,6 +49,7 @@ from scacchi.types import (
     QActionSet,
     QPairReduction,
     QSupervisionConfig,
+    RootPolicySupport,
     SearchConfig,
     SearchKind,
     SelfplayConfig,
@@ -499,6 +501,136 @@ def test_q21_solved_target_is_uniform_but_commitment_stays_native():
         readout,
         jnp.asarray([[0.5, 0.5, 0.0]], dtype=jnp.float32),
     )
+
+
+def test_replay_policy_is_masked_to_search_evidence_and_sharpened():
+    class Summary(NamedTuple):
+        alpha: jax.Array
+        q_categorical_outcome: jax.Array
+        q_categorical_distance: jax.Array
+        v_categorical_outcome: jax.Array
+        visit_counts: jax.Array
+
+    native_policy = jnp.asarray([[0.2, 0.3, 0.5]], dtype=jnp.float32)
+    readout = _dirichlet_root_policy_readout(
+        native_policy,
+        summary=Summary(
+            alpha=jnp.ones((1, 3, 2), dtype=jnp.float32),
+            q_categorical_outcome=jnp.full(
+                (1, 3),
+                int(NO_OUTCOME),
+                dtype=jnp.int8,
+            ),
+            q_categorical_distance=jnp.zeros((1, 3), dtype=jnp.int32),
+            v_categorical_outcome=jnp.asarray(
+                [int(NO_OUTCOME)],
+                dtype=jnp.int8,
+            ),
+            visit_counts=jnp.asarray([[1.0, 1.0, 0.0]]),
+        ),
+        legal_action_mask=jnp.ones((1, 3), dtype=jnp.bool_),
+        search_cfg=DirichletThompsonSearchConfig(
+            root_policy_support=RootPolicySupport.search_evidence,
+            policy_target_temperature=0.5,
+            posterior_update=PosteriorUpdateConfig(
+                kind=PosteriorUpdateKind.numerical,
+            ),
+        ),
+    )
+    estimate = (
+        dirichlet_mctx.binary_posterior_best_policy_prefix_quadrature(
+            jnp.ones((1, 3, 2), dtype=jnp.float32),
+            jnp.asarray([[False, False, True]]),
+            jnp.full((1, 3), int(NO_OUTCOME), dtype=jnp.int8),
+        ).policy
+    )
+    expected = _normalize_policy_on_support(
+        estimate,
+        jnp.asarray([[True, True, False]]),
+        temperature=0.5,
+    )
+
+    assert jnp.allclose(readout, expected)
+    assert readout[0, 2] == 0.0
+
+
+def test_numerical_commitment_stays_on_search_support():
+    batch_size = 64
+    no_outcome = int(NO_OUTCOME)
+    support = jnp.broadcast_to(
+        jnp.asarray([True, False, True]),
+        (batch_size, 3),
+    )
+    alpha_q = jnp.broadcast_to(
+        jnp.asarray(
+            [[2.0, 5.0], [1.0, 20.0], [4.0, 2.0]],
+            dtype=jnp.float32,
+        ),
+        (batch_size, 3, 2),
+    )
+    categorical_outcome = jnp.full(
+        (batch_size, 3),
+        no_outcome,
+        dtype=jnp.int8,
+    )
+    posterior = PosteriorTargets(
+        prediction=PosteriorPrediction(
+            policy=jnp.full(
+                (batch_size, 3),
+                1.0 / 3.0,
+                dtype=jnp.float32,
+            ),
+            alpha_q=alpha_q,
+        ),
+        metadata=TargetMetadata(
+            q_positive_evidence_action=support,
+            search_action=jnp.zeros((batch_size,), dtype=jnp.int32),
+            q_target_outcome=categorical_outcome,
+            v_target_outcome=jnp.full(
+                (batch_size,),
+                no_outcome,
+                dtype=jnp.int8,
+            ),
+        ),
+    )
+    search_config = DirichletThompsonSearchConfig(
+        root_policy_support=RootPolicySupport.search_evidence,
+        posterior_update=PosteriorUpdateConfig(
+            kind=PosteriorUpdateKind.numerical,
+            numerical=NumericalPosteriorUpdateConfig(
+                fallback_policy_samples=8,
+                fallback_policy_sample_chunk_size=2,
+            ),
+        ),
+    )
+    legal = jnp.ones((batch_size, 3), dtype=jnp.bool_)
+    commitment_policy = _dirichlet_commitment_policy(
+        posterior,
+        legal,
+        jax.random.PRNGKey(947),
+        search_config,
+        PosteriorUpdateKind.numerical,
+    )
+    action = make_action_committer(
+        ActionCommitmentConfig(
+            kind=ActionCommitmentType.posterior_sample,
+            posterior_update=PosteriorUpdateKind.numerical,
+        ),
+        search_config,
+    )(
+        posterior,
+        legal,
+        jax.random.PRNGKey(948),
+    )
+
+    assert jnp.all(commitment_policy[~support] == 0.0)
+    assert jnp.allclose(jnp.sum(commitment_policy, axis=-1), 1.0)
+    selected_is_supported = jnp.take_along_axis(
+        support,
+        action[:, None],
+        axis=-1,
+    )
+    assert bool(jnp.all(selected_is_supported))
 
 
 def test_search_player_preserves_solved_native_action_under_temperature():

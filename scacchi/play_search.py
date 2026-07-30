@@ -43,6 +43,7 @@ from .types import (
     PolicySearchConfig,
     PosteriorUpdateKind,
     QSupervisionConfig,
+    RootPolicySupport,
     SearchConfig,
     SearchKind,
 )
@@ -205,6 +206,72 @@ def _numerical_policy_readout(
     )
 
 
+def _root_policy_support(
+    legal_action_mask: jax.Array,
+    positive_search_evidence: jax.Array,
+    categorical_outcome: jax.Array,
+    support_mode: RootPolicySupport,
+) -> jax.Array:
+    """Choose a stable Q21 population without discarding legal fallback rows."""
+
+    legal_action_mask = jnp.asarray(legal_action_mask, dtype=jnp.bool_)
+    if support_mode == RootPolicySupport.all_legal:
+        return legal_action_mask
+    if support_mode != RootPolicySupport.search_evidence:
+        raise ValueError(f"unknown root_policy_support: {support_mode!r}")
+    candidate = legal_action_mask & (
+        jnp.asarray(positive_search_evidence, dtype=jnp.bool_)
+        | (jnp.asarray(categorical_outcome) != int(NO_OUTCOME))
+    )
+    return jnp.where(
+        jnp.any(candidate, axis=-1, keepdims=True),
+        candidate,
+        legal_action_mask,
+    )
+
+
+def _normalize_policy_on_support(
+    policy: jax.Array,
+    support: jax.Array,
+    *,
+    temperature: float = 1.0,
+) -> jax.Array:
+    """Project and power-normalize a policy while preserving exact zeros."""
+
+    policy = jnp.asarray(policy)
+    support = jnp.asarray(support, dtype=jnp.bool_)
+    positive = support & (policy > 0.0)
+    log_policy = jnp.log(
+        jnp.clip(
+            policy,
+            jnp.finfo(policy.dtype).tiny,
+            1.0,
+        )
+    )
+    masked_log_policy = jnp.where(
+        positive,
+        log_policy,
+        jnp.finfo(policy.dtype).min,
+    )
+    centered_log_policy = masked_log_policy - jnp.max(
+        masked_log_policy,
+        axis=-1,
+        keepdims=True,
+    )
+    scaled_logits = jnp.where(
+        positive,
+        centered_log_policy
+        / jnp.asarray(float(temperature), dtype=policy.dtype),
+        jnp.finfo(policy.dtype).min,
+    )
+    normalized = jax.nn.softmax(scaled_logits, axis=-1)
+    normalized = jnp.where(positive, normalized, 0.0)
+    has_positive = jnp.any(positive, axis=-1, keepdims=True)
+    support_count = jnp.sum(support, axis=-1, keepdims=True)
+    fallback = support.astype(policy.dtype) / jnp.maximum(support_count, 1)
+    return jnp.where(has_positive, normalized, fallback)
+
+
 def _dirichlet_root_policy_readout(
     native_policy: jax.Array,
     *,
@@ -217,13 +284,31 @@ def _dirichlet_root_policy_readout(
     if search_cfg.posterior_update.kind != PosteriorUpdateKind.numerical:
         return native_policy
 
-    invalid_actions = ~legal_action_mask
+    visit_counts = getattr(summary, "visit_counts", None)
+    if visit_counts is None:
+        positive_search_evidence = jnp.zeros_like(
+            legal_action_mask,
+            dtype=jnp.bool_,
+        )
+    else:
+        positive_search_evidence = jnp.asarray(visit_counts) > 0
+    readout_support = _root_policy_support(
+        legal_action_mask,
+        positive_search_evidence,
+        summary.q_categorical_outcome,
+        search_cfg.root_policy_support,
+    )
+    native_policy = _normalize_policy_on_support(
+        native_policy,
+        readout_support,
+    )
+    invalid_actions = ~readout_support
     target_policy = _numerical_policy_readout(
         native_policy,
         alpha=summary.alpha,
         q_categorical_outcome=summary.q_categorical_outcome,
         v_categorical_outcome=summary.v_categorical_outcome,
-        legal_action_mask=legal_action_mask,
+        legal_action_mask=readout_support,
         config=search_cfg.posterior_update.numerical,
     )
     categorical_policy = categorical_action_population(
@@ -249,8 +334,11 @@ def _dirichlet_root_policy_readout(
         categorical_policy,
         target_policy,
     )
-
-    return target_policy
+    return _normalize_policy_on_support(
+        target_policy,
+        readout_support,
+        temperature=search_cfg.policy_target_temperature,
+    )
 
 
 def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_supervision_config: QSupervisionConfig) -> SearchOutput:
@@ -539,7 +627,18 @@ def _dirichlet_commitment_policy(
     policy_samples, chunk_size = _posterior_policy_sampling_budget(
         update_config
     )
-    invalid_actions = ~legal_action_mask
+    positive_search_evidence = (
+        jnp.zeros_like(legal_action_mask, dtype=jnp.bool_)
+        if metadata.q_positive_evidence_action is None
+        else metadata.q_positive_evidence_action
+    )
+    commitment_support = _root_policy_support(
+        legal_action_mask,
+        positive_search_evidence,
+        metadata.q_target_outcome,
+        search_config.root_policy_support,
+    )
+    invalid_actions = ~commitment_support
     native_policy = posterior_best_policy(
         rng_key,
         alpha,
@@ -561,13 +660,17 @@ def _dirichlet_commitment_policy(
         solved_policy,
         native_policy,
     )
+    native_policy = _normalize_policy_on_support(
+        native_policy,
+        commitment_support,
+    )
     if isinstance(update_config, NumericalPosteriorUpdateConfig):
         return _numerical_policy_readout(
             native_policy,
             alpha=alpha,
             q_categorical_outcome=metadata.q_target_outcome,
             v_categorical_outcome=metadata.v_target_outcome,
-            legal_action_mask=legal_action_mask,
+            legal_action_mask=commitment_support,
             config=update_config,
         )
     return native_policy

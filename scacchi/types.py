@@ -38,6 +38,11 @@ class PosteriorUpdateKind(StrEnum):
     numerical = "numerical"
 
 
+class RootPolicySupport(StrEnum):
+    all_legal = "all_legal"
+    search_evidence = "search_evidence"
+
+
 class QActionSet(StrEnum):
     positive_search_evidence_or_solved = (
         "positive_search_evidence_or_solved"
@@ -289,6 +294,8 @@ class PosteriorUpdateConfig:
 class DirichletThompsonSearchConfig:
     num_simulations: int = 32
     max_depth: int | None = None
+    root_policy_support: RootPolicySupport = RootPolicySupport.all_legal
+    policy_target_temperature: float = 1.0
     posterior_update: PosteriorUpdateConfig = field(
         default_factory=PosteriorUpdateConfig
     )
@@ -307,6 +314,15 @@ class DirichletThompsonSearchConfig:
             self.max_depth,
             minimum_depth,
         )
+        if (
+            not math.isfinite(self.policy_target_temperature)
+            or self.policy_target_temperature <= 0.0
+        ):
+            raise ValueError(
+                "search.dirichlet_thompson.policy_target_temperature must be "
+                "finite and > 0; got "
+                f"{self.policy_target_temperature}."
+            )
 
 
 @dataclass

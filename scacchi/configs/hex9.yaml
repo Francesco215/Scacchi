@@ -1,7 +1,8 @@
-# From-scratch Hex8 convolutional numerical-Q21 trial.
+# Effective configuration of W&B run pal/scacchi-az/cl3xe7ka
+# ("hex_9_dt_solved"). The run was launched from hex9_dirichlet_scratch
+# with run.max_num_iters overridden to 41.
 #
-# This keeps the warm-started run's architecture, search budget, and loss
-# balance, but intentionally does not initialize parameters from Hex7.
+# Match the solved run's search-evidence-supported, sharpened replay policy.
 
 run:
   seed: 9105
@@ -9,7 +10,7 @@ run:
 
 env:
   id: hex
-  board_size: 8
+  board_size: 9
   num_outcomes: 2
 
 model:
@@ -18,13 +19,14 @@ model:
   num_layers: 6
   compute_dtype: bfloat16
   resnet_v2: true
-  dirichlet_concentration_floor: 3.0
+  dirichlet_concentration_floor: null
   dirichlet_initial_concentration: 3.1
+  legacy_dirichlet_head_init: false
   rezero_kernel_init: variance_scaling
 
 selfplay:
   batch_size: 4096
-  max_num_steps: 64
+  max_num_steps: 81
   action_commitment:
     kind: posterior_sample
     posterior_update: numerical
@@ -34,6 +36,8 @@ selfplay:
     dirichlet_thompson:
       num_simulations: 32
       max_depth: 32
+      root_policy_support: search_evidence
+      policy_target_temperature: 0.3333333333333333
       posterior_update:
         kind: numerical
         numerical:
@@ -47,7 +51,10 @@ selfplay:
 
 training:
   batch_size: 1024
+  max_updates_per_iter: null
   learning_rate: 1e-3
+  lr_decay_after_iters: null
+  lr_decay_factor: 1.0
   grad_clip_norm: 1.0
   losses:
     policy_weight: 1.0
@@ -71,7 +78,8 @@ eval:
   interval: 5
   batch_size: 512
   baseline: checkpoint
-  checkpoint_path: checkpoints/8_solved
+  baseline_id: null
+  checkpoint_path: checkpoints/9_solved
   player_action_commitment:
     kind: posterior_argmax
     posterior_update: numerical
@@ -82,6 +90,7 @@ eval:
     dirichlet_thompson:
       num_simulations: 32
       max_depth: 32
+      root_policy_support: search_evidence
       posterior_update:
         kind: numerical
         numerical:
@@ -96,6 +105,7 @@ eval:
     kind: gumbel
     gumbel:
       num_simulations: 4
+      gumbel_scale: 1.0
 
 logging:
   interval: 1
@@ -104,6 +114,6 @@ logging:
     project: scacchi-az
 
 checkpointing:
-  max_to_keep: 3
-  save_interval_steps: 10
+  max_to_keep: 0
+  save_interval_steps: 5
   directory: checkpoints/asd

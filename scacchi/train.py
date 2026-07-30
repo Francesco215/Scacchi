@@ -82,8 +82,6 @@ def _should_evaluate(iteration: int, config: Config) -> bool:
 def _evaluate(iteration: int, rng_key: jax.Array, model: nnx.Module, evaluate, parallel, history: list[float], config: Config) -> dict[str, Metric]:
     if evaluate is None or not _should_evaluate(iteration, config):
         return {}
-    if jax.process_index() == 0:
-        print(f"Iteration {iteration}: evaluation starting", flush=True)
     with parallel.mesh_context():
         returns = evaluate(rng_key, model)
     metrics: dict[str, Metric] = {}
@@ -117,12 +115,14 @@ def _run_loop(config: Config, model: nnx.Module, optimizer: nnx.Optimizer, train
         for iteration in progress:
             rng_key, eval_key, train_key = jax.random.split(rng_key, 3)
             metrics = _evaluate(iteration, eval_key, model, evaluate, parallel, evaluation_history, config)
+            if "eval/vs_baseline/win_rate" in metrics:
+                progress.set_postfix(win_rate=f"{metrics['eval/vs_baseline/win_rate']:.1%}")
             train_result, seconds = _train_iteration(train_key, model, optimizer, training_iteration, parallel)
             frames_this_iteration = config.selfplay.batch_size * config.selfplay.max_num_steps
             frames += frames_this_iteration
             hours += seconds / 3600
             metrics.update(training_metrics(train_result, seconds=seconds, hours=hours, frames=frames, frames_this_iteration=frames_this_iteration))
-            logger.log(iteration, metrics, pbar=progress, prefix="", pbar_filter=r"loss|avg_R")
+            logger.log(iteration, metrics, prefix="")
             maybe_save(checkpoint_manager, iteration, model, optimizer, rng_key, config, hours, frames)
 
 

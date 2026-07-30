@@ -129,6 +129,19 @@ def test_hex5_uses_corrected_dirichlet_search_recipe():
     assert config.checkpointing.save_interval_steps == 10
 
 
+def test_hex9_restores_solved_run_policy_target_recipe():
+    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex9.yaml"
+    config = load_config(OmegaConf.load(cfg_path))
+
+    selfplay_search = config.selfplay.search.dirichlet_thompson
+    assert selfplay_search.root_policy_support == "search_evidence"
+    assert selfplay_search.policy_target_temperature == 1.0 / 3.0
+    assert (
+        config.eval.player_search.dirichlet_thompson.root_policy_support
+        == "search_evidence"
+    )
+
+
 def test_policy_search_temperature_must_be_positive():
     with pytest.raises(ValueError, match="search.policy.temperature"):
         _config(
@@ -988,6 +1001,53 @@ def test_posterior_sample_temperature_defaults_to_one():
     assert (
         config.selfplay.action_commitment.posterior_sample_temperature == 1.0
     )
+
+
+def test_dirichlet_policy_target_controls_are_configurable():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "root_policy_support": "search_evidence",
+                        "policy_target_temperature": 1.0 / 3.0,
+                    },
+                },
+            },
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.root_policy_support == "search_evidence"
+    assert search.policy_target_temperature == 1.0 / 3.0
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [0.0, -1.0, math.nan, math.inf, -math.inf],
+)
+def test_policy_target_temperature_must_be_finite_and_positive(
+    temperature: float,
+):
+    with pytest.raises(
+        ValueError,
+        match="search.dirichlet_thompson.policy_target_temperature",
+    ):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "selfplay": {
+                    "search": {
+                        "kind": "dirichlet_thompson",
+                        "dirichlet_thompson": {
+                            "policy_target_temperature": temperature,
+                        },
+                    },
+                },
+            }
+        )
 
 
 def test_legacy_action_commitment_fields_migrate_to_player_config():
