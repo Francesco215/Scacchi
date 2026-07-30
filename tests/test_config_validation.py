@@ -35,6 +35,7 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.model.num_channels == 128
     assert config.model.num_layers == 6
     assert config.model.compute_dtype == "float32"
+    assert config.model.dirichlet_head_parameterization == "log_concentration"
     assert config.selfplay.batch_size == 2048
     assert config.selfplay.max_num_steps == 128
     assert config.selfplay.action_commitment.kind == "posterior_sample"
@@ -76,7 +77,6 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.training.losses.q_dir_kl_weight == 5.0
     assert config.training.losses.terminal_edge_targets is True
     assert config.training.losses.terminal_parent_targets is True
-    assert config.training.losses.categorical_epsilon == 1e-4
     assert config.training.regularization.dirichlet_concentration_clip == 300.0
     assert config.eval.interval == 10
     assert config.eval.batch_size == 1024
@@ -124,7 +124,8 @@ def test_hex5_uses_corrected_dirichlet_search_recipe():
     assert config.training.learning_rate == 2e-3
     assert config.training.losses.q_dir_kl_weight == 1.0
     assert config.training.losses.q_outcome_weight == 0.25
-    assert config.training.losses.categorical_epsilon == 0.01
+    assert config.model.dirichlet_head_parameterization == "log_concentration"
+    assert config.training.regularization.dirichlet_concentration_clip == 8.0
     assert config.checkpointing.max_to_keep == 1
     assert config.checkpointing.save_interval_steps == 10
 
@@ -227,13 +228,16 @@ def test_legacy_dirichlet_constants_block_is_rejected():
         )
 
 
-@pytest.mark.parametrize("epsilon", [0.0, 1.0 / 3.0, 0.5])
-def test_categorical_training_epsilon_must_stay_inside_simplex(epsilon: float):
-    with pytest.raises(ValueError, match="categorical_epsilon"):
-        _config({"training": {"losses": {"categorical_epsilon": epsilon}}})
+def test_deprecated_categorical_epsilon_selects_legacy_head_compatibility():
+    with pytest.warns(FutureWarning):
+        config = _config(
+            {"training": {"losses": {"categorical_epsilon": 0.01}}}
+        )
+
+    assert config.model.dirichlet_head_parameterization == "legacy"
 
 
-def test_categorical_density_training_requires_finite_concentration_cap():
+def test_full_categorical_dispersion_requires_finite_reference_concentration():
     with pytest.raises(ValueError, match="finite.*concentration_clip"):
         _config(
             {
@@ -247,6 +251,25 @@ def test_categorical_density_training_requires_finite_concentration_cap():
         )
 
 
+def test_mean_categorical_training_does_not_require_reference_concentration():
+    with pytest.warns(UserWarning, match="mean"):
+        config = _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {"kind": "dirichlet_thompson"},
+                "training": {
+                    "losses": {
+                        "value_dir_kl_weight": 1.0,
+                        "dirichlet_loss_mode": "mean",
+                    },
+                    "regularization": {"dirichlet_concentration_clip": None},
+                },
+            }
+        )
+
+    assert config.training.regularization.dirichlet_concentration_clip is None
+
+
 @pytest.mark.parametrize("clip", [math.inf, math.nan])
 def test_dirichlet_concentration_cap_must_be_finite(clip: float):
     with pytest.raises(ValueError, match="concentration_clip.*finite"):
@@ -256,6 +279,39 @@ def test_dirichlet_concentration_cap_must_be_finite(clip: float):
                     "regularization": {
                         "dirichlet_concentration_clip": clip,
                     }
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "initial_concentration",
+    [0.0, -1.0, math.inf, math.nan],
+)
+def test_direct_initial_concentration_must_be_finite_and_positive(
+    initial_concentration: float,
+):
+    with pytest.raises(ValueError, match="initial_concentration"):
+        _config(
+            {
+                "model": {
+                    "network": "boardlaw_dirichlet",
+                    "dirichlet_initial_concentration": (
+                        initial_concentration
+                    ),
+                }
+            }
+        )
+
+
+def test_direct_log_head_rejects_a_concentration_floor():
+    with pytest.raises(ValueError, match="incompatible"):
+        _config(
+            {
+                "model": {
+                    "network": "boardlaw_dirichlet",
+                    "dirichlet_head_parameterization": "log_concentration",
+                    "dirichlet_concentration_floor": 2.0,
                 }
             }
         )
@@ -322,7 +378,8 @@ def test_hex7_uses_full_learned_concentration_head():
     config = load_config(OmegaConf.load(cfg_path))
 
     assert config.run.seed == 7104
-    assert config.model.dirichlet_concentration_floor == 2.0
+    assert config.model.dirichlet_head_parameterization == "log_concentration"
+    assert config.model.dirichlet_concentration_floor is None
     assert config.model.dirichlet_initial_concentration == 2.1
     assert config.training.losses.dirichlet_loss_mode == "full"
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 64

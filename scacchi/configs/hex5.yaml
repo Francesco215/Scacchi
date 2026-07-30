@@ -17,6 +17,7 @@ model:
   num_layers: 8
   compute_dtype: bfloat16
   resnet_v2: true
+  dirichlet_head_parameterization: log_concentration
 
 selfplay:
   batch_size: 8192
@@ -52,9 +53,9 @@ training:
     terminal_edge_targets: false
     terminal_parent_targets: false
     policy_target_mode: search
-    categorical_epsilon: 0.01
 
   regularization:
+    # Exact-outcome reference concentration; this does not clip the head.
     dirichlet_concentration_clip: 8.0
 
 eval:

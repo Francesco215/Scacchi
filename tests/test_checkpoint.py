@@ -1,10 +1,14 @@
 from pathlib import Path
 from typing import Any
 
+from flax import nnx
 import jax
 import numpy as np
+import optax
+import pytest
 
 from scacchi import checkpoint
+from scacchi.network import BoardlawDirichletNet
 from scacchi.types import CheckpointingConfig, Config, RunConfig
 
 
@@ -71,6 +75,7 @@ def test_nested_checkpoint_migrates_legacy_search_blocks_to_total_simulations() 
     )
 
     search = config.selfplay.search.dirichlet_thompson
+    assert config.model.dirichlet_head_parameterization == "legacy"
     assert search.num_simulations == 64
     assert search.max_depth == 64
     assert search.posterior_update.kind == "numerical"
@@ -81,6 +86,67 @@ def test_nested_checkpoint_migrates_legacy_search_blocks_to_total_simulations() 
         == 2
     )
     assert search.posterior_update.numerical.half_width == 11
+
+
+def test_nested_checkpoint_preserves_explicit_log_concentration_marker() -> None:
+    config = checkpoint._load_checkpoint_config(
+        {
+            "env": {"num_outcomes": 2},
+            "model": {
+                "network": "boardlaw_dirichlet",
+                "dirichlet_head_parameterization": "log_concentration",
+                "dirichlet_initial_concentration": 3.0,
+            },
+        }
+    )
+
+    assert config.model.dirichlet_head_parameterization == "log_concentration"
+
+
+def test_restore_rejects_legacy_state_for_direct_log_head() -> None:
+    model = BoardlawDirichletNet(
+        num_actions=2,
+        observation_shape=(1, 1, 1),
+        width=4,
+        depth=1,
+        rngs=nnx.Rngs(0),
+    )
+    optimizer = nnx.Optimizer(
+        model,
+        optax.sgd(0.1),
+        wrt=nnx.Param,
+    )
+    rng_key = jax.random.PRNGKey(0)
+
+    class FakeManager:
+        def latest_step(self):
+            return 0
+
+        def restore(self, step, args):
+            del step, args
+            return {
+                "model": nnx.state(model),
+                "optimizer": nnx.state(optimizer),
+                "rngs": {
+                    "key": checkpoint._rng_key_to_checkpoint_value(rng_key)
+                },
+                "meta": {
+                    "config": {
+                        "env": {"id": "hex", "num_outcomes": 2},
+                        "model": {"network": "boardlaw_dirichlet"},
+                    },
+                    "hours": 0.0,
+                    "frames": 0,
+                },
+            }
+
+    with pytest.raises(ValueError, match="not interchangeable"):
+        checkpoint.restore(
+            FakeManager(),
+            model,
+            optimizer,
+            rng_key,
+        )
 
 
 def test_rng_key_checkpoint_value_is_host_numpy_array() -> None:

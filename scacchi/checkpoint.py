@@ -161,6 +161,14 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
         # persistent tree, so migrate that historical product at this I/O
         # boundary instead of retaining ``num_blocks`` in the public config.
         migrated = copy.deepcopy(raw)
+        model_config = migrated.get("model")
+        if isinstance(model_config, dict):
+            network = str(model_config.get("network", ""))
+            if network.endswith("_dirichlet"):
+                model_config.setdefault(
+                    "dirichlet_head_parameterization",
+                    "legacy",
+                )
 
         def migrate_search(search: Any) -> None:
             if not isinstance(search, dict):
@@ -323,6 +331,8 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
             "save_interval_steps": raw.get("ckpt_save_interval_steps", 50),
         },
     }
+    if str(legacy_sections["model"]["network"]).endswith("_dirichlet"):
+        legacy_sections["model"]["dirichlet_head_parameterization"] = "legacy"
     legacy_q_losses = {
         name: raw[name]
         for name in ("q_loss_weight_mode", "q_dir_kl_reduction")
@@ -383,10 +393,29 @@ def restore(
             meta=ocp.args.JsonRestore(),
         ),
     )
+    meta = restored["meta"]
+    checkpoint_config = _load_checkpoint_config(meta["config"])
+    checkpoint_parameterization = str(
+        checkpoint_config.model.dirichlet_head_parameterization
+    )
+    model_parameterization = getattr(
+        model,
+        "dirichlet_head_parameterization",
+        None,
+    )
+    if (
+        model_parameterization is not None
+        and str(model_parameterization) != checkpoint_parameterization
+    ):
+        raise ValueError(
+            "refusing to restore a Dirichlet checkpoint with concentration "
+            f"parameterization {checkpoint_parameterization!r} into a model "
+            f"using {str(model_parameterization)!r}; the raw concentration "
+            "head coordinates are not interchangeable"
+        )
     nnx.update(model, restored["model"])
     nnx.update(optimizer, restored["optimizer"])
     rng_key = _rng_key_from_checkpoint_value(restored["rngs"]["key"], rng_key)
-    meta = restored["meta"]
     print(f"Restored checkpoint from step {step}.")
     return step + 1, rng_key, float(meta["hours"]), int(meta["frames"])
 

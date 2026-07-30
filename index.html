@@ -237,6 +237,18 @@ Q_{s,a}=\alpha_\theta^Q(s,a).
 =\frac{\alpha}{\sum_z\alpha_z}.
       </d-math>
 
+      <p>The head predicts mean logits <d-math>r_\theta</d-math> and a raw log-concentration <d-math>\eta_\theta</d-math> directly:</p>
+
+      <d-math block>
+\mu_\theta=\mathrm{softmax}(r_\theta),
+\qquad
+c_\theta=e^{\eta_\theta},
+\qquad
+\alpha_\theta=c_\theta\mu_\theta.
+      </d-math>
+
+      <p>Equivalently, <d-math>s_\theta=-\eta_\theta=\log(1/c_\theta)</d-math> is a log-dispersion. There is no learned concentration floor, squared-softplus transform, bounded sigmoid, or training-time output ceiling in the direct head. A very broad floating-point guard uses an identity backward derivative, so it cannot create a zero-gradient dead zone.</p>
+
       <p>The outcomes are ordered as <d-math>(L,W)</d-math> or <d-math>(L,D,W)</d-math>. Search compares samples with the same utility everywhere:</p>
 
       <d-math block>
@@ -677,44 +689,48 @@ T^V_s=
 \log\pi_\theta(a\mid s).
       </d-math>
 
-      <p>Full Dirichlet training matches both mean and concentration:</p>
+      <p>For an unresolved Dirichlet target, separate its mean and inverse-concentration:</p>
 
       <d-math block>
-\mathcal L_{\mathrm{full}}(\beta,\alpha_\theta)
-=
-D_{\mathrm{KL}}
-\left(
-\mathrm{Dirichlet}(\mathrm{stopgrad}\beta)
-\,\|\,
-\mathrm{Dirichlet}(\alpha_\theta)
-\right).
-      </d-math>
-
-      <p>Mean-only training ignores concentration and matches normalized outcome probabilities:</p>
-
-      <d-math block>
-\mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta)
-=
-D_{\mathrm{KL}}
-\left(
-\mathrm{stopgrad}\mu(\beta)
-\,\|\,
-\mu(\alpha_\theta)
-\right).
-      </d-math>
-
-      <p>For an exact categorical outcome <d-math>z</d-math>, move the point just inside the simplex and train the predicted Dirichlet by density likelihood:</p>
-
-      <d-math block>
-\phi_z^\epsilon
-=(1-K\epsilon)e_z+\epsilon\mathbf 1,
+\beta_0=\sum_i\beta_i,
 \qquad
-\mathcal L_{\mathrm{cat}}(\alpha_\theta,z)
-=-\log p_{\mathrm{Dirichlet}(\alpha_\theta)}
-(\phi_z^\epsilon).
+m=\frac{\beta}{\beta_0},
+\qquad
+v=\frac1{\beta_0},
+\qquad
+d=D_{\mathrm{KL}}(\mathrm{stopgrad}(m)\,\|\,\mu_\theta).
       </d-math>
 
-      <p>Thus unresolved rows use full or mean Dirichlet matching, while categorical rows use this exact-outcome density loss in either mode. The concentration is learned by the model; no terminal concentration constant is injected by search.</p>
+      <p>Full training uses a coupled log-dispersion score, analogous to a Gaussian loss with predicted log-variance:</p>
+
+      <d-math block>
+\mathcal L_{\mathrm{disp}}
+=-\log(c_\theta v)
++c_\theta(v+d)-1
+=s_\theta-\log v+e^{-s_\theta}(v+d)-1.
+      </d-math>
+
+      <d-math block>
+\frac{\partial\mathcal L_{\mathrm{disp}}}{\partial\eta_\theta}
+=c_\theta(v+d)-1,
+\qquad
+c_\theta^*=\frac1{v+d}.
+      </d-math>
+
+      <p>At the joint optimum, <d-math>\mu_\theta=m</d-math>, <d-math>c_\theta=\beta_0</d-math>, and therefore <d-math>\alpha_\theta=\beta</d-math>. Mean error automatically lowers confidence. At the correct mean for a target concentration of three, predictions at concentrations two, three, and four receive log-concentration gradients <d-math>-1/3</d-math>, <d-math>0</d-math>, and <d-math>+1/3</d-math>.</p>
+
+      <p>For an exact categorical outcome <d-math>z</d-math>, use the exact one-hot mean and a finite loss-only reference concentration <d-math>c_{\mathrm{cat}}</d-math>:</p>
+
+      <d-math block>
+\mathcal L_{\mathrm{cat,full}}
+=-\log\frac{c_\theta}{c_{\mathrm{cat}}}
++c_\theta
+\left(
+\frac1{c_{\mathrm{cat}}}-\log\mu_{\theta,z}
+\right)-1.
+      </d-math>
+
+      <p>This has finite optimum <d-math>c_\theta\to c_{\mathrm{cat}}</d-math> as <d-math>\mu_{\theta,z}\to1</d-math>. It needs no epsilon-interior point, gamma functions, or hard output cap. The reference calibrates training only; search still uses the exact categorical sidecar. Mean-only mode retains ordinary mean KL for Dirichlet targets and cross-entropy <d-math>-\log\mu_{\theta,z}</d-math> for categorical targets.</p>
 
       <p>For an unresolved Q target, the loss can be weighted by structural support or by root policy. A categorical row no longer owns an <d-math>R</d-math> value and receives an explicit unit categorical weight:</p>
 

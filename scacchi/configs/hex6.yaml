@@ -16,8 +16,8 @@ model:
   num_layers: 8
   compute_dtype: bfloat16
   resnet_v2: true
+  dirichlet_head_parameterization: log_concentration
   # Start from a symmetric low-evidence binary prior, then learn its mass.
-  dirichlet_concentration_floor: 3.0
   dirichlet_initial_concentration: 3.1
 
 selfplay:
@@ -63,17 +63,16 @@ training:
       # inclusion, not gradient magnitude.
       action_set: positive_search_evidence_or_solved
       reduction: mean_over_selected_state_action_pairs
-    # Full KL is intentional: mean-only KL has exactly zero concentration
-    # gradient on unresolved Dirichlet targets.
+    # Full dispersion training is intentional: mean-only mode has exactly zero
+    # concentration gradient.
     dirichlet_loss_mode: full
     loss_mask_mode: value
     terminal_edge_targets: true
     terminal_parent_targets: true
     policy_target_mode: search
-    categorical_epsilon: 0.01
   regularization:
-    # A broad ceiling regularizes categorical density without pinning the
-    # unresolved state-dependent concentration learned by the model.
+    # Finite concentration learned at a perfectly classified exact outcome.
+    # This is a loss reference, not an output ceiling.
     dirichlet_concentration_clip: 16.0
 
 eval:

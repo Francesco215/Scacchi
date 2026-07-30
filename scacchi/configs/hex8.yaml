@@ -18,7 +18,7 @@ model:
   num_layers: 6
   compute_dtype: bfloat16
   resnet_v2: true
-  dirichlet_concentration_floor: 3.0
+  dirichlet_head_parameterization: log_concentration
   dirichlet_initial_concentration: 3.1
   rezero_kernel_init: variance_scaling
 
@@ -53,8 +53,8 @@ training:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 1.0
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
     q_supervision:
       action_set: positive_search_evidence_or_solved
       reduction: mean_over_selected_state_action_pairs
@@ -63,8 +63,8 @@ training:
     terminal_edge_targets: true
     terminal_parent_targets: true
     policy_target_mode: search
-    categorical_epsilon: 0.01
   regularization:
+    # Exact-outcome reference concentration; this does not clip the head.
     dirichlet_concentration_clip: 16.0
 
 eval:

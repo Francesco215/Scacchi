@@ -80,7 +80,7 @@ def _pair_losses(alpha):
         kind,
         outcome,
         weight,
-        categorical_epsilon=1e-4,
+        categorical_reference_concentration=8.0,
         loss_mode="full",
     )
 
@@ -234,6 +234,10 @@ def test_q_population_metrics_use_direct_semantic_counts():
         legal,
         alpha,
     ) = _mixed_targets()
+    # Put every selected Q concentration above the categorical reference.
+    # Direct heads must report that relationship only for categorical targets,
+    # never as saturation at an output clip.
+    alpha = 10.0 * alpha
     supervision = build_q_supervision(
         "positive_search_evidence_or_solved",
         "mean_over_selected_state_action_pairs",
@@ -276,6 +280,12 @@ def test_q_population_metrics_use_direct_semantic_counts():
     assert metrics.q_supervised_action_count == 4
     assert metrics.q_supervised_actions_per_row == 2
     assert metrics.q_supervised_action_fraction == pytest.approx(4.0 / 5.0)
+    assert metrics.alpha_Q_concentration_clip_fraction == 0.0
+    assert metrics.alpha_Q_dirichlet_concentration_clip_fraction == 0.0
+    assert (
+        metrics.alpha_Q_categorical_concentration_reference_fraction
+        == 1.0
+    )
 
     logged = training_metrics(
         metrics,
@@ -292,6 +302,27 @@ def test_q_population_metrics_use_direct_semantic_counts():
     assert logged["data/q_supervised_action_fraction"] == pytest.approx(
         4.0 / 5.0
     )
+    assert "train/Q_C_at_clip_fraction_dir" not in logged
+    assert "train/Q_C_at_clip_fraction_cat" not in logged
+    assert (
+        logged["train/Q_C_at_or_above_reference_fraction_cat"]
+        == 1.0
+    )
+
+    legacy_metrics = metrics._replace(
+        dirichlet_head_is_legacy=jnp.ones_like(
+            metrics.dirichlet_head_is_legacy
+        )
+    )
+    legacy_logged = training_metrics(
+        legacy_metrics,
+        seconds=1.0,
+        hours=0.0,
+        frames=2,
+        frames_this_iteration=2,
+    )
+    assert "train/Q_C_at_clip_fraction_dir" in legacy_logged
+    assert "train/Q_C_at_clip_fraction_cat" in legacy_logged
 
 
 @pytest.mark.parametrize(

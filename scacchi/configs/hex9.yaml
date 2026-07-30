@@ -19,7 +19,7 @@ model:
   num_layers: 6
   compute_dtype: bfloat16
   resnet_v2: true
-  dirichlet_concentration_floor: null
+  dirichlet_head_parameterization: log_concentration
   dirichlet_initial_concentration: 3.1
   legacy_dirichlet_head_init: false
   rezero_kernel_init: variance_scaling
@@ -70,8 +70,8 @@ training:
     terminal_edge_targets: true
     terminal_parent_targets: true
     policy_target_mode: search
-    categorical_epsilon: 0.01
   regularization:
+    # Exact-outcome reference concentration; this does not clip the head.
     dirichlet_concentration_clip: 16.0
 
 eval:

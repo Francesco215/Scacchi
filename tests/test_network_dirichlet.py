@@ -25,36 +25,45 @@ from scacchi.types import (
 )
 
 
-def test_dirichlet_from_logits_uses_squared_softplus_concentration():
+def test_dirichlet_from_logits_uses_direct_log_concentration():
     mean_logits = jnp.array([[0.0, 0.0]])
-    concentration_logit = jnp.array([0.0])
+    log_concentration = jnp.log(jnp.array([3.0]))
 
-    alpha = dirichlet_from_logits(mean_logits, concentration_logit)
+    alpha = dirichlet_from_logits(mean_logits, log_concentration)
 
-    assert jnp.allclose(alpha.sum(axis=-1), jax.nn.softplus(concentration_logit) ** 2)
+    assert jnp.allclose(alpha.sum(axis=-1), jnp.array([3.0]))
     assert jnp.allclose(outcome_mean(alpha), jnp.array([[0.5, 0.5]]))
 
 
-def test_dirichlet_from_logits_smoothly_approaches_dumb_prior_floor():
-    mean_logits = jnp.array([[0.0, 0.0, 0.0]])
-    concentration_logit = jnp.array([-10.0])
+def test_direct_log_concentration_has_unsquashed_radial_gradient():
+    mean_logits = jnp.array([[0.0, 0.0]])
+    log_concentration = jnp.log(jnp.array([2.0]))
 
-    concentration = lambda logit: jnp.sum(
-        dirichlet_from_logits(
-            mean_logits,
-            logit,
-            concentration_floor=3.0,
-            concentration_clip=8.0,
+    def concentration(candidate):
+        return jnp.sum(
+            dirichlet_from_logits(mean_logits, candidate)
         )
+
+    total = concentration(log_concentration)
+    gradient = jax.grad(concentration)(log_concentration)
+
+    assert jnp.allclose(total, 2.0)
+    assert jnp.allclose(gradient, 2.0)
+
+
+def test_categorical_reference_does_not_clip_direct_head():
+    mean_logits = jnp.zeros((1, 3))
+    alpha = dirichlet_from_logits(
+        mean_logits,
+        jnp.log(jnp.array([32.0])),
+        concentration_clip=5.0,
     )
-    total = concentration(concentration_logit)
-    gradient = jax.grad(concentration)(concentration_logit)
 
-    assert 3.0 < total < 3.001
-    assert gradient[0] > 0.0
+    assert jnp.allclose(alpha.sum(axis=-1), jnp.array([32.0]))
+    assert jnp.allclose(outcome_mean(alpha), jnp.full((1, 3), 1 / 3))
 
 
-def test_bounded_dirichlet_concentration_has_gradients_away_from_both_limits():
+def test_legacy_parameterization_preserves_bounded_checkpoint_semantics():
     mean_logits = jnp.zeros((1, 3))
 
     def concentration(logit):
@@ -62,6 +71,7 @@ def test_bounded_dirichlet_concentration_has_gradients_away_from_both_limits():
             dirichlet_from_logits(
                 mean_logits,
                 logit,
+                parameterization="legacy",
                 concentration_floor=3.0,
                 concentration_clip=8.0,
             )
@@ -74,16 +84,6 @@ def test_bounded_dirichlet_concentration_has_gradients_away_from_both_limits():
     assert 3.0 < concentration(high) < 8.0
     assert jax.grad(concentration)(low)[0] > 0.0
     assert jax.grad(concentration)(high)[0] > 0.0
-
-
-def test_dirichlet_from_logits_clips_total_concentration():
-    mean_logits = jnp.array([[0.0, 0.0, 0.0]])
-    concentration_logit = jnp.array([100.0])
-
-    alpha = dirichlet_from_logits(mean_logits, concentration_logit, concentration_clip=5.0)
-
-    assert jnp.allclose(alpha.sum(axis=-1), jnp.array([5.0]))
-    assert jnp.allclose(outcome_mean(alpha), jnp.full((1, 3), 1 / 3))
 
 
 def test_boardlaw_dirichlet_net_shapes_and_positive_alphas():
@@ -121,7 +121,7 @@ def test_boardlaw_dirichlet_heads_initialize_near_uniform_dumb_prior():
 
     logits, alpha_v, alpha_q = model(obs, train=False)
 
-    assert model.dirichlet_concentration_floor is None
+    assert model.dirichlet_head_parameterization == "log_concentration"
     assert jnp.allclose(logits, jnp.zeros_like(logits))
     assert jnp.allclose(jax.nn.softmax(logits, axis=-1), jnp.full_like(logits, 0.1))
     expected_alpha = (3.0 + 0.1) / 3.0
@@ -136,7 +136,7 @@ def test_boardlaw_dirichlet_heads_accept_trainable_initial_concentration():
         num_outcomes=2,
         width=16,
         depth=2,
-        dirichlet_concentration_clip=100.0,
+        dirichlet_concentration_clip=8.0,
         dirichlet_initial_concentration=32.0,
         rngs=nnx.Rngs(0),
     )
@@ -150,28 +150,24 @@ def test_boardlaw_dirichlet_heads_accept_trainable_initial_concentration():
     assert jnp.allclose(outcome_mean(alpha_q), 0.5)
 
 
-def test_no_floor_concentration_keeps_recovery_gradient_below_dumb_prior():
+def test_direct_concentration_keeps_recovery_gradient_below_dumb_prior():
     mean_logits = jnp.zeros((1, 2))
     low_concentration = 0.5
-    low_logit = jnp.asarray(
-        [math.log(math.expm1(math.sqrt(low_concentration)))]
-    )
+    low_logit = jnp.asarray([math.log(low_concentration)])
 
     def concentration(logit):
         return jnp.sum(
-            dirichlet_from_logits(
-                mean_logits,
-                logit,
-                concentration_floor=None,
-                concentration_clip=100.0,
-            )
+            dirichlet_from_logits(mean_logits, logit)
         )
 
     assert jnp.allclose(concentration(low_logit), low_concentration)
-    assert jax.grad(concentration)(low_logit)[0] > 0.5
+    assert jnp.allclose(
+        jax.grad(concentration)(low_logit)[0],
+        low_concentration,
+    )
 
 
-def test_boardlaw_dirichlet_heads_accept_configurable_concentration_floor():
+def test_boardlaw_legacy_head_accepts_configurable_concentration_floor():
     model = BoardlawDirichletNet(
         num_actions=10,
         observation_shape=(3, 3, 4),
@@ -180,6 +176,7 @@ def test_boardlaw_dirichlet_heads_accept_configurable_concentration_floor():
         depth=2,
         dirichlet_concentration_clip=100.0,
         dirichlet_concentration_floor=32.0,
+        dirichlet_head_parameterization="legacy",
         rngs=nnx.Rngs(0),
     )
     obs = jnp.ones((4, 3, 3, 4))
@@ -214,15 +211,13 @@ def test_az_dirichlet_net_shapes_and_unit_alphas():
     assert jnp.allclose(alpha_q, jnp.ones_like(alpha_q))
 
 
-def test_az_dirichlet_heads_honor_configured_floor_and_initial_concentration():
+def test_az_dirichlet_heads_honor_direct_initial_concentration():
     model = AZDirichletNet(
         num_actions=10,
         observation_shape=(3, 3, 4),
         num_outcomes=2,
         num_channels=8,
         num_blocks=1,
-        dirichlet_concentration_clip=16.0,
-        dirichlet_concentration_floor=3.0,
         dirichlet_initial_concentration=3.1,
         rngs=nnx.Rngs(0),
     )
@@ -230,7 +225,7 @@ def test_az_dirichlet_heads_honor_configured_floor_and_initial_concentration():
 
     _, alpha_v, alpha_q = model(obs, train=False)
 
-    assert model.dirichlet_concentration_floor == 3.0
+    assert model.dirichlet_head_parameterization == "log_concentration"
     assert model.dirichlet_initial_concentration == 3.1
     assert jnp.allclose(jnp.sum(alpha_v, axis=-1), 3.1)
     assert jnp.allclose(jnp.sum(alpha_q, axis=-1), 3.1)
@@ -276,7 +271,7 @@ def test_build_model_supports_az_dirichlet_for_go_wdl3():
     assert model.num_outcomes == 3
 
 
-def test_build_model_passes_az_dirichlet_concentration_configuration():
+def test_build_model_passes_az_direct_log_concentration_configuration():
     config = Config(
         env=EnvConfig(
             id="go_9x9_white_wins_draw",
@@ -287,7 +282,6 @@ def test_build_model_passes_az_dirichlet_concentration_configuration():
             network=Network.aznet_dirichlet,
             num_channels=8,
             num_layers=1,
-            dirichlet_concentration_floor=3.0,
             dirichlet_initial_concentration=3.1,
         ),
         search=SearchConfig(kind=SearchKind.dirichlet_thompson),
@@ -302,7 +296,8 @@ def test_build_model_passes_az_dirichlet_concentration_configuration():
     )
 
     assert isinstance(model, AZDirichletNet)
-    assert model.dirichlet_concentration_floor == 3.0
+    assert model.dirichlet_head_parameterization == "log_concentration"
+    assert model.dirichlet_concentration_clip is None
     assert model.dirichlet_initial_concentration == 3.1
 
 
@@ -328,7 +323,7 @@ def test_dirichlet_thompson_null_hex_outcomes_builds_legacy_two_outcome_head():
     assert model.num_outcomes == 2
 
 
-def test_legacy_dirichlet_head_init_matches_runstate_initial_concentration():
+def test_legacy_random_head_initialization_uses_active_direct_transform():
     config = Config(
         env=EnvConfig(id="hex", num_outcomes=2),
         model=ModelConfig(
@@ -349,7 +344,7 @@ def test_legacy_dirichlet_head_init_matches_runstate_initial_concentration():
 
     _, alpha_v, alpha_q = model(jnp.zeros((1, 3, 3, 4)), train=False)
 
-    expected_total = jax.nn.softplus(jnp.array(0.0)) ** 2
+    expected_total = jnp.asarray(1.0)
     assert jnp.allclose(jnp.sum(alpha_v, axis=-1), expected_total)
     assert jnp.allclose(jnp.sum(alpha_q, axis=-1), expected_total)
 

@@ -115,41 +115,45 @@ fixed, and certified distance is unchanged.
 
 ## 2. Dirichlet parameterization
 
-Each Dirichlet head predicts mean logits $r$ and a concentration logit $t$:
+Each Dirichlet head predicts mean logits $r$ and a raw log-concentration
+$\eta$:
 
 $$
 \mu=\operatorname{softmax}(r),
 \qquad
+c=\exp(\eta),
+\qquad
 \alpha=c\mu.
 $$
 
-The modern `boardlaw_dirichlet` head uses a configurable concentration floor
-$c_{\min}$ and optional ceiling $c_{\max}$:
+Equivalently, $s=-\eta=\log(1/c)$ is a log-dispersion variable:
 
 $$
-c=
-\begin{cases}
-c_{\min}+\operatorname{softplus}(t),
-& c_{\max}\text{ is absent},\\[4pt]
-c_{\min}+(c_{\max}-c_{\min})\operatorname{sigmoid}(t),
-& c_{\max}\text{ is present}.
-\end{cases}
+c=\exp(-s).
 $$
 
-The optional unfloored head parameterization is
+The head bias is initialized directly as
 
 $$
-c=\operatorname{softplus}(t)^2,
+\eta_{\mathrm{init}}=\log c_{\mathrm{init}}.
 $$
 
-optionally clipped above. In every case, search receives the resulting positive
-vector $\alpha$ and does not reinterpret its learned concentration.
+There is no learned floor, squared-softplus transform, bounded sigmoid, or
+training-time concentration ceiling in this parameterization. The
+implementation clips $\eta$ only at very broad floating-point safety limits
+before exponentiating and uses the identity derivative through that numerical
+guard, so leaving the safe exponent range cannot create a zero-gradient dead
+zone. Search receives the positive vector $\alpha$ and does not reinterpret it.
 
-When categorical density supervision is active, the concentration must have a
-finite ceiling or an explicit regularizer. Moving the target point into the
-simplex interior prevents $\log 0$, but by itself does not stop point-density
-likelihood from favoring unbounded concentration. Scacchi therefore requires a
-finite `dirichlet_concentration_clip` for an active categorical head loss.
+Historical checkpoints store concentration-head coordinates for the earlier
+softplus/floor/sigmoid transforms. They are loaded only through the explicit
+`legacy` parameterization; those coordinates must never be silently treated as
+log-concentrations.
+
+The historically named
+`training.regularization.dirichlet_concentration_clip` is no longer applied to
+the direct-log head. In `full` loss mode it supplies the finite categorical
+reference concentration $c_{\mathrm{cat}}$ defined in Section 11.2.
 
 ---
 
@@ -960,52 +964,114 @@ $$
 
 ### 11.2 Typed Dirichlet-head loss
 
-In `full` mode, a search target $\beta$ trains both mean and concentration:
+The `full` objective uses concentration as a learned inverse-dispersion,
+analogous to heteroscedastic regression with a predicted log-variance. For a
+native Dirichlet target $\beta$, define
 
 $$
-\mathcal L_{\mathrm{full}}(\beta,\alpha_\theta)=
-D_{\mathrm{KL}}
-\left(
-\operatorname{Dirichlet}(\operatorname{stopgrad}\beta)
-\,\|\,
-\operatorname{Dirichlet}(\alpha_\theta)
-\right).
-$$
-
-In `mean` mode, only the categorical means are matched:
-
-$$
-\mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta)=
-D_{\mathrm{KL}}
-\left(
-\operatorname{stopgrad}\mu(\beta)
-\,\|\,
-\mu(\alpha_\theta)
-\right).
-$$
-
-For a categorical outcome $z$ in a $K$-outcome space, define the
-epsilon-interior point
-
-$$
-\phi_z^\epsilon=(1-K\epsilon)e_z+\epsilon\mathbf 1,
+\beta_0=\sum_i\beta_i,
 \qquad
-0<\epsilon<\frac1K.
+m=\frac{\beta}{\beta_0},
+\qquad
+v=\frac1{\beta_0},
 $$
 
-Its target coordinate is $1-(K-1)\epsilon$ and every other coordinate is
-$\epsilon$. This is `training.losses.categorical_epsilon`; search-time exact
-tags need no smoothing or message floor. The native categorical loss is the
-negative log density of the predicted Dirichlet at this stop-gradient point:
+where $v$ is the target inverse-concentration, not the literal coordinate
+variance of a Dirichlet. Let
 
 $$
-\begin{aligned}
-\mathcal L_{\mathrm{cat}}(\alpha_\theta,z)
-&=-\log p_{\operatorname{Dirichlet}(\alpha_\theta)}(\phi_z^\epsilon)\\
-&=-\log\Gamma(\alpha_0)
-+\sum_i\log\Gamma(\alpha_i)
--\sum_i(\alpha_i-1)\log\phi_{z,i}^\epsilon.
-\end{aligned}
+d(m,\mu_\theta)
+=D_{\mathrm{KL}}
+\left(
+\operatorname{stopgrad}(m)
+\,\|\,
+\mu_\theta
+\right).
+$$
+
+With $c_\theta=\exp(\eta_\theta)$, the coupled loss is
+
+$$
+\boxed{
+\mathcal L_{\mathrm{disp}}(\beta;\mu_\theta,c_\theta)
+=-\log(c_\theta v)
++c_\theta\left(v+d(m,\mu_\theta)\right)-1
+}.
+$$
+
+Writing $s_\theta=-\eta_\theta$ exposes the log-variance form directly:
+
+$$
+\mathcal L_{\mathrm{disp}}
+=s_\theta-\log v
++e^{-s_\theta}\left(v+d(m,\mu_\theta)\right)-1.
+$$
+
+For stable evaluation near $c_\theta=\beta_0$, the implementation uses
+
+$$
+x=\log c_\theta-\log\beta_0,
+\qquad
+\mathcal L_{\mathrm{disp}}
+=\operatorname{expm1}(x)-x+c_\theta d(m,\mu_\theta).
+$$
+
+The radial gradient and conditional optimum are
+
+$$
+\frac{\partial\mathcal L_{\mathrm{disp}}}{\partial\eta_\theta}
+=c_\theta\left(v+d(m,\mu_\theta)\right)-1,
+\qquad
+c_\theta^*=\frac1{v+d(m,\mu_\theta)}.
+$$
+
+At the joint optimum,
+
+$$
+\mu_\theta=m,
+\qquad
+c_\theta=\beta_0,
+\qquad
+\alpha_\theta=\beta.
+$$
+
+Mean error deliberately lowers the optimal concentration, just as residual
+error raises a learned Gaussian variance. Once the mean matches a target with
+$\beta_0=3$, the log-concentration gradients at $c_\theta=2,3,4$ are
+$-1/3,0,+1/3$ respectively. Thus a head initialized at two receives a direct
+signal toward three rather than a signal attenuated by an outer softplus or
+sigmoid.
+
+For an exact categorical outcome $z$, use the exact mean target $e_z$ and a
+finite loss-only reference concentration $c_{\mathrm{cat}}>0$:
+
+$$
+\boxed{
+\mathcal L_{\mathrm{cat,full}}(\alpha_\theta,z)
+=-\log\frac{c_\theta}{c_{\mathrm{cat}}}
++c_\theta
+\left(
+\frac1{c_{\mathrm{cat}}}-\log\mu_{\theta,z}
+\right)-1
+}.
+$$
+
+As $\mu_{\theta,z}\to1$, the optimum approaches
+$c_\theta=c_{\mathrm{cat}}$. This makes the deterministic target well posed
+without moving it to an arbitrary interior point and without evaluating a
+continuous Dirichlet density. The reference affects training only; search
+still treats the native categorical sidecar as exact.
+
+In `mean` mode concentration is ignored:
+
+$$
+\mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta)
+=D_{\mathrm{KL}}\left(
+\operatorname{stopgrad}\mu(\beta)\,\|\,\mu(\alpha_\theta)
+\right),
+\qquad
+\mathcal L_{\mathrm{cat,mean}}(\alpha_\theta,z)
+=-\log\mu_{\theta,z}.
 $$
 
 The complete typed loss is
@@ -1013,23 +1079,22 @@ The complete typed loss is
 $$
 \mathcal L_{\mathrm{native}}(T,\alpha_\theta)=
 \begin{cases}
-\mathcal L_{\mathrm{full}}(\beta,\alpha_\theta),
+\mathcal L_{\mathrm{disp}}(\beta;\mu_\theta,c_\theta),
 &T=\operatorname{Dir}(\beta),\ \texttt{full},\\
 \mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta),
 &T=\operatorname{Dir}(\beta),\ \texttt{mean},\\
-\mathcal L_{\mathrm{cat}}(\alpha_\theta,z),
-&T=\operatorname{Cat}(z,\tau)\text{ in either mode},\\
+\mathcal L_{\mathrm{cat,full}}(\alpha_\theta,z),
+&T=\operatorname{Cat}(z,\tau),\ \texttt{full},\\
+\mathcal L_{\mathrm{cat,mean}}(\alpha_\theta,z),
+&T=\operatorname{Cat}(z,\tau),\ \texttt{mean},\\
 0,&T=\operatorname{Pad}.
 \end{cases}
 $$
 
 No target Dirichlet is constructed for a categorical row. Distance controls
-proof propagation and action choice but not this neural NLL. As a continuous
-density NLL, the loss may legitimately be negative. Epsilon prevents boundary
-logs; the finite concentration ceiling from Section 2 makes the optimization
-well posed. For numerical defense, the implementation evaluates the formula at
-$\max(\alpha_{\theta,i},10^{-6})$ componentwise; this is inert for the positive,
-floored head outputs used in normal training.
+proof propagation and action choice but not this neural loss. Both full losses
+are nonnegative. There are no gamma/digamma terms, epsilon-interior targets, or
+large-loss cutoffs.
 
 The value loss applies this to $(T^V,\alpha_\theta^V)$. The Q loss applies it to
 $(T^Q(a),\alpha_\theta^Q(a))$ using `q_target_weight` to validate/scale each
@@ -1054,7 +1119,8 @@ $$
 Optional terminal-edge and terminal-parent handling may additionally mark an
 exact replay target categorical. The auxiliary mean-outcome term is masked
 where the corresponding native target is already categorical, so that head's
-supervision is simply the density NLL rather than duplicated categorical loss.
+supervision is the typed categorical loss rather than duplicated mean
+supervision.
 
 The configured Dirichlet training objective is
 
@@ -1178,8 +1244,8 @@ A correct implementation maintains all of the following:
     certificates or become categorical targets.
 15. Categorical ties use the search RNG to sample uniformly among equally good
     certified actions; they never trigger a policy reevaluation.
-16. Categorical V/Q targets use density NLL in both Dirichlet loss modes;
-    unresolved targets retain the configured full/mean behavior.
+16. In `full` mode, unresolved and categorical V/Q targets use the coupled
+    log-dispersion score. In `mean` mode, both use mean-only KL/cross-entropy.
 17. Terminal means categorical tag plus node payload zero; zero support alone
     is not terminal.
 18. `num_simulations` and $N+1$ are static iteration/capacity bounds;
@@ -1187,35 +1253,41 @@ A correct implementation maintains all of the following:
 
 ---
 
-## Appendix A. Dirichlet KL
+## Appendix A. Properties of the log-dispersion score
 
-For $\operatorname{Dirichlet}(\beta)$ and
-$\operatorname{Dirichlet}(\alpha)$, with
+Write the full loss in terms of a target inverse-concentration $v>0$, a
+nonnegative mean discrepancy $d\ge0$, and predicted concentration $c>0$:
 
 $$
-\beta_0=\sum_i\beta_i,
+\mathcal L=-\log(cv)+c(v+d)-1.
+$$
+
+Let $a=cv$ and $t=d/v$. Then
+
+$$
+\mathcal L=(a-1-\log a)+at\ge0.
+$$
+
+For $\eta=\log c$,
+
+$$
+\frac{\partial\mathcal L}{\partial\eta}
+=c(v+d)-1,
 \qquad
-\alpha_0=\sum_i\alpha_i,
+\frac{\partial^2\mathcal L}{\partial\eta^2}
+=c(v+d)>0.
 $$
 
-the full target-to-prediction KL is
+Therefore the unique optimum for fixed mean is
 
 $$
-\begin{aligned}
-D_{\mathrm{KL}}
-\left(
-\operatorname{Dirichlet}(\beta)
-\,\|\,
-\operatorname{Dirichlet}(\alpha)
-\right)
-={}&
-\log\Gamma(\beta_0)-\log\Gamma(\alpha_0)\\
-&+\sum_i\left[\log\Gamma(\alpha_i)-\log\Gamma(\beta_i)\right]\\
-&+\sum_i(\beta_i-\alpha_i)
-\left[\psi(\beta_i)-\psi(\beta_0)\right].
-\end{aligned}
+c^*=\frac1{v+d},
+\qquad
+\mathcal L^*=\log\left(1+\frac d v\right).
 $$
 
-This appendix applies only to native Dirichlet targets, for which $\beta$ is
-stop-gradient. Native categorical targets have no $\beta$ and instead use the
-density NLL in Section 11.2.
+For a Dirichlet target, $v=1/\beta_0$ and
+$d=D_{\mathrm{KL}}(\mu(\beta)\|\mu_\theta)$. The unique joint optimum is
+$\mu_\theta=\mu(\beta)$ and $c_\theta=\beta_0$. For a categorical target,
+$v=1/c_{\mathrm{cat}}$ and $d=-\log\mu_{\theta,z}$; its infimum is approached
+as $\mu_{\theta,z}\to1$ and $c_\theta\to c_{\mathrm{cat}}$.

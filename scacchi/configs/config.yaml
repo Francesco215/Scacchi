@@ -12,6 +12,7 @@ model:
   num_channels: 128
   num_layers: 6
   resnet_v2: true
+  dirichlet_head_parameterization: log_concentration
 
 selfplay:
   batch_size: 2048
@@ -51,9 +52,9 @@ training:
     loss_mask_mode: value
     terminal_edge_targets: true
     terminal_parent_targets: true
-    categorical_epsilon: 1e-4
 
   regularization:
+    # Finite concentration learned for a perfectly classified exact outcome.
     dirichlet_concentration_clip: 300.0
 
 eval:

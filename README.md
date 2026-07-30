@@ -19,8 +19,8 @@ Search refines uncertain WDL beliefs by passing Dirichlet messages through the
 tree and propagates exact terminal results as native categorical
 outcome/distance certificates. Categorical branches are absorbing and pruned;
 the search-improved policy compares their exact utility with Thompson samples
-from unresolved branches. Value/Q heads use posterior KL for unresolved targets
-and epsilon-interior Dirichlet density NLL for categorical targets.
+from unresolved branches. Value/Q heads predict log-concentration directly and
+use a coupled mean/dispersion score for unresolved and categorical targets.
 
 Q supervision selects legal actions with positive search evidence, together
 with legal solved actions:

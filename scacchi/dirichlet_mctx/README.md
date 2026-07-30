@@ -33,7 +33,7 @@ The module map is also parallel to MCTX:
 - `base.py`: root, expansion, and policy-output contracts.
 - `tree.py`: compact fixed-capacity `Tree` and update-view types.
 - `outcomes.py`: outcome sentinels, perspective alignment, and utilities.
-- `native_targets.py`: native target tags, smoothing, and categorical density NLL.
+- `native_targets.py`: native target tags and fixed-shape metadata helpers.
 - `action_selection.py`: one node-local Thompson selector used everywhere.
 - `search.py`: `simulate -> expand -> bottom-up repair`.
 - `policies.py`: the public `dirichlet_thompson_policy` wrapper.
@@ -119,12 +119,13 @@ the stored alpha; exact sidecars still own selection, propagation, and targets.
 
 The backend returns the raw app-style unresolved caches together with native
 categorical tags. Scacchi trains unresolved Q/V targets toward the
-effective alphas and cache. Categorical Q/V targets instead use the negative
-log density of the predicted Dirichlet at an epsilon-interior categorical
-point; neither structural support nor the temporary cache projection becomes a
-target. Individual categorical-edge counts no longer exist. Evidence-mass Q
-weighting reads counts only for unresolved rows; categorical rows receive their
-explicit categorical weight.
+effective alphas and cache with the coupled log-dispersion score documented in
+`math.md`. Categorical Q/V targets use the same score with an exact one-hot
+mean and a finite loss-only reference concentration; neither structural
+support nor the temporary cache projection becomes a target. Individual
+categorical-edge counts no longer exist. Evidence-mass Q weighting reads
+counts only for unresolved rows; categorical rows receive their explicit
+categorical weight.
 
 Static mathematical choices belong to the update callable rather than the
 tree. For example, callers can pass

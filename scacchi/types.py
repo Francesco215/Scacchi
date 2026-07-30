@@ -68,6 +68,13 @@ class DirichletLossMode(StrEnum):
     mean = "mean"
 
 
+class DirichletHeadParameterization(StrEnum):
+    log_concentration = "log_concentration"
+    # Checkpoint-compatibility path for heads trained before the direct
+    # log-concentration parameterization was introduced.
+    legacy = "legacy"
+
+
 class LossMaskMode(StrEnum):
     search = "search"
     value = "value"
@@ -94,13 +101,10 @@ def _require_ge(name: str, value: int | None, minimum: int) -> None:
 
 
 def _require_gt(name: str, value: float | int | None, minimum: float) -> None:
-    if value is not None and value <= minimum:
+    if value is not None and (
+        not math.isfinite(float(value)) or value <= minimum
+    ):
         raise ValueError(f"{name} must be > {minimum}; got {value}.")
-
-
-def _require_range(name: str, value: float, *, lower: float, upper: float) -> None:
-    if not lower < value < upper:
-        raise ValueError(f"{name} must be > {lower} and < {upper}; got {value}.")
 
 
 @dataclass
@@ -130,6 +134,10 @@ class ModelConfig:
     # TODO: remove the three config below and settle on some defaults in the code
     resnet_v2: bool = True
     legacy_dirichlet_head_init: bool = False
+    dirichlet_head_parameterization: DirichletHeadParameterization = (
+        DirichletHeadParameterization.log_concentration
+    )
+    # Used only by the legacy checkpoint-compatible parameterization.
     dirichlet_concentration_floor: float | None = None
     dirichlet_initial_concentration: float | None = None
     rezero_kernel_init: RezeroKernelInit = RezeroKernelInit.variance_scaling
@@ -145,6 +153,17 @@ class ModelConfig:
             self.dirichlet_initial_concentration,
             0.0,
         )
+        if (
+            self.dirichlet_head_parameterization
+            == DirichletHeadParameterization.log_concentration
+            and self.dirichlet_concentration_floor is not None
+        ):
+            raise ValueError(
+                "model.dirichlet_concentration_floor is incompatible with "
+                "the direct log-concentration head; remove the floor or set "
+                "model.dirichlet_head_parameterization='legacy' when loading "
+                "an old checkpoint."
+            )
 
 
 
@@ -394,14 +413,13 @@ class TrainingLossConfig:
     q_supervision: QSupervisionConfig = field(
         default_factory=QSupervisionConfig
     )
-    # ``full`` trains the coupled Dirichlet density; ``mean`` ignores evidence
-    # mass.
+    # ``full`` trains the coupled mean/dispersion score; ``mean`` ignores
+    # concentration.
     dirichlet_loss_mode: DirichletLossMode = DirichletLossMode.full
     loss_mask_mode: LossMaskMode = LossMaskMode.search
     terminal_edge_targets: bool = False
     terminal_parent_targets: bool = False
     policy_target_mode: PolicyTargetMode = PolicyTargetMode.search
-    categorical_epsilon: float = 1e-4
 
     def __post_init__(self) -> None:
         if self.dirichlet_loss_mode == DirichletLossMode.mean:
@@ -422,12 +440,6 @@ class TrainingLossConfig:
             ("training.losses.q_outcome_weight", self.q_outcome_weight),
         ):
             _require_gt(name, value, -1.0)
-        _require_range(
-            "training.losses.categorical_epsilon",
-            self.categorical_epsilon,
-            lower=0.0,
-            upper=1.0 / 3.0,
-        )
 
     def active_dirichlet_weights(self) -> list[str]:
         weights = (
@@ -441,6 +453,9 @@ class TrainingLossConfig:
 
 @dataclass
 class TrainingRegularizationConfig:
+    # Historical name retained for configuration compatibility. With the
+    # direct log-concentration head this is the finite categorical reference
+    # concentration c_cat; it no longer clips model outputs.
     dirichlet_concentration_clip: float | None = 8.0
 
     def __post_init__(self) -> None:
@@ -622,21 +637,25 @@ class TrainConfig:
             self.selfplay.search.kind == SearchKind.dirichlet_thompson
         )
         categorical_head_loss_active = (
-            losses.value_dir_kl_weight > 0.0
-            and (search_emits_categorical or losses.terminal_parent_targets)
-        ) or (
-            losses.q_dir_kl_weight > 0.0
-            and (search_emits_categorical or losses.terminal_edge_targets)
+            losses.dirichlet_loss_mode == DirichletLossMode.full
+        ) and (
+            (
+                losses.value_dir_kl_weight > 0.0
+                and (search_emits_categorical or losses.terminal_parent_targets)
+            )
+            or (
+                losses.q_dir_kl_weight > 0.0
+                and (search_emits_categorical or losses.terminal_edge_targets)
+            )
         )
         if (
             categorical_head_loss_active
             and self.training.regularization.dirichlet_concentration_clip is None
         ):
             raise ValueError(
-                "categorical Dirichlet-density NLL requires a finite "
-                "training.regularization.dirichlet_concentration_clip; "
-                "epsilon moves the target off the simplex boundary but does "
-                "not bound the density optimum."
+                "full categorical dispersion training requires a finite "
+                "training.regularization.dirichlet_concentration_clip to "
+                "serve as the categorical reference concentration."
             )
         if self.eval.baseline == EvalBaseline.none and self.eval.interval != 0:
             raise ValueError("eval.baseline=none requires eval.interval=0.")
@@ -654,9 +673,20 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
         return OmegaConf.create(OmegaConf.to_container(value, resolve=False))
 
     training = aliased.get("training")
+    deprecated_density_loss = False
     if isinstance(training, DictConfig):
         losses = training.get("losses")
         if isinstance(losses, DictConfig):
+            if "categorical_epsilon" in losses:
+                losses.pop("categorical_epsilon")
+                deprecated_density_loss = True
+                warnings.warn(
+                    "training.losses.categorical_epsilon is deprecated and "
+                    "ignored because categorical targets now use the finite "
+                    "log-dispersion score.",
+                    FutureWarning,
+                    stacklevel=3,
+                )
             old_fields = {
                 "q_loss_weight_mode",
                 "q_dir_kl_reduction",
@@ -710,6 +740,24 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
                     "action_set": action_set,
                     "reduction": reduction,
                 }
+
+    model = aliased.get("model")
+    if model is None and deprecated_density_loss:
+        aliased["model"] = OmegaConf.create({})
+        model = aliased["model"]
+    if isinstance(model, DictConfig) and "dirichlet_head_parameterization" not in model:
+        legacy_floor = model.get("dirichlet_concentration_floor")
+        if deprecated_density_loss or legacy_floor is not None:
+            model["dirichlet_head_parameterization"] = "legacy"
+            warnings.warn(
+                "configuration predates the direct log-concentration head; "
+                "using the legacy concentration parameterization for "
+                "checkpoint compatibility. Set "
+                "model.dirichlet_head_parameterization='log_concentration' "
+                "for new training.",
+                FutureWarning,
+                stacklevel=3,
+            )
 
     selfplay = aliased.get("selfplay")
     if selfplay is None:

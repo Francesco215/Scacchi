@@ -90,12 +90,17 @@ def _count(values: Any) -> float:
 
 def _concentration_metrics(train_metrics: Any) -> dict[str, float]:
     result: dict[str, float] = {}
+    legacy_flags = np.asarray(
+        jax.device_get(train_metrics.dirichlet_head_is_legacy),
+        dtype=np.bool_,
+    )
+    is_legacy_head = bool(np.all(legacy_flags))
     for head, lower in (("V", "v"), ("Q", "q")):
         dir_count = getattr(train_metrics, f"{lower}_dirichlet_target_count")
         cat_count = getattr(train_metrics, f"{lower}_categorical_target_count")
         native_count = getattr(train_metrics, f"{lower}_native_target_count")
         native_total = _count(native_count)
-        result.update({
+        head_metrics: dict[str, float] = {
             f"train/alpha_{head}_concentration": _weighted_mean(getattr(train_metrics, f"alpha_{head}_concentration"), native_count),
             f"train/alpha_{head}_concentration_std": _pooled_std(getattr(train_metrics, f"alpha_{head}_concentration"), getattr(train_metrics, f"alpha_{head}_concentration_std"), native_count),
             f"train/{head}_C_pred_mean_dir": _weighted_mean(getattr(train_metrics, f"alpha_{head}_dirichlet_concentration"), dir_count),
@@ -103,14 +108,19 @@ def _concentration_metrics(train_metrics: Any) -> dict[str, float]:
             f"train/{head}_C_target_mean_dir": _weighted_mean(getattr(train_metrics, f"beta_{head}_concentration"), dir_count),
             f"train/{head}_C_target_std_dir": _pooled_std(getattr(train_metrics, f"beta_{head}_concentration"), getattr(train_metrics, f"beta_{head}_concentration_std"), dir_count),
             f"train/{head}_C_log_mae_dir": _weighted_mean(getattr(train_metrics, f"{lower}_dirichlet_log_concentration_mae"), dir_count),
-            f"train/{head}_C_at_floor_fraction_dir": _weighted_mean(getattr(train_metrics, f"alpha_{head}_dirichlet_concentration_floor_fraction"), dir_count),
-            f"train/{head}_C_at_clip_fraction_dir": _weighted_mean(getattr(train_metrics, f"alpha_{head}_dirichlet_concentration_clip_fraction"), dir_count),
             f"train/{head}_C_pred_mean_cat": _weighted_mean(getattr(train_metrics, f"alpha_{head}_categorical_concentration"), cat_count),
-            f"train/{head}_C_at_clip_fraction_cat": _weighted_mean(getattr(train_metrics, f"alpha_{head}_categorical_concentration_clip_fraction"), cat_count),
+            f"train/{head}_C_at_or_above_reference_fraction_cat": _weighted_mean(getattr(train_metrics, f"alpha_{head}_categorical_concentration_reference_fraction"), cat_count),
             f"data/{lower}_categorical_target_fraction": 0.0 if native_total <= 0.0 else _count(cat_count) / native_total,
             f"data/{lower}_dirichlet_target_count": _count(dir_count),
             f"data/{lower}_categorical_target_count": _count(cat_count),
-        })
+        }
+        if is_legacy_head:
+            head_metrics.update({
+                f"train/{head}_C_at_floor_fraction_dir": _weighted_mean(getattr(train_metrics, f"alpha_{head}_dirichlet_concentration_floor_fraction"), dir_count),
+                f"train/{head}_C_at_clip_fraction_dir": _weighted_mean(getattr(train_metrics, f"alpha_{head}_dirichlet_concentration_clip_fraction"), dir_count),
+                f"train/{head}_C_at_clip_fraction_cat": _weighted_mean(getattr(train_metrics, f"alpha_{head}_categorical_concentration_reference_fraction"), cat_count),
+            })
+        result.update(head_metrics)
     return result
 
 

@@ -21,7 +21,7 @@ model:
   num_layers: 8
   compute_dtype: bfloat16
   resnet_v2: true
-  dirichlet_concentration_floor: 2.0
+  dirichlet_head_parameterization: log_concentration
   dirichlet_initial_concentration: 2.1
 
 selfplay:
@@ -63,8 +63,8 @@ training:
     terminal_edge_targets: true
     terminal_parent_targets: true
     policy_target_mode: search
-    categorical_epsilon: 0.01
   regularization:
+    # Exact-outcome reference concentration; this does not clip the head.
     dirichlet_concentration_clip: 100.0
 
 eval:
@@ -102,4 +102,4 @@ logging:
 checkpointing:
   max_to_keep: 1
   save_interval_steps: 10
-  directory: checkpoints/hex7_nativecat_fullc_c100_dt64p32_floor2_seed7104_v7
+  directory: checkpoints/hex7_logdisp_c100_dt64p32_seed7104_v8

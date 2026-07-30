@@ -1,9 +1,9 @@
+import math
 from typing import Any, NamedTuple
 
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from jax.scipy.special import digamma, gammaln
 from jaxtyping import Array, Bool, Float, Int, Int8, Int32
 import optax
 
@@ -12,21 +12,17 @@ from .dirichlet_mctx.native_targets import (
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
     NativeTargetFields,
-    dirichlet_nll_at_categorical,
     native_fields_from_beta,
 )
 from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, assert_batch_axis_sharded
 from .play import TrainingSamples
 
 
-DIRICHLET_KL_LOSS_CUTOFF = 1000.0
-
 # A fixed, config-independent grid makes concentration histograms directly
 # comparable across runs.  The first interval covers concentrations close to
-# zero; the remaining intervals are approximately uniform in log2 space.  All
-# current model caps fit comfortably below the final edge (the largest shipped
-# cap is 300).  `_masked_concentration_histogram_counts` deliberately folds
-# larger finite values into the final bin instead of dropping observations.
+# zero; the remaining intervals are approximately uniform in log2 space.
+# `_masked_concentration_histogram_counts` deliberately folds large finite
+# values into the final bin instead of dropping observations.
 CONCENTRATION_HISTOGRAM_NUM_BINS = 100
 CONCENTRATION_HISTOGRAM_BIN_EDGES: tuple[float, ...] = (
     0.0,
@@ -125,8 +121,15 @@ class TrainMetrics(NamedTuple):
     alpha_Q_dirichlet_concentration_clip_fraction: Float[Array, "*batch"]
     alpha_V_concentration_clip_fraction: Float[Array, "*batch"]
     alpha_Q_concentration_clip_fraction: Float[Array, "*batch"]
-    alpha_V_categorical_concentration_clip_fraction: Float[Array, "*batch"]
-    alpha_Q_categorical_concentration_clip_fraction: Float[Array, "*batch"]
+    alpha_V_categorical_concentration_reference_fraction: Float[
+        Array,
+        "*batch",
+    ]
+    alpha_Q_categorical_concentration_reference_fraction: Float[
+        Array,
+        "*batch",
+    ]
+    dirichlet_head_is_legacy: Float[Array, "*batch"]
     v_dirichlet_target_count: Float[Array, "*batch"]
     q_dirichlet_target_count: Float[Array, "*batch"]
     v_categorical_target_count: Float[Array, "*batch"]
@@ -451,51 +454,15 @@ def _masked_std(value: jax.Array, mask: jax.Array) -> jax.Array:
     return jnp.sqrt(jnp.maximum(variance, 0.0))
 
 
-def _bounded_loss_mask(
-    loss: jax.Array,
-    mask: jax.Array,
-    *,
-    cutoff: float = DIRICHLET_KL_LOSS_CUTOFF,
-) -> jax.Array:
-    return mask.astype(jnp.bool_) & jnp.isfinite(loss) & (loss <= cutoff)
-
-
 def _native_loss_mask(
     loss: jax.Array,
     mask: jax.Array,
     target_kind: jax.Array,
-    *,
-    cutoff: float = DIRICHLET_KL_LOSS_CUTOFF,
 ) -> jax.Array:
-    """Bound posterior KLs while retaining every finite categorical NLL."""
+    """Keep every finite active native loss; no large-loss dead zone."""
 
-    target_kind = jnp.asarray(target_kind)
-    categorical = target_kind == int(TARGET_CATEGORICAL)
-    within_bound = categorical | (loss <= cutoff)
-    return mask.astype(jnp.bool_) & jnp.isfinite(loss) & within_bound
-
-
-def _bounded_masked_mean(
-    loss: jax.Array,
-    mask: jax.Array,
-    *,
-    cutoff: float = DIRICHLET_KL_LOSS_CUTOFF,
-) -> jax.Array:
-    active_mask = mask.astype(jnp.bool_)
-    bounded_mask = _bounded_loss_mask(loss, active_mask, cutoff=cutoff)
-    safe_loss = jnp.where(
-        bounded_mask,
-        jnp.nan_to_num(loss),
-        jnp.zeros_like(loss),
-    )
-    mean = _masked_mean(safe_loss, bounded_mask)
-    active_count = jnp.sum(active_mask.astype(loss.dtype))
-    kept_count = jnp.sum(bounded_mask.astype(loss.dtype))
-    return jnp.where(
-        (active_count > 0) & (kept_count == 0),
-        jnp.asarray(jnp.nan, dtype=loss.dtype),
-        mean,
-    )
+    del target_kind
+    return mask.astype(jnp.bool_) & jnp.isfinite(loss)
 
 
 def _native_masked_mean(
@@ -676,33 +643,14 @@ def _dirichlet_mean_categorical_nll(alpha: jax.Array, outcome: jax.Array) -> jax
     dtype = jnp.result_type(alpha, jnp.float32)
     eps = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
     alpha = jnp.maximum(alpha.astype(dtype), eps)
-    probs = alpha / jnp.sum(alpha, axis=-1, keepdims=True)
+    log_probs = jax.nn.log_softmax(jnp.log(alpha), axis=-1)
     clipped_outcome = jnp.clip(jnp.asarray(outcome, dtype=jnp.int32), 0, alpha.shape[-1] - 1)
-    outcome_prob = jnp.take_along_axis(
-        probs,
+    outcome_log_prob = jnp.take_along_axis(
+        log_probs,
         clipped_outcome[..., None],
         axis=-1,
     ).squeeze(axis=-1)
-    return -jnp.log(jnp.maximum(outcome_prob, eps))
-
-
-def _dirichlet_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
-    dtype = jnp.result_type(beta, alpha)
-    eps = jnp.asarray(1e-6, dtype=dtype)
-    beta = jax.lax.stop_gradient(jnp.maximum(beta.astype(dtype), eps))
-    alpha = jnp.maximum(alpha.astype(dtype), eps)
-
-    beta_sum = jnp.sum(beta, axis=-1)
-    alpha_sum = jnp.sum(alpha, axis=-1)
-    return (
-        gammaln(beta_sum)
-        - gammaln(alpha_sum)
-        + jnp.sum(gammaln(alpha) - gammaln(beta), axis=-1)
-        + jnp.sum(
-            (beta - alpha) * (digamma(beta) - digamma(beta_sum)[..., None]),
-            axis=-1,
-        )
-    )
+    return -outcome_log_prob
 
 
 def _dirichlet_mean_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
@@ -713,14 +661,92 @@ def _dirichlet_mean_kl(beta: jax.Array, alpha: jax.Array) -> jax.Array:
     beta = jnp.maximum(beta.astype(dtype), eps)
     alpha = jnp.maximum(alpha.astype(dtype), eps)
     target = jax.lax.stop_gradient(beta / jnp.sum(beta, axis=-1, keepdims=True))
-    prediction = alpha / jnp.sum(alpha, axis=-1, keepdims=True)
+    prediction_log = jax.nn.log_softmax(jnp.log(alpha), axis=-1)
     return jnp.sum(
         target
         * (
             jnp.log(jnp.maximum(target, eps))
-            - jnp.log(jnp.maximum(prediction, eps))
+            - prediction_log
         ),
         axis=-1,
+    )
+
+
+def _dirichlet_dispersion_loss(
+    beta: jax.Array,
+    alpha: jax.Array,
+) -> jax.Array:
+    """Coupled mean/inverse-concentration score for a Dirichlet target.
+
+    For target concentration beta_0, prediction concentration c, and
+    d=KL(mu(beta)||mu(alpha)), this evaluates
+
+        expm1(log(c / beta_0)) - log(c / beta_0) + c * d.
+
+    It is nonnegative and has its unique optimum at alpha == beta.
+    """
+
+    dtype = jnp.result_type(beta, alpha, jnp.float32)
+    tiny = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
+    beta = jax.lax.stop_gradient(jnp.maximum(beta.astype(dtype), tiny))
+    alpha = jnp.maximum(alpha.astype(dtype), tiny)
+    beta_concentration = jnp.sum(beta, axis=-1)
+    concentration = jnp.sum(alpha, axis=-1)
+    target_mean = beta / beta_concentration[..., None]
+    # Normalize through log-softmax so radial gradients remain finite even
+    # when a direct log-concentration head predicts an extremely small mass.
+    prediction_log_mean = jax.nn.log_softmax(jnp.log(alpha), axis=-1)
+    mean_kl = jnp.sum(
+        target_mean
+        * (
+            jnp.log(target_mean)
+            - prediction_log_mean
+        ),
+        axis=-1,
+    )
+    log_ratio = jnp.log(concentration) - jnp.log(beta_concentration)
+    return jnp.expm1(log_ratio) - log_ratio + concentration * mean_kl
+
+
+def _categorical_dispersion_loss(
+    alpha: jax.Array,
+    outcome: jax.Array,
+    reference_concentration: float,
+) -> jax.Array:
+    """Coupled exact-outcome/reference-concentration score."""
+
+    reference_concentration = float(reference_concentration)
+    if (
+        not math.isfinite(reference_concentration)
+        or reference_concentration <= 0.0
+    ):
+        raise ValueError(
+            "categorical reference concentration must be finite and > 0; "
+            f"got {reference_concentration}"
+        )
+    dtype = jnp.result_type(alpha, jnp.float32)
+    tiny = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
+    alpha = jnp.maximum(alpha.astype(dtype), tiny)
+    concentration = jnp.sum(alpha, axis=-1)
+    prediction_log_mean = jax.nn.log_softmax(jnp.log(alpha), axis=-1)
+    outcome = jnp.asarray(outcome, dtype=jnp.int32)
+    valid_outcome = (outcome >= 0) & (outcome < alpha.shape[-1])
+    safe_outcome = jnp.clip(outcome, 0, alpha.shape[-1] - 1)
+    outcome_log_probability = jnp.take_along_axis(
+        prediction_log_mean,
+        safe_outcome[..., None],
+        axis=-1,
+    ).squeeze(axis=-1)
+    mean_nll = -outcome_log_probability
+    log_ratio = (
+        jnp.log(concentration)
+        - jnp.log(jnp.asarray(reference_concentration, dtype=dtype))
+    )
+    loss = jnp.expm1(log_ratio) - log_ratio + concentration * mean_nll
+    return jnp.where(
+        valid_outcome,
+        loss,
+        jnp.asarray(jnp.nan, dtype=loss.dtype),
     )
 
 
@@ -730,7 +756,7 @@ def _native_dirichlet_loss(
     target_kind: jax.Array,
     target_outcome: jax.Array,
     target_weight: jax.Array,
-    categorical_epsilon: float,
+    categorical_reference_concentration: float | None,
     loss_mode: str,
 ) -> jax.Array:
     target_kind = jnp.asarray(target_kind)
@@ -747,16 +773,31 @@ def _native_dirichlet_loss(
         jnp.ones_like(beta),
     )
     if loss_mode == "full":
-        dir_loss = _dirichlet_kl(safe_beta, alpha)
+        dir_loss = _dirichlet_dispersion_loss(safe_beta, alpha)
+        reference_concentration = (
+            1.0
+            if categorical_reference_concentration is None
+            else float(categorical_reference_concentration)
+        )
+        cat_loss = _categorical_dispersion_loss(
+            alpha,
+            jnp.where(valid_categorical_outcome, target_outcome, 0),
+            reference_concentration,
+        )
+        if categorical_reference_concentration is None:
+            cat_loss = jnp.where(
+                categorical_target,
+                jnp.asarray(jnp.nan, dtype=cat_loss.dtype),
+                cat_loss,
+            )
     elif loss_mode == "mean":
         dir_loss = _dirichlet_mean_kl(safe_beta, alpha)
+        cat_loss = _dirichlet_mean_categorical_nll(
+            alpha,
+            jnp.where(valid_categorical_outcome, target_outcome, 0),
+        )
     else:
         raise ValueError(f"unknown dirichlet_loss_mode: {loss_mode!r}")
-    cat_loss = dirichlet_nll_at_categorical(
-        alpha,
-        jnp.where(valid_categorical_outcome, target_outcome, 0),
-        categorical_epsilon,
-    )
     cat_loss = jnp.where(
         ~categorical_target | valid_categorical_outcome,
         cat_loss,
@@ -799,7 +840,9 @@ def _compute_dirichlet_losses(
     policy_target_entropy = _masked_mean(policy_target_entropy, policy_loss_mask)
     policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
 
-    categorical_epsilon = float(config.training.losses.categorical_epsilon)
+    categorical_reference_concentration = (
+        config.training.regularization.dirichlet_concentration_clip
+    )
     dirichlet_loss_mode = str(config.training.losses.dirichlet_loss_mode)
     value_dir_kl = _native_dirichlet_loss(
         data.beta_V_target,
@@ -807,7 +850,7 @@ def _compute_dirichlet_losses(
         native_fields.v_target_kind,
         native_fields.v_target_outcome,
         native_fields.v_target_weight,
-        categorical_epsilon,
+        categorical_reference_concentration,
         dirichlet_loss_mode,
     )
     value_dir_kl_loss = _native_masked_mean(
@@ -822,7 +865,7 @@ def _compute_dirichlet_losses(
         native_fields.q_target_kind,
         native_fields.q_target_outcome,
         native_fields.q_target_weight,
-        categorical_epsilon,
+        categorical_reference_concentration,
         dirichlet_loss_mode,
     )
     q_row_mask = (
@@ -1051,6 +1094,9 @@ def _compute_dirichlet_losses(
             (alpha_q_mass <= floor_threshold).astype(alpha_q_mass.dtype),
             q_dirichlet_mask,
         )
+    is_legacy_head = (
+        str(config.model.dirichlet_head_parameterization) == "legacy"
+    )
     if concentration_clip is None:
         alpha_v_concentration_clip_fraction = jnp.zeros_like(
             alpha_v_concentration
@@ -1058,10 +1104,10 @@ def _compute_dirichlet_losses(
         alpha_q_concentration_clip_fraction = jnp.zeros_like(
             alpha_q_concentration
         )
-        alpha_v_categorical_concentration_clip_fraction = jnp.zeros_like(
+        alpha_v_categorical_concentration_reference_fraction = jnp.zeros_like(
             alpha_v_concentration
         )
-        alpha_q_categorical_concentration_clip_fraction = jnp.zeros_like(
+        alpha_q_categorical_concentration_reference_fraction = jnp.zeros_like(
             alpha_q_concentration
         )
         alpha_v_dirichlet_concentration_clip_fraction = jnp.zeros_like(
@@ -1071,40 +1117,59 @@ def _compute_dirichlet_losses(
             alpha_q_concentration
         )
     else:
-        if concentration_floor is None:
-            clip_tolerance = 0.01 * float(concentration_clip)
-        else:
-            clip_tolerance = 0.01 * (
-                float(concentration_clip) - float(concentration_floor)
-            )
-        clip_threshold = jnp.asarray(
-            float(concentration_clip) - clip_tolerance,
+        reference_tolerance = 0.01 * float(concentration_clip)
+        reference_threshold = jnp.asarray(
+            float(concentration_clip) - reference_tolerance,
             dtype=alpha_v_mass.dtype,
         )
-        alpha_v_concentration_clip_fraction = _masked_mean(
-            (alpha_v_mass >= clip_threshold).astype(alpha_v_mass.dtype),
-            value_loss_mask,
-        )
-        alpha_q_concentration_clip_fraction = _masked_mean(
-            (alpha_q_mass >= clip_threshold).astype(alpha_q_mass.dtype),
-            q_supervised_pair_mask,
-        )
-        alpha_v_dirichlet_concentration_clip_fraction = _masked_mean(
-            (alpha_v_mass >= clip_threshold).astype(alpha_v_mass.dtype),
-            v_dirichlet_mask,
-        )
-        alpha_q_dirichlet_concentration_clip_fraction = _masked_mean(
-            (alpha_q_mass >= clip_threshold).astype(alpha_q_mass.dtype),
-            q_dirichlet_mask,
-        )
-        alpha_v_categorical_concentration_clip_fraction = _masked_mean(
-            (alpha_v_mass >= clip_threshold).astype(alpha_v_mass.dtype),
+        alpha_v_categorical_concentration_reference_fraction = _masked_mean(
+            (alpha_v_mass >= reference_threshold).astype(alpha_v_mass.dtype),
             v_categorical_mask,
         )
-        alpha_q_categorical_concentration_clip_fraction = _masked_mean(
-            (alpha_q_mass >= clip_threshold).astype(alpha_q_mass.dtype),
+        alpha_q_categorical_concentration_reference_fraction = _masked_mean(
+            (alpha_q_mass >= reference_threshold).astype(alpha_q_mass.dtype),
             q_categorical_mask,
         )
+        if not is_legacy_head:
+            alpha_v_concentration_clip_fraction = jnp.zeros_like(
+                alpha_v_concentration
+            )
+            alpha_q_concentration_clip_fraction = jnp.zeros_like(
+                alpha_q_concentration
+            )
+            alpha_v_dirichlet_concentration_clip_fraction = jnp.zeros_like(
+                alpha_v_concentration
+            )
+            alpha_q_dirichlet_concentration_clip_fraction = jnp.zeros_like(
+                alpha_q_concentration
+            )
+        else:
+            clip_range = (
+                float(concentration_clip)
+                if concentration_floor is None
+                else float(concentration_clip) - float(concentration_floor)
+            )
+            clip_tolerance = 0.01 * clip_range
+            clip_threshold = jnp.asarray(
+                float(concentration_clip) - clip_tolerance,
+                dtype=alpha_v_mass.dtype,
+            )
+            alpha_v_concentration_clip_fraction = _masked_mean(
+                (alpha_v_mass >= clip_threshold).astype(alpha_v_mass.dtype),
+                value_loss_mask,
+            )
+            alpha_q_concentration_clip_fraction = _masked_mean(
+                (alpha_q_mass >= clip_threshold).astype(alpha_q_mass.dtype),
+                q_supervised_pair_mask,
+            )
+            alpha_v_dirichlet_concentration_clip_fraction = _masked_mean(
+                (alpha_v_mass >= clip_threshold).astype(alpha_v_mass.dtype),
+                v_dirichlet_mask,
+            )
+            alpha_q_dirichlet_concentration_clip_fraction = _masked_mean(
+                (alpha_q_mass >= clip_threshold).astype(alpha_q_mass.dtype),
+                q_dirichlet_mask,
+            )
     q_supervised_actions_per_row = _masked_mean(
         jnp.sum(q_supervised_pair_mask.astype(count_dtype), axis=-1),
         q_row_mask,
@@ -1227,11 +1292,15 @@ def _compute_dirichlet_losses(
         alpha_Q_concentration_clip_fraction=(
             alpha_q_concentration_clip_fraction
         ),
-        alpha_V_categorical_concentration_clip_fraction=(
-            alpha_v_categorical_concentration_clip_fraction
+        alpha_V_categorical_concentration_reference_fraction=(
+            alpha_v_categorical_concentration_reference_fraction
         ),
-        alpha_Q_categorical_concentration_clip_fraction=(
-            alpha_q_categorical_concentration_clip_fraction
+        alpha_Q_categorical_concentration_reference_fraction=(
+            alpha_q_categorical_concentration_reference_fraction
+        ),
+        dirichlet_head_is_legacy=jnp.asarray(
+            is_legacy_head,
+            dtype=alpha_v_mass.dtype,
         ),
         v_dirichlet_target_count=v_dirichlet_target_count,
         q_dirichlet_target_count=q_dirichlet_target_count,

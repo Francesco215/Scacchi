@@ -16,6 +16,7 @@ model:
   num_channels: 512  # Hidden width.
   num_layers: 8  # ReZero residual depth.
   resnet_v2: true  # Ignored by Boardlaw models, kept for schema consistency.
+  dirichlet_head_parameterization: log_concentration
 
 selfplay:
   batch_size: 4096  # Number of games advanced in parallel.
@@ -45,7 +46,7 @@ training:
     policy_target_mode: search  # Use the search-improved policy target.
 
   regularization:
-    dirichlet_concentration_clip: 8.0  # Bound Dirichlet confidence during fine tuning.
+    dirichlet_concentration_clip: 8.0  # Exact-outcome reference concentration.
 
 eval:
   interval: 1  # Evaluate often enough to monitor convergence without dominating runtime.
