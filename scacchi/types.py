@@ -404,6 +404,16 @@ class TrainingLossConfig:
     categorical_epsilon: float = 1e-4
 
     def __post_init__(self) -> None:
+        if self.dirichlet_loss_mode == DirichletLossMode.mean:
+            warnings.warn(
+                "training.losses.dirichlet_loss_mode='mean' discards "
+                "Dirichlet concentration (evidence mass) and is inconsistent "
+                "with the rigorous mathematical treatment documented in "
+                "math.md. Use it only for comparisons or ablations, not for "
+                "a real training run.",
+                UserWarning,
+                stacklevel=2,
+            )
         for name, value in (
             ("training.losses.policy_weight", self.policy_weight),
             ("training.losses.value_dir_kl_weight", self.value_dir_kl_weight),

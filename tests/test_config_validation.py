@@ -518,16 +518,30 @@ def test_dirichlet_network_allows_dirichlet_loss_weights():
     assert config.model.network == "boardlaw_dirichlet"
 
 
-@pytest.mark.parametrize("loss_mode", ["full", "mean"])
-def test_dirichlet_loss_modes_are_configurable(loss_mode: str):
+def test_full_dirichlet_loss_mode_is_configurable():
     config = _config(
         {
             "model": {"network": "boardlaw_dirichlet"},
-            "training": {"losses": {"dirichlet_loss_mode": loss_mode}},
+            "training": {"losses": {"dirichlet_loss_mode": "full"}},
         }
     )
 
-    assert config.training.losses.dirichlet_loss_mode == loss_mode
+    assert config.training.losses.dirichlet_loss_mode == "full"
+
+
+def test_mean_dirichlet_loss_mode_warns_that_it_is_comparison_only():
+    with pytest.warns(
+        UserWarning,
+        match="Use it only for comparisons or ablations",
+    ):
+        config = _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "training": {"losses": {"dirichlet_loss_mode": "mean"}},
+            }
+        )
+
+    assert config.training.losses.dirichlet_loss_mode == "mean"
 
 
 def test_num_search_blocks_is_not_a_public_config_field():
