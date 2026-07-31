@@ -441,6 +441,14 @@ class TrainingLossConfig:
         ):
             _require_gt(name, value, -1.0)
 
+            
+        if self.value_outcome_weight != 0.0 or self.q_outcome_weight != 0.0 :
+            warnings.warn(
+                "with the rigorous math treatment documented in math.md; they should both be 0, instead got "
+                f"value_outcome_weight={self.value_outcome_weight}, "
+                f"q_outcome_weight={self.q_outcome_weight}."
+            )
+            
     def active_dirichlet_weights(self) -> list[str]:
         weights = (
             ("value_dir_kl_weight", self.value_dir_kl_weight),

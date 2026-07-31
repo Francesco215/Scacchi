@@ -30,14 +30,14 @@ selfplay:
   action_commitment:
     kind: posterior_sample
     posterior_update: numerical
-    posterior_sample_temperature: 0.3333333333333333
+    posterior_sample_temperature: 1.
   search:
     kind: dirichlet_thompson
     dirichlet_thompson:
       num_simulations: 32
       max_depth: 32
       root_policy_support: search_evidence
-      policy_target_temperature: 0.3333333333333333
+      policy_target_temperature: 1.
       posterior_update:
         kind: numerical
         numerical:
@@ -60,8 +60,8 @@ training:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 1.0
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
     q_supervision:
       action_set: positive_search_evidence_or_solved
       reduction: mean_over_selected_state_action_pairs

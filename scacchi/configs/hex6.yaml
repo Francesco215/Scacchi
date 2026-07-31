@@ -1,4 +1,4 @@
-# Hex6 training with numerical posterior updates and cubic commitment.
+# Hex6 training with numerical posterior updates and posterior sampling.
 
 run:
   seed: 9105
@@ -28,7 +28,7 @@ selfplay:
   action_commitment:
     kind: posterior_sample
     posterior_update: numerical
-    posterior_sample_temperature: 0.3333333333333333
+    posterior_sample_temperature: 1.0
   search:
     kind: dirichlet_thompson
     dirichlet_thompson:
@@ -56,8 +56,8 @@ training:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 1.0
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
     q_supervision:
       # Train each selected (state, action) pair equally. Evidence determines
       # inclusion, not gradient magnitude.

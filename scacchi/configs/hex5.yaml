@@ -44,12 +44,9 @@ training:
   losses:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
-    # Keep the known-stable Q balance while testing the corrected search.
-    # Changing the updater and the target weighting in the same run made the
-    # earlier short experiment impossible to interpret.
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 0.25
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
     terminal_edge_targets: false
     terminal_parent_targets: false
     policy_target_mode: search

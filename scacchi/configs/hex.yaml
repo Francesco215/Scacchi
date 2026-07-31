@@ -24,6 +24,7 @@ selfplay:
   action_commitment:
     kind: posterior_sample
     posterior_update: monte_carlo
+    posterior_sample_temperature: 1.0
   search:
     kind: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
 
@@ -43,6 +44,8 @@ training:
     policy_weight: 0.05  # Keep noisy early policy targets auxiliary during bootstrap.
     value_dir_kl_weight: 5.0  # Keep the WDL state posterior as a primary signal.
     q_dir_kl_weight: 5.0  # Keep action-Q posteriors as a primary signal.
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
     policy_target_mode: search  # Use the search-improved policy target.
 
   regularization:

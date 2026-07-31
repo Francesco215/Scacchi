@@ -123,7 +123,8 @@ def test_hex5_uses_corrected_dirichlet_search_recipe():
     assert config.training.batch_size == 2048
     assert config.training.learning_rate == 2e-3
     assert config.training.losses.q_dir_kl_weight == 1.0
-    assert config.training.losses.q_outcome_weight == 0.25
+    assert config.training.losses.value_outcome_weight == 0.0
+    assert config.training.losses.q_outcome_weight == 0.0
     assert config.model.dirichlet_head_parameterization == "log_concentration"
     assert config.training.regularization.dirichlet_concentration_clip == 8.0
     assert config.checkpointing.max_to_keep == 1
@@ -340,7 +341,7 @@ def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
     assert config.eval.baseline_search.gumbel.num_simulations == eval_simulations
 
 
-def test_hex6_recipe_uses_q21_cubic_commitment_and_wandb():
+def test_hex6_recipe_uses_q21_unit_temperature_commitment_and_wandb():
     cfg_path = (
         Path(__file__).parents[1]
         / "scacchi"
@@ -358,7 +359,7 @@ def test_hex6_recipe_uses_q21_cubic_commitment_and_wandb():
     )
     assert (
         config.selfplay.action_commitment.posterior_sample_temperature
-        == pytest.approx(1.0 / 3.0)
+        == 1.0
     )
     selfplay_search = config.selfplay.search.dirichlet_thompson
     assert selfplay_search.posterior_update.kind == "numerical"
