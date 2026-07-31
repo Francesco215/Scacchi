@@ -1,0 +1,4 @@
+interface:
+  display_name: "Monitor Training Runs"
+  short_description: "Efficiently monitor long-running training jobs"
+  default_prompt: "Use $monitor-training-runs to monitor this training job with adaptive, low-frequency check-ins."

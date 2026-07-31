@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inspect Training Curves"
+  short_description: "Render and visually compare training dynamics"
+  default_prompt: "Use $inspect-training-curves to visually compare these training runs."
