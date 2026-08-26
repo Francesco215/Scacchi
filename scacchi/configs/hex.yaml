@@ -1,71 +1,104 @@
-# Dirichlet Thompson Hex training config.
-# Action-selection symbols are explicit enum values. Use posterior_argmax or
-# posterior_sample where those modes are accepted; there is no posterior_mean mode.
-
-run:
-  seed: 0  # Random seed for model init, self-play, and search sampling.
-  max_num_iters: 80  # Training budget, below the requested 100-step cap.
+# Shared Dirichlet-Thompson Hex recipe, based on the solved Hex 9 run.
+#
+# Board-specific configs import this file and supply their board size, rollout
+# shape, network size, evaluation checkpoint, and checkpoint destination.
 
 env:
-  id: hex  # PGX environment id.
-  board_size: 5  # Hex board side length.
-  num_outcomes: 3  # WDL outcome dimension for Dirichlet value/Q heads.
+  id: hex
+  num_outcomes: 2
 
 model:
-  network: boardlaw_dirichlet  # Network architecture with policy, value-Dirichlet, and Q-Dirichlet heads.
-  num_channels: 512  # Hidden width.
-  num_layers: 8  # ReZero residual depth.
-  resnet_v2: true  # Ignored by Boardlaw models, kept for schema consistency.
+  network: aznet_dirichlet
+  compute_dtype: bfloat16
+  resnet_v2: true
   dirichlet_head_parameterization: log_concentration
+  dirichlet_initial_concentration: 3.1
+  legacy_dirichlet_head_init: false
+  rezero_kernel_init: variance_scaling
 
 selfplay:
-  batch_size: 4096  # Number of games advanced in parallel.
-  max_num_steps: 25  # 5x5 Hex has at most 25 placements.
+  batch_size: 4096
   action_commitment:
     kind: posterior_sample
-    posterior_update: monte_carlo
+    posterior_update: numerical
     posterior_sample_temperature: 1.0
   search:
-    kind: dirichlet_thompson  # Dirichlet-Q MCTS search policy.
-
+    kind: dirichlet_thompson
     dirichlet_thompson:
-      num_simulations: 256  # Persistent-tree simulations per root.
+      num_simulations: 32
+      max_depth: 32
+      root_policy_support: search_evidence
+      policy_target_temperature: 1.0
       posterior_update:
-        kind: monte_carlo
-        monte_carlo:
-          kappa: 4.0  # Prior strength in gamma = n / (kappa + n).
+        kind: numerical
+        numerical:
+          kappa: 4.0
+          half_width: 10
+          tail_scale: 8.0
+          min_half_range: 6.0
+          max_half_range: 11.0
+          fallback_policy_samples: 8
+          fallback_policy_sample_chunk_size: 32
 
 training:
-  batch_size: 1024  # Learner minibatch size; multiple updates per fresh self-play batch.
-  learning_rate: 1e-3  # Adam learning rate used by solved scalar Boardlaw runs.
-  grad_clip_norm: 1.0  # Keep Dirichlet-head fine tuning stable.
-
+  batch_size: 1024
+  max_updates_per_iter: null
+  learning_rate: 1e-3
+  lr_decay_after_iters: null
+  lr_decay_factor: 1.0
+  grad_clip_norm: 1.0
   losses:
-    policy_weight: 0.05  # Keep noisy early policy targets auxiliary during bootstrap.
-    value_dir_kl_weight: 5.0  # Keep the WDL state posterior as a primary signal.
-    q_dir_kl_weight: 5.0  # Keep action-Q posteriors as a primary signal.
+    policy_weight: 1.0
+    value_dir_kl_weight: 1.0
+    q_dir_kl_weight: 1.0
     value_outcome_weight: 0.0
     q_outcome_weight: 0.0
-    policy_target_mode: search  # Use the search-improved policy target.
-
+    q_supervision:
+      action_set: positive_search_evidence_or_solved
+      reduction: mean_over_selected_state_action_pairs
+    dirichlet_loss_mode: full
+    loss_mask_mode: value
+    terminal_edge_targets: true
+    terminal_parent_targets: true
+    policy_target_mode: search
   regularization:
-    dirichlet_concentration_clip: 8.0  # Exact-outcome reference concentration.
+    # Exact-outcome reference concentration; this does not clip the head.
+    dirichlet_concentration_clip: 16.0
 
 eval:
-  interval: 1  # Evaluate often enough to monitor convergence without dominating runtime.
-  batch_size: 512  # Number of evaluation games run in parallel.
-  baseline: checkpoint  # Solved Hex checkpoints are scalar Boardlaw baselines.
+  interval: 1
+  batch_size: 512
+  baseline: checkpoint
+  baseline_id: null
+  player_action_commitment:
+    kind: posterior_argmax
+    posterior_update: numerical
+  baseline_action_commitment:
+    kind: search_action
+  player_search:
+    kind: dirichlet_thompson
+    dirichlet_thompson:
+      num_simulations: 32
+      max_depth: 32
+      root_policy_support: search_evidence
+      posterior_update:
+        kind: numerical
+        numerical:
+          kappa: 4.0
+          half_width: 10
+          tail_scale: 8.0
+          min_half_range: 6.0
+          max_half_range: 11.0
+          fallback_policy_samples: 8
+          fallback_policy_sample_chunk_size: 32
   baseline_search:
     kind: gumbel
     gumbel:
       num_simulations: 32
+      gumbel_scale: 1.0
 
 logging:
-  interval: 1  # Log training metrics every N iterations.
+  interval: 1
   wandb:
-    enabled: false
+    enabled: true
     project: scacchi-az
-
-checkpointing:
-  max_to_keep: 0  # Number of checkpoints to retain; 0 disables retention.
-  save_interval_steps: 50  # Save checkpoint every N iterations when retention is enabled.

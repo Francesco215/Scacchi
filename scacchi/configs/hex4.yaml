@@ -1,14 +1,14 @@
-# From-scratch Hex7 native-categorical concentration-learning trial.
+# From-scratch Hex4 numerical-Q21 trial.
 
 defaults:
   - hex
   - _self_
 
 run:
-  max_num_iters: 100
+  max_num_iters: 30
 
 env:
-  board_size: 7
+  board_size: 4
 
 model:
   num_channels: 128
@@ -16,10 +16,10 @@ model:
 
 selfplay:
   batch_size: 4096
-  max_num_steps: 49
+  max_num_steps: 16
 
 eval:
-  checkpoint_path: checkpoints/7_solved
+  checkpoint_path: checkpoints/4_solved
 
 checkpointing:
   max_to_keep: 0

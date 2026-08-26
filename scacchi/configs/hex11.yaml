@@ -1,114 +1,29 @@
 # Wide Hex 11 scratch run against the published PGX hex_v0 anchor.
-#
-# This extends the Hex 9 KL-only, temperature-1 recipe to 256 channels while
-# keeping the per-iteration rollout volume close to Hex 8 (2048 * 128 rows).
+
+defaults:
+  - hex
+  - _self_
 
 run:
-  seed: 9105
   max_num_iters: 300
 
 env:
-  id: hex
   board_size: 11
-  num_outcomes: 2
 
 model:
-  network: aznet_dirichlet
   num_channels: 256
   num_layers: 6
-  compute_dtype: bfloat16
-  resnet_v2: true
-  dirichlet_head_parameterization: log_concentration
-  dirichlet_initial_concentration: 3.1
-  legacy_dirichlet_head_init: false
-  rezero_kernel_init: variance_scaling
 
 selfplay:
   batch_size: 2048
   max_num_steps: 128
-  action_commitment:
-    kind: posterior_sample
-    posterior_update: numerical
-    posterior_sample_temperature: 1.0
-  search:
-    kind: dirichlet_thompson
-    dirichlet_thompson:
-      num_simulations: 32
-      max_depth: 32
-      root_policy_support: search_evidence
-      policy_target_temperature: 1.0
-      posterior_update:
-        kind: numerical
-        numerical:
-          kappa: 4.0
-          half_width: 10
-          tail_scale: 8.0
-          min_half_range: 6.0
-          max_half_range: 11.0
-          fallback_policy_samples: 8
-          fallback_policy_sample_chunk_size: 32
-
-training:
-  batch_size: 1024
-  max_updates_per_iter: null
-  learning_rate: 1e-3
-  lr_decay_after_iters: null
-  lr_decay_factor: 1.0
-  grad_clip_norm: 1.0
-  losses:
-    policy_weight: 1.0
-    value_dir_kl_weight: 1.0
-    q_dir_kl_weight: 1.0
-    value_outcome_weight: 0.0
-    q_outcome_weight: 0.0
-    q_supervision:
-      action_set: positive_search_evidence_or_solved
-      reduction: mean_over_selected_state_action_pairs
-    dirichlet_loss_mode: full
-    loss_mask_mode: value
-    terminal_edge_targets: true
-    terminal_parent_targets: true
-    policy_target_mode: search
-  regularization:
-    dirichlet_concentration_clip: 16.0
 
 eval:
-  interval: 5
-  batch_size: 512
   baseline: pgx
   baseline_id: hex_v0
-  player_action_commitment:
-    kind: posterior_argmax
-    posterior_update: numerical
-  baseline_action_commitment:
-    kind: search_action
-  player_search:
-    kind: dirichlet_thompson
-    dirichlet_thompson:
-      num_simulations: 32
-      max_depth: 32
-      root_policy_support: search_evidence
-      posterior_update:
-        kind: numerical
-        numerical:
-          kappa: 4.0
-          half_width: 10
-          tail_scale: 8.0
-          min_half_range: 6.0
-          max_half_range: 11.0
-          fallback_policy_samples: 8
-          fallback_policy_sample_chunk_size: 32
   baseline_search:
-    kind: gumbel
     gumbel:
       num_simulations: 32
-      gumbel_scale: 1.0
-
-logging:
-  interval: 1
-  wandb:
-    enabled: true
-    project: scacchi-az
 
 checkpointing:
   max_to_keep: 3

@@ -1,117 +1,27 @@
-# Hex6 training with numerical posterior updates and posterior sampling.
+# From-scratch Hex6 numerical-Q21 trial.
+
+defaults:
+  - hex
+  - _self_
 
 run:
-  seed: 9105
-  max_num_iters: 201
+  max_num_iters: 50
 
 env:
-  id: hex
   board_size: 6
-  # Hex has no draw, which enables the guarded binary prefix-CDF estimator.
-  num_outcomes: 2
 
 model:
-  network: boardlaw_dirichlet
   num_channels: 128
-  num_layers: 8
-  compute_dtype: bfloat16
-  resnet_v2: true
-  dirichlet_head_parameterization: log_concentration
-  # Start from a symmetric low-evidence binary prior, then learn its mass.
-  dirichlet_initial_concentration: 3.1
+  num_layers: 6
 
 selfplay:
   batch_size: 4096
-  max_num_steps: 64
-  # Build and sample a fresh numerical posterior policy during self-play so
-  # independent games keep exploring; evaluation commits its argmax below.
-  action_commitment:
-    kind: posterior_sample
-    posterior_update: numerical
-    posterior_sample_temperature: 1.0
-  search:
-    kind: dirichlet_thompson
-    dirichlet_thompson:
-      num_simulations: 32
-      # Q21 drives cache repair and the replay target. Action commitment
-      # independently selects the same numerical variant above.
-      posterior_update:
-        kind: numerical
-        numerical:
-          kappa: 4.0
-          half_width: 10  # Q = 2 * half_width + 1 = 21 grid points.
-          tail_scale: 8.0
-          min_half_range: 6.0
-          max_half_range: 11.0
-          # Q21 is primary; this budget is used only by the native safety
-          # fallback.
-          fallback_policy_samples: 8
-          fallback_policy_sample_chunk_size: 32
-
-training:
-  batch_size: 1024
-  learning_rate: 1e-3
-  grad_clip_norm: 1.0
-  losses:
-    policy_weight: 1.0
-    value_dir_kl_weight: 1.0
-    q_dir_kl_weight: 1.0
-    value_outcome_weight: 0.0
-    q_outcome_weight: 0.0
-    q_supervision:
-      # Train each selected (state, action) pair equally. Evidence determines
-      # inclusion, not gradient magnitude.
-      action_set: positive_search_evidence_or_solved
-      reduction: mean_over_selected_state_action_pairs
-    # Full dispersion training is intentional: mean-only mode has exactly zero
-    # concentration gradient.
-    dirichlet_loss_mode: full
-    loss_mask_mode: value
-    terminal_edge_targets: true
-    terminal_parent_targets: true
-    policy_target_mode: search
-  regularization:
-    # Finite concentration learned at a perfectly classified exact outcome.
-    # This is a loss reference, not an output ceiling.
-    dirichlet_concentration_clip: 16.0
+  max_num_steps: 36
 
 eval:
-  interval: 5
-  batch_size: 512
-  baseline: checkpoint
   checkpoint_path: checkpoints/6_solved
-  player_action_commitment:
-    kind: posterior_argmax
-    posterior_update: numerical
-  baseline_action_commitment:
-    kind: posterior_argmax
-  player_search:
-    kind: dirichlet_thompson
-    dirichlet_thompson:
-      num_simulations: 32
-      posterior_update:
-        kind: numerical
-        numerical:
-          kappa: 4.0
-          half_width: 10
-          tail_scale: 8.0
-          min_half_range: 6.0
-          max_half_range: 11.0
-          fallback_policy_samples: 32
-          fallback_policy_sample_chunk_size: 32
-  baseline_search:
-    kind: gumbel
-    gumbel:
-      num_simulations: 4
-
-logging:
-  interval: 1
-  wandb:
-    # All training runs from this recipe are logged externally.
-    enabled: true
-    project: scacchi-az
 
 checkpointing:
   max_to_keep: 0
-  save_interval_steps: 25
+  save_interval_steps: 10
   directory: checkpoints/asd
