@@ -1,5 +1,47 @@
 "use strict";
 
+function reportEmbedHeight() {
+  if (window.parent === window) {
+    return;
+  }
+
+  const app = document.querySelector(".app");
+  const contentHeight = app
+    ? Math.ceil(app.getBoundingClientRect().bottom)
+    : Math.ceil(document.documentElement.scrollHeight);
+
+  window.parent.postMessage(
+    {
+      type: "tictactoe-demo:resize",
+      height: contentHeight,
+    },
+    "*",
+  );
+}
+
+if (window.parent !== window) {
+  window.addEventListener("load", reportEmbedHeight);
+  const embeddedApp = document.querySelector(".app");
+  if (embeddedApp) {
+    new ResizeObserver(reportEmbedHeight).observe(embeddedApp);
+  }
+
+  // An iframe is an independent scroll context, so wheel events do not
+  // naturally bubble to the article. Forward them to the parent to make this
+  // interactive demo move with the page like an ordinary figure.
+  window.addEventListener(
+    "wheel",
+    (event) => {
+      if (event.ctrlKey) {
+        return;
+      }
+      window.parent.scrollBy({ left: event.deltaX, top: event.deltaY });
+      event.preventDefault();
+    },
+    { passive: false },
+  );
+}
+
 const DEFAULT_SAMPLES_PER_SECOND = 300;
 const MAX_FRAME_SAMPLES = 80;
 const RENDER_INTERVAL_MS = 140;
@@ -87,20 +129,13 @@ const els = {
   reset: document.getElementById("reset"),
   computeSlider: document.getElementById("compute-slider"),
   computeValue: document.getElementById("compute-value"),
-  perspective: document.getElementById("perspective"),
-  sims: document.getElementById("sims"),
-  recommended: document.getElementById("recommended"),
-  alphaTotal: document.getElementById("alpha-total"),
-  nodeCount: document.getElementById("node-count"),
-  alphaReadout: document.getElementById("alpha-readout"),
-  lossBar: document.getElementById("loss-bar"),
+  xWinBar: document.getElementById("x-win-bar"),
   drawBar: document.getElementById("draw-bar"),
-  winBar: document.getElementById("win-bar"),
-  lossPct: document.getElementById("loss-pct"),
+  oWinBar: document.getElementById("o-win-bar"),
+  xWinPct: document.getElementById("x-win-pct"),
   drawPct: document.getElementById("draw-pct"),
-  winPct: document.getElementById("win-pct"),
+  oWinPct: document.getElementById("o-win-pct"),
   simplex: document.getElementById("simplex"),
-  actionList: document.getElementById("action-list"),
 };
 
 function opponent(player) {
@@ -633,10 +668,6 @@ function actionName(action) {
   return `r${row} c${col}`;
 }
 
-function formatNumber(value) {
-  return value.toFixed(2);
-}
-
 function formatPct(value) {
   return `${Math.round(value * 100)}%`;
 }
@@ -647,7 +678,12 @@ function render() {
   renderBoard();
   renderStatus();
   renderPosterior();
-  renderActions();
+}
+
+function renderSearchProgress() {
+  analysis = analyzePosition();
+  renderStatus();
+  renderPosterior();
 }
 
 function renderComputeControl() {
@@ -658,6 +694,7 @@ function renderComputeControl() {
 
 function renderBoard() {
   const result = gameResult(board);
+  els.board.dataset.player = currentPlayer;
   els.board.innerHTML = "";
 
   for (let action = 0; action < 9; action += 1) {
@@ -671,9 +708,6 @@ function renderBoard() {
 
     if (mark) {
       cell.classList.add(mark === "X" ? "mark-x" : "mark-o");
-    }
-    if (analysis.bestAction === action && !result.terminal && mark === null) {
-      cell.classList.add("recommended");
     }
     if (result.line.includes(action)) {
       cell.classList.add("win-line");
@@ -700,67 +734,20 @@ function renderPosterior() {
   const alpha = analysis.valueAlpha;
   const posterior = { alpha, outcome: analysis.valueOutcome };
   const mean = posteriorMean(posterior);
-  const displayedAlpha =
-    posterior.outcome === null ? alpha : categoricalMean(posterior.outcome);
-  const total = alpha.reduce((sum, value) => sum + value, 0);
+  const xWinProbability =
+    currentPlayer === "X" ? mean[OUTCOME.WIN] : mean[OUTCOME.LOSS];
+  const oWinProbability =
+    currentPlayer === "O" ? mean[OUTCOME.WIN] : mean[OUTCOME.LOSS];
 
-  els.perspective.textContent = currentPlayer;
-  els.sims.textContent = String(analysis.simulations);
-  els.recommended.textContent = actionName(analysis.bestAction);
-  els.alphaTotal.textContent =
-    posterior.outcome === null ? formatNumber(total) : "exact";
-  els.nodeCount.textContent = String(analysis.nodes);
-  els.alphaReadout.textContent = `L=${formatNumber(displayedAlpha[0])}  D=${formatNumber(
-    displayedAlpha[1],
-  )}  W=${formatNumber(displayedAlpha[2])}`;
-
-  setBar(els.lossBar, els.lossPct, mean[OUTCOME.LOSS]);
+  setBar(els.xWinBar, els.xWinPct, xWinProbability);
   setBar(els.drawBar, els.drawPct, mean[OUTCOME.DRAW]);
-  setBar(els.winBar, els.winPct, mean[OUTCOME.WIN]);
+  setBar(els.oWinBar, els.oWinPct, oWinProbability);
   drawSimplex(alpha, posterior.outcome);
 }
 
 function setBar(bar, label, value) {
   bar.style.width = `${Math.max(0, Math.min(100, value * 100))}%`;
   label.textContent = formatPct(value);
-}
-
-function renderActions() {
-  els.actionList.innerHTML = "";
-  const result = gameResult(board);
-  const actions = legalActions(board);
-
-  if (result.terminal || actions.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "action-row";
-    empty.textContent = "No legal actions";
-    els.actionList.appendChild(empty);
-    return;
-  }
-
-  for (const action of actions) {
-    const row = document.createElement("div");
-    const probability = analysis.policy.get(action) ?? 0;
-    const posterior = analysis.rootPosteriors.get(action) ?? {
-      alpha: DUMB_ALPHA,
-      outcome: null,
-    };
-    const q = posteriorUtility(posterior);
-
-    row.className = "action-row";
-    if (action === analysis.bestAction) {
-      row.classList.add("best");
-    }
-
-    row.innerHTML = `
-      <strong>${actionName(action)}</strong>
-      <div class="policy-track" aria-label="Posterior-best probability">
-        <div class="policy-fill" style="width: ${Math.round(probability * 100)}%"></div>
-      </div>
-      <span>${formatPct(probability)} / q ${q.toFixed(2)}</span>
-    `;
-    els.actionList.appendChild(row);
-  }
 }
 
 function playMove(action) {
@@ -823,7 +810,10 @@ function searchTick(timestamp) {
       sampleCarry -= samplesToRun;
 
       if (timestamp - lastRenderTime >= RENDER_INTERVAL_MS) {
-        render();
+        // Search updates must not recreate the cell buttons. Replacing a
+        // button between pointer-down and pointer-up causes its click to be
+        // discarded, which made fast taps appear unreliable.
+        renderSearchProgress();
         lastRenderTime = timestamp;
       }
     }
@@ -926,9 +916,11 @@ function drawSimplex(alpha, categoricalOutcome = null) {
   context.font = "12px ui-sans-serif, system-ui, sans-serif";
   context.fillStyle = "#4b5563";
   context.textAlign = "center";
-  context.fillText("D", vertices.D.x, vertices.D.y - 10);
-  context.fillText("L", vertices.L.x - 14, vertices.L.y + 4);
-  context.fillText("W", vertices.W.x + 14, vertices.W.y + 4);
+  const lossLabel = currentPlayer === "X" ? "O" : "X";
+  const winLabel = currentPlayer;
+  context.fillText("Draw", vertices.D.x, vertices.D.y - 10);
+  context.fillText(`${lossLabel} wins`, vertices.L.x + 4, vertices.L.y + 18);
+  context.fillText(`${winLabel} wins`, vertices.W.x - 4, vertices.W.y + 18);
 
   if (categoricalOutcome === null) {
     context.fillStyle = "rgba(31, 122, 140, 0.24)";

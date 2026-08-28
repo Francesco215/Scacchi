@@ -4,217 +4,150 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="A math-first explanation of Scacchi's Dirichlet Thompson tree search and bottom-up posterior repair.">
-    <title>Dirichlet Thompson Tree Search</title>
+    <title>Curious Tree Search</title>
     <script src="https://distill.pub/template.v2.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.css" integrity="sha384-zTROYFVGOfTw7JV7KUu8udsvW2fx4lWOsCEDqhBreBwlHI4ioVRtmIvEThzJHGET" crossorigin="anonymous">
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.js" integrity="sha384-GxNFqL3r9uRJQhR+47eDxuPoNE7yLftQM8LcxzgS4HT73tp970WS/wV5p8UzCOmb" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/contrib/auto-render.min.js" integrity="sha384-vZTG03m+2yp6N6BNi5iM4rW4oIwk5DfcNdFfxkk9ZWpDriOkXX8voJBFrAO7MpVl" crossorigin="anonymous"></script>
+    <script>
+      document.addEventListener("DOMContentLoaded", function () {
+        renderMathInElement(document.body, {
+          delimiters: [
+            { left: "$$", right: "$$", display: true },
+            { left: "$", right: "$", display: false },
+            { left: "\\(", right: "\\)", display: false },
+            { left: "\\[", right: "\\]", display: true }
+          ],
+          throwOnError: false
+        });
+      });
+
+      window.addEventListener("message", function (event) {
+        const demo = document.getElementById("tictactoe-demo");
+        if (
+          demo &&
+          event.source === demo.contentWindow &&
+          event.data?.type === "tictactoe-demo:resize"
+        ) {
+          demo.style.height = `${event.data.height}px`;
+        }
+      });
+    </script>
     <style>
-      :root {
-        --ink: #202124;
-        --muted: #646b73;
-        --accent: #356859;
-        --accent-soft: #eaf2ef;
-        --surface: #f5f7f6;
-        --rule: #d9dedb;
-        --warm: #fff8e7;
-        --warm-line: #c58b16;
+      .tictactoe-embed {
+        margin-bottom: 2.5rem;
+        margin-top: 2rem;
       }
 
-      html { scroll-behavior: smooth; }
-      body { color: var(--ink); }
-
-      d-title {
-        border-bottom: 1px solid var(--rule);
-        padding-bottom: 1.25rem;
-      }
-
-      d-title h1 {
-        letter-spacing: -0.025em;
-        max-width: 820px;
-      }
-
-      d-title p {
-        color: var(--muted);
-        max-width: 760px;
-      }
-
-      d-article h2 {
-        border-top: 1px solid var(--rule);
-        margin-top: 3.4rem;
-        padding-top: 1.2rem;
-      }
-
-      d-article h3 { margin-top: 2.2rem; }
-
-      d-article code {
-        background: var(--surface);
-        border-radius: 3px;
-        color: var(--accent);
-        padding: 0.12em 0.32em;
-      }
-
-      d-article li { margin-bottom: 0.4rem; }
-
-      .lead {
-        color: #38413e;
-        font-size: 1.1rem;
-        line-height: 1.65;
-      }
-
-      .correction {
-        background: var(--warm);
-        border-left: 3px solid var(--warm-line);
+      .tictactoe-embed iframe {
+        background: transparent;
+        border: 0;
         box-sizing: border-box;
-        grid-column: text;
-        margin: 1.6rem 0;
-        padding: 0.9rem 1rem;
+        display: block;
+        height: 860px;
+        max-width: 100%;
+        overflow: hidden;
         width: 100%;
       }
 
-      .correction p { margin: 0; }
-
-      .symbol-table {
-        border-collapse: collapse;
-        grid-column: text;
-        margin: 1.5rem 0 2rem;
-        width: 100%;
+      .tictactoe-embed figcaption {
+        margin-top: 0.75rem;
       }
 
-      .symbol-table th,
-      .symbol-table td {
-        border-bottom: 1px solid var(--rule);
-        padding: 0.65rem 0.55rem;
-        text-align: left;
-        vertical-align: top;
-      }
-
-      .symbol-table th {
-        color: var(--muted);
-        font-size: 0.82rem;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-      }
-
-      .symbol-table td:first-child {
-        color: var(--accent);
-        white-space: nowrap;
-        width: 18%;
-      }
-
-      .stage-row {
-        display: grid;
-        gap: 0.85rem;
-        grid-column: text;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        margin: 1.7rem 0 2rem;
-        width: 100%;
-      }
-
-      .stage {
-        background: var(--surface);
-        border-top: 3px solid var(--accent);
-        padding: 0.9rem 1rem;
-      }
-
-      .stage .number {
-        color: var(--accent);
-        font-size: 0.76rem;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-      }
-
-      .stage-title {
-        font-size: 1.02rem;
-        font-weight: 600;
-        margin: 0.25rem 0 0.45rem;
-      }
-
-      .stage p {
-        color: #4e5552;
-        font-size: 0.9rem;
-        line-height: 1.5;
-        margin: 0;
-      }
-
-      .equation-note {
-        border-left: 2px solid var(--rule);
-        color: var(--muted);
-        font-size: 0.9rem;
-        margin: -0.5rem 0 1.75rem;
-        padding-left: 0.8rem;
-      }
-
-      .step-label {
-        color: var(--accent);
-        font-size: 0.8rem;
-        font-weight: 700;
-        letter-spacing: 0.06em;
-        margin-top: 2.1rem;
-        text-transform: uppercase;
-      }
-
-      .two-column {
-        display: grid;
-        gap: 1rem;
-        grid-column: text;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        margin: 1.5rem 0;
-        width: 100%;
-      }
-
-      .mini-card {
-        background: var(--accent-soft);
-        padding: 0.85rem 1rem;
-      }
-
-      .mini-card p {
-        font-size: 0.9rem;
-        margin: 0.3rem 0;
-      }
-
-      .page-footer {
-        border-top: 1px solid var(--rule);
-        color: var(--muted);
-        font-size: 0.86rem;
-        margin-top: 4rem;
-        padding-top: 1rem;
-      }
-
-      @media (max-width: 760px) {
-        d-title h1 {
-          font-size: 2.2rem;
-          line-height: 1.08;
-        }
-
-        .stage-row,
-        .two-column {
-          grid-template-columns: 1fr;
-        }
-
-        .symbol-table {
-          font-size: 0.9rem;
-        }
-
-        d-article d-math[block] {
-          overflow-x: auto;
-          overflow-y: hidden;
+      @media (max-width: 860px) {
+        .tictactoe-embed iframe {
+          height: 1500px;
         }
       }
     </style>
   </head>
   <body>
+    <d-front-matter>
+      <script type="text/json">
+        {
+          "authors": [
+            {
+              "author": "Francesco Sacco",
+              "authorURL": "https://github.com/Francesco215"
+            }
+          ]
+        }
+      </script>
+    </d-front-matter>
+
     <d-title>
-      <h1>Dirichlet Thompson Tree Search</h1>
-      <p>A math-first explanation of Scacchi's lightweight tree, its bottom-up message passing, and the targets returned to the network.</p>
+      <h1>Curiosity-Driven Tree Search</h1>
+      <p></p>
     </d-title>
+
+    <d-byline></d-byline>
 
     <d-article>
       <d-contents></d-contents>
 
-      <p class="lead">The search represents unresolved state and action values as learned Dirichlet beliefs over loss, draw, and win. Exact terminal and solved results live in categorical outcome/distance sidecars. A simulation walks unresolved edges by Thompson sampling, evaluates one frontier edge, and repairs every node on the path back to the root.</p>
+      <p>This is the second blog post of my series of "mathematical foundations of curiosity"</p>
+      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem. Here we are going to show how it generalizes to board games such as tic-tac-toe, hex, chess and go and make a search engine<d-footnote>By search engine I mean an engine that searches the game tree, not the internet.</d-footnote> out of it!</p>
 
-      <div class="correction">
-        <p><strong>The central idea:</strong> an unresolved edge stores the latest repaired Dirichlet message; it does not keep adding leaf evidence. A separate structural count controls prior mixing. Once an edge is categorical, its exact sidecar—not an artificially concentrated alpha—owns its semantics.</p>
-      </div>
+      <figure class="l-page-outset tictactoe-embed">
+        <iframe
+          id="tictactoe-demo"
+          src="tictactoe-demo/index.html"
+          title="Interactive Tic-Tac-Toe Dirichlet-Q demo"
+          scrolling="no"
+        ></iframe>
+        <figcaption>Figure 1: Curiosity-based search with an maximaly dumb model. Over time it finds the best move. Wanna know how it works? Read the blog!</figcaption>
+      </figure>
+
+      <h2>Games as unfair coin tosses</h2>
+      
+      <p>
+        Suppose two players, $A$ and $B$, are given a particular board position.
+        We want to predict the probability that each player will win. (From now on, we are going to ignore draws to make the explanation simpler)
+      </p>
+      
+      <p>
+        The game rules may be deterministic, but the players, are not. Each
+        follows a policy, $\pi_A$ and $\pi_B$.
+        From the current position, the eventual winner therefore behaves like the
+        outcome of an unfair coin.<d-footnote>
+          Mathematically, you can show how you can derive the probability of $A$ winning from state $s$ under the two policies the following way:<br><br>
+          Let $\tau=(s_0,a_0,s_1,a_1,\ldots)$ denote a complete game and let
+          $i_t\in\{A,B\}$ be the player who moves at time $t$. The probability
+          that $A$ wins from state $s$ under the two policies is
+          $$
+          p_A(s;\pi_A,\pi_B)
+          =\sum_{\tau\,:\,s_0=s}
+          \mathbf{1}\{\operatorname{winner}(\tau)=A\}
+          \prod_t \pi_{i_t}(a_t\mid s_t).
+          $$
+          Thus, if draws are excluded, the winner $Y$ satisfies
+          $p(Y\mid s,\pi_A,\pi_B)\sim\operatorname{Bernoulli}
+          (p_A(s;\pi_A,\pi_B))$, where $Y=1$ means that $A$ wins and
+          $1-p_A$ is the probability that $B$ wins.
+        </d-footnote>
+      </p>
+
+      <p>
+          Given a dataset made of lots of starting board positions and for each board position tons of games played between the two players we theoretically could train a NN that looks at the board state and predicts the probability of $A$ or $B$ winning.
+      </p>
+      <p>We could just predict the odds, however there is a big difference between $40\% \pm 3\%$ chance of $A$ winning and $40\% \pm 30\%$ chance of $A$ winning. In the former case the model is pretty sure that if you sample lots of games $40\% $ of them will rule in favour of $A$, while in the latter case the model is not so sure, in principle $A$ could lose almost all the time.</p>
+
+      <h2>What does a search engine predict?</h2>
+      <p>
+          A search engine must estimate that probability under the assumption that both players play <i>optimally</i>, but even a search engine doesn't know how that would play out. 
+        may be uncertain. Predicting a 40% chance of A winning with high confidence
+        is very different from predicting 40% with little confidence.
+      </p>
+      
+      <p>
+        Instead of returning only a single number, an uncertainty-aware search
+        engine can return a distribution over possible win probabilities. For two
+        outcomes, this is naturally modeled by a <b>Beta distribution</b>; for
+        several outcomes—such as win, draw, and loss—it generalizes to a
+        <b>Dirichlet distribution</b>.
+      </p>
+      
+
 
       <h2 id="1-network-beliefs">1. Network beliefs</h2>
 
@@ -272,7 +205,7 @@ x,&p=q,\\
 \end{cases}
       </d-math>
 
-      <p class="equation-note">Every child-to-parent message is aligned before it is stored.</p>
+      <p><em>Every child-to-parent message is aligned before it is stored.</em></p>
 
       <h2 id="2-what-the-tree-remembers">2. A compact tree layout</h2>
 
@@ -280,7 +213,7 @@ x,&p=q,\\
 
       <p>The tree has no nested <code>NodePosterior</code>. It stores the following arrays directly:</p>
 
-      <table class="symbol-table">
+      <table>
         <thead>
           <tr>
             <th>Physical slot</th>
@@ -407,9 +340,7 @@ d_s\leftarrow\tau_s.
 
       <p>A terminal child is the base case: <d-math>\tau_{s_a}=0</d-math>, so its incoming edge receives distance one and contributes structural support one before the overwrite.</p>
 
-      <div class="correction">
-        <p><strong>Information that really is discarded:</strong> after an edge becomes categorical, its individual <d-math>R_{s,a}</d-math> no longer exists. Root summaries report structural counts only for unresolved edges, and categorical Q rows use their explicit categorical weight. The node total preserves mixing support but cannot reconstruct historical per-edge counts.</p>
-      </div>
+      <p><strong>Information that really is discarded:</strong> after an edge becomes categorical, its individual <d-math>R_{s,a}</d-math> no longer exists. Root summaries report structural counts only for unresolved edges, and categorical Q rows use their explicit categorical weight. The node total preserves mixing support but cannot reconstruct historical per-edge counts.</p>
 
       <h3 id="2-3-native-categorical-certificates">2.3 Native categorical certificates</h3>
 
@@ -472,27 +403,15 @@ X(\mathrm{Dir}(A))=U(\phi),\quad
 \phi\sim\mathrm{Dirichlet}(A).
       </d-math>
 
-      <p class="equation-note">Traversal applies this rule only to unresolved edges; mixed policy readout compares exact categorical utility with sampled Dirichlet utility. Node repair and root readout use populations of the same selector. There is no second action-selection algorithm.</p>
+      <p><em>Traversal applies this rule only to unresolved edges; mixed policy readout compares exact categorical utility with sampled Dirichlet utility. Node repair and root readout use populations of the same selector. There is no second action-selection algorithm.</em></p>
 
       <h2 id="4-one-simulation">4. One simulation</h2>
 
-      <div class="stage-row">
-        <div class="stage">
-          <div class="number">Stage 1</div>
-          <div class="stage-title">Simulate</div>
-          <p>Thompson-sample at each node and follow existing children to an unexpanded, terminal, or depth-cutoff edge.</p>
-        </div>
-        <div class="stage">
-          <div class="number">Stage 2</div>
-          <div class="stage-title">Expand</div>
-          <p>Step the environment and evaluate the child. Create a node only when the selected edge is new.</p>
-        </div>
-        <div class="stage">
-          <div class="number">Stage 3</div>
-          <div class="stage-title">Repair</div>
-          <p>Walk from the deepest parent back to the root and update every node with the same posterior rule.</p>
-        </div>
-      </div>
+      <ol>
+        <li><strong>Simulate.</strong> Thompson-sample at each node and follow existing children to an unexpanded, terminal, or depth-cutoff edge.</li>
+        <li><strong>Expand.</strong> Step the environment and evaluate the child. Create a node only when the selected edge is new.</li>
+        <li><strong>Repair.</strong> Walk from the deepest parent back to the root and update every node with the same posterior rule.</li>
+      </ol>
 
       <d-math block>
 \text{simulation}
@@ -528,7 +447,7 @@ z_{s'},&s'\text{ is terminal},\\
 
       <p>The default rule is local: it receives one node, all of its child summaries, and the final leaf only when this is the deepest path node.</p>
 
-      <div class="step-label">Step A · write the final edge</div>
+      <p><strong>Step A · write the final edge</strong></p>
 
       <p>At the deepest node <d-math>s_d</d-math>, an unresolved selected edge increments its structural count and replaces its alpha message:</p>
 
@@ -542,9 +461,9 @@ B_{s_d,a_d}\leftarrow
 \quad\text{only when }z_{s_d,a_d}=\bot.
       </d-math>
 
-      <p class="equation-note"><d-math>B</d-math> is replaced, not added. If expansion is terminal, the engine instead folds support one into <d-math>n_{s_d}</d-math> and overwrites the edge payload with distance one; the posterior callback never reads that distance as <d-math>R</d-math>.</p>
+      <p><em><d-math>B</d-math> is replaced, not added. If expansion is terminal, the engine instead folds support one into <d-math>n_{s_d}</d-math> and overwrites the edge payload with distance one; the posterior callback never reads that distance as <d-math>R</d-math>.</em></p>
 
-      <div class="step-label">Step B · refresh from children</div>
+      <p><strong>Step B · refresh from children</strong></p>
 
       <p>For every expanded, unresolved child with repaired information below it, replace the parent edge by the child's current cache. Its node payload still means <d-math>n_{s_a}</d-math>:</p>
 
@@ -561,7 +480,7 @@ R_{s,a}
 
       <p>When a child becomes categorical, the engine first commits the final <d-math>1+n_{s_a}</d-math> count delta to the parent total, then overwrites the incoming edge count with distance. Categorical children are never refreshed as Dirichlet messages afterwards.</p>
 
-      <div class="step-label">Step C · form a fresh node policy</div>
+      <p><strong>Step C · form a fresh node policy</strong></p>
 
       <p>Recompute all effective action posteriors and estimate a fresh posterior-best policy:</p>
 
@@ -574,7 +493,7 @@ R_{s,a}
 
       <p>This is not a visit distribution or a running average. It is a new mixed-native population: categorical utilities are exact and unresolved utilities are freshly Thompson-sampled.</p>
 
-      <div class="step-label">Step D · repair the node value</div>
+      <p><strong>Step D · repair the node value</strong></p>
 
       <p>While the node is unresolved, its node payload is the incrementally maintained total structural support</p>
 
@@ -673,9 +592,7 @@ T^V_s=
 \pi_{\mathrm{search}}(a\mid s_0).
       </d-math>
 
-      <div class="correction">
-        <p>There is no root-only reconstruction <d-math>\beta_Q=\alpha_{\mathrm{base}}+E_Q</d-math>, and <d-math>R</d-math> is never added to Dirichlet concentration. A categorical target consumes the exact sidecar, not the numeric cache projection.</p>
-      </div>
+      <p><strong>There is no root-only reconstruction</strong> <d-math>\beta_Q=\alpha_{\mathrm{base}}+E_Q</d-math>, and <d-math>R</d-math> is never added to Dirichlet concentration. A categorical target consumes the exact sidecar, not the numeric cache projection.</p>
 
       <h3 id="6-1-losses">6.1 Losses</h3>
 
@@ -792,7 +709,9 @@ N_{\mathrm{real\ nodes}}\le N+1.
 \text{posterior mathematics}.
       </d-math>
 
-      <p class="page-footer">For field-level contracts, concentration parameterization, action commitment modes, and the full loss definition, see <a href="math.md"><code>math.md</code></a>. The algorithm follows the message-passing logic in <code>tictactoe-demo/app.js</code> and the active <code>scacchi.dirichlet_mctx</code> backend.</p>
+      <hr>
+
+      <p>For field-level contracts, concentration parameterization, action commitment modes, and the full loss definition, see <a href="math.md"><code>math.md</code></a>. The algorithm follows the message-passing logic in <code>tictactoe-demo/app.js</code> and the active <code>scacchi.dirichlet_mctx</code> backend.</p>
     </d-article>
   </body>
 </html>
