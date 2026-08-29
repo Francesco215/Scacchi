@@ -56,6 +56,21 @@
         margin-top: 0.75rem;
       }
 
+      .search-overview-figure {
+        margin-bottom: 2.25rem;
+        margin-top: 1.75rem;
+      }
+
+      .search-overview-figure img {
+        display: block;
+        height: auto;
+        width: 100%;
+      }
+
+      .search-overview-figure figcaption {
+        margin-top: 0.8rem;
+      }
+
       @media (max-width: 860px) {
         .tictactoe-embed iframe {
           height: 1500px;
@@ -199,26 +214,49 @@
         we can give it a position it has never seen and ask it to predict how games
         between players like $A$ and $B$ would usually end from that position.
       </p>
-      <p>
-          Let's be clear: this is not how you train a chess-engine. The point of this section thus far has been to show you...
-      </p>
-      <h2>What does a search engine predict?</h2>
-      <p>
-          A search engine must estimate that probability under the assumption that both players play <i>optimally</i>, but even a search engine doesn't know how that would play out.
-        may be uncertain. Predicting a 40% chance of A winning with high confidence
-        is very different from predicting 40% with little confidence.
-      </p>
 
       <p>
-        Instead of returning only a single number, an uncertainty-aware search
-        engine can return a distribution over possible win probabilities. For two
-        outcomes, this is naturally modeled by a <b>Beta distribution</b>; for
-        several outcomes—such as win, draw, and loss—it generalizes to a
-        <b>Dirichlet distribution</b>.
+        Let's be clear: <b>this is not how you train a chess engine</b>. The point of
+        this section was to show how a Beta distribution can represent both a
+        prediction and its uncertainty.
       </p>
 
+      <h2>What search does</h2>
+      <!--alternative titles: what's the point of doing search? a high level overview on search engines -->
+      <p>
+         A search engine estimates the probability of winning for each possible next move, assuming both players play optimally. Because the optimal strategy is often unknown, the engine is uncertain about its evaluation, so its estimates must be represented as probability distributions—just like in the example above!
+      </p>
 
+      <figure class="l-body search-overview-figure">
+        <img
+          src="search-beta-refinement.svg"
+          alt="A broad starting Beta distribution flowing through search into a taller, narrower Beta distribution"
+        >
+        <figcaption>
+          Figure 4: Search starts from the network’s broad Beta prediction. As it gathers evidence, the output becomes more concentrated, expressing greater confidence in the estimated win probability.
+        </figcaption>
+      </figure>
 
+      <p>
+          In a search engine, the network provides
+          an initial distribution $q_\theta$ as a starting guess; search improves it, and the
+          improved prediction $q_\textrm{search}$ becomes the network's training target.
+      </p>
+
+      $$
+L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
+      $$
+      <p>
+          If the search algorithms proves that one of the players has a forced win opportunity, then the target becomes a dirac delta. 
+      </p>
+      <h3>From son to father</h3>
+      <p>Tree search is about exploring the tree and updating the value of all the nodes with children. Let's suppose we just have a root node and all the other nodes are leaf nodes, how should we update the root node?</p>
+      <p>
+          So we have a initial value $V$ for the node represented by it's probability distribution. This is going to act as a prior, and we are going to update it with the information we have for each possible next action $Q_a$
+      </p>
+      <p>BASICALLY HERE TALK ABOUT POSTERIOR UPDATE, EXPLAIN THE LINK WITH THE BANDITS</p>
+      <h2>Curiosity driven search</h2>
+      <p>plot a tree and talk about sorting it to do the backward pass and put pseudocode </p>
       <h2 id="1-network-beliefs">1. Network beliefs</h2>
 
       <p>At state $s$, the network predicts a policy together with one state Dirichlet and one Dirichlet for every action:</p>
