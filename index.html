@@ -7,8 +7,10 @@
     <title>Curious Tree Search</title>
     <script src="https://distill.pub/template.v2.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.css" integrity="sha384-zTROYFVGOfTw7JV7KUu8udsvW2fx4lWOsCEDqhBreBwlHI4ioVRtmIvEThzJHGET" crossorigin="anonymous">
+    <link rel="stylesheet" href="chess-dataset.css">
     <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.js" integrity="sha384-GxNFqL3r9uRJQhR+47eDxuPoNE7yLftQM8LcxzgS4HT73tp970WS/wV5p8UzCOmb" crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/contrib/auto-render.min.js" integrity="sha384-vZTG03m+2yp6N6BNi5iM4rW4oIwk5DfcNdFfxkk9ZWpDriOkXX8voJBFrAO7MpVl" crossorigin="anonymous"></script>
+    <script src="chess-dataset.js"></script>
     <script>
       document.addEventListener("DOMContentLoaded", function () {
         renderMathInElement(document.body, {
@@ -86,9 +88,9 @@
       <d-contents></d-contents>
 
       <p>This is the second blog post of my series of "mathematical foundations of curiosity"</p>
-      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem. Here we are going to show how it generalizes to board games such as tic-tac-toe, hex, chess and go and make a search engine<d-footnote>By search engine I mean an engine that searches the game tree, not the internet.</d-footnote> out of it!</p>
+      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem. Here we are going to show how you can make a search-engine<d-footnote>By search engine I mean an engine that searches the game tree, not the internet.</d-footnote> out of it for board games such as tic-tac-toe, hex, chess and go.</p>
 
-      <figure class="l-page-outset tictactoe-embed">
+      <figure class="tictactoe-embed">
         <iframe
           id="tictactoe-demo"
           src="tictactoe-demo/index.html"
@@ -99,12 +101,11 @@
       </figure>
 
       <h2>Games as unfair coin tosses</h2>
-      
+
       <p>
-        Suppose two players, $A$ and $B$, are given a particular board position.
-        We want to predict the probability that each player will win. (From now on, we are going to ignore draws to make the explanation simpler)
+        Suppose two players, $A$ and $B$, are given a particular board state $s$. We want to predict the probability that each player will win. <d-footnote>From simplicity, we are going to ignore draws to make the explanation simpler</d-footnote>
       </p>
-      
+
       <p>
         The game rules may be deterministic, but the players, are not. Each
         follows a policy, $\pi_A$ and $\pi_B$.
@@ -127,18 +128,87 @@
         </d-footnote>
       </p>
 
-      <p>
-          Given a dataset made of lots of starting board positions and for each board position tons of games played between the two players we theoretically could train a NN that looks at the board state and predicts the probability of $A$ or $B$ winning.
-      </p>
-      <p>We could just predict the odds, however there is a big difference between $40\% \pm 3\%$ chance of $A$ winning and $40\% \pm 30\%$ chance of $A$ winning. In the former case the model is pretty sure that if you sample lots of games $40\% $ of them will rule in favour of $A$, while in the latter case the model is not so sure, in principle $A$ could lose almost all the time.</p>
+      <div>
+        <figure class="l-body side">
+          <img
+            src="beta-nll.svg"
+            alt="The predicted distribution Beta(· | θ), with the true probability p_A(s) marked by a dashed orange line and the conditional mean E[p | θ] by a solid blue line"
+          >
+          <figcaption>
+            Figure 2: Here, the true odds $p_A(s)$ are shown by the dashed orange line, while the blue curve is the model’s prediction $\operatorname{Beta}\!\left(\cdot  | \theta \right)$ and the solid blue line marks its mean. The model receives a lower loss when the curve places more density at the true odds.</figcaption>
+        </figure>
+        <p>
+          Let's say that we want to train a NN that predicts the probability $p_A(s)$ of the player $A$ winning given a board state $s$. What would be the correct way of parametrizing the problem?<br><br>
+          The thing we want to minimize is the Negative Log-Likelihood (NLL) of the actual real-world odds of $A$ winning. For this, we use a Beta distribution: the conjugate prior to the Bernoulli likelihood<d-footnote>The Beta distribution is a family of distributions over a probability $p\in(0,1)$. Its density is
+          $$
+          f(p;\alpha,\beta)
+          =\frac{p^{\alpha-1}(1-p)^{\beta-1}}{B(\alpha,\beta)},
+          \qquad \alpha,\beta&gt;0.
+          $$
+          <br>
+          Its two parameters have an intuitive decomposition:
+          $$
+          \underbrace{\frac{\alpha}{\alpha+\beta}}_{\text{mean: predicted odds}},
+          \qquad
+          \underbrace{\alpha+\beta}_{\text{concentration: confidence}}.
+          $$
+          <br>
+          This makes the Beta distribution a natural representation of uncertainty about an unknown Bernoulli probability. It has exactly the right support, and it expresses both where the win probability is believed to lie and how certain that belief is.<br><br>
+          It is also <em>conjugate</em> to the Bernoulli likelihood. If
+          $$
+          p\sim\operatorname{Beta}(\alpha,\beta)
+          $$
+          before observing any new games, then after $w$ wins by $A$ and $\ell$ losses,
+          $$
+          p\mid\text{data}
+          \sim\operatorname{Beta}(\alpha+w,\beta+\ell).
+          $$
+          <br>
+          In other words, every win adds one unit of evidence to $\alpha$, and every loss adds one to $\beta$. In this model the network outputs these two positive parameters for each board state, so its prediction is a full distribution over the latent win probability rather than only a point estimate.</d-footnote>
+          $$
+          \mathcal L(s)=-\log\operatorname{Beta}\!\left(p_A(s) | \theta \right).
+          $$
+          Where $\theta$ are trainable model parameters.
+        </p>
+      </div>
 
+      <h3 id="a-ten-position-toy-dataset">A toy example</h3>
+
+      <p>
+        Suppose our dataset contains several board positions. For every position, we let
+        the same two players play from there many times. Once we have enough games, we'll
+        have reasonably accurate empirical estimates of $p_A$ to use as training targets
+        for our model.
+      </p>
+
+      <figure class="l-page-outset coin-dataset">
+        <div id="coin-dataset-grid" class="coin-dataset__interactive"></div>
+        <noscript>This figure needs JavaScript to draw its inline SVG chessboards and Beta curves.</noscript>
+        <figcaption>
+          Figure 3: A toy dataset of chess positions. Select a board to compare the
+          win rate estimated from repeated games with the model’s prediction. The
+          positions are adapted from the
+          <a href="https://lichess.org/study/KhHUn7L4">Lichess “10 Immortal Games” study</a>;
+          all odds and predictions are synthetic.
+        </figcaption>
+      </figure>
+
+      <p>
+        In principle, a model can
+        learn the mapping from a board state to these outcome odds. After training,
+        we can give it a position it has never seen and ask it to predict how games
+        between players like $A$ and $B$ would usually end from that position.
+      </p>
+      <p>
+          Let's be clear: this is not how you train a chess-engine. The point of this section thus far has been to show you...
+      </p>
       <h2>What does a search engine predict?</h2>
       <p>
-          A search engine must estimate that probability under the assumption that both players play <i>optimally</i>, but even a search engine doesn't know how that would play out. 
+          A search engine must estimate that probability under the assumption that both players play <i>optimally</i>, but even a search engine doesn't know how that would play out.
         may be uncertain. Predicting a 40% chance of A winning with high confidence
         is very different from predicting 40% with little confidence.
       </p>
-      
+
       <p>
         Instead of returning only a single number, an uncertainty-aware search
         engine can return a distribution over possible win probabilities. For two
@@ -146,64 +216,64 @@
         several outcomes—such as win, draw, and loss—it generalizes to a
         <b>Dirichlet distribution</b>.
       </p>
-      
+
 
 
       <h2 id="1-network-beliefs">1. Network beliefs</h2>
 
-      <p>At state <d-math>s</d-math>, the network predicts a policy together with one state Dirichlet and one Dirichlet for every action:</p>
+      <p>At state $s$, the network predicts a policy together with one state Dirichlet and one Dirichlet for every action:</p>
 
-      <d-math block>
+      $$
 \pi_\theta(a\mid s),
 \qquad
 V_s=\alpha_\theta^V(s),
 \qquad
 Q_{s,a}=\alpha_\theta^Q(s,a).
-      </d-math>
+      $$
 
-      <p>A Dirichlet parameter vector <d-math>\alpha</d-math> represents uncertainty about an outcome distribution:</p>
+      <p>A Dirichlet parameter vector $\alpha$ represents uncertainty about an outcome distribution:</p>
 
-      <d-math block>
+      $$
 \phi\sim\mathrm{Dirichlet}(\alpha),
 \qquad
 \mu(\alpha)=\mathbb E[\phi]
 =\frac{\alpha}{\sum_z\alpha_z}.
-      </d-math>
+      $$
 
-      <p>The head predicts mean logits <d-math>r_\theta</d-math> and a raw log-concentration <d-math>\eta_\theta</d-math> directly:</p>
+      <p>The head predicts mean logits $r_\theta$ and a raw log-concentration $\eta_\theta$ directly:</p>
 
-      <d-math block>
+      $$
 \mu_\theta=\mathrm{softmax}(r_\theta),
 \qquad
 c_\theta=e^{\eta_\theta},
 \qquad
 \alpha_\theta=c_\theta\mu_\theta.
-      </d-math>
+      $$
 
-      <p>Equivalently, <d-math>s_\theta=-\eta_\theta=\log(1/c_\theta)</d-math> is a log-dispersion. There is no learned concentration floor, squared-softplus transform, bounded sigmoid, or training-time output ceiling in the direct head. A very broad floating-point guard uses an identity backward derivative, so it cannot create a zero-gradient dead zone.</p>
+      <p>Equivalently, $s_\theta=-\eta_\theta=\log(1/c_\theta)$ is a log-dispersion. There is no learned concentration floor, squared-softplus transform, bounded sigmoid, or training-time output ceiling in the direct head. A very broad floating-point guard uses an identity backward derivative, so it cannot create a zero-gradient dead zone.</p>
 
-      <p>The outcomes are ordered as <d-math>(L,W)</d-math> or <d-math>(L,D,W)</d-math>. Search compares samples with the same utility everywhere:</p>
+      <p>The outcomes are ordered as $(L,W)$ or $(L,D,W)$. Search compares samples with the same utility everywhere:</p>
 
-      <d-math block>
+      $$
 U(\phi)=\phi_W-\phi_L.
-      </d-math>
+      $$
 
       <h3 id="1-1-player-perspective">1.1 Player perspective</h3>
 
       <p>Values belong to the player to move at their node. Moving a value to the opponent's perspective reverses loss and win:</p>
 
-      <d-math block>
+      $$
 \mathrm{flip}(x_L,x_D,x_W)
 =(x_W,x_D,x_L).
-      </d-math>
+      $$
 
-      <d-math block>
+      $$
 \mathrm{Align}(x;p\to q)=
 \begin{cases}
 x,&p=q,\\
 \mathrm{flip}(x),&p\ne q.
 \end{cases}
-      </d-math>
+      $$
 
       <p><em>Every child-to-parent message is aligned before it is stored.</em></p>
 
@@ -223,46 +293,46 @@ x,&p=q,\\
         </thead>
         <tbody>
           <tr>
-            <td><d-math>H_{s,a}</d-math> · float <d-math>[A,O]</d-math></td>
-            <td>Network <d-math>Q_{s,a}</d-math> until repaired, then the latest message <d-math>B_{s,a}</d-math></td>
+            <td>$H_{s,a}$ · float $[A,O]$</td>
+            <td>Network $Q_{s,a}$ until repaired, then the latest message $B_{s,a}$</td>
             <td>Last learned alpha, retained only while an unresolved parent needs its concentration for the numeric cache mixture</td>
           </tr>
           <tr>
-            <td><d-math>V_s</d-math> · float <d-math>[O]</d-math></td>
+            <td>$V_s$ · float $[O]$</td>
             <td>Fixed network value prior</td>
             <td>Unused by search after the node becomes absorbing</td>
           </tr>
           <tr>
-            <td><d-math>C_s</d-math> · float <d-math>[O]</d-math></td>
+            <td>$C_s$ · float $[O]$</td>
             <td>Current repaired node cache</td>
             <td>Unused; the exact node certificate owns the value</td>
           </tr>
           <tr>
-            <td><d-math>z_{s,a}</d-math> · int8 <d-math>[A]</d-math></td>
-            <td><d-math>\bot</d-math></td>
-            <td>Exact edge outcome <d-math>L,D,</d-math> or <d-math>W</d-math></td>
+            <td>$z_{s,a}$ · int8 $[A]$</td>
+            <td>$\bot$</td>
+            <td>Exact edge outcome $L,D,$ or $W$</td>
           </tr>
           <tr>
-            <td><d-math>d_{s,a}</d-math> · int32 <d-math>[A]</d-math></td>
-            <td>Structural count <d-math>R_{s,a}</d-math></td>
-            <td>Certified edge distance <d-math>\tau_{s,a}</d-math></td>
+            <td>$d_{s,a}$ · int32 $[A]$</td>
+            <td>Structural count $R_{s,a}$</td>
+            <td>Certified edge distance $\tau_{s,a}$</td>
           </tr>
           <tr>
-            <td><d-math>z_s</d-math> · int8</td>
-            <td><d-math>\bot</d-math></td>
+            <td>$z_s$ · int8</td>
+            <td>$\bot$</td>
             <td>Exact node outcome</td>
           </tr>
           <tr>
-            <td><d-math>d_s</d-math> · int32</td>
-            <td>Total structural support <d-math>n_s</d-math></td>
-            <td>Certified node distance <d-math>\tau_s</d-math></td>
+            <td>$d_s$ · int32</td>
+            <td>Total structural support $n_s$</td>
+            <td>Certified node distance $\tau_s$</td>
           </tr>
         </tbody>
       </table>
 
       <p>The outcome tag determines how each integer payload is decoded:</p>
 
-      <d-math block>
+      $$
 d_{s,a}=
 \begin{cases}
 R_{s,a},&z_{s,a}=\bot,\\
@@ -274,15 +344,15 @@ d_s=
 n_s,&z_s=\bot,\\
 \tau_s,&z_s\ne\bot.
 \end{cases}
-      </d-math>
+      $$
 
-      <p>An unresolved node may have <d-math>n_s=0</d-math>, so zero alone cannot mean terminal once the slots are overlaid. The redundant terminal Boolean disappears, but the exact test is</p>
+      <p>An unresolved node may have $n_s=0$, so zero alone cannot mean terminal once the slots are overlaid. The redundant terminal Boolean disappears, but the exact test is</p>
 
-      <d-math block>
+      $$
 \mathrm{terminal}(s)
 \iff
 z_s\ne\bot\ \land\ d_s=0.
-      </d-math>
+      $$
 
       <p>This requires root evaluation to provide an exact terminal outcome whenever the root itself can be terminal. A Boolean terminal flag without its outcome is no longer a sufficient root contract.</p>
 
@@ -290,7 +360,7 @@ z_s\ne\bot\ \land\ d_s=0.
 
       <p>While an edge is unresolved, its integer payload is a count and its float slot changes meaning in place:</p>
 
-      <d-math block>
+      $$
 A_{s,a}=
 \begin{cases}
 H_{s,a}=B_{s,a},
@@ -300,93 +370,93 @@ H_{s,a}=B_{s,a},
 H_{s,a}=Q_{s,a},
 &z_{s,a}=\bot\ \land\ s_a\text{ does not exist}.
 \end{cases}
-      </d-math>
+      $$
 
-      <p>Thus <d-math>Q</d-math> and <d-math>B</d-math> are successive contents of one float slot, while <d-math>A</d-math> is computed and never stored. The fixed <d-math>V_s</d-math> and mutable <d-math>C_s</d-math> cannot share a slot while the node is unresolved: every repair needs both at the same time.</p>
+      <p>Thus $Q$ and $B$ are successive contents of one float slot, while $A$ is computed and never stored. The fixed $V_s$ and mutable $C_s$ cannot share a slot while the node is unresolved: every repair needs both at the same time.</p>
 
       <p>Policy logits are not tree state. Legality is extracted during evaluation and stored as a compact mask. Categorical ties use the search RNG directly, so they never trigger another network evaluation.</p>
 
       <h3 id="2-2-state-transitions">2.2 Safe integer-slot transitions</h3>
 
-      <p>The node total is maintained incrementally. For every unresolved edge-count change <d-math>r_{\mathrm{old}}\to r_{\mathrm{new}}</d-math>, update</p>
+      <p>The node total is maintained incrementally. For every unresolved edge-count change $r_{\mathrm{old}}\to r_{\mathrm{new}}$, update</p>
 
-      <d-math block>
+      $$
 d_s\leftarrow d_s+r_{\mathrm{new}}-r_{\mathrm{old}}
 \qquad(z_s=\bot)
-      </d-math>
+      $$
 
-      <p>before writing the new edge payload. The tree never recomputes <d-math>n_s</d-math> by summing a mixture of counts and distances.</p>
+      <p>before writing the new edge payload. The tree never recomputes $n_s$ by summing a mixture of counts and distances.</p>
 
       <p>When a child becomes categorical, publication is ordered as one transaction:</p>
 
-      <d-math block>
+      $$
 \begin{aligned}
 r_{\mathrm{final}}&\leftarrow 1+n_{s_a},\\
 d_s&\leftarrow d_s+r_{\mathrm{final}}-r_{\mathrm{old}},\\
 z_{s,a}&\leftarrow \mathrm{Align}(z_{s_a};p_{s_a}\to p_s),\\
 d_{s,a}&\leftarrow \tau_{s_a}+1.
 \end{aligned}
-      </d-math>
+      $$
 
-      <p>The first two lines preserve the child's final structural contribution in the unresolved parent. Only then may the edge count be overwritten by distance. Once <d-math>z_{s,a}\ne\bot</d-math>, that payload is never again read as a count.</p>
+      <p>The first two lines preserve the child's final structural contribution in the unresolved parent. Only then may the edge count be overwritten by distance. Once $z_{s,a}\ne\bot$, that payload is never again read as a count.</p>
 
-      <p>When the node itself becomes categorical, first publish its final <d-math>1+n_s</d-math> contribution to its unresolved parent using the same transaction. After that value is safe in the parent total, overwrite</p>
+      <p>When the node itself becomes categorical, first publish its final $1+n_s$ contribution to its unresolved parent using the same transaction. After that value is safe in the parent total, overwrite</p>
 
-      <d-math block>
+      $$
 z_s\leftarrow z_s^{\mathrm{cat}},
 \qquad
 d_s\leftarrow\tau_s.
-      </d-math>
+      $$
 
-      <p>A terminal child is the base case: <d-math>\tau_{s_a}=0</d-math>, so its incoming edge receives distance one and contributes structural support one before the overwrite.</p>
+      <p>A terminal child is the base case: $\tau_{s_a}=0$, so its incoming edge receives distance one and contributes structural support one before the overwrite.</p>
 
-      <p><strong>Information that really is discarded:</strong> after an edge becomes categorical, its individual <d-math>R_{s,a}</d-math> no longer exists. Root summaries report structural counts only for unresolved edges, and categorical Q rows use their explicit categorical weight. The node total preserves mixing support but cannot reconstruct historical per-edge counts.</p>
+      <p><strong>Information that really is discarded:</strong> after an edge becomes categorical, its individual $R_{s,a}$ no longer exists. Root summaries report structural counts only for unresolved edges, and categorical Q rows use their explicit categorical weight. The node total preserves mixing support but cannot reconstruct historical per-edge counts.</p>
 
       <h3 id="2-3-native-categorical-certificates">2.3 Native categorical certificates</h3>
 
       <p>An action is still one of two logical objects even though its count and distance share storage:</p>
 
-      <d-math block>
+      $$
 Y_{s,a}=
 \begin{cases}
 \mathrm{Cat}(z_{s,a},d_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
 \mathrm{Dir}(A_{s,a}),&z_{s,a}=\bot.
 \end{cases}
-      </d-math>
+      $$
 
       <p>The categorical tag is exact and absorbing. A certified edge is pruned from traversal. One certified win solves a node; a draw or loss is proved only after every legal edge is categorical.</p>
 
       <p>Certified wins choose a shortest winning edge and certified losses choose a longest losing edge. All certified draw edges are equivalent. Whenever more than one edge remains tied—including equal-distance win or loss edges—the engine samples uniformly among them with the existing search RNG. Policy logits, draw-distance preferences, and action order do not break categorical ties.</p>
 
-      <d-math block>
+      $$
 u_{\mathrm{cat}}(L)=-1,
 \qquad
 u_{\mathrm{cat}}(D)=0,
 \qquad
 u_{\mathrm{cat}}(W)=1.
-      </d-math>
+      $$
 
       <h2 id="3-one-thompson-rule">3. One Thompson rule</h2>
 
       <p>At every node—root or internal—the same selector assigns one utility to each native action:</p>
 
-      <d-math block>
+      $$
 X(Y_{s,a})=
 \begin{cases}
 u_{\mathrm{cat}}(z_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
 U(\phi_a),\quad \phi_a\sim\mathrm{Dirichlet}(A_{s,a}),&z_{s,a}=\bot,
 \end{cases}
-      </d-math>
+      $$
 
       <p>and chooses the legal action with highest utility:</p>
 
-      <d-math block>
+      $$
 a^*=\arg\max_{a\in\mathcal A(s)}X(Y_{s,a}).
-      </d-math>
+      $$
 
-      <p>Repeating this same choice <d-math>M</d-math> times estimates the probability that each action is best:</p>
+      <p>Repeating this same choice $M$ times estimates the probability that each action is best:</p>
 
-      <d-math block>
+      $$
 \widehat\pi_M(a\mid s)
 =
 \frac1M
@@ -394,14 +464,14 @@ a^*=\arg\max_{a\in\mathcal A(s)}X(Y_{s,a}).
 \mathbf 1\!\left[
 a=\arg\max_b X(Y_{s,b})^{(j)}
 \right].
-      </d-math>
+      $$
 
-      <d-math block>
+      $$
 X(\mathrm{Cat}(z,\tau))=u_{\mathrm{cat}}(z),
 \qquad
 X(\mathrm{Dir}(A))=U(\phi),\quad
 \phi\sim\mathrm{Dirichlet}(A).
-      </d-math>
+      $$
 
       <p><em>Traversal applies this rule only to unresolved edges; mixed policy readout compares exact categorical utility with sampled Dirichlet utility. Node repair and root readout use populations of the same selector. There is no second action-selection algorithm.</em></p>
 
@@ -413,7 +483,7 @@ X(\mathrm{Dir}(A))=U(\phi),\quad
         <li><strong>Repair.</strong> Walk from the deepest parent back to the root and update every node with the same posterior rule.</li>
       </ol>
 
-      <d-math block>
+      $$
 \text{simulation}
 =
 \text{traversal}
@@ -421,27 +491,27 @@ X(\mathrm{Dir}(A))=U(\phi),\quad
 \text{leaf evaluation}
 \longrightarrow
 \text{bottom-up repair}.
-      </d-math>
+      $$
 
       <h3 id="4-1-leaf-result">4.1 Tagged leaf result</h3>
 
       <p>A non-terminal frontier contributes its complete network value prior:</p>
 
-      <d-math block>
+      $$
 L_{s'}=V_{s'}.
-      </d-math>
+      $$
 
       <p>Expansion also returns one exact tag:</p>
 
-      <d-math block>
+      $$
 \mathrm{terminal\_outcome}(s')=
 \begin{cases}
 z_{s'},&s'\text{ is terminal},\\
 \mathrm{NO\_OUTCOME},&s'\text{ is non-terminal}.
 \end{cases}
-      </d-math>
+      $$
 
-      <p>A terminal tag creates <d-math>\mathrm{Cat}(z_{s'},0)</d-math> on the child and the aligned distance-one certificate on its incoming edge. It does not create a terminal Dirichlet. Model alphas are used as unresolved leaf messages and caches only.</p>
+      <p>A terminal tag creates $\mathrm{Cat}(z_{s'},0)$ on the child and the aligned distance-one certificate on its incoming edge. It does not create a terminal Dirichlet. Model alphas are used as unresolved leaf messages and caches only.</p>
 
       <h2 id="5-bottom-up-posterior-repair">5. Bottom-up posterior repair</h2>
 
@@ -449,25 +519,25 @@ z_{s'},&s'\text{ is terminal},\\
 
       <p><strong>Step A · write the final edge</strong></p>
 
-      <p>At the deepest node <d-math>s_d</d-math>, an unresolved selected edge increments its structural count and replaces its alpha message:</p>
+      <p>At the deepest node $s_d$, an unresolved selected edge increments its structural count and replaces its alpha message:</p>
 
-      <d-math block>
+      $$
 R_{s_d,a_d}\leftarrow R_{s_d,a_d}+1,
-      </d-math>
+      $$
 
-      <d-math block>
+      $$
 B_{s_d,a_d}\leftarrow
 \mathrm{Align}(V_{s'};p_{s'}\to p_{s_d})
 \quad\text{only when }z_{s_d,a_d}=\bot.
-      </d-math>
+      $$
 
-      <p><em><d-math>B</d-math> is replaced, not added. If expansion is terminal, the engine instead folds support one into <d-math>n_{s_d}</d-math> and overwrites the edge payload with distance one; the posterior callback never reads that distance as <d-math>R</d-math>.</em></p>
+      <p><em>$B$ is replaced, not added. If expansion is terminal, the engine instead folds support one into $n_{s_d}$ and overwrites the edge payload with distance one; the posterior callback never reads that distance as $R$.</em></p>
 
       <p><strong>Step B · refresh from children</strong></p>
 
-      <p>For every expanded, unresolved child with repaired information below it, replace the parent edge by the child's current cache. Its node payload still means <d-math>n_{s_a}</d-math>:</p>
+      <p>For every expanded, unresolved child with repaired information below it, replace the parent edge by the child's current cache. Its node payload still means $n_{s_a}$:</p>
 
-      <d-math block>
+      $$
 B_{s,a}
 \leftarrow
 \mathrm{Align}(C_{s_a};p_{s_a}\to p_s),
@@ -476,20 +546,20 @@ R_{s,a}
 \leftarrow
 1+n_{s_a},
 \quad n_{s_a}>0.
-      </d-math>
+      $$
 
-      <p>When a child becomes categorical, the engine first commits the final <d-math>1+n_{s_a}</d-math> count delta to the parent total, then overwrites the incoming edge count with distance. Categorical children are never refreshed as Dirichlet messages afterwards.</p>
+      <p>When a child becomes categorical, the engine first commits the final $1+n_{s_a}$ count delta to the parent total, then overwrites the incoming edge count with distance. Categorical children are never refreshed as Dirichlet messages afterwards.</p>
 
       <p><strong>Step C · form a fresh node policy</strong></p>
 
       <p>Recompute all effective action posteriors and estimate a fresh posterior-best policy:</p>
 
-      <d-math block>
+      $$
 \pi_s
 =
 \widehat\pi_{M_{\mathrm{node}}}
 (\,\cdot\mid s;Y_s).
-      </d-math>
+      $$
 
       <p>This is not a visit distribution or a running average. It is a new mixed-native population: categorical utilities are exact and unresolved utilities are freshly Thompson-sampled.</p>
 
@@ -497,34 +567,34 @@ R_{s,a}
 
       <p>While the node is unresolved, its node payload is the incrementally maintained total structural support</p>
 
-      <d-math block>
+      $$
 \gamma_s=\frac{n_s}{\kappa+n_s}.
-      </d-math>
+      $$
 
       <p>The incremental form is necessary because categorical edge payloads now contain distance, not their discarded historical count.</p>
 
       <p>For the numeric cache mixture only, preserve each categorical edge's learned effective-alpha mass but replace its direction by the exact sidecar outcome:</p>
 
-      <d-math block>
+      $$
 \widetilde A_{s,a}=
 \begin{cases}
 A_{s,a},&z_{s,a}=\bot,\\[3pt]
 \left(\sum_i A_{s,a,i}\right)e_{z_{s,a}},&z_{s,a}\ne\bot.
 \end{cases}
-      </d-math>
+      $$
 
       <p>Average these cache operands with the fresh search policy:</p>
 
-      <d-math block>
+      $$
 \bar A_s
 =
 \sum_{a\in\mathcal A(s)}
 \pi_s(a)\widetilde A_{s,a}.
-      </d-math>
+      $$
 
       <p>Then interpolate between the fixed network value and the repaired descendants:</p>
 
-      <d-math block>
+      $$
 \boxed{
 C_s
 =
@@ -532,31 +602,31 @@ C_s
 +
 \gamma_s\bar A_s
 }.
-      </d-math>
+      $$
 
-      <p>If <d-math>n_s=0</d-math>, then <d-math>C_s=V_s</d-math>. The sole constant <d-math>\kappa&gt;0</d-math> is the strength of that learned value prior against repaired descendants. It is not leaf evidence or terminal confidence. The categorical projection does not mutate <d-math>A</d-math> and never replaces the exact sidecar or categorical training target.</p>
+      <p>If $n_s=0$, then $C_s=V_s$. The sole constant $\kappa&gt;0$ is the strength of that learned value prior against repaired descendants. It is not leaf evidence or terminal confidence. The categorical projection does not mutate $A$ and never replaces the exact sidecar or categorical training target.</p>
 
       <h3 id="5-1-why-the-order-matters">5.1 Why the order matters</h3>
 
       <p>For a selected path</p>
 
-      <d-math block>
+      $$
 s_0\to s_1\to\cdots\to s_d,
-      </d-math>
+      $$
 
       <p>repair runs in the reverse order:</p>
 
-      <d-math block>
+      $$
 s_d,\ s_{d-1},\ \ldots,\ s_0.
-      </d-math>
+      $$
 
-      <p>When <d-math>s_i</d-math> is repaired, it therefore sees the new <d-math>C_{s_{i+1}}</d-math> computed moments earlier. This is how one local rule transports information all the way to the root.</p>
+      <p>When $s_i$ is repaired, it therefore sees the new $C_{s_{i+1}}$ computed moments earlier. This is how one local rule transports information all the way to the root.</p>
 
       <h2 id="6-root-readout-and-training-targets">6. Root readout and training targets</h2>
 
       <p>If the root remains unresolved, its policy is another mixed-native posterior-best population. If the root is categorical, the engine samples uniformly among tied certified actions and returns a one-hot policy on that sample:</p>
 
-      <d-math block>
+      $$
 \pi_{\mathrm{search}}(a\mid s_0)
 =
 \begin{cases}
@@ -565,50 +635,50 @@ s_d,\ s_{d-1},\ \ldots,\ s_0.
 \mathbf 1[a=a_{\mathrm{cat}}(s_0)],
 &z_{s_0}\ne\bot.
 \end{cases}
-      </d-math>
+      $$
 
       <p>The Q and V targets retain the same native tags used by search:</p>
 
-      <d-math block>
+      $$
 T^Q_{s,a}=
 \begin{cases}
 \mathrm{Pad},&a\text{ illegal},\\
 \mathrm{Cat}(z_{s,a},\tau_{s,a}),&z_{s,a}\ne\bot,\\
 \mathrm{Dir}(A_{s,a}),&z_{s,a}=\bot,
 \end{cases}
-      </d-math>
+      $$
 
-      <d-math block>
+      $$
 T^V_s=
 \begin{cases}
 \mathrm{Cat}(z_s,\tau_s),&z_s\ne\bot,\\
 \mathrm{Dir}(C_s),&z_s=\bot.
 \end{cases}
-      </d-math>
+      $$
 
-      <d-math block>
+      $$
 \pi_{\mathrm{target}}(a\mid s_0)
 =
 \pi_{\mathrm{search}}(a\mid s_0).
-      </d-math>
+      $$
 
-      <p><strong>There is no root-only reconstruction</strong> <d-math>\beta_Q=\alpha_{\mathrm{base}}+E_Q</d-math>, and <d-math>R</d-math> is never added to Dirichlet concentration. A categorical target consumes the exact sidecar, not the numeric cache projection.</p>
+      <p><strong>There is no root-only reconstruction</strong> $\beta_Q=\alpha_{\mathrm{base}}+E_Q$, and $R$ is never added to Dirichlet concentration. A categorical target consumes the exact sidecar, not the numeric cache projection.</p>
 
       <h3 id="6-1-losses">6.1 Losses</h3>
 
       <p>The policy head distills the posterior-best distribution:</p>
 
-      <d-math block>
+      $$
 \mathcal L_\pi
 =
 -\sum_{a\in\mathcal A(s)}
 \mathrm{stopgrad}(\pi_{\mathrm{target}}(a\mid s))
 \log\pi_\theta(a\mid s).
-      </d-math>
+      $$
 
       <p>For an unresolved Dirichlet target, separate its mean and inverse-concentration:</p>
 
-      <d-math block>
+      $$
 \beta_0=\sum_i\beta_i,
 \qquad
 m=\frac{\beta}{\beta_0},
@@ -616,42 +686,42 @@ m=\frac{\beta}{\beta_0},
 v=\frac1{\beta_0},
 \qquad
 d=D_{\mathrm{KL}}(\mathrm{stopgrad}(m)\,\|\,\mu_\theta).
-      </d-math>
+      $$
 
       <p>Full training uses a coupled log-dispersion score, analogous to a Gaussian loss with predicted log-variance:</p>
 
-      <d-math block>
+      $$
 \mathcal L_{\mathrm{disp}}
 =-\log(c_\theta v)
 +c_\theta(v+d)-1
 =s_\theta-\log v+e^{-s_\theta}(v+d)-1.
-      </d-math>
+      $$
 
-      <d-math block>
+      $$
 \frac{\partial\mathcal L_{\mathrm{disp}}}{\partial\eta_\theta}
 =c_\theta(v+d)-1,
 \qquad
 c_\theta^*=\frac1{v+d}.
-      </d-math>
+      $$
 
-      <p>At the joint optimum, <d-math>\mu_\theta=m</d-math>, <d-math>c_\theta=\beta_0</d-math>, and therefore <d-math>\alpha_\theta=\beta</d-math>. Mean error automatically lowers confidence. At the correct mean for a target concentration of three, predictions at concentrations two, three, and four receive log-concentration gradients <d-math>-1/3</d-math>, <d-math>0</d-math>, and <d-math>+1/3</d-math>.</p>
+      <p>At the joint optimum, $\mu_\theta=m$, $c_\theta=\beta_0$, and therefore $\alpha_\theta=\beta$. Mean error automatically lowers confidence. At the correct mean for a target concentration of three, predictions at concentrations two, three, and four receive log-concentration gradients $-1/3$, $0$, and $+1/3$.</p>
 
-      <p>For an exact categorical outcome <d-math>z</d-math>, use the exact one-hot mean and a finite loss-only reference concentration <d-math>c_{\mathrm{cat}}</d-math>:</p>
+      <p>For an exact categorical outcome $z$, use the exact one-hot mean and a finite loss-only reference concentration $c_{\mathrm{cat}}$:</p>
 
-      <d-math block>
+      $$
 \mathcal L_{\mathrm{cat,full}}
 =-\log\frac{c_\theta}{c_{\mathrm{cat}}}
 +c_\theta
 \left(
 \frac1{c_{\mathrm{cat}}}-\log\mu_{\theta,z}
 \right)-1.
-      </d-math>
+      $$
 
-      <p>This has finite optimum <d-math>c_\theta\to c_{\mathrm{cat}}</d-math> as <d-math>\mu_{\theta,z}\to1</d-math>. It needs no epsilon-interior point, gamma functions, or hard output cap. The reference calibrates training only; search still uses the exact categorical sidecar. Mean-only mode retains ordinary mean KL for Dirichlet targets and cross-entropy <d-math>-\log\mu_{\theta,z}</d-math> for categorical targets.</p>
+      <p>This has finite optimum $c_\theta\to c_{\mathrm{cat}}$ as $\mu_{\theta,z}\to1$. It needs no epsilon-interior point, gamma functions, or hard output cap. The reference calibrates training only; search still uses the exact categorical sidecar. Mean-only mode retains ordinary mean KL for Dirichlet targets and cross-entropy $-\log\mu_{\theta,z}$ for categorical targets.</p>
 
-      <p>For an unresolved Q target, the loss can be weighted by structural support or by root policy. A categorical row no longer owns an <d-math>R</d-math> value and receives an explicit unit categorical weight:</p>
+      <p>For an unresolved Q target, the loss can be weighted by structural support or by root policy. A categorical row no longer owns an $R$ value and receives an explicit unit categorical weight:</p>
 
-      <d-math block>
+      $$
 w_a=
 \begin{cases}
 R_{s_0,a},
@@ -660,13 +730,13 @@ R_{s_0,a},
 &z_{s_0,a}=\bot\ \text{and policy mode},\\
 1,&z_{s_0,a}\ne\bot.
 \end{cases}
-      </d-math>
+      $$
 
       <h2 id="7-simulations-are-not-tree-size">7. Simulations are not tree size</h2>
 
-      <p>With <code>num_simulations = N</code>, search allocates <d-math>N</d-math> static iterations and performs at most <d-math>N</d-math> active traversal–evaluation–repair cycles on one persistent tree:</p>
+      <p>With <code>num_simulations = N</code>, search allocates $N$ static iterations and performs at most $N$ active traversal–evaluation–repair cycles on one persistent tree:</p>
 
-      <d-math block>
+      $$
 \mathcal T_0
 \xrightarrow{\text{simulation }1}
 \mathcal T_1
@@ -674,19 +744,19 @@ R_{s_0,a},
 \cdots
 \xrightarrow{\text{simulation }N}
 \mathcal T_N.
-      </d-math>
+      $$
 
       <p>JAX allocates a static upper bound of one possible new node per simulation, plus the root:</p>
 
-      <d-math block>
+      $$
 N_{\mathrm{slots}}=N+1.
-      </d-math>
+      $$
 
       <p>A revisit or depth cutoff still evaluates and repairs the path but does not initialize a new node. Therefore</p>
 
-      <d-math block>
+      $$
 N_{\mathrm{real\ nodes}}\le N+1.
-      </d-math>
+      $$
 
       <p>The fixed array is capacity, not a requirement to fill every slot. Once the root is categorical, later static iterations are inactive and do not call expansion. <code>max_depth</code> separately limits one traversal's length.</p>
 
@@ -694,20 +764,20 @@ N_{\mathrm{real\ nodes}}\le N+1.
 
       <p>The tree-search engine owns traversal, exact terminal tags, categorical sidecars, proof propagation, storage, and bottom-up order. The posterior callback owns unresolved Dirichlet repair and the cache mixture:</p>
 
-      <d-math block>
+      $$
 \mathcal F_{\mathrm{posterior}}:
 (\text{key},\ \text{node},\ \text{children},\ \text{leaf})
 \longmapsto
 (H_s,\ d_s^{\mathrm{edge}},\ C_s).
-      </d-math>
+      $$
 
-      <p>It is called once for every node on the selected path and returns an ephemeral update; the persistent tree remains flat. A different rule can inspect the current node embedding and all child summaries, then replace unresolved alphas, counts, and the node cache without changing traversal. The engine owns count-delta accounting and categorical payload transitions. The default callback exposes its single prior-strength choice as <d-math>\kappa</d-math> in <d-math>\gamma=n/(\kappa+n)</d-math>.</p>
+      <p>It is called once for every node on the selected path and returns an ephemeral update; the persistent tree remains flat. A different rule can inspect the current node embedding and all child summaries, then replace unresolved alphas, counts, and the node cache without changing traversal. The engine owns count-delta accounting and categorical payload transitions. The default callback exposes its single prior-strength choice as $\kappa$ in $\gamma=n/(\kappa+n)$.</p>
 
-      <d-math block>
+      $$
 \text{search mechanics}
 \quad\perp\quad
 \text{posterior mathematics}.
-      </d-math>
+      $$
 
       <hr>
 

@@ -150,7 +150,7 @@ input[type="range"] {
 }
 
 .board {
-  width: min(100%, 338px);
+  width: min(90%, 200px);
   aspect-ratio: 1;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -281,7 +281,31 @@ input[type="range"] {
   display: block;
 }
 
-@media (max-width: 860px) {
+@media (min-width: 581px) and (max-width: 860px) {
+  .app {
+    grid-template-columns: minmax(290px, 1fr) minmax(230px, 300px);
+    width: calc(100% - 20px);
+    padding: 22px 0;
+  }
+
+  .play-area {
+    padding-right: 24px;
+  }
+
+  .topbar {
+    display: grid;
+  }
+
+  .actions {
+    justify-content: start;
+  }
+
+  .cell {
+    font-size: 3.1rem;
+  }
+}
+
+@media (max-width: 580px) {
   .app {
     grid-template-columns: 1fr;
     width: min(100% - 20px, 620px);
