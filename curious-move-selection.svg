@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 365" role="img" aria-labelledby="title description">
+  <title id="title">Three candidate moves with different value and uncertainty</title>
+  <desc id="description">The first Go position has a narrow low-value distribution and a near-zero policy logit. The second has a slightly lower but wider distribution whose upper tail can still exceed the strongest move, giving it a meaningful policy logit. The third has a narrow high-value distribution and the highest policy logit.</desc>
+
+  <defs>
+    <g id="board">
+      <rect width="180" height="180" rx="18" fill="#ead3a5" stroke="#d3ad68" stroke-width="1.5"/>
+      <g stroke="#2f2922">
+        <g stroke-width="1.2">
+          <path d="M40 40H140M40 90H140M40 140H140"/>
+          <path d="M40 40V140M90 40V140M140 40V140"/>
+        </g>
+        <circle cx="90" cy="90" r="2.4" fill="#2f2922" stroke="none"/>
+        <circle cx="40" cy="40" r="15" fill="#2f2922"/>
+        <circle cx="40" cy="140" r="15" fill="#2f2922"/>
+        <circle cx="140" cy="40" r="15" fill="#fffdf8" stroke-width="1.4"/>
+      </g>
+      <path d="M18 150H162" fill="none" stroke="#aeb9b5" stroke-width="1.5"/>
+    </g>
+  </defs>
+
+  <g fill="#3f4945" font-family="Seravek, Avenir, system-ui, sans-serif" font-size="16" font-weight="400" text-anchor="middle">
+    <text x="130" y="31">Terrible move</text>
+    <text x="360" y="10">
+      <tspan x="360">Uncertain prediction</tspan>
+      <tspan x="360" dy="21">There is a chance it could</tspan>
+      <tspan x="360" dy="21">be the best move</tspan>
+    </text>
+    <text x="590" y="20">
+      <tspan x="590">Confidently good prediction</tspan>
+      <tspan x="590" dy="21">Most likely the best move</tspan>
+    </text>
+  </g>
+
+  <g transform="translate(40 75)">
+    <use href="#board"/>
+    <g>
+      <circle cx="40" cy="90" r="15" fill="#fffdf8" stroke="#2f2922" stroke-width="1.4"/>
+    </g>
+    <circle cx="40" cy="90" r="19" fill="none" stroke="#c45d19" stroke-width="2" opacity="0.58"/>
+    <path d="M18 150C21 132 25 83 34 49C40 27 48 28 55 50C64 80 67 132 86 145C98 151 125 150 162 150L18 150Z" fill="#1f7a8c" opacity="0.28"/>
+    <path d="M18 150C21 132 25 83 34 49C40 27 48 28 55 50C64 80 67 132 86 145C98 151 125 150 162 150" fill="none" stroke="#397f91" stroke-linecap="round" stroke-linejoin="round" stroke-width="4"/>
+  </g>
+
+  <g transform="translate(270 75)">
+    <use href="#board"/>
+    <g>
+      <circle cx="90" cy="90" r="15" fill="#fffdf8" stroke="#2f2922" stroke-width="1.4"/>
+    </g>
+    <circle cx="90" cy="90" r="19" fill="none" stroke="#c45d19" stroke-width="2" opacity="0.58"/>
+    <path d="M18 150C31 150 46 143 61 128C76 113 86 85 101 69C114 55 129 57 141 75C153 94 158 125 162 150L18 150Z" fill="#1f7a8c" opacity="0.28"/>
+    <path d="M18 150C31 150 46 143 61 128C76 113 86 85 101 69C114 55 129 57 141 75C153 94 158 125 162 150" fill="none" stroke="#397f91" stroke-linecap="round" stroke-linejoin="round" stroke-width="4"/>
+  </g>
+
+  <g transform="translate(500 75)">
+    <use href="#board"/>
+    <g>
+      <circle cx="140" cy="90" r="15" fill="#fffdf8" stroke="#2f2922" stroke-width="1.4"/>
+    </g>
+    <circle cx="140" cy="90" r="19" fill="none" stroke="#c45d19" stroke-width="2" opacity="0.58"/>
+    <path d="M18 150C75 150 91 145 103 119C114 94 118 45 126 27C134 45 138 94 149 119C155 134 159 144 162 150L18 150Z" fill="#1f7a8c" opacity="0.28"/>
+    <path d="M18 150C75 150 91 145 103 119C114 94 118 45 126 27C134 45 138 94 149 119C155 134 159 144 162 150" fill="none" stroke="#397f91" stroke-linecap="round" stroke-linejoin="round" stroke-width="4"/>
+  </g>
+
+  <text x="218" y="330" fill="#3f4945" font-family="STIX Two Math, Times New Roman, serif" font-size="28" font-style="italic">π =</text>
+  <g fill="#397f91">
+    <rect x="286" y="337" width="20" height="8" rx="2"/>
+    <rect x="320" y="305" width="20" height="40" rx="2"/>
+    <rect x="354" y="285" width="20" height="60" rx="2"/>
+  </g>
+  <path d="M276 345H384" fill="none" stroke="#75817d" stroke-width="1.5"/>
+  <text x="408" y="329" fill="#3f4945" font-family="Seravek, Avenir, system-ui, sans-serif" font-size="16">probability of being the best move</text>
+</svg>

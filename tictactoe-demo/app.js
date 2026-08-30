@@ -42,7 +42,7 @@ if (window.parent !== window) {
   );
 }
 
-const DEFAULT_SAMPLES_PER_SECOND = 300;
+const DEFAULT_SAMPLES_PER_SECOND = 100;
 const MAX_FRAME_SAMPLES = 80;
 const RENDER_INTERVAL_MS = 140;
 const POLICY_SAMPLES = 128;

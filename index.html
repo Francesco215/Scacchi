@@ -71,6 +71,30 @@
         margin-top: 0.8rem;
       }
 
+      .l-side {
+        margin-bottom: 0 !important;
+        padding-bottom: 1em;
+        padding-left: 0;
+        width: 100%;
+      }
+
+      .l-side img {
+        display: block;
+        height: auto;
+        width: 100%;
+      }
+
+      @media (min-width: 1180px) {
+        .l-side {
+          float: right;
+          left: 11em;
+          margin-left: -11em;
+          padding-left: 1em;
+          position: relative;
+          width: 450px;
+        }
+      }
+
       @media (max-width: 860px) {
         .tictactoe-embed iframe {
           height: 1500px;
@@ -104,6 +128,7 @@
 
       <p>This is the second blog post of my series of "mathematical foundations of curiosity"</p>
       <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem. Here we are going to show how you can make a search-engine<d-footnote>By search engine I mean an engine that searches the game tree, not the internet.</d-footnote> out of it for board games such as tic-tac-toe, hex, chess and go.</p>
+      <p>In this blog post i'm going to show you how it is possible to create an algorithm competitive with alpha-zero from first-principles</p>
 
       <figure class="tictactoe-embed">
         <iframe
@@ -247,15 +272,131 @@
 L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       $$
       <p>
-          If the search algorithms proves that one of the players has a forced win opportunity, then the target becomes a dirac delta. 
+          If the search algorithms proves that one of the players has a forced win opportunity, then the target becomes a Dirac delta function.
       </p>
-      <h3>From son to father</h3>
-      <p>Tree search is about exploring the tree and updating the value of all the nodes with children. Let's suppose we just have a root node and all the other nodes are leaf nodes, how should we update the root node?</p>
-      <p>
-          So we have a initial value $V$ for the node represented by it's probability distribution. This is going to act as a prior, and we are going to update it with the information we have for each possible next action $Q_a$
-      </p>
-      <p>BASICALLY HERE TALK ABOUT POSTERIOR UPDATE, EXPLAIN THE LINK WITH THE BANDITS</p>
-      <h2>Curiosity driven search</h2>
+      <p>But how does he do that?</p>
+      <h3>Move selection</h3>
+      <div>
+          <figure class="l-side">
+              <img
+                  src="son-to-father-beta-tree.svg"
+                  alt="A parent Beta distribution above three child distributions ordered from a terrible move, to an uncertain move, to a confidently good move"
+              >
+              <figcaption>Figure 5: The parent node is represented by the value distribution $V$, the children by $Q_a$ distributions.</figcaption>
+          </figure>
+        <p>
+          Let's suppose we only have a root node with an initial guess about its
+          value distribution $V$ and some children with value distributions $Q_a$.
+          We want to know is:
+        </p>
+        <blockquote>
+             What is the probability that a given action $a$ is the best action $a^\star$?
+        </blockquote>
+        <p>This can be written mathematically as follows:</p>
+
+        $$
+        \mathbb P(a^\star=a)
+        =
+        \mathbb P\left(q_a \geq q_b\;\;\forall b\neq a\right),
+        \quad q_a\sim Q_a.
+        $$
+        <p>
+          This is the same question we asked in the first post when studying the
+          $K$-armed bandit problem<d-cite key="sacco2026Curiosity"></d-cite>.
+        </p>
+
+        <p>
+          We can compute the probability that "child $a$ is the best" directly from their densities like so:
+        </p>
+
+        $$
+        \mathbb P(a^\star=a)
+        =
+        \int_0^1
+        f_a(x)
+        \prod_{b\neq a} F_b(x)\,dx,
+        $$
+
+        <p>
+          where $f_a$ is the density of $Q_a$ and $F_b$ is the cumulative
+          distribution function of $Q_b$. This integral is surprisingly GPU-friendly as well!
+          <d-footnote>
+          Here is why this integral is GPU-friendly:<br>
+          Pick a shared grid of $G$ points, $x_1,\ldots,x_G$, and then:<br><br>
+
+          <strong>1.</strong> Evaluate $f_a(x_g)$ for every action $a$ and grid
+          point $x_g$ at once. This gives one big $A\times G$ table whose entries
+          can be computed in parallel.<br><br>
+
+          <strong>2.</strong> Turn each row into its CDF $F_a(x_g)$ with a prefix
+          sum—a running numerical integral. GPUs implement these scans
+          efficiently for all actions in parallel.<br><br>
+
+          <strong>3.</strong> At each grid point we need
+          $\prod_{b\neq a}F_b(x_g)$ for every action. Recomputing that whole
+          product separately for each action would be wasteful. Instead, add the
+          log-CDFs once and subtract the current action's term:
+          $$
+          S_g=\sum_b\log F_b(x_g),
+          \qquad
+          \prod_{b\neq a}F_b(x_g)
+          =\exp\!\left(S_g-\log F_a(x_g)\right).
+          $$
+          In practice, zero CDF values are handled separately so that we never
+          literally compute $\log 0$.<br><br>
+
+          <strong>4.</strong> Finally, multiply by $f_a(x_g)$ and sum over the
+          grid for every action at the same time. The whole calculation takes
+          $O(AG)$ work instead of the naive $O(A^2G)$.<br><br>
+          Empirically you also found we can get a quite good approximation of
+          this integral using a shared grid of just $G=21$ points, and it's much faster than monte carlo!
+          </d-footnote>
+        </p>
+        <p>
+          However, if we just want to do one sample from this distribution we don't even need to evaluate
+          this integral explicitly, we can just do a Thompson-sample: sample one possible value from
+          every child and choose the biggest one.
+        </p>
+
+        $$
+        \tilde q_a\sim Q_a
+        \quad\text{for each }a,
+        \qquad
+        a_{\mathrm{TS}}=\arg\max_a\tilde q_a.
+        $$
+
+        <p>
+          As a result, we can sample a policy equal to the probability
+          that each action is optimal under our current beliefs:
+        </p>
+
+        $$
+        \pi(a)
+        =\mathbb P(a^\star=a).
+        $$
+        <p>
+            This policy is natively curious. A child does not need to have the highest expected value to be worth exploring: it only needs enough uncertainty for there to be a meaningful chance that it is actually the best move
+        </p>
+        <figure class="l-body">
+          <img
+            src="curious-move-selection.svg"
+            alt="Three candidate Go moves with policy-probability bars: a terrible move, an uncertain move that could be best, and a confidently strong move"
+          >
+          <figcaption>Figure 6: Policy probabilities induced by uncertain value estimates. The model is inherently curious: uncertain beliefs encourage it to explore moves that may appear suboptimal but still have a meaningful chance of being the best.</figcaption>
+        </figure>
+
+        <p>
+          Unlike PUCT, which handles uncertainty indirectly through visit counts,
+          our model predicts its uncertainty explicitly. Two moves with the same
+          number of visits can therefore receive different levels of confidence.
+          This allows exploration to be guided by what the model does not yet know,
+          rather than only by how often a move has been examined.
+        </p>
+
+      </div>
+      
+      <h3>Updating beliefs</h3>
+      <p>When we look at all possible next moves we get some new information. Our goal is to propagate this information back to the parent node.</p>
       <p>plot a tree and talk about sorting it to do the backward pass and put pseudocode </p>
       <h2 id="1-network-beliefs">1. Network beliefs</h2>
 
@@ -821,5 +962,21 @@ N_{\mathrm{real\ nodes}}\le N+1.
 
       <p>For field-level contracts, concentration parameterization, action commitment modes, and the full loss definition, see <a href="math.md"><code>math.md</code></a>. The algorithm follows the message-passing logic in <code>tictactoe-demo/app.js</code> and the active <code>scacchi.dirichlet_mctx</code> backend.</p>
     </d-article>
+
+    <d-appendix>
+      <d-footnote-list></d-footnote-list>
+      <d-citation-list></d-citation-list>
+      <d-bibliography>
+        <script type="text/bibtex">
+          @article{sacco2026Curiosity,
+            author = {Sacco, Francesco},
+            title  = {The Bayes Bandit},
+            year   = {2026},
+            doi    = {10.5281/zenodo.20038430},
+            url    = {https://francesco215.github.io/Bayes-bandit/}
+          }
+        </script>
+      </d-bibliography>
+    </d-appendix>
   </body>
 </html>

@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 510" role="img" aria-labelledby="title description">
+  <title id="title">Three Go child positions contributing to a parent distribution</title>
+  <desc id="description">A three-by-three Go position with a broad Beta distribution sits above three one-move child positions. From left to right, their value distributions are narrow and poor, broad and uncertain, and narrow and strong. Plain lines connect the children to the parent.</desc>
+
+  <defs>
+    <g id="board">
+      <rect width="160" height="160" rx="18" fill="#ead3a5" stroke="#d3ad68" stroke-width="1.5"/>
+      <g stroke="#2f2922">
+        <g stroke-width="1.2">
+          <path d="M36 36H124M36 80H124M36 124H124"/>
+          <path d="M36 36V124M80 36V124M124 36V124"/>
+        </g>
+        <circle cx="80" cy="80" r="2.2" fill="#2f2922" stroke="none"/>
+        <circle cx="36" cy="36" r="14" fill="#2f2922"/>
+        <circle cx="36" cy="124" r="14" fill="#2f2922"/>
+        <circle cx="124" cy="36" r="14" fill="#fffdf8" stroke-width="1.4"/>
+      </g>
+      <path d="M16 132H144" fill="none" stroke="#aeb9b5" stroke-width="1.5"/>
+    </g>
+  </defs>
+
+  <g fill="none" stroke="#8b8983" stroke-linecap="round" stroke-width="2">
+    <path d="M135 330C182 263 326 232 415 180"/>
+    <path d="M450 330V180"/>
+    <path d="M765 330C718 263 574 232 485 180"/>
+  </g>
+
+  <g transform="translate(370 20)">
+    <use href="#board"/>
+    <path d="M16 132C36 132 50 128 64 116C78 104 86 72 96 52C106 32 118 28 128 47C138 66 140 103 144 132L16 132Z" fill="#1f7a8c" opacity="0.28"/>
+    <path d="M16 132C36 132 50 128 64 116C78 104 86 72 96 52C106 32 118 28 128 47C138 66 140 103 144 132" fill="none" stroke="#397f91" stroke-linecap="round" stroke-linejoin="round" stroke-width="4"/>
+  </g>
+
+  <g transform="translate(55 330)">
+    <use href="#board"/>
+    <g>
+      <circle cx="36" cy="80" r="14" fill="#fffdf8" stroke="#2f2922" stroke-width="1.4"/>
+    </g>
+    <circle cx="36" cy="80" r="18" fill="none" stroke="#c45d19" stroke-width="2" opacity="0.58"/>
+    <path d="M16 132C19 116 22 74 30 44C36 24 43 25 49 44C57 71 60 117 76 129C87 134 111 132 144 132L16 132Z" fill="#1f7a8c" opacity="0.28"/>
+    <path d="M16 132C19 116 22 74 30 44C36 24 43 25 49 44C57 71 60 117 76 129C87 134 111 132 144 132" fill="none" stroke="#397f91" stroke-linecap="round" stroke-linejoin="round" stroke-width="4"/>
+  </g>
+
+  <g transform="translate(370 330)">
+    <use href="#board"/>
+    <g>
+      <circle cx="80" cy="80" r="14" fill="#fffdf8" stroke="#2f2922" stroke-width="1.4"/>
+    </g>
+    <circle cx="80" cy="80" r="18" fill="none" stroke="#c45d19" stroke-width="2" opacity="0.58"/>
+    <path d="M16 132C28 132 41 126 54 113C68 100 76 75 90 61C101 49 115 51 125 67C136 84 140 111 144 132L16 132Z" fill="#1f7a8c" opacity="0.28"/>
+    <path d="M16 132C28 132 41 126 54 113C68 100 76 75 90 61C101 49 115 51 125 67C136 84 140 111 144 132" fill="none" stroke="#397f91" stroke-linecap="round" stroke-linejoin="round" stroke-width="4"/>
+  </g>
+
+  <g transform="translate(685 330)">
+    <use href="#board"/>
+    <g>
+      <circle cx="124" cy="80" r="14" fill="#fffdf8" stroke="#2f2922" stroke-width="1.4"/>
+    </g>
+    <circle cx="124" cy="80" r="18" fill="none" stroke="#c45d19" stroke-width="2" opacity="0.58"/>
+    <path d="M16 132C67 132 81 128 92 105C101 83 105 40 112 24C119 40 123 83 132 105C138 118 141 127 144 132L16 132Z" fill="#1f7a8c" opacity="0.28"/>
+    <path d="M16 132C67 132 81 128 92 105C101 83 105 40 112 24C119 40 123 83 132 105C138 118 141 127 144 132" fill="none" stroke="#397f91" stroke-linecap="round" stroke-linejoin="round" stroke-width="4"/>
+  </g>
+</svg>
