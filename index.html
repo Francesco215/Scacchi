@@ -84,6 +84,72 @@
         width: 100%;
       }
 
+      .compact-list li {
+        margin-bottom: 0.2em;
+      }
+
+      .compact-list li:last-child {
+        margin-bottom: 0;
+      }
+
+      .tree-cycle-figure {
+        margin-bottom: 2.4rem;
+        margin-top: 1.8rem;
+      }
+
+      .tree-cycle-figure img {
+        display: block;
+        height: auto;
+        width: 100%;
+      }
+
+      .tree-cycle-figure figcaption {
+        margin-top: 0.8rem;
+      }
+
+      .algorithm-figure {
+        margin-bottom: 2.6rem;
+        margin-top: 2rem;
+      }
+
+      .algorithm-code {
+        border-left: 1px solid #aeb9b5;
+        color: #3f465d;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 0.98rem;
+        line-height: 1.7;
+        overflow-x: auto;
+        padding: 0.35rem 0 0.35rem 1.35rem;
+      }
+
+      .algorithm-line {
+        min-width: max-content;
+        white-space: nowrap;
+      }
+
+      .algorithm-indent-1 { padding-left: 1.75rem; }
+      .algorithm-indent-2 { padding-left: 3.5rem; }
+      .algorithm-indent-3 { padding-left: 5.25rem; }
+
+      .algorithm-keyword {
+        color: #f05a13;
+      }
+
+      .algorithm-function {
+        color: #78a5ff;
+      }
+
+      .algorithm-code .katex {
+        font-size: 1.05em;
+      }
+
+      .algorithm-figure figcaption {
+        color: #6f7489;
+        margin-left: 1.35rem;
+        margin-top: 0.65rem;
+        text-align: left;
+      }
+
       @media (min-width: 1180px) {
         .l-side {
           float: right;
@@ -249,7 +315,7 @@
       <h2>What search does</h2>
       <!--alternative titles: what's the point of doing search? a high level overview on search engines -->
       <p>
-         A search engine estimates the probability of winning for each possible next move, assuming both players play optimally. Because the optimal strategy is often unknown, the engine is uncertain about its evaluation, so its estimates must be represented as probability distributions—just like in the example above!
+          A search engine estimates the probability of winning for each possible next move, assuming both players play optimally.<br>Because the optimal strategy is often unknown, the engine is uncertain about its evaluation, so its estimates must be represented as probability distributions.
       </p>
 
       <figure class="l-body search-overview-figure">
@@ -272,9 +338,19 @@
 L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       $$
       <p>
-          If the search algorithms proves that one of the players has a forced win opportunity, then the target becomes a Dirac delta function.
+          To me, this really feels like how search should work: it should produce a more precise evaluation of the position!<br>
+              Furthermore, the loss should be the amount of information gained from the search process, as a matter of fact the unit of measurement should be bits!<d-footnote>
+              This loss is effectively the same as the NLL shown in the previous section
+              $$
+              \mathbb E_{q_{\mathrm{search}}}\!\left[-\log q_\theta\right]=
+              D_{\mathrm{KL}}\!\left(q_{\mathrm{search}}\middle\|q_\theta\right)
+              +\underbrace{H\!\left(q_{\mathrm{search}}\right)}_{
+              \text{has zero gradient}}.
+              $$
+              If the search algorithms proves that one of the players has a forced win opportunity, then the target becomes a Dirac delta function.
+              </d-footnote>
       </p>
-      <p>But how does he do that?</p>
+      <p>But how does search work precisely?</p>
       <h3>Move selection</h3>
       <div>
           <figure class="l-side">
@@ -354,7 +430,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
         </p>
         <p>
           However, if we just want to do one sample from this distribution we don't even need to evaluate
-          this integral explicitly, we can just do a Thompson-sample: sample one possible value from
+          this integral explicitly, we can just do a <b>Thompson-sample</b>: sample one possible value from
           every child and choose the biggest one.
         </p>
 
@@ -375,7 +451,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
         =\mathbb P(a^\star=a).
         $$
         <p>
-            This policy is natively curious. A child does not need to have the highest expected value to be worth exploring: it only needs enough uncertainty for there to be a meaningful chance that it is actually the best move
+            <b>This policy is natively curious</b>. A child does not need to have the highest expected value to be worth exploring: it only needs enough uncertainty for there to be a meaningful chance that it is actually the best move
         </p>
         <figure class="l-body">
           <img
@@ -387,8 +463,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
 
         <p>
           Unlike PUCT, which handles uncertainty indirectly through visit counts,
-          our model predicts its uncertainty explicitly. Two moves with the same
-          number of visits can therefore receive different levels of confidence.
+          our model predicts its uncertainty explicitly.
           This allows exploration to be guided by what the model does not yet know,
           rather than only by how often a move has been examined.
         </p>
@@ -396,65 +471,167 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       </div>
       
       <h3>Updating beliefs</h3>
-      <p>When we look at all possible next moves we get some new information. Our goal is to propagate this information back to the parent node.</p>
-      <p>plot a tree and talk about sorting it to do the backward pass and put pseudocode </p>
-      <h2 id="1-network-beliefs">1. Network beliefs</h2>
+      <p>
+        Exploring a child is useful only if what we learn there can change
+        what we believe about its parent. Now we are going to see how we can use the information of the child to update our beliefs about the parent.
+      </p>
 
-      <p>At state $s$, the network predicts a policy together with one state Dirichlet and one Dirichlet for every action:</p>
-
-      $$
-\pi_\theta(a\mid s),
-\qquad
-V_s=\alpha_\theta^V(s),
-\qquad
-Q_{s,a}=\alpha_\theta^Q(s,a).
-      $$
-
-      <p>A Dirichlet parameter vector $\alpha$ represents uncertainty about an outcome distribution:</p>
+      <p>The previous section gave us</p>
 
       $$
-\phi\sim\mathrm{Dirichlet}(\alpha),
-\qquad
-\mu(\alpha)=\mathbb E[\phi]
-=\frac{\alpha}{\sum_z\alpha_z}.
+      \pi(a)=\mathbb P(a\text{ is the best move}).
       $$
 
-      <p>The head predicts mean logits $r_\theta$ and a raw log-concentration $\eta_\theta$ directly:</p>
+      <p>We reuse those probabilities to combine the current beliefs about the moves:</p>
 
       $$
-\mu_\theta=\mathrm{softmax}(r_\theta),
-\qquad
-c_\theta=e^{\eta_\theta},
-\qquad
-\alpha_\theta=c_\theta\mu_\theta.
+      \bar Q=\sum_a \pi(a)Q_a.
       $$
 
-      <p>Equivalently, $s_\theta=-\eta_\theta=\log(1/c_\theta)$ is a log-dispersion. There is no learned concentration floor, squared-softplus transform, bounded sigmoid, or training-time output ceiling in the direct head. A very broad floating-point guard uses an identity backward derivative, so it cannot create a zero-gradient dead zone.</p>
+      <p>
+        Thus, a move that is very likely to be best has a large influence on
+        the position’s value. An uncertain move can still matter when there is
+        a meaningful chance that it is best.
+      </p>
+      
+      <figure class="l-page-outset">
+        <img
+          src="beta-mixture-summary.svg"
+          alt="Three action-value Beta distributions and a comparison between their exact policy-weighted mixture and the Beta obtained by averaging their parameter vectors"
+        >
+        <figcaption>
+          Figure 7: Three action beliefs and their probabilities of being the
+          best move. The exact weighted mixture is generally not a Beta
+          distribution; search keeps a Beta-shaped summary by averaging the
+          three parameter vectors with the same weights. I found this approximation to be good enough, and it keeps things simple.
+        </figcaption>
+      </figure>
 
-      <p>The outcomes are ordered as $(L,W)$ or $(L,D,W)$. Search compares samples with the same utility everywhere:</p>
+
+      <p>
+        We do not immediately throw away the network’s original prediction.
+        Instead, we blend it with the information obtained from search:
+      </p>
 
       $$
-U(\phi)=\phi_W-\phi_L.
+      C
+      =
+      (1-\gamma)V
+      +
+      \gamma\bar Q,
+      \qquad
+      \gamma=\frac{n}{\kappa+n}.
       $$
 
-      <h3 id="1-1-player-perspective">1.1 Player perspective</h3>
+      <p>
+        Here $n$ measures how much search support has accumulated below the
+        position, while $\kappa$ controls how strongly we initially trust the
+        network.<d-footnote>
+        This has the same form as a Bayesian update with a Beta prior. A prior
+        with mean $V$ and concentration $\kappa=\alpha+\beta$ can be written
+        as $\operatorname{Beta}(\kappa V,\kappa(1-V))$. After $n$ Bernoulli
+        observations with empirical mean $\bar Q$, its posterior mean is
+        $$
+        \frac{\kappa V+n\bar Q}{\kappa+n}
+        =\frac{\kappa}{\kappa+n}V+\frac{n}{\kappa+n}\bar Q.
+        $$
+        Thus $\kappa$ behaves like a prior sample size: when $n=\kappa$, the
+        prior and the new evidence receive equal weight, while a larger
+        $\kappa$ means that more evidence is needed to move away from the
+        network's prediction.<br><br>
 
-      <p>Values belong to the player to move at their node. Moving a value to the opponent's perspective reverses loss and win:</p>
+        The update here is only <em>pseudo-Bayesian</em>. Search backups are
+        not literally independent Bernoulli observations, so $n$ is best
+        understood as an effective amount of search evidence. We borrow the
+        weighting rule and its prior-strength interpretation without claiming
+        that the result is an exact Bayesian posterior.
+        </d-footnote>
+      </p>
+
+
+      <h3 id="building-the-tree">Building the tree</h3>
+
+      <p>
+        Now we have everything needed to build a search tree. Thompson
+        sampling tells us where to look, while the update rule tells us how to
+        propagate the information we find back to the rest of the tree. Search builds the tree by repeatedly combining these
+        two operations.
+      </p>
 
       $$
-\mathrm{flip}(x_L,x_D,x_W)
-=(x_W,x_D,x_L).
+      \text{sample downward}
+      \longrightarrow
+      \text{expand one position}
+      \longrightarrow
+      \text{update beliefs upward}.
       $$
 
-      $$
-\mathrm{Align}(x;p\to q)=
-\begin{cases}
-x,&p=q,\\
-\mathrm{flip}(x),&p\ne q.
-\end{cases}
-      $$
+      <figure class="l-page-outset tree-cycle-figure">
+        <img
+          src="tree-search-cycle.svg"
+          alt="Three stages of one search simulation: Thompson samples select a path down the tree, one new position is expanded and evaluated, and beliefs are updated along the selected path back to the root"
+        >
+        <figcaption>
+          Figure 8: One search simulation. Thompson samples choose a path from
+          the root to an unexplored move. Search evaluates at most one new
+          position, then updates beliefs along the same path from the deepest
+          node back to the root.
+        </figcaption>
+      </figure>
 
-      <p><em>Every child-to-parent message is aligned before it is stored.</em></p>
+      <div>
+      <figure class="l-body side algorithm-figure">
+        <div
+          class="algorithm-code"
+          aria-label="Pseudocode for one tree-search simulation"
+        >
+          <div class="algorithm-line">
+            <span class="algorithm-keyword">def</span>
+            <span class="algorithm-function">search_simulation</span>($root$):
+          </div>
+          <div class="algorithm-line algorithm-indent-1">$s \leftarrow root$</div>
+          <div class="algorithm-line algorithm-indent-1">$path \leftarrow [\,]$</div>
+          <div class="algorithm-line algorithm-indent-1">
+            $a \leftarrow$ <span class="algorithm-function">thompson_sample</span>$(s)$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            <span class="algorithm-keyword">while</span> $(s,a)$ is explored:
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            <span class="algorithm-keyword">append</span> $(s,a)$ to $path$
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            $s \leftarrow$ <span class="algorithm-function">child</span>$(s,a)$
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            $a \leftarrow$ <span class="algorithm-function">thompson_sample</span>$(s)$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            <span class="algorithm-keyword">append</span> $(s,a)$ to $path$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            $s' \leftarrow$ <span class="algorithm-function">expand</span>$(s,a)$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            <span class="algorithm-keyword">for</span> each $(s,a)$ in
+            <span class="algorithm-function">reverse</span>$(path)$:
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            $Q_a \leftarrow$ belief of <span class="algorithm-function">child</span>$(s,a)$
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            $C \leftarrow$ <span class="algorithm-function">update_belief</span>$(V,\{Q_b\})$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            <span class="algorithm-keyword">return</span> tree
+          </div>
+        </div>
+        <figcaption>Algorithm 1</figcaption>
+      </figure>
+      <p>The whole procedure can be summarized in the algorithm to the side right here.</p>
+      <p>Typically, predictions become sharper as the search moves deeper into the tree because positions farther along in the game are, on average, easier to evaluate.</p>
+      <p>Empirically, this appears as an increasingly concentrated distribution over moves and a corresponding decline in policy entropy.</p>
+      </div>
 
       <h2 id="2-what-the-tree-remembers">2. A compact tree layout</h2>
 
