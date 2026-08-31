@@ -376,5 +376,286 @@
     showPosition(0);
   }
 
+  function appendSvgText(svg, textContent, attributes) {
+    const text = svgElement("text", attributes);
+    text.textContent = textContent;
+    svg.appendChild(text);
+    return text;
+  }
+
+  function renderOutcomeBetaPlot() {
+    const alpha = 6;
+    const beta = 3;
+    const left = 42;
+    const right = 398;
+    const top = 70;
+    const baseline = 270;
+    const mean = alpha / (alpha + beta);
+    const samples = Array.from({ length: 121 }, (_, index) => {
+      const probability = 0.001 + (0.998 * index) / 120;
+      const logDensity = (alpha - 1) * Math.log(probability) + (beta - 1) * Math.log(1 - probability);
+      return { probability, logDensity };
+    });
+    const maxLogDensity = Math.max(...samples.map((sample) => sample.logDensity));
+    const points = samples.map((sample) => ({
+      x: left + sample.probability * (right - left),
+      y: baseline - Math.exp(sample.logDensity - maxLogDensity) * (baseline - top - 8)
+    }));
+    const pointPath = points.map((point) => `${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" L ");
+    const meanX = left + mean * (right - left);
+    const svg = svgElement("svg", {
+      viewBox: "0 0 440 360",
+      role: "img",
+      "aria-labelledby": "outcome-beta-title outcome-beta-description"
+    });
+    const title = svgElement("title", { id: "outcome-beta-title" });
+    title.textContent = "Beta distribution for two possible outcomes";
+    const description = svgElement("desc", { id: "outcome-beta-description" });
+    description.textContent = "A Beta(6, 3) density over the probability of winning. The probability of losing is one minus the probability of winning.";
+    svg.append(title, description);
+
+    appendSvgText(svg, "Beta distribution", { x: 220, y: 23, class: "outcome-plot__title" });
+    appendSvgText(svg, "two outcomes · Beta(6, 3)", { x: 220, y: 44, class: "outcome-plot__subtitle" });
+    svg.append(
+      svgElement("line", { x1: left, y1: baseline, x2: right, y2: baseline, class: "outcome-plot__axis" }),
+      svgElement("path", { d: `M ${left} ${baseline} L ${pointPath} L ${right} ${baseline} Z`, class: "outcome-plot__area" }),
+      svgElement("path", { d: `M ${pointPath}`, class: "outcome-plot__curve" }),
+      svgElement("line", { x1: meanX, y1: 91, x2: meanX, y2: baseline, class: "outcome-plot__mean-line" })
+    );
+
+    [[left, "0"], [(left + right) / 2, ".5"], [right, "1"]].forEach(([x, label]) => {
+      appendSvgText(svg, label, { x, y: 290, class: "outcome-plot__tick" });
+    });
+    appendSvgText(svg, "mean = 0.67", { x: meanX, y: 84, class: "outcome-plot__annotation" });
+    appendSvgText(svg, "p(win)", { x: 220, y: 321, class: "outcome-plot__axis-label" });
+    appendSvgText(svg, "p(loss) = 1 − p(win)", { x: 220, y: 343, class: "outcome-plot__annotation" });
+    return svg;
+  }
+
+  function simplexPoint(win, draw, loss, vertices) {
+    return {
+      x: win * vertices.win.x + draw * vertices.draw.x + loss * vertices.loss.x,
+      y: win * vertices.win.y + draw * vertices.draw.y + loss * vertices.loss.y
+    };
+  }
+
+  function interpolateDensityColor(amount) {
+    const low = [246, 249, 249];
+    const high = [17, 85, 119];
+    const mix = Math.pow(Math.max(0, Math.min(1, amount)), 0.65);
+    const channels = low.map((channel, index) => Math.round(channel + (high[index] - channel) * mix));
+    return `rgb(${channels.join(",")})`;
+  }
+
+  function simplexCoordinates(point, vertices) {
+    const draw = (vertices.loss.y - point.y) / (vertices.loss.y - vertices.draw.y);
+    const remaining = 1 - draw;
+    const win = (
+      point.x - draw * vertices.draw.x - remaining * vertices.loss.x
+    ) / (vertices.win.x - vertices.loss.x);
+    return { win, draw, loss: 1 - win - draw };
+  }
+
+  function renderOutcomeDirichletPlot() {
+    const alphas = { win: 6, draw: 3, loss: 2 };
+    const alphaTotal = alphas.win + alphas.draw + alphas.loss;
+    const vertices = {
+      draw: { x: 190, y: 65.17 },
+      loss: { x: 55, y: 299 },
+      win: { x: 325, y: 299 }
+    };
+    const mode = {
+      win: (alphas.win - 1) / (alphaTotal - 3),
+      draw: (alphas.draw - 1) / (alphaTotal - 3),
+      loss: (alphas.loss - 1) / (alphaTotal - 3)
+    };
+    const logDensity = (win, draw, loss) => (
+      (alphas.win - 1) * Math.log(Math.max(win, 1e-6)) +
+      (alphas.draw - 1) * Math.log(Math.max(draw, 1e-6)) +
+      (alphas.loss - 1) * Math.log(Math.max(loss, 1e-6))
+    );
+    const maxLogDensity = logDensity(mode.win, mode.draw, mode.loss);
+    const densityNormalizer = 15120;
+    const maxDensity = densityNormalizer * Math.exp(maxLogDensity);
+    const svg = svgElement("svg", {
+      viewBox: "0 0 440 360",
+      role: "img",
+      "aria-labelledby": "outcome-dirichlet-title outcome-dirichlet-description"
+    });
+    const title = svgElement("title", { id: "outcome-dirichlet-title" });
+    title.textContent = "Dirichlet distribution for three possible outcomes";
+    const description = svgElement("desc", { id: "outcome-dirichlet-description" });
+    description.textContent = "A smooth filled-contour plot of a Dirichlet(6, 3, 2) density over win, draw, and loss probabilities, with ternary axes and a density scale.";
+    svg.append(title, description);
+
+    appendSvgText(svg, "Dirichlet distribution", { x: 220, y: 23, class: "outcome-plot__title" });
+    appendSvgText(svg, "three outcomes · α = (6, 3, 2)", { x: 220, y: 44, class: "outcome-plot__subtitle" });
+
+    const modePoint = simplexPoint(mode.win, mode.draw, mode.loss, vertices);
+    const contourLevels = [0.025, 0.06, 0.12, 0.22, 0.36, 0.54, 0.73, 0.88];
+    const contourPath = (level) => {
+      const targetLogDensity = maxLogDensity + Math.log(level);
+      const points = Array.from({ length: 144 }, (_, index) => {
+        const angle = -Math.PI / 2 + (index * Math.PI * 2) / 144;
+        const direction = { x: Math.cos(angle), y: Math.sin(angle) };
+        let insideDistance = 0;
+        let outsideDistance = 420;
+
+        for (let iteration = 0; iteration < 32; iteration += 1) {
+          const distance = (insideDistance + outsideDistance) / 2;
+          const coordinates = simplexCoordinates({
+            x: modePoint.x + direction.x * distance,
+            y: modePoint.y + direction.y * distance
+          }, vertices);
+          const isInside = Math.min(coordinates.win, coordinates.draw, coordinates.loss) >= 0;
+          if (isInside) insideDistance = distance;
+          else outsideDistance = distance;
+        }
+
+        let highDensityDistance = 0;
+        let lowDensityDistance = insideDistance * 0.999999;
+        for (let iteration = 0; iteration < 32; iteration += 1) {
+          const distance = (highDensityDistance + lowDensityDistance) / 2;
+          const coordinates = simplexCoordinates({
+            x: modePoint.x + direction.x * distance,
+            y: modePoint.y + direction.y * distance
+          }, vertices);
+          const candidateLogDensity = logDensity(coordinates.win, coordinates.draw, coordinates.loss);
+          if (candidateLogDensity > targetLogDensity) highDensityDistance = distance;
+          else lowDensityDistance = distance;
+        }
+
+        const distance = (highDensityDistance + lowDensityDistance) / 2;
+        return {
+          x: modePoint.x + direction.x * distance,
+          y: modePoint.y + direction.y * distance
+        };
+      });
+      return `M ${points.map((point) => `${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" L ")} Z`;
+    };
+    const contours = contourLevels.map((level) => ({ level, path: contourPath(level) }));
+
+    svg.appendChild(svgElement("polygon", {
+      points: `${vertices.draw.x},${vertices.draw.y} ${vertices.win.x},${vertices.win.y} ${vertices.loss.x},${vertices.loss.y}`,
+      fill: interpolateDensityColor(0)
+    }));
+    contours.forEach(({ level, path }) => {
+      svg.appendChild(svgElement("path", { d: path, fill: interpolateDensityColor(level) }));
+    });
+    contours.forEach(({ path }) => {
+      svg.appendChild(svgElement("path", { d: path, class: "outcome-plot__contour" }));
+    });
+
+    svg.appendChild(svgElement("polygon", {
+      points: `${vertices.draw.x},${vertices.draw.y} ${vertices.win.x},${vertices.win.y} ${vertices.loss.x},${vertices.loss.y}`,
+      class: "outcome-plot__simplex"
+    }));
+
+    [0.2, 0.4, 0.6, 0.8].forEach((level) => {
+      const drawTick = simplexPoint(0, level, 1 - level, vertices);
+      const winTick = simplexPoint(level, 1 - level, 0, vertices);
+      const lossTick = simplexPoint(1 - level, 0, level, vertices);
+      appendSvgText(svg, level.toFixed(1), {
+        x: drawTick.x - 9,
+        y: drawTick.y + 3,
+        class: "outcome-plot__ternary-tick",
+        transform: `rotate(-60 ${drawTick.x - 9} ${drawTick.y + 3})`
+      });
+      appendSvgText(svg, level.toFixed(1), {
+        x: winTick.x + 9,
+        y: winTick.y + 3,
+        class: "outcome-plot__ternary-tick",
+        transform: `rotate(60 ${winTick.x + 9} ${winTick.y + 3})`
+      });
+      appendSvgText(svg, level.toFixed(1), {
+        x: lossTick.x,
+        y: lossTick.y + 13,
+        class: "outcome-plot__ternary-tick"
+      });
+    });
+
+    const gradient = svgElement("linearGradient", {
+      id: "outcome-density-gradient",
+      x1: "0%",
+      y1: "100%",
+      x2: "0%",
+      y2: "0%"
+    });
+    [0, 0.2, 0.4, 0.6, 0.8, 1].forEach((level) => {
+      gradient.appendChild(svgElement("stop", {
+        offset: `${level * 100}%`,
+        "stop-color": interpolateDensityColor(level)
+      }));
+    });
+    const definitions = svgElement("defs");
+    definitions.appendChild(gradient);
+    svg.appendChild(definitions);
+    svg.appendChild(svgElement("rect", {
+      x: 369,
+      y: 100,
+      width: 12,
+      height: 175,
+      fill: "url(#outcome-density-gradient)",
+      stroke: "#7e9189",
+      "stroke-width": 0.8
+    }));
+    [0, 0.25, 0.5, 0.75, 1].forEach((level) => {
+      const y = 275 - level * 175;
+      svg.appendChild(svgElement("line", { x1: 381, y1: y, x2: 385, y2: y, class: "outcome-plot__axis" }));
+      appendSvgText(svg, (maxDensity * level).toFixed(level === 0 ? 0 : 1), {
+        x: 399,
+        y: y + 3,
+        class: "outcome-plot__ternary-tick"
+      });
+    });
+    appendSvgText(svg, "density", {
+      x: 425,
+      y: 187.5,
+      class: "outcome-plot__axis-label",
+      transform: "rotate(90 425 187.5)"
+    });
+
+    const mean = simplexPoint(
+      alphas.win / alphaTotal,
+      alphas.draw / alphaTotal,
+      alphas.loss / alphaTotal,
+      vertices
+    );
+    svg.appendChild(svgElement("circle", { cx: mean.x, cy: mean.y, r: 5.2, class: "outcome-plot__mean-dot" }));
+
+    appendSvgText(svg, "p(draw)", {
+      x: 91,
+      y: 184,
+      class: "outcome-plot__axis-label",
+      transform: "rotate(-60 91 184)"
+    });
+    appendSvgText(svg, "p(win)", {
+      x: 289,
+      y: 184,
+      class: "outcome-plot__axis-label",
+      transform: "rotate(60 289 184)"
+    });
+    appendSvgText(svg, "p(loss)", { x: 190, y: 329, class: "outcome-plot__axis-label" });
+    appendSvgText(svg, "mean", { x: mean.x + 28, y: mean.y - 8, class: "outcome-plot__annotation" });
+    appendSvgText(svg, "p(win) + p(draw) + p(loss) = 1", { x: 190, y: 351, class: "outcome-plot__annotation" });
+    return svg;
+  }
+
+  function renderOutcomeDistributionComparison() {
+    const root = document.getElementById("outcome-distribution-comparison");
+    if (!root) return;
+    const plots = document.createElement("div");
+    plots.className = "outcome-distribution-comparison__plots";
+    const betaPanel = document.createElement("div");
+    betaPanel.className = "outcome-distribution-panel";
+    betaPanel.appendChild(renderOutcomeBetaPlot());
+    const dirichletPanel = document.createElement("div");
+    dirichletPanel.className = "outcome-distribution-panel";
+    dirichletPanel.appendChild(renderOutcomeDirichletPlot());
+    plots.append(betaPanel, dirichletPanel);
+    root.appendChild(plots);
+  }
+
   document.addEventListener("DOMContentLoaded", renderCoinDataset);
+  document.addEventListener("DOMContentLoaded", renderOutcomeDistributionComparison);
 })();
