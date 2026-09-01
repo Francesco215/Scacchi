@@ -415,7 +415,6 @@
     svg.append(title, description);
 
     appendSvgText(svg, "Beta distribution", { x: 220, y: 23, class: "outcome-plot__title" });
-    appendSvgText(svg, "two outcomes · Beta(6, 3)", { x: 220, y: 44, class: "outcome-plot__subtitle" });
     svg.append(
       svgElement("line", { x1: left, y1: baseline, x2: right, y2: baseline, class: "outcome-plot__axis" }),
       svgElement("path", { d: `M ${left} ${baseline} L ${pointPath} L ${right} ${baseline} Z`, class: "outcome-plot__area" }),
@@ -426,9 +425,8 @@
     [[left, "0"], [(left + right) / 2, ".5"], [right, "1"]].forEach(([x, label]) => {
       appendSvgText(svg, label, { x, y: 290, class: "outcome-plot__tick" });
     });
-    appendSvgText(svg, "mean = 0.67", { x: meanX, y: 84, class: "outcome-plot__annotation" });
+    appendSvgText(svg, "mean", { x: meanX, y: 84, class: "outcome-plot__annotation outcome-plot__mean-label" });
     appendSvgText(svg, "p(win)", { x: 220, y: 321, class: "outcome-plot__axis-label" });
-    appendSvgText(svg, "p(loss) = 1 − p(win)", { x: 220, y: 343, class: "outcome-plot__annotation" });
     return svg;
   }
 
@@ -489,7 +487,6 @@
     svg.append(title, description);
 
     appendSvgText(svg, "Dirichlet distribution", { x: 220, y: 23, class: "outcome-plot__title" });
-    appendSvgText(svg, "three outcomes · α = (6, 3, 2)", { x: 220, y: 44, class: "outcome-plot__subtitle" });
 
     const modePoint = simplexPoint(mode.win, mode.draw, mode.loss, vertices);
     const contourLevels = [0.025, 0.06, 0.12, 0.22, 0.36, 0.54, 0.73, 0.88];
@@ -636,8 +633,7 @@
       transform: "rotate(60 289 184)"
     });
     appendSvgText(svg, "p(loss)", { x: 190, y: 329, class: "outcome-plot__axis-label" });
-    appendSvgText(svg, "mean", { x: mean.x + 28, y: mean.y - 8, class: "outcome-plot__annotation" });
-    appendSvgText(svg, "p(win) + p(draw) + p(loss) = 1", { x: 190, y: 351, class: "outcome-plot__annotation" });
+    appendSvgText(svg, "mean", { x: mean.x - 32, y: mean.y - 12, class: "outcome-plot__annotation outcome-plot__mean-label" });
     return svg;
   }
 

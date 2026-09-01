@@ -363,9 +363,7 @@ d-article figure.side {
 }
 
 .outcome-distribution-panel {
-  border-top: 1px solid #dce5e1;
   min-width: 0;
-  padding-top: 0.8rem;
 }
 
 .outcome-distribution-panel svg {
@@ -376,7 +374,6 @@ d-article figure.side {
 }
 
 .outcome-plot__title,
-.outcome-plot__subtitle,
 .outcome-plot__tick,
 .outcome-plot__axis-label,
 .outcome-plot__vertex-label,
@@ -387,14 +384,8 @@ d-article figure.side {
 
 .outcome-plot__title {
   fill: #33423d;
-  font-size: 17px;
+  font-size: 21px;
   font-weight: 650;
-}
-
-.outcome-plot__subtitle {
-  fill: #71807b;
-  font-size: 11px;
-  letter-spacing: 0.025em;
 }
 
 .outcome-plot__axis {
@@ -448,21 +439,30 @@ d-article figure.side {
 }
 
 .outcome-plot__tick {
-  font-size: 10px;
+  font-size: 13px;
 }
 
 .outcome-plot__ternary-tick {
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .outcome-plot__axis-label,
 .outcome-plot__vertex-label {
-  font-size: 11px;
+  font-size: 14px;
   font-weight: 600;
 }
 
 .outcome-plot__annotation {
-  font-size: 10px;
+  font-size: 13px;
+}
+
+.outcome-plot__mean-label {
+  fill: #33423d;
+  font-weight: 650;
+  paint-order: stroke;
+  stroke: #ffffff;
+  stroke-linejoin: round;
+  stroke-width: 3px;
 }
 
 .outcome-distribution-comparison figcaption {

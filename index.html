@@ -34,6 +34,125 @@
           demo.style.height = `${event.data.height}px`;
         }
       });
+
+      document.addEventListener("DOMContentLoaded", function () {
+        const svg = document.getElementById("hex-board-svg");
+        const cells = document.getElementById("hex-board-cells");
+        const rails = document.getElementById("hex-board-rails");
+        const slider = document.getElementById("hex-board-size");
+        const output = document.getElementById("hex-board-size-output");
+
+        if (!svg || !cells || !rails || !slider || !output) return;
+
+        const svgNamespace = "http://www.w3.org/2000/svg";
+        const radius = 18;
+        const columnStep = Math.sqrt(3) * radius;
+        const rowStep = 1.5 * radius;
+
+        function makeSvgElement(name, attributes) {
+          const element = document.createElementNS(svgNamespace, name);
+          Object.entries(attributes).forEach(([key, value]) => {
+            element.setAttribute(key, value);
+          });
+          return element;
+        }
+
+        function hexagonVertices(centerX, centerY) {
+          return Array.from({ length: 6 }, (_, index) => {
+            const angle = ((60 * index - 90) * Math.PI) / 180;
+            return {
+              x: centerX + radius * Math.cos(angle),
+              y: centerY + radius * Math.sin(angle)
+            };
+          });
+        }
+
+        function pointsAttribute(points) {
+          return points.map(({ x, y }) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+        }
+
+        function hexagonPoints(centerX, centerY) {
+          return pointsAttribute(hexagonVertices(centerX, centerY));
+        }
+
+        function drawBoard(size) {
+          cells.replaceChildren();
+          rails.replaceChildren();
+
+          const last = size - 1;
+          const cellHalfWidth = columnStep / 2;
+          const bottomRightX = columnStep * last * 1.5;
+          const bottomY = rowStep * last;
+          const borderGap = radius * 0.36;
+
+          function boardVertex(row, column, vertex) {
+            const centerX = columnStep * (column + row * 0.5);
+            const centerY = rowStep * row;
+            return hexagonVertices(centerX, centerY)[vertex];
+          }
+
+          function shifted(points, xOffset, yOffset) {
+            return points.map(({ x, y }) => ({ x: x + xOffset, y: y + yOffset }));
+          }
+
+          const topBorder = [boardVertex(0, 0, 5)];
+          const bottomBorder = [boardVertex(last, 0, 4)];
+          const leftBorder = [boardVertex(0, 0, 5)];
+          const rightBorder = [boardVertex(0, last, 1)];
+
+          for (let column = 0; column < size; column += 1) {
+            topBorder.push(boardVertex(0, column, 0), boardVertex(0, column, 1));
+            bottomBorder.push(boardVertex(last, column, 3), boardVertex(last, column, 2));
+          }
+
+          for (let row = 0; row < size; row += 1) {
+            leftBorder.push(boardVertex(row, 0, 4));
+            rightBorder.push(boardVertex(row, last, 2));
+            if (row < last) {
+              leftBorder.push(boardVertex(row + 1, 0, 5));
+              rightBorder.push(boardVertex(row + 1, last, 1));
+            }
+          }
+
+          [
+            [shifted(topBorder, 0, -borderGap), "hex-board-rail-red"],
+            [shifted(bottomBorder, 0, borderGap), "hex-board-rail-red"],
+            [shifted(leftBorder, -borderGap * Math.sqrt(3) / 2, borderGap / 2), "hex-board-rail-blue"],
+            [shifted(rightBorder, borderGap * Math.sqrt(3) / 2, -borderGap / 2), "hex-board-rail-blue"]
+          ].forEach(([points, className]) => {
+            rails.appendChild(makeSvgElement("polyline", {
+              points: pointsAttribute(points),
+              class: className
+            }));
+          });
+
+          for (let row = 0; row < size; row += 1) {
+            for (let column = 0; column < size; column += 1) {
+              const centerX = columnStep * (column + row * 0.5);
+              const centerY = rowStep * row;
+              cells.appendChild(makeSvgElement("polygon", {
+                points: hexagonPoints(centerX, centerY),
+                class: "hex-board-cell"
+              }));
+            }
+          }
+
+          const minX = -cellHalfWidth - radius * 1.15;
+          const maxX = bottomRightX + cellHalfWidth + radius * 1.15;
+          const minY = -radius * 1.7;
+          const maxY = bottomY + radius * 1.7;
+          svg.setAttribute("viewBox", `${minX} ${minY} ${maxX - minX} ${maxY - minY}`);
+          svg.setAttribute("aria-label", `Empty ${size} by ${size} Hex board`);
+          output.textContent = `${size} × ${size}`;
+          slider.setAttribute("aria-valuetext", `${size} by ${size}`);
+        }
+
+        slider.addEventListener("input", function () {
+          drawBoard(Number(slider.value));
+        });
+
+        drawBoard(Number(slider.value));
+      });
     </script>
     <style>
       .tictactoe-embed {
@@ -107,6 +226,99 @@
         margin-top: 0.8rem;
       }
 
+      .results-figure {
+        clear: both;
+        margin-bottom: 2.5rem;
+        margin-top: 1.75rem;
+      }
+
+      .results-figure img {
+        display: block;
+        height: auto;
+        width: 100%;
+      }
+
+      .results-figure figcaption {
+        margin-top: 0.8rem;
+      }
+
+      .prediction-entropy-callout {
+        display: flow-root;
+        margin-top: 1.5rem;
+      }
+
+      .prediction-entropy-figure {
+        margin-top: 0;
+      }
+
+      .hex-board-figure {
+        color: #52596c;
+        margin-top: 0.35rem;
+      }
+
+      .hex-board-svg {
+        display: block;
+        height: 18rem;
+        overflow: visible;
+        width: 100%;
+      }
+
+      .hex-board-cell {
+        fill: #f2d39b;
+        stroke: #8d7147;
+        stroke-width: 1.25;
+      }
+
+      .hex-board-rail-red,
+      .hex-board-rail-blue {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 5;
+      }
+
+      .hex-board-rail-red {
+        stroke: #d95b59;
+      }
+
+      .hex-board-rail-blue {
+        stroke: #4c7fc1;
+      }
+
+      .hex-board-control {
+        align-items: center;
+        display: grid;
+        gap: 0.55rem;
+        grid-template-columns: max-content minmax(6rem, 1fr) 3.4rem;
+        margin-top: 0.65rem;
+      }
+
+      .hex-board-control label,
+      .hex-board-size-output {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+
+      .hex-board-control input[type="range"] {
+        accent-color: #4c7fc1;
+        cursor: pointer;
+        margin: 0;
+        min-width: 0;
+        width: 100%;
+      }
+
+      .hex-board-size-output {
+        color: #303747;
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+      }
+
+      .hex-board-figure figcaption {
+        margin-top: 0.7rem;
+      }
+
       .algorithm-figure {
         margin-bottom: 2.6rem;
         margin-top: 2rem;
@@ -159,6 +371,7 @@
           position: relative;
           width: 450px;
         }
+
       }
 
       @media (max-width: 860px) {
@@ -653,8 +866,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       <figure class="l-page-outset outcome-distribution-comparison">
         <div id="outcome-distribution-comparison"></div>
         <noscript>This figure needs JavaScript to draw the Beta curve and Dirichlet simplex.</noscript>
-        <figcaption>TODO: improve the image!<br>
-          Figure 9: A Beta distribution places density along the one-dimensional
+        <figcaption>Figure 9: A Beta distribution places density along the one-dimensional
           win–loss line. Once draws are possible, the belief lives on a
           two-dimensional simplex: every point in the triangle is one complete
           win–draw–loss probability vector. Darker filled contours indicate
@@ -664,16 +876,102 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       </figure>
 
       <p>
-        The Dirichlet distribution has virtually all the same properties as the Beta distribution, so all the math we talked so far remains virtually the same.
+        The Dirichlet distribution has virtually all the same properties as the Beta distribution, so all the math we talked so far remains basically the same.
       </p>
-      <h2>Results</h2>
+      </div>
+
+      <h2 id="results">Results</h2>
+      <div class="results-intro">
+        <figure class="l-side hex-board-figure">
+          <div class="hex-board-shell">
+            <svg
+              id="hex-board-svg"
+              class="hex-board-svg"
+              role="img"
+              aria-label="Empty 6 by 6 Hex board"
+            >
+              <title>Interactive Hex board</title>
+              <desc>Use the slider to change the board from 3 by 3 to 9 by 9.</desc>
+              <g id="hex-board-rails" aria-hidden="true"></g>
+              <g id="hex-board-cells" aria-hidden="true"></g>
+            </svg>
+            <div class="hex-board-control">
+              <label for="hex-board-size">Board size</label>
+              <input id="hex-board-size" type="range" min="3" max="9" step="1" value="6">
+              <output id="hex-board-size-output" class="hex-board-size-output" for="hex-board-size">6 × 6</output>
+            </div>
+          </div>
+          <figcaption>
+            Figure 10: Players alternate claiming empty cells. Blue connects the
+            blue left and right edges; red connects the red top and bottom edges.
+            The first unbroken path wins, and Hex cannot end in a draw.
+          </figcaption>
+        </figure>
+        <p>
+          I decided to compare this Curiosity-Driven search algorithm against
+          Gumbel-AlphaZero<d-cite key="danihelka2022Gumbel"></d-cite> (the latest iteration of the AlphaZero algorithm by Google-DeepMind)
+        </p>
+        <p>
+          For the experiments I was inspired by the paper "Scaling Scaling Laws
+          with Board Games"<d-cite key="jones2021Scaling"></d-cite>, where the author chose to train several models with different hex board sizes from $3\times3$ through $9\times9$ and measured scaling laws for both algorithms. 
+
+        </p>
+        <p><i>And it's scalable and competitive with Gumbel-AlphaZero!</i></p>
+      </div>
+
+      <figure class="l-page-outset results-figure">
+        <img
+          src="hex3-9-scaling-paper-logbins.svg"
+          alt="Two-panel compute-scaling plot for Hex boards 3 through 9. Curiosity-Driven is shown on the left and Gumbel-AlphaZero on the right. Learning transitions move to higher neural-network FLOPs as board size increases."
+        >
+        <figcaption>
+          Figure 11: Win rate against a roughly optimal-play baseline as a function of
+          neural-network FLOPs. Color denotes board size; faint points are raw
+          evaluations and solid curves are time-averages.
+          The dotted line marks a 50% win rate.
+        </figcaption>
+      </figure>
+      <p>
+        Gumbel-AlphaZero tends to converge faster, while
+        Curiosity-Driven seems to reach slightly better final performance (althought it's pretty negligible).
+      </p>
+      <figure class="results-figure">
+        <img
+          src="hex3-9-paired-paper-logbins.svg"
+          alt="Seven-panel comparison of Curiosity-Driven and Gumbel-AlphaZero compute-scaling curves, with one panel for each Hex board size from 3 through 9 and the legend in the eighth grid cell."
+        >
+        <figcaption>
+          Figure 12: Matched-board comparison of Curiosity-Driven and Gumbel-AlphaZero.
+        </figcaption>
+      </figure>
+      <div class="prediction-entropy-callout">
+        <figure class="l-side prediction-entropy-figure">
+          <img
+            src="hex3-9-dt-prediction-entropy-logbins.svg"
+            alt="Prediction entropy for Curiosity-Driven agents on Hex boards 3 through 9, plotted against neural-network FLOPs on a logarithmic scale"
+          >
+        </figure>
+        <p>Another interesting graph is the entropy of the predictions as the search goes on.</p>
+        <h3>Experimental details</h3>
+        <p>
+            I used a JAX-native stack made of pgx<d-cite key="koyamada2023PGX"></d-cite>
+            for fast and parallelizable environments and mctx<d-cite key="deepmindMctx"></d-cite>
+            as an initial version of the tree-search. Over time I've developed an
+            adaptation of mctx specifically for Curiosity-Driven search.
+        </p>
+        <p>
+            Self-play/training batch sizes were 4,096/1,024; the network was a
+            128-channel ResNet<d-cite key="he2016ResNet"></d-cite> with six blocks,
+            trained with Muon<d-cite key="jordan2024Muon"></d-cite> at a fixed
+            $5\times 10^{-3}$ learning rate.
+        </p>
       </div>
 
     </d-article>
 
     <d-appendix>
       <h3>Acknowledgements</h3>
-      <p>I want to thank <a href="https://x.com/HessianFree">Omehad Pooladzandi</a> for giving me access to compute, and I want to thank (in no particular order) <a href="https://wtedw.com/">Ted Wong</a>, <a href="https://x.com/NMonti25537">Nicolò Monti</a>, <a href="https://www.diego-marti.com/">Diego Martì Monso</a>, <a href="https://the-puzzler.github.io/">Matteo Peluso</a> and <a href="https://x.com/evaninwords">Evan Walters</a> for the precious feedback and support.</p>
+      <p>I want to thank <a href="https://x.com/HessianFree">Omehad Pooladzandi</a> for giving me access to compute, and I also want to thank (in no particular order) <a href="https://wtedw.com/">Ted Wong</a>, <a href="https://x.com/NMonti25537">Nicolò Monti</a>, <a href="https://www.diego-marti.com/">Diego Martì Monso</a>, <a href="https://the-puzzler.github.io/">Matteo Peluso</a> and <a href="https://x.com/evaninwords">Evan Walters</a> for the precious feedback and support.</p>
       <d-footnote-list></d-footnote-list>
       <d-citation-list></d-citation-list>
       <d-bibliography>
@@ -720,6 +1018,60 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
             primaryClass  = {cs.LG},
             doi           = {10.48550/arXiv.1911.08265},
             url           = {https://arxiv.org/pdf/1911.08265.pdf}
+          }
+
+          @article{jones2021Scaling,
+            author        = {Jones, Andy L.},
+            title         = {Scaling Scaling Laws with Board Games},
+            journal       = {arXiv preprint arXiv:2104.03113},
+            year          = {2021},
+            eprint        = {2104.03113},
+            archivePrefix = {arXiv},
+            primaryClass  = {cs.LG},
+            doi           = {10.48550/arXiv.2104.03113},
+            url           = {https://arxiv.org/pdf/2104.03113.pdf}
+          }
+
+          @inproceedings{danihelka2022Gumbel,
+            author    = {Danihelka, Ivo and Guez, Arthur and Schrittwieser, Julian and Silver, David},
+            title     = {Policy Improvement by Planning with Gumbel},
+            booktitle = {International Conference on Learning Representations},
+            year      = {2022},
+            url       = {https://openreview.net/forum?id=bERaNdoegnO}
+          }
+
+          @inproceedings{koyamada2023PGX,
+            author    = {Koyamada, Sotetsu and Okano, Shinri and Nishimori, Soichiro and Murata, Yu and Habara, Keigo and Kita, Haruka and Ishii, Shin},
+            title     = {PGX: Hardware-Accelerated Parallel Game Simulators for Reinforcement Learning},
+            booktitle = {Advances in Neural Information Processing Systems},
+            volume    = {36},
+            pages     = {45716--45743},
+            year      = {2023},
+            url       = {https://github.com/sotetsuk/pgx}
+          }
+
+          @software{deepmindMctx,
+            author = {DeepMind and Babuschkin, Igor and Baumli, Kate and Bell, Alison and Bhupatiraju, Surya and Bruce, Jake and Buchlovsky, Peter and Budden, David and Cai, Trevor and Clark, Aidan and Danihelka, Ivo and Dedieu, Antoine and Fantacci, Claudio and Godwin, Jonathan and Jones, Chris and Hemsley, Ross and Hennigan, Tom and Hessel, Matteo and Hou, Shaobo and Kapturowski, Steven and Keck, Thomas and Kemaev, Iurii and King, Michael and Kunesch, Markus and Martens, Lena and Merzic, Hamza and Mikulik, Vladimir and Norman, Tamara and Papamakarios, George and Quan, John and Ring, Roman and Ruiz, Francisco and Sanchez, Alvaro and Sartran, Laurent and Schneider, Rosalia and Sezener, Eren and Spencer, Stephen and Srinivasan, Srivatsan and Stanojevi\'{c}, Milo\v{s} and Stokowiec, Wojciech and Wang, Luyu and Zhou, Guangyao and Viola, Fabio},
+            title  = {The {D}eep{M}ind {JAX} {E}cosystem},
+            year   = {2020},
+            url    = {https://github.com/google-deepmind/mctx}
+          }
+
+          @inproceedings{he2016ResNet,
+            author    = {He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+            title     = {Deep Residual Learning for Image Recognition},
+            booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition},
+            pages     = {770--778},
+            year      = {2016},
+            doi       = {10.1109/CVPR.2016.90},
+            url       = {https://openaccess.thecvf.com/content_cvpr_2016/papers/He_Deep_Residual_Learning_CVPR_2016_paper.pdf}
+          }
+
+          @misc{jordan2024Muon,
+            author = {Jordan, Keller and Jin, Yuchen and Boza, Vlado and You, Jiacheng and Cesista, Franz and Newhouse, Laker and Bernstein, Jeremy},
+            title  = {Muon: An Optimizer for Hidden Layers in Neural Networks},
+            year   = {2024},
+            url    = {https://kellerjordan.github.io/posts/muon/}
           }
         </script>
       </d-bibliography>
