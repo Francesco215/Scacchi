@@ -406,7 +406,7 @@
       <d-contents></d-contents>
 
       <p>This is the second blog post of my series of "mathematical foundations of curiosity"</p>
-      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem. Here we are going to show how you can make a search-engine<d-footnote>By search engine I mean an engine that searches the game tree, not the internet.</d-footnote> out of it for board games such as tic-tac-toe, hex, chess and go.</p>
+      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem. Here we are going to show how you can make a tree-search algorithm out of it for board games such as tic-tac-toe, hex, chess and go.</p>
       <p>
         This line of search-based game-playing systems includes
         AlphaGo<d-cite key="silver2016AlphaGo"></d-cite>,
@@ -533,9 +533,9 @@
       </p>
 
       <h2>What search does</h2>
-      <!--alternative titles: what's the point of doing search? a high level overview on search engines -->
+      <!--alternative titles: what's the point of doing search? a high level overview of tree-search algorithms -->
       <p>
-          A search engine estimates the probability of winning for each possible next move, assuming both players play optimally.<br>Because the optimal strategy is often unknown, the engine is uncertain about its evaluation, so its estimates must be represented as probability distributions.
+          A tree-search algorithm estimates the probability of winning for each possible next move, assuming both players play optimally.<br>Because the optimal strategy is often unknown, the algorithm is uncertain about its evaluation, so its estimates must be represented as probability distributions.
       </p>
 
       <figure class="l-body search-overview-figure">
@@ -549,7 +549,7 @@
       </figure>
 
       <p>
-          In a search engine, the network provides
+          In a tree-search algorithm, the network provides
           an initial distribution $q_\theta$ as a starting guess; search improves it, and the
           improved prediction $q_\textrm{search}$ becomes the network's training target.
       </p>
@@ -567,7 +567,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
               +\underbrace{H\!\left(q_{\mathrm{search}}\right)}_{
               \text{has zero gradient}}.
               $$
-              If the search algorithms proves that one of the players has a forced win opportunity, then the target becomes a Dirac delta function.
+              If the tree-search algorithm proves that one of the players has a forced win opportunity, then the target becomes a Dirac delta function.
               </d-footnote>
       </p>
       <p>But how does search work precisely?</p>
@@ -908,7 +908,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
           </figcaption>
         </figure>
         <p>
-          I decided to compare this Curiosity-Driven search algorithm against
+          I decided to compare this Curiosity-Driven tree-search algorithm against
           Gumbel-AlphaZero<d-cite key="danihelka2022Gumbel"></d-cite> (the latest iteration of the AlphaZero algorithm by Google-DeepMind)
         </p>
         <p>
@@ -950,13 +950,17 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
             src="hex3-9-dt-prediction-entropy-logbins.svg"
             alt="Prediction entropy for Curiosity-Driven agents on Hex boards 3 through 9, plotted against neural-network FLOPs on a logarithmic scale"
           >
+          <figcaption>
+            Figure 13: Prediction entropy for Curiosity-Driven agents as a function of
+            training FLOPs.
+          </figcaption>
         </figure>
-        <p>Another interesting graph is the entropy of the predictions as the search goes on.</p>
+        <p>Another interesting graph is the entropy of the predictions as the training goes on. You can clearly see how it learns smootly to predict with higher and higher accuracy (Figure 13).</p>
         <h3>Experimental details</h3>
         <p>
             I used a JAX-native stack made of pgx<d-cite key="koyamada2023PGX"></d-cite>
             for fast and parallelizable environments and mctx<d-cite key="deepmindMctx"></d-cite>
-            as an initial version of the tree-search. Over time I've developed an
+            as an initial version of the tree-search algorithm. Over time I've developed an
             adaptation of mctx specifically for Curiosity-Driven search.
         </p>
         <p>
@@ -966,12 +970,25 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
             $5\times 10^{-3}$ learning rate.
         </p>
       </div>
+      <h2>Conclusion</h2>
+
+      <p>
+         We have seen how the notion of <i>Curiosity</i>, introduced in the first post of this series<d-cite key="sacco2026Curiosity"></d-cite>, can be generalized into a complete and scalable tree-search algorithm that performs competitively with AlphaZero.
+      </p>
+      <p>
+          The algorithm follows from a small set of simple axioms and requires few additional assumptions. Its main approximations appear in the process of updating beliefs, which is therefore both its clearest limitation and the most promising place to look for future improvements.
+      </p>
+      <p>
+          If you want to work on this kind of research and are curious about this stuff reach out! 🐝
+      </p>
 
     </d-article>
 
     <d-appendix>
       <h3>Acknowledgements</h3>
-      <p>I want to thank <a href="https://x.com/HessianFree">Omehad Pooladzandi</a> for giving me access to compute, and I also want to thank (in no particular order) <a href="https://wtedw.com/">Ted Wong</a>, <a href="https://x.com/NMonti25537">Nicolò Monti</a>, <a href="https://www.diego-marti.com/">Diego Martì Monso</a>, <a href="https://the-puzzler.github.io/">Matteo Peluso</a> and <a href="https://x.com/evaninwords">Evan Walters</a> for the precious feedback and support.</p>
+      <p>I want to thank <a href="https://x.com/HessianFree">Omehad Pooladzandi</a> for giving me access to compute.<br>I also want to thank (in no particular order) <a href="https://wtedw.com/">Ted Wong</a>, <a href="https://x.com/NMonti25537">Nicolò Monti</a>, <a href="https://www.diego-marti.com/">Diego Martì Monso</a>, <a href="https://the-puzzler.github.io/">Matteo Peluso</a> and <a href="https://x.com/evaninwords">Evan Walters</a> for the precious feedback and support.</p>
+      <h3>Contact</h3>
+      <p>You can do so by sending an email to this address francesco215@live.it or by messaging on discord at sacco215</p>
       <d-footnote-list></d-footnote-list>
       <d-citation-list></d-citation-list>
       <d-bibliography>

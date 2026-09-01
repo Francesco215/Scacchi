@@ -489,7 +489,7 @@ L -2.7 0
      </g>
     </g>
     <g id="text_13">
-     <text style="font-size: 8.2px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #3f4945" x="21.527313" y="109.62" transform="rotate(-90 21.527313 109.62)">prediction entropy</text>
+     <text style="font-size: 8.2px; font-family: 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #3f4945" x="21.527313" y="109.62" transform="rotate(-90 21.527313 109.62)">prediction entropy (nats)</text>
     </g>
    </g>
    <image xlink:href="data:image/png;base64,

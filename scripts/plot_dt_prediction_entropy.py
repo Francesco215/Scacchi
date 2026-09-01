@@ -146,7 +146,7 @@ def plot(histories: dict[str, EntropySeries], output_dir: Path) -> None:
         )
 
     style_axis(ax)
-    ax.set_ylabel("prediction entropy", color=AXIS_LABEL_COLOR, fontsize=8.2)
+    ax.set_ylabel("prediction entropy (nats)", color=AXIS_LABEL_COLOR, fontsize=8.2)
     ax.set_xlabel(
         "Training FLOPs",
         color=AXIS_LABEL_COLOR,
