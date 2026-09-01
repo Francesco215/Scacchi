@@ -44,7 +44,7 @@ button {
   padding: 0.65rem 0.9rem;
 }
 
-button:hover:not(:disabled) {
+button:not(.cell):hover:not(:disabled) {
   background: var(--accent-dark);
 }
 
@@ -109,12 +109,6 @@ h2 {
   letter-spacing: -0.015em;
 }
 
-.status {
-  margin-top: 8px;
-  color: var(--muted);
-  min-height: 1.5rem;
-}
-
 .actions {
   display: flex;
   gap: 10px;
@@ -157,9 +151,6 @@ input[type="range"] {
   grid-template-rows: repeat(3, 1fr);
   gap: 2px;
   margin: 0 auto;
-  overflow: hidden;
-  border: 2px solid var(--strong-line);
-  border-radius: 12px;
   background: var(--strong-line);
 }
 
@@ -177,10 +168,6 @@ input[type="range"] {
   min-width: 0;
   min-height: 0;
   padding: 0;
-}
-
-.cell:hover:not(:disabled) {
-  background: #f1f7f8;
 }
 
 @media (hover: hover) {

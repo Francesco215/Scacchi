@@ -49,6 +49,14 @@ const POLICY_SAMPLES = 128;
 const PLOT_SAMPLES = 180;
 const KAPPA = 4;
 const DUMB_ALPHA = Object.freeze([1, 1, 1]);
+const UNIFORM_DENSITY_COLOR_LEVEL = 0.06;
+const IBM_COLOR_SCALE = Object.freeze([
+  Object.freeze([100, 143, 255]), // #648FFF
+  Object.freeze([120, 94, 240]),  // #785EF0
+  Object.freeze([220, 38, 127]),  // #DC267F
+  Object.freeze([254, 97, 0]),    // #FE6100
+  Object.freeze([255, 176, 0]),   // #FFB000
+]);
 const WIN_LINES = Object.freeze([
   [0, 1, 2],
   [3, 4, 5],
@@ -124,7 +132,6 @@ let lastRenderTime = 0;
 
 const els = {
   board: document.getElementById("board"),
-  status: document.getElementById("status"),
   playBest: document.getElementById("play-best"),
   reset: document.getElementById("reset"),
   computeSlider: document.getElementById("compute-slider"),
@@ -676,13 +683,13 @@ function render() {
   analysis = analyzePosition();
   renderComputeControl();
   renderBoard();
-  renderStatus();
+  renderControls();
   renderPosterior();
 }
 
 function renderSearchProgress() {
   analysis = analyzePosition();
-  renderStatus();
+  renderControls();
   renderPosterior();
 }
 
@@ -718,15 +725,8 @@ function renderBoard() {
   }
 }
 
-function renderStatus() {
+function renderControls() {
   const result = gameResult(board);
-
-  if (result.terminal) {
-    els.status.textContent = result.draw ? "Draw" : `${result.winner} wins`;
-  } else {
-    els.status.textContent = `${currentPlayer} to move`;
-  }
-
   els.playBest.disabled = result.terminal || analysis.bestAction === null;
 }
 
@@ -879,6 +879,28 @@ function sampleDirichlet(alpha) {
   return gammas.map((value) => value / total);
 }
 
+function dirichletLogDensity(probabilities, alpha) {
+  return probabilities.reduce(
+    (density, probability, index) =>
+      density +
+      (alpha[index] - 1) * Math.log(Math.max(probability, 1e-12)),
+    0,
+  );
+}
+
+function interpolateDensityColor(amount) {
+  const colorStops = [[246, 249, 249], ...IBM_COLOR_SCALE];
+  const scaledAmount = Math.max(0, Math.min(1, amount)) *
+    (colorStops.length - 1);
+  const lowerIndex = Math.floor(scaledAmount);
+  const upperIndex = Math.min(lowerIndex + 1, colorStops.length - 1);
+  const mix = scaledAmount - lowerIndex;
+  const channels = colorStops[lowerIndex].map((channel, index) =>
+    Math.round(channel + (colorStops[upperIndex][index] - channel) * mix),
+  );
+  return `rgb(${channels.join(",")})`;
+}
+
 function drawSimplex(alpha, categoricalOutcome = null) {
   const canvas = els.simplex;
   const context = canvas.getContext("2d");
@@ -923,13 +945,40 @@ function drawSimplex(alpha, categoricalOutcome = null) {
   context.fillText(`${winLabel} wins`, vertices.W.x - 4, vertices.W.y + 18);
 
   if (categoricalOutcome === null) {
-    context.fillStyle = "rgba(31, 122, 140, 0.24)";
-    for (let i = 0; i < PLOT_SAMPLES; i += 1) {
-      const point = simplexPoint(sampleDirichlet(alpha), vertices);
+    const samples = Array.from(
+      { length: PLOT_SAMPLES },
+      () => sampleDirichlet(alpha),
+    );
+    const logDensities = samples.map((sample) =>
+      dirichletLogDensity(sample, alpha),
+    );
+    const meanLogDensity = logDensities.reduce(
+      (sum, density) => sum + density,
+      0,
+    ) / logDensities.length;
+    const densitySpread = Math.sqrt(
+      logDensities.reduce(
+        (sum, density) => sum + (density - meanLogDensity) ** 2,
+        0,
+      ) / logDensities.length,
+    );
+    const densityContrast = densitySpread / (densitySpread + 1);
+
+    samples.forEach((sample, index) => {
+      const point = simplexPoint(sample, vertices);
+      const centeredDensity = 1 / (
+        1 + Math.exp(
+          -(logDensities[index] - meanLogDensity) /
+          Math.max(densitySpread, Number.EPSILON),
+        )
+      );
+      const colorLevel = UNIFORM_DENSITY_COLOR_LEVEL + densityContrast *
+        (centeredDensity - UNIFORM_DENSITY_COLOR_LEVEL);
+      context.fillStyle = interpolateDensityColor(colorLevel);
       context.beginPath();
       context.arc(point.x, point.y, 2.2, 0, Math.PI * 2);
       context.fill();
-    }
+    });
   }
 
   const mean =
@@ -937,7 +986,7 @@ function drawSimplex(alpha, categoricalOutcome = null) {
       ? alphaMean(alpha)
       : categoricalMean(categoricalOutcome);
   const meanPoint = simplexPoint(mean, vertices);
-  context.fillStyle = "#c2413d";
+  context.fillStyle = "#dc267f";
   context.strokeStyle = "#ffffff";
   context.lineWidth = 2;
   context.beginPath();

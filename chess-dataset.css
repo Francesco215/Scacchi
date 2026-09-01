@@ -288,7 +288,6 @@ d-article figure.side {
 
 .beta-marker--target {
   stroke: #d97706;
-  stroke-dasharray: 3 2;
 }
 
 .beta-marker--mean { stroke: #2563a9; }
@@ -322,20 +321,32 @@ d-article figure.side {
   display: inline-flex;
 }
 
-.coin-sample__key > span::before {
-  border-top: 3px solid;
-  content: "";
-  display: inline-block;
+.coin-sample__key-swatch {
+  flex: 0 0 auto;
+  height: 30px;
   margin-right: 0.45rem;
-  width: 23px;
+  overflow: visible;
+  width: 44px;
 }
 
-.coin-sample__key .density::before { border-color: #397f91; }
-.coin-sample__key .target::before {
-  border-color: #d97706;
-  border-top-style: dashed;
+.coin-sample__key-density-area {
+  fill: rgba(31, 122, 140, 0.14);
 }
-.coin-sample__key .mean::before { border-color: #2563a9; }
+
+.coin-sample__key-density-curve {
+  fill: none;
+  stroke: #397f91;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2.5;
+}
+
+.coin-sample__key-marker {
+  stroke-width: 3;
+}
+
+.coin-sample__key-marker--target { stroke: #d97706; }
+.coin-sample__key-marker--mean { stroke: #2563a9; }
 
 .coin-formula {
   letter-spacing: normal;
@@ -394,12 +405,13 @@ d-article figure.side {
 }
 
 .outcome-plot__area {
-  fill: rgba(31, 122, 140, 0.14);
+  fill: url("#outcome-beta-gradient");
+  fill-opacity: 0.55;
 }
 
 .outcome-plot__curve {
   fill: none;
-  stroke: #397f91;
+  stroke: url("#outcome-beta-gradient");
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 3;
@@ -407,7 +419,7 @@ d-article figure.side {
 
 .outcome-plot__contour {
   fill: none;
-  stroke: #397f91;
+  stroke: #785ef0;
   stroke-opacity: 0.45;
   stroke-width: 0.8;
 }
@@ -420,13 +432,13 @@ d-article figure.side {
 }
 
 .outcome-plot__mean-line {
-  stroke: #2563a9;
+  stroke: #dc267f;
   stroke-width: 1.8;
 }
 
 .outcome-plot__mean-dot {
   fill: #ffffff;
-  stroke: #2563a9;
+  stroke: #dc267f;
   stroke-width: 2.5;
 }
 

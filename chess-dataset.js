@@ -257,6 +257,32 @@
     svg.appendChild(axisLabel);
     return svg;
   }
+
+  function renderBetaLegendSwatch(type) {
+    const svg = svgElement("svg", {
+      class: `coin-sample__key-swatch coin-sample__key-swatch--${type}`,
+      viewBox: "0 0 44 30",
+      "aria-hidden": "true"
+    });
+
+    if (type === "density") {
+      const curve = "M 2 25 C 10 25 14 24 18 19 C 22 14 24 4 29 3 C 34 2 36 13 39 19 C 41 23 42 25 43 25";
+      svg.append(
+        svgElement("path", { d: `${curve} L 43 25 L 2 25 Z`, class: "coin-sample__key-density-area" }),
+        svgElement("path", { d: curve, class: "coin-sample__key-density-curve" })
+      );
+    } else {
+      svg.appendChild(svgElement("line", {
+        x1: 22,
+        y1: 2,
+        x2: 22,
+        y2: 28,
+        class: `coin-sample__key-marker coin-sample__key-marker--${type}`
+      }));
+    }
+
+    return svg;
+  }
   
   function renderCoinDataset() {
     const root = document.getElementById("coin-dataset-grid");
@@ -322,6 +348,7 @@
       ].forEach(([className, formula]) => {
         const item = document.createElement("span");
         item.className = className;
+        item.appendChild(renderBetaLegendSwatch(className));
         item.appendChild(renderFormula(formula));
         key.appendChild(item);
       });
@@ -383,6 +410,14 @@
     return text;
   }
 
+  const IBM_COLOR_SCALE = [
+    [100, 143, 255], // #648FFF
+    [120, 94, 240],  // #785EF0
+    [220, 38, 127],  // #DC267F
+    [254, 97, 0],    // #FE6100
+    [255, 176, 0]    // #FFB000
+  ];
+
   function renderOutcomeBetaPlot() {
     const alpha = 6;
     const beta = 3;
@@ -411,8 +446,23 @@
     const title = svgElement("title", { id: "outcome-beta-title" });
     title.textContent = "Beta distribution for two possible outcomes";
     const description = svgElement("desc", { id: "outcome-beta-description" });
-    description.textContent = "A Beta(6, 3) density over the probability of winning. The probability of losing is one minus the probability of winning.";
+    description.textContent = "A Beta(6, 3) density over the probability of winning, filled from IBM blue to purple, with its mean marked in magenta. The probability of losing is one minus the probability of winning.";
     svg.append(title, description);
+
+    const gradient = svgElement("linearGradient", {
+      id: "outcome-beta-gradient",
+      x1: "0%",
+      y1: "0%",
+      x2: "100%",
+      y2: "0%"
+    });
+    gradient.append(
+      svgElement("stop", { offset: "0%", "stop-color": "#648FFF" }),
+      svgElement("stop", { offset: "100%", "stop-color": "#785EF0" })
+    );
+    const definitions = svgElement("defs");
+    definitions.appendChild(gradient);
+    svg.appendChild(definitions);
 
     appendSvgText(svg, "Beta distribution", { x: 220, y: 23, class: "outcome-plot__title" });
     svg.append(
@@ -438,10 +488,14 @@
   }
 
   function interpolateDensityColor(amount) {
-    const low = [246, 249, 249];
-    const high = [17, 85, 119];
-    const mix = Math.pow(Math.max(0, Math.min(1, amount)), 0.65);
-    const channels = low.map((channel, index) => Math.round(channel + (high[index] - channel) * mix));
+    const colorStops = [[246, 249, 249], ...IBM_COLOR_SCALE];
+    const scaledAmount = Math.max(0, Math.min(1, amount)) * (colorStops.length - 1);
+    const lowerIndex = Math.floor(scaledAmount);
+    const upperIndex = Math.min(lowerIndex + 1, colorStops.length - 1);
+    const mix = scaledAmount - lowerIndex;
+    const channels = colorStops[lowerIndex].map((channel, index) => (
+      Math.round(channel + (colorStops[upperIndex][index] - channel) * mix)
+    ));
     return `rgb(${channels.join(",")})`;
   }
 
@@ -483,7 +537,7 @@
     const title = svgElement("title", { id: "outcome-dirichlet-title" });
     title.textContent = "Dirichlet distribution for three possible outcomes";
     const description = svgElement("desc", { id: "outcome-dirichlet-description" });
-    description.textContent = "A smooth filled-contour plot of a Dirichlet(6, 3, 2) density over win, draw, and loss probabilities, with ternary axes and a density scale.";
+    description.textContent = "A smooth filled-contour plot of a Dirichlet(6, 3, 2) density over win, draw, and loss probabilities, using the IBM color-blind-safe scale, with ternary axes and a magenta mean marker.";
     svg.append(title, description);
 
     appendSvgText(svg, "Dirichlet distribution", { x: 220, y: 23, class: "outcome-plot__title" });

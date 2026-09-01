@@ -458,10 +458,10 @@
         <figure class="l-body side">
           <img
             src="beta-nll.svg"
-            alt="The predicted distribution Beta(· | θ), with the true probability p_A(s) marked by a dashed orange line and the conditional mean E[p | θ] by a solid blue line"
+            alt="The predicted distribution Beta(· | θ), with the true probability p_A(s) marked by a solid orange line and the conditional mean E[p | θ] by a solid blue line"
           >
           <figcaption>
-            Figure 2: Here, the true odds $p_A(s)$ are shown by the dashed orange line, while the blue curve is the model’s prediction $\operatorname{Beta}\!\left(\cdot  | \theta \right)$ and the solid blue line marks its mean. The model receives a lower loss when the curve places more density at the true odds.</figcaption>
+            Figure 2: Here, the true odds $p_A(s)$ are shown by the solid orange line, while the blue curve is the model’s prediction $\operatorname{Beta}\!\left(\cdot  | \theta \right)$ and the solid blue line marks its mean. The model receives a lower loss when the curve places more density at the true odds.</figcaption>
         </figure>
         <p>
           Let's say that we want to train a NN that predicts the probability $p_A(s)$ of the player $A$ winning given a board state $s$. What would be the correct way of parametrizing the problem?<br><br>
@@ -540,7 +540,7 @@
 
       <figure class="l-body search-overview-figure">
         <img
-          src="search-beta-refinement.svg"
+          src="search-beta-refinement.svg?v=20260831"
           alt="A broad starting Beta distribution flowing through search into a taller, narrower Beta distribution"
         >
         <figcaption>
@@ -591,7 +591,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
         <p>This can be written mathematically as follows:</p>
 
         $$
-        \mathbb P(a^\star=a)
+        \mathbb P(a=a^\star)
         =
         \mathbb P\left(q_a \geq q_b\;\;\forall b\neq a\right),
         \quad q_a\sim Q_a.
@@ -606,7 +606,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
         </p>
 
         $$
-        \mathbb P(a^\star=a)
+        \mathbb P(a=a^\star)
         =
         \int_0^1
         f_a(x)
@@ -668,7 +668,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
 
         $$
         \pi(a)
-        =\mathbb P(a^\star=a).
+        =\mathbb P(a=a^\star).
         $$
         <p>
             <b>This policy is natively curious</b>. A child does not need to have the highest expected value to be worth exploring: it only needs enough uncertainty for there to be a meaningful chance that it is actually the best move
@@ -716,7 +716,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       
       <figure class="l-page-outset">
         <img
-          src="beta-mixture-summary.svg"
+          src="beta-mixture-summary.svg?v=20260831"
           alt="Three action-value Beta distributions and a comparison between their exact policy-weighted mixture and the Beta obtained by averaging their parameter vectors"
         >
         <figcaption>
@@ -850,6 +850,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       <p>The whole procedure can be summarized in the algorithm to the side right here.</p>
       <p>Typically, predictions become sharper as the search moves deeper into the tree because positions farther along in the game are, on average, easier to evaluate.</p>
       <p>Empirically, this appears as an increasingly concentrated distribution over moves and a corresponding decline in policy entropy.</p>
+
       <h3 id="one-last-thing">What about draws?</h3>
       <p>
         With only wins and losses, the outcome is Bernoulli: once we know
@@ -870,7 +871,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
           win–loss line. Once draws are possible, the belief lives on a
           two-dimensional simplex: every point in the triangle is one complete
           win–draw–loss probability vector. Darker filled contours indicate
-          higher probability density, while the blue marks show the means of the
+          higher probability density, while the magenta marks show the means of the
           example distributions.
         </figcaption>
       </figure>
@@ -878,6 +879,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       <p>
         The Dirichlet distribution has virtually all the same properties as the Beta distribution, so all the math we talked so far remains basically the same.
       </p>
+      <p>The triangle in the tic-tac-toe demo visualizes this Dirichlet distribution: each point represents a different combination of win, draw, and loss probabilities.</p>
       </div>
 
       <h2 id="results">Results</h2>
@@ -957,12 +959,20 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
         </figure>
         <p>Another interesting graph is the entropy of the predictions as the training goes on. You can clearly see how it learns smootly to predict with higher and higher accuracy (Figure 13).</p>
         <h3>Experimental details</h3>
-        <p>
-            I used a JAX-native stack made of pgx<d-cite key="koyamada2023PGX"></d-cite>
-            for fast and parallelizable environments and mctx<d-cite key="deepmindMctx"></d-cite>
-            as an initial version of the tree-search algorithm. Over time I've developed an
-            adaptation of mctx specifically for Curiosity-Driven search.
-        </p>
+        <p>I used a JAX-native stack made of:</p>
+        <ul class="compact-list">
+          <li>
+            PGX<d-cite key="koyamada2023PGX"></d-cite> for fast and parallelizable
+            environments;
+          </li>
+          <li>
+            MCTX<d-cite key="deepmindMctx"></d-cite> as the initial version of the
+            tree-search algorithm;
+          </li>
+          <li>
+              A custom adaptation of mctx for Curiosity-Driven search.
+          </li>
+        </ul>
         <p>
             Self-play/training batch sizes were 4,096/1,024; the network was a
             128-channel ResNet<d-cite key="he2016ResNet"></d-cite> with six blocks,
@@ -973,10 +983,10 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       <h2>Conclusion</h2>
 
       <p>
-         We have seen how the notion of <i>Curiosity</i>, introduced in the first post of this series<d-cite key="sacco2026Curiosity"></d-cite>, can be generalized into a complete and scalable tree-search algorithm that performs competitively with AlphaZero.
+          The algorithm follows from a small set of simple axioms with minimal additional assumptions. I prioritized mathematical elegance over raw performance: a principled foundation can always be optimized later.
       </p>
       <p>
-          The algorithm follows from a small set of simple axioms and requires few additional assumptions. Its main approximations appear in the process of updating beliefs, which is therefore both its clearest limitation and the most promising place to look for future improvements.
+         We have seen how the notion of <i>Curiosity</i>, introduced in the first post of this series<d-cite key="sacco2026Curiosity"></d-cite>, can be generalized into a complete and scalable tree-search algorithm that performs competitively with AlphaZero.
       </p>
       <p>
           If you want to work on this kind of research and are curious about this stuff reach out! 🐝
@@ -986,7 +996,12 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
 
     <d-appendix>
       <h3>Acknowledgements</h3>
-      <p>I want to thank <a href="https://x.com/HessianFree">Omehad Pooladzandi</a> for giving me access to compute.<br>I also want to thank (in no particular order) <a href="https://wtedw.com/">Ted Wong</a>, <a href="https://x.com/NMonti25537">Nicolò Monti</a>, <a href="https://www.diego-marti.com/">Diego Martì Monso</a>, <a href="https://the-puzzler.github.io/">Matteo Peluso</a> and <a href="https://x.com/evaninwords">Evan Walters</a> for the precious feedback and support.</p>
+      <p>
+          I want to thank <a href="https://x.com/HessianFree">Omehad Pooladzandi</a> for giving me access to compute.<br>I also want to thank (in no particular order) <a href="https://wtedw.com/">Ted Wong</a>, <a href="https://x.com/NMonti25537">Nicolò Monti</a>, <a href="https://www.diego-marti.com/">Diego Martì Monso</a>, <a href="https://the-puzzler.github.io/">Matteo Peluso</a> and <a href="https://x.com/evaninwords">Evan Walters</a> for the precious feedback and support.
+      </p>
+      <p>
+          A few words about the project: I’ve worked on it part-time over the past couple of months, and since I’ll have even less time going forward, I’ve decided to release it as it is. I’m very proud of how it turned out, though I wish I’d had more time to scale it to even more challenging environments.
+      </p>
       <h3>Contact</h3>
       <p>You can do so by sending an email to this address francesco215@live.it or by messaging on discord at sacco215</p>
       <d-footnote-list></d-footnote-list>
