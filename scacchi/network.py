@@ -25,7 +25,7 @@ def _dtype_from_name(name: str):
 
 
 def _squared_softplus_concentration_logit(concentration: float) -> float:
-    """Logit whose squared-softplus transform has the requested mass."""
+    """Legacy logit whose squared-softplus transform has the requested mass."""
 
     if concentration <= 0.0:
         raise ValueError(f"concentration must be > 0, got {concentration}")
@@ -33,11 +33,47 @@ def _squared_softplus_concentration_logit(concentration: float) -> float:
 
 
 def _unit_dirichlet_concentration_logit(num_outcomes: int) -> float:
-    """Logit whose squared-softplus transform totals ``num_outcomes``."""
+    """Legacy logit whose squared-softplus transform totals ``num_outcomes``."""
     return _squared_softplus_concentration_logit(float(num_outcomes))
 
 
 _DIRICHLET_INITIAL_EXCESS_CONCENTRATION = 0.1
+_LOG_CONCENTRATION_MIN = -80.0
+_LOG_CONCENTRATION_MAX = 80.0
+
+
+@jax.custom_jvp
+def _guard_log_concentration(log_concentration: jax.Array) -> jax.Array:
+    """Bound the forward value while retaining an identity recovery gradient."""
+
+    return jnp.clip(
+        log_concentration,
+        _LOG_CONCENTRATION_MIN,
+        _LOG_CONCENTRATION_MAX,
+    )
+
+
+@_guard_log_concentration.defjvp
+def _guard_log_concentration_jvp(
+    primals: tuple[jax.Array],
+    tangents: tuple[jax.Array],
+) -> tuple[jax.Array, jax.Array]:
+    (log_concentration,) = primals
+    (log_concentration_tangent,) = tangents
+    guarded = jnp.clip(
+        log_concentration,
+        _LOG_CONCENTRATION_MIN,
+        _LOG_CONCENTRATION_MAX,
+    )
+    return guarded, log_concentration_tangent
+
+
+def _direct_log_concentration(concentration: float) -> float:
+    """Raw direct-log head value for a requested initial concentration."""
+
+    if not math.isfinite(concentration) or concentration <= 0.0:
+        raise ValueError(f"concentration must be finite and > 0, got {concentration}")
+    return math.log(concentration)
 
 
 def _smooth_dirichlet_concentration_logit(
@@ -67,35 +103,64 @@ def dirichlet_from_logits(
     mean_logits: jax.Array,
     concentration_logit: jax.Array,
     *,
+    parameterization: str = "log_concentration",
     concentration_floor: float | None = None,
     concentration_clip: float | None = None,
 ) -> jax.Array:
     mean_logits = mean_logits.astype(jnp.float32)
     concentration_logit = concentration_logit.astype(jnp.float32)
-    if concentration_floor is None:
-        concentration = jax.nn.softplus(concentration_logit) ** 2
-        if concentration_clip is not None:
-            concentration = jnp.minimum(
-                concentration,
-                jnp.asarray(concentration_clip, dtype=concentration.dtype),
+    if parameterization == "log_concentration":
+        if concentration_floor is not None:
+            raise ValueError(
+                "concentration_floor is incompatible with direct "
+                "log-concentration heads"
             )
-    else:
-        floor = jnp.asarray(concentration_floor, dtype=concentration_logit.dtype)
-        if concentration_clip is None:
-            concentration = floor + jax.nn.softplus(concentration_logit)
-        else:
-            if concentration_clip <= concentration_floor:
-                raise ValueError(
-                    "concentration_clip must be greater than concentration_floor; "
-                    f"got floor={concentration_floor}, clip={concentration_clip}"
+        # This is a floating-point guard, not a trainable floor or confidence
+        # ceiling. Its straight-through derivative preserves the radial
+        # recovery signal even if a raw parameter temporarily leaves the safe
+        # exponent range.
+        safe_log_concentration = _guard_log_concentration(concentration_logit)
+        concentration = jnp.exp(safe_log_concentration)
+    elif parameterization == "legacy":
+        if concentration_floor is None:
+            concentration = jax.nn.softplus(concentration_logit) ** 2
+            if concentration_clip is not None:
+                concentration = jnp.minimum(
+                    concentration,
+                    jnp.asarray(
+                        concentration_clip,
+                        dtype=concentration.dtype,
+                    ),
                 )
-            concentration_range = jnp.asarray(
-                concentration_clip - concentration_floor,
+        else:
+            floor = jnp.asarray(
+                concentration_floor,
                 dtype=concentration_logit.dtype,
             )
-            concentration = floor + concentration_range * jax.nn.sigmoid(
-                concentration_logit
-            )
+            if concentration_clip is None:
+                concentration = floor + jax.nn.softplus(
+                    concentration_logit
+                )
+            else:
+                if concentration_clip <= concentration_floor:
+                    raise ValueError(
+                        "concentration_clip must be greater than "
+                        "concentration_floor; got "
+                        f"floor={concentration_floor}, "
+                        f"clip={concentration_clip}"
+                    )
+                concentration_range = jnp.asarray(
+                    concentration_clip - concentration_floor,
+                    dtype=concentration_logit.dtype,
+                )
+                concentration = floor + concentration_range * jax.nn.sigmoid(
+                    concentration_logit
+                )
+    else:
+        raise ValueError(
+            "unknown Dirichlet concentration parameterization: "
+            f"{parameterization!r}"
+        )
     return concentration[..., None] * jax.nn.softmax(mean_logits, axis=-1)
 
 
@@ -236,6 +301,9 @@ class AZDirichletNet(nnx.Module):
         resnet_v2: bool = True,
         dtype=jnp.float32,
         dirichlet_concentration_clip: float | None = 8.0,
+        dirichlet_concentration_floor: float | None = None,
+        dirichlet_initial_concentration: float | None = None,
+        dirichlet_head_parameterization: str = "log_concentration",
         rngs: nnx.Rngs,
     ):
         height, width, input_channels = observation_shape
@@ -245,7 +313,81 @@ class AZDirichletNet(nnx.Module):
         self.num_blocks = num_blocks
         self.resnet_v2 = resnet_v2
         self.dtype = dtype
+        self.dirichlet_head_parameterization = str(
+            dirichlet_head_parameterization
+        )
+        self.dirichlet_concentration_floor = (
+            None
+            if dirichlet_concentration_floor is None
+            else float(dirichlet_concentration_floor)
+        )
         self.dirichlet_concentration_clip = dirichlet_concentration_clip
+        self.dirichlet_initial_concentration = dirichlet_initial_concentration
+
+        if self.dirichlet_head_parameterization == "log_concentration":
+            if self.dirichlet_concentration_floor is not None:
+                raise ValueError(
+                    "direct log-concentration heads do not support a "
+                    "concentration floor"
+                )
+            initial_concentration = (
+                float(num_outcomes)
+                if dirichlet_initial_concentration is None
+                else float(dirichlet_initial_concentration)
+            )
+            concentration_logit = _direct_log_concentration(
+                initial_concentration
+            )
+        elif (
+            self.dirichlet_head_parameterization == "legacy"
+            and self.dirichlet_concentration_floor is None
+        ):
+            initial_concentration = (
+                float(num_outcomes)
+                if dirichlet_initial_concentration is None
+                else float(dirichlet_initial_concentration)
+            )
+            if (
+                self.dirichlet_concentration_clip is not None
+                and initial_concentration
+                >= float(self.dirichlet_concentration_clip)
+            ):
+                raise ValueError(
+                    "dirichlet_concentration_clip must exceed "
+                    "dirichlet_initial_concentration; got "
+                    f"initial={initial_concentration}, "
+                    f"clip={self.dirichlet_concentration_clip}"
+                )
+            concentration_logit = _squared_softplus_concentration_logit(
+                initial_concentration
+            )
+        elif self.dirichlet_head_parameterization == "legacy":
+            legacy_floor = self.dirichlet_concentration_floor
+            if legacy_floor is None:
+                raise AssertionError("legacy floor branch requires a floor")
+            initial_excess = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+            if dirichlet_initial_concentration is not None:
+                initial_excess = (
+                    float(dirichlet_initial_concentration)
+                    - legacy_floor
+                )
+                if initial_excess <= 0.0:
+                    raise ValueError(
+                        "dirichlet_initial_concentration must exceed the "
+                        f"configured floor "
+                        f"{legacy_floor}; got "
+                        f"{dirichlet_initial_concentration}"
+                    )
+            concentration_logit = _smooth_dirichlet_concentration_logit(
+                legacy_floor,
+                self.dirichlet_concentration_clip,
+                initial_excess=initial_excess,
+            )
+        else:
+            raise ValueError(
+                "unknown Dirichlet concentration parameterization: "
+                f"{self.dirichlet_head_parameterization!r}"
+            )
 
         self.conv = nnx.Conv(input_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         if not resnet_v2:
@@ -280,7 +422,7 @@ class AZDirichletNet(nnx.Module):
             rngs=rngs,
         )
         concentration_bias_init = jax.nn.initializers.constant(
-            _unit_dirichlet_concentration_logit(num_outcomes)
+            concentration_logit
         )
         self.value_conc_out = nnx.Linear(
             num_channels,
@@ -359,6 +501,8 @@ class AZDirichletNet(nnx.Module):
         alpha_v = dirichlet_from_logits(
             self.value_dir_out(value_features),
             self.value_conc_out(value_features).reshape((value_features.shape[0],)),
+            parameterization=self.dirichlet_head_parameterization,
+            concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
 
@@ -382,6 +526,8 @@ class AZDirichletNet(nnx.Module):
         alpha_q = dirichlet_from_logits(
             q_mean_logits,
             q_concentration_logit,
+            parameterization=self.dirichlet_head_parameterization,
+            concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
         return logits.astype(jnp.float32), alpha_v, alpha_q
@@ -492,6 +638,7 @@ class BoardlawDirichletNet(nnx.Module):
         legacy_dirichlet_head_init: bool = False,
         dirichlet_concentration_floor: float | None = None,
         dirichlet_initial_concentration: float | None = None,
+        dirichlet_head_parameterization: str = "log_concentration",
         rezero_kernel_init: str = "variance_scaling",
         rngs: nnx.Rngs,
     ):
@@ -500,6 +647,9 @@ class BoardlawDirichletNet(nnx.Module):
         self.width = width
         self.depth = depth
         self.dtype = dtype
+        self.dirichlet_head_parameterization = str(
+            dirichlet_head_parameterization
+        )
         concentration_floor = (
             None
             if dirichlet_concentration_floor is None
@@ -510,6 +660,22 @@ class BoardlawDirichletNet(nnx.Module):
         )
         self.dirichlet_concentration_clip = dirichlet_concentration_clip
         self.dirichlet_initial_concentration = dirichlet_initial_concentration
+        if (
+            self.dirichlet_head_parameterization == "log_concentration"
+            and concentration_floor is not None
+        ):
+            raise ValueError(
+                "direct log-concentration heads do not support a "
+                "concentration floor"
+            )
+        if self.dirichlet_head_parameterization not in {
+            "log_concentration",
+            "legacy",
+        }:
+            raise ValueError(
+                "unknown Dirichlet concentration parameterization: "
+                f"{self.dirichlet_head_parameterization!r}"
+            )
 
         if legacy_dirichlet_head_init and (
             dirichlet_concentration_floor is not None
@@ -547,7 +713,17 @@ class BoardlawDirichletNet(nnx.Module):
                 bias_init=jax.nn.initializers.zeros,
                 rngs=rngs,
             )
-            if concentration_floor is None:
+            if self.dirichlet_head_parameterization == "log_concentration":
+                initial_concentration = (
+                    float(num_outcomes)
+                    + _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+                    if dirichlet_initial_concentration is None
+                    else float(dirichlet_initial_concentration)
+                )
+                concentration_logit = _direct_log_concentration(
+                    initial_concentration
+                )
+            elif concentration_floor is None:
                 initial_concentration = (
                     float(num_outcomes)
                     + _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
@@ -628,6 +804,7 @@ class BoardlawDirichletNet(nnx.Module):
         alpha_v = dirichlet_from_logits(
             value_mean_logits,
             value_concentration_logit,
+            parameterization=self.dirichlet_head_parameterization,
             concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
@@ -639,6 +816,7 @@ class BoardlawDirichletNet(nnx.Module):
         alpha_q = dirichlet_from_logits(
             q_mean_logits,
             q_concentration_logit,
+            parameterization=self.dirichlet_head_parameterization,
             concentration_floor=self.dirichlet_concentration_floor,
             concentration_clip=self.dirichlet_concentration_clip,
         )
@@ -653,12 +831,12 @@ def build_model(
     rngs: nnx.Rngs,
 ) -> nnx.Module:
     compute_dtype = _dtype_from_name(config.model.compute_dtype)
-
-    def dirichlet_num_outcomes() -> int:
-        num_outcomes = config.env.num_outcomes
-        if num_outcomes is None:
-            return 2 if config.env.id == "hex" else 3
-        return num_outcomes
+    head_parameterization = str(config.model.dirichlet_head_parameterization)
+    legacy_concentration_clip = (
+        config.training.regularization.dirichlet_concentration_clip
+        if head_parameterization == "legacy"
+        else None
+    )
 
     if config.model.network == "aznet":
         return AZNet(
@@ -674,14 +852,19 @@ def build_model(
         return AZDirichletNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
-            num_outcomes=dirichlet_num_outcomes(),
+            num_outcomes=config.env.resolved_num_outcomes(),
             num_channels=config.model.num_channels,
             num_blocks=config.model.num_layers,
             resnet_v2=config.model.resnet_v2,
             dtype=compute_dtype,
-            dirichlet_concentration_clip=(
-                config.training.regularization.dirichlet_concentration_clip
+            dirichlet_concentration_clip=legacy_concentration_clip,
+            dirichlet_concentration_floor=(
+                config.model.dirichlet_concentration_floor
             ),
+            dirichlet_initial_concentration=(
+                config.model.dirichlet_initial_concentration
+            ),
+            dirichlet_head_parameterization=head_parameterization,
             rngs=rngs,
         )
     if config.model.network == "boardlaw":
@@ -698,13 +881,11 @@ def build_model(
         return BoardlawDirichletNet(
             num_actions=num_actions,
             observation_shape=observation_shape,
-            num_outcomes=dirichlet_num_outcomes(),
+            num_outcomes=config.env.resolved_num_outcomes(),
             width=config.model.num_channels,
             depth=config.model.num_layers,
             dtype=compute_dtype,
-            dirichlet_concentration_clip=(
-                config.training.regularization.dirichlet_concentration_clip
-            ),
+            dirichlet_concentration_clip=legacy_concentration_clip,
             legacy_dirichlet_head_init=config.model.legacy_dirichlet_head_init,
             dirichlet_concentration_floor=(
                 config.model.dirichlet_concentration_floor
@@ -712,6 +893,7 @@ def build_model(
             dirichlet_initial_concentration=(
                 config.model.dirichlet_initial_concentration
             ),
+            dirichlet_head_parameterization=head_parameterization,
             rezero_kernel_init=config.model.rezero_kernel_init,
             rngs=rngs,
         )

@@ -1,93 +1,23 @@
 # From-scratch Hex7 native-categorical concentration-learning trial.
-#
-# Keep the search and optimization recipe of the successful run, but remove
-# its fixed C64 calibration.  The model starts near the uninformative
-# Beta(1, 1), and full Dirichlet matching must learn both posterior mean and
-# state-dependent concentration.  This is the conservative non-calibrated
-# recipe while the posterior concentration update is being revised.
+
+defaults:
+  - hex
+  - _self_
 
 run:
-  seed: 7104
-  max_num_iters: 650
+  max_num_iters: 100
 
 env:
-  id: hex
   board_size: 7
-  num_outcomes: 2
 
-model:
-  network: boardlaw_dirichlet
-  num_channels: 256
-  num_layers: 8
-  compute_dtype: bfloat16
-  resnet_v2: true
-  dirichlet_concentration_floor: 2.0
-  dirichlet_initial_concentration: 2.1
 
 selfplay:
-  batch_size: 4096
-  max_num_steps: 64
-  action_commitment_type: posterior_sample
-  search:
-    kind: dirichlet_thompson
-    dirichlet_thompson:
-      # Match hu8ir576's useful self-play budget, but learn concentration from
-      # C=2.1 instead of hard-wiring C64.
-      num_simulations: 64
-      kappa: 4.0
-      policy_samples: 32
-      posterior_policy_samples: 32
-      policy_sample_chunk_size: 32
-
-training:
-  batch_size: 1024
-  learning_rate: 1e-3
-  grad_clip_norm: 1.0
-  losses:
-    policy_weight: 1.0
-    value_dir_kl_weight: 1.0
-    q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 1.0
-    q_loss_weight_mode: evidence_mass
-    q_dir_kl_reduction: masked_mean
-    dirichlet_loss_mode: full
-    loss_mask_mode: value
-    terminal_edge_targets: true
-    terminal_parent_targets: true
-    policy_target_mode: search
-    categorical_epsilon: 0.01
-  regularization:
-    dirichlet_concentration_clip: 100.0
+  max_num_steps: 49
 
 eval:
-  # Match hu8ir576's per-evaluation player budget.  Evaluating every ten
-  # iterations avoids spending its much larger tree on every fifth update.
-  interval: 10
-  batch_size: 1024
-  baseline: checkpoint
-  player_action_commitment_type: posterior_argmax
-  baseline_action_commitment_type: search_action
-  player_search:
-    kind: dirichlet_thompson
-    dirichlet_thompson:
-      num_simulations: 128
-      kappa: 4.0
-      policy_samples: 256
-      posterior_policy_samples: 32
-      policy_sample_chunk_size: 32
-  baseline_search:
-    kind: gumbel
-    gumbel:
-      num_simulations: 32
-
-logging:
-  interval: 1
-  wandb:
-    enabled: true
-    project: scacchi-az
+  checkpoint_path: checkpoints/7_solved
 
 checkpointing:
-  max_to_keep: 1
+  max_to_keep: 0
   save_interval_steps: 10
-  directory: checkpoints/hex7_nativecat_fullc_c100_dt64p32_floor2_seed7104_v7
+  directory: checkpoints/hex7_aznet_dirichlet_c128_l6_seed0

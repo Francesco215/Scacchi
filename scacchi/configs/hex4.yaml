@@ -1,0 +1,23 @@
+# From-scratch Hex4 numerical-Q21 trial.
+
+defaults:
+  - hex
+  - _self_
+
+run:
+  max_num_iters: 30
+
+env:
+  board_size: 4
+
+
+selfplay:
+  max_num_steps: 16
+
+eval:
+  checkpoint_path: checkpoints/4_solved
+
+checkpointing:
+  max_to_keep: 0
+  save_interval_steps: 10
+  directory: checkpoints/hex4_aznet_dirichlet_c128_l6_seed0

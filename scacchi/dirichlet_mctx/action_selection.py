@@ -52,6 +52,48 @@ def categorical_action(rng_key: base.PRNGKey, node_outcome: Int8[Array, "*batch"
     return jnp.where(has_candidate, sampled, 0).astype(jnp.int32)
 
 
+def categorical_action_population(
+    node_outcome: Int8[Array, "*batch"],
+    edge_outcome: Int8[Array, "*batch action"],
+    edge_distance: Int32[Array, "*batch action"],
+    invalid_actions: Bool[Array, "*batch action"],
+    *,
+    num_outcomes: int,
+    dtype: jnp.dtype = jnp.float32,
+) -> Float[Array, "*batch action"]:
+    """Return uniform mass over every native distance-optimal action.
+
+    This is the deterministic population corresponding to
+    :func:`categorical_action`: shortest certified wins, longest certified
+    losses, and every certified draw.  Illegal actions receive zero mass.
+    A row with no matching candidate is the zero policy.
+    """
+
+    legal = ~invalid_actions
+    win_index = int(num_outcomes) - 1
+    win_candidates = legal & (edge_outcome == win_index)
+    loss_candidates = legal & (edge_outcome == 0)
+    draw_candidates = legal & (edge_outcome == 1)
+
+    distance = edge_distance.astype(jnp.float32)
+    win_scores = jnp.where(win_candidates, -distance, -jnp.inf)
+    loss_scores = jnp.where(loss_candidates, distance, -jnp.inf)
+    draw_scores = jnp.where(draw_candidates, 0.0, -jnp.inf)
+    scores = jnp.where(
+        (node_outcome == win_index)[..., None],
+        win_scores,
+        jnp.where(
+            (node_outcome == 0)[..., None],
+            loss_scores,
+            draw_scores,
+        ),
+    )
+    best = jnp.max(scores, axis=-1, keepdims=True)
+    tied = jnp.isfinite(scores) & (scores == best)
+    count = jnp.sum(tied, axis=-1, keepdims=True)
+    return tied.astype(dtype) / jnp.maximum(count, 1).astype(dtype)
+
+
 def masked_argmax(scores: Float[Array, "*batch action"], invalid_actions: Bool[Array, "*batch action"]) -> Int32[Array, "*batch"]:
     return jnp.argmax(jnp.where(invalid_actions, -jnp.inf, scores), axis=-1).astype(jnp.int32)
 
@@ -59,7 +101,7 @@ def masked_argmax(scores: Float[Array, "*batch action"], invalid_actions: Bool[A
 def sample_dirichlet(rng_key: base.PRNGKey, alpha: Float[Array, "*batch outcome"]) -> Float[Array, "*batch outcome"]:
     """Draw a bounded-work Marsaglia--Tsang Dirichlet sample.
 
-    The north-star implementation in ``tictactoe-demo/app.js`` samples each
+    The north-star implementation in ``website/tictactoe-demo/app.js`` samples each
     gamma variate with Marsaglia--Tsang acceptance/rejection and applies the
     exact shape-augmentation identity below one. A single uncorrected
     Wilson--Hilferty proposal is measurably biased, especially when Thompson

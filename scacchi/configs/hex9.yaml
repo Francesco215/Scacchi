@@ -1,0 +1,23 @@
+# Effective board/run-specific overrides for W&B run pal/scacchi-az/cl3xe7ka
+# ("hex_9_dt_solved"). The shared algorithmic recipe lives in hex.yaml.
+
+defaults:
+  - hex
+  - _self_
+
+run:
+  max_num_iters: 300
+
+env:
+  board_size: 9
+
+selfplay:
+  max_num_steps: 81
+
+eval:
+  checkpoint_path: checkpoints/9_solved
+
+checkpointing:
+  max_to_keep: 0
+  save_interval_steps: 5
+  directory: checkpoints/hex9_aznet_dirichlet_c128_l6_seed0

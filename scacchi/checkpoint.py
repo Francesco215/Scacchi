@@ -37,7 +37,7 @@ def _suppress_orbax_logs() -> None:
 
 
 class NoOpCheckpointManager(ocp.CheckpointManager):
-    """Drops all saves — returned when max_to_keep == 0."""
+    """Drops all saves on non-primary distributed workers."""
 
     def __init__(self, directory: Path, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
@@ -68,6 +68,9 @@ class NoOpCheckpointManager(ocp.CheckpointManager):
     def save(self, *args: Any, **kwargs: Any) -> bool:
         del args, kwargs
         return False
+
+    def wait_until_finished(self) -> None:
+        return None
 
 
 def _checkpoint_manager_options(
@@ -114,14 +117,15 @@ def build_checkpoint_manager(
 ) -> ocp.CheckpointManager:
     _suppress_orbax_logs()
     options = _checkpoint_manager_options(
-        max_to_keep=config.checkpointing.max_to_keep,
+        max_to_keep=(
+            1
+            if config.checkpointing.max_to_keep == 0
+            else config.checkpointing.max_to_keep
+        ),
         save_interval_steps=config.checkpointing.save_interval_steps,
-        save_on_steps=(config.run.max_num_iters - 1,),
         primary_only=True,
     )
     item_names = ("model", "optimizer", "rngs", "meta")
-    if config.checkpointing.max_to_keep == 0:
-        return NoOpCheckpointManager(ckpt_dir)
     if jax.process_count() > 1 and jax.process_index() != 0:
         # Pod workers have private local disks: only process 0 saves (its
         # manager uses active_processes={0}); the rest must not construct a
@@ -161,6 +165,14 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
         # persistent tree, so migrate that historical product at this I/O
         # boundary instead of retaining ``num_blocks`` in the public config.
         migrated = copy.deepcopy(raw)
+        model_config = migrated.get("model")
+        if isinstance(model_config, dict):
+            network = str(model_config.get("network", ""))
+            if network.endswith("_dirichlet"):
+                model_config.setdefault(
+                    "dirichlet_head_parameterization",
+                    "legacy",
+                )
 
         def migrate_search(search: Any) -> None:
             if not isinstance(search, dict):
@@ -177,7 +189,87 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
                 # the implementation used the app.js default of four.
                 settings.pop("constants", None)
                 settings.pop("categorical_draw_rule", None)
-                settings.setdefault("kappa", 4.0)
+
+                root_samples = settings.pop(
+                    "policy_samples",
+                    32,
+                )
+                root_chunk_size = settings.pop(
+                    "policy_sample_chunk_size",
+                    32,
+                )
+
+                posterior_update = settings.get("posterior_update")
+                posterior_update_kind = (
+                    posterior_update.get("kind")
+                    if isinstance(posterior_update, dict)
+                    else None
+                )
+                current_posterior_update = (
+                    isinstance(posterior_update, dict)
+                    and posterior_update_kind in {"monte_carlo", "numerical"}
+                    and isinstance(
+                        posterior_update.get(posterior_update_kind),
+                        dict,
+                    )
+                )
+                if not current_posterior_update:
+                    flat_update = (
+                        posterior_update
+                        if isinstance(posterior_update, dict)
+                        else {}
+                    )
+                    kappa = settings.pop(
+                        "kappa",
+                        flat_update.pop("kappa", 4.0),
+                    )
+                    policy_samples = settings.pop(
+                        "posterior_policy_samples",
+                        flat_update.pop("policy_samples", None),
+                    )
+                    if policy_samples is None:
+                        policy_samples = max(
+                            1,
+                            int(root_samples),
+                        )
+                    chunk_size = flat_update.pop(
+                        "policy_sample_chunk_size",
+                        root_chunk_size,
+                    )
+                    estimator = settings.pop(
+                        "posterior_policy_estimator",
+                        flat_update.pop("estimator", "winner_mc"),
+                    )
+                    numerical: dict[str, Any] = {
+                        "kappa": kappa,
+                        "fallback_policy_samples": policy_samples,
+                        "fallback_policy_sample_chunk_size": chunk_size,
+                    }
+                    for old_name, new_name in (
+                        ("prefix_cdf_half_width", "half_width"),
+                        ("prefix_cdf_tail_scale", "tail_scale"),
+                        ("prefix_cdf_min_half_range", "min_half_range"),
+                        ("prefix_cdf_max_half_range", "max_half_range"),
+                    ):
+                        value = settings.pop(
+                            old_name,
+                            flat_update.pop(old_name, None),
+                        )
+                        if value is not None:
+                            numerical[new_name] = value
+                    settings["posterior_update"] = {
+                        "kind": (
+                            "numerical"
+                            if estimator == "prefix_cdf"
+                            else "monte_carlo"
+                        ),
+                        "monte_carlo": {
+                            "kappa": kappa,
+                            "policy_samples": policy_samples,
+                            "policy_sample_chunk_size": chunk_size,
+                        },
+                        "numerical": numerical,
+                    }
             gumbel = search.get("gumbel")
             if isinstance(gumbel, dict):
                 for stale in (
@@ -243,6 +335,15 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
             "save_interval_steps": raw.get("ckpt_save_interval_steps", 50),
         },
     }
+    if str(legacy_sections["model"]["network"]).endswith("_dirichlet"):
+        legacy_sections["model"]["dirichlet_head_parameterization"] = "legacy"
+    legacy_q_losses = {
+        name: raw[name]
+        for name in ("q_loss_weight_mode", "q_dir_kl_reduction")
+        if name in raw
+    }
+    if legacy_q_losses:
+        legacy_sections["training"]["losses"] = legacy_q_losses
     return load_config(OmegaConf.create(legacy_sections))
 
 
@@ -255,8 +356,12 @@ def maybe_save(
     config: Config,
     hours: float,
     frames: int,
+    *,
+    force: bool = False,
 ) -> None:
-    if not manager.should_save(step):
+    if not force and config.checkpointing.max_to_keep == 0:
+        return
+    if not force and not manager.should_save(step):
         return
     meta: dict[str, Any] = {
         "config": config_to_dict(config),
@@ -270,7 +375,24 @@ def maybe_save(
         rngs=ocp.args.StandardSave({"key": _rng_key_to_checkpoint_value(rng_key)}),
         meta=ocp.args.JsonSave(meta),
     )
-    manager.save(step, args=save_args)
+    manager.save(step, args=save_args, force=force)
+
+
+def config_from_checkpoint(checkpoint_path: str | Path) -> Config:
+    """Load the runtime configuration stored with the latest checkpoint."""
+
+    _suppress_orbax_logs()
+    checkpoint_path = Path(checkpoint_path).resolve()
+    options = _checkpoint_manager_options(read_only=True)
+    with ocp.CheckpointManager(str(checkpoint_path), options=options) as manager:
+        step = manager.latest_step()
+        if step is None:
+            raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
+        restored = manager.restore(
+            step,
+            args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
+        )
+    return _load_checkpoint_config(restored["meta"]["config"])
 
 
 def restore(
@@ -296,10 +418,29 @@ def restore(
             meta=ocp.args.JsonRestore(),
         ),
     )
+    meta = restored["meta"]
+    checkpoint_config = _load_checkpoint_config(meta["config"])
+    checkpoint_parameterization = str(
+        checkpoint_config.model.dirichlet_head_parameterization
+    )
+    model_parameterization = getattr(
+        model,
+        "dirichlet_head_parameterization",
+        None,
+    )
+    if (
+        model_parameterization is not None
+        and str(model_parameterization) != checkpoint_parameterization
+    ):
+        raise ValueError(
+            "refusing to restore a Dirichlet checkpoint with concentration "
+            f"parameterization {checkpoint_parameterization!r} into a model "
+            f"using {str(model_parameterization)!r}; the raw concentration "
+            "head coordinates are not interchangeable"
+        )
     nnx.update(model, restored["model"])
     nnx.update(optimizer, restored["optimizer"])
     rng_key = _rng_key_from_checkpoint_value(restored["rngs"]["key"], rng_key)
-    meta = restored["meta"]
     print(f"Restored checkpoint from step {step}.")
     return step + 1, rng_key, float(meta["hours"]), int(meta["frames"])
 

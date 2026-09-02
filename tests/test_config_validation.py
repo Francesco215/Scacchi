@@ -2,17 +2,44 @@ import math
 from pathlib import Path
 
 import jax.numpy as jnp
+from hydra import compose, initialize_config_dir
 import pytest
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import ConfigKeyError, ValidationError
 
 from scacchi.envs import make_env
 from scacchi.evaluations import load_eval_baseline
-from scacchi.types import Config, load_config
+from scacchi.types import (
+    Config,
+    MonteCarloPosteriorUpdateConfig,
+    NumericalPosteriorUpdateConfig,
+    load_config,
+)
 
 
 def _config(values: dict) -> Config:
     return load_config(OmegaConf.create(values))
+
+
+def _load_named_config(name: str) -> Config:
+    config_dir = Path(__file__).parents[1] / "scacchi" / "configs"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        return load_config(compose(config_name=name))
+
+
+def test_numbered_hex_configs_import_shared_recipe():
+    config_dir = Path(__file__).parents[1] / "scacchi" / "configs"
+    for path in sorted(config_dir.glob("hex[0-9]*.yaml")):
+        defaults = OmegaConf.load(path).defaults
+        assert list(defaults) == ["hex", "_self_"]
+
+
+def test_numbered_hex_configs_use_uniform_network_architecture():
+    config_dir = Path(__file__).parents[1] / "scacchi" / "configs"
+    for path in sorted(config_dir.glob("hex[0-9]*.yaml")):
+        config = _load_named_config(path.stem)
+        assert config.model.num_channels == 128, path.name
+        assert config.model.num_layers == 6, path.name
 
 
 def test_config_yaml_loads_into_nested_runtime_config():
@@ -30,23 +57,39 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.model.num_channels == 128
     assert config.model.num_layers == 6
     assert config.model.compute_dtype == "float32"
+    assert config.model.dirichlet_head_parameterization == "log_concentration"
     assert config.selfplay.batch_size == 2048
     assert config.selfplay.max_num_steps == 128
-    assert config.selfplay.action_commitment_type == "posterior_sample"
+    assert config.selfplay.action_commitment.kind == "posterior_sample"
+    assert (
+        config.selfplay.action_commitment.posterior_update
+        == "monte_carlo"
+    )
     assert config.selfplay.search.kind == "dirichlet_thompson"
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 16
     assert config.selfplay.search.dirichlet_thompson.max_depth == 16
-    assert config.selfplay.search.dirichlet_thompson.policy_samples == 1
-    assert config.selfplay.search.dirichlet_thompson.policy_sample_chunk_size == 1
-    assert config.selfplay.search.dirichlet_thompson.kappa == 4.0
+    assert (
+        config.selfplay.search.dirichlet_thompson.posterior_update.monte_carlo.policy_samples
+        == 1
+    )
+    assert (
+        config.selfplay.search.dirichlet_thompson.posterior_update.monte_carlo.kappa
+        == 4.0
+    )
     assert config.eval.player_search.kind == "dirichlet_thompson"
     assert config.eval.baseline_search.kind == "dirichlet_thompson"
     assert config.search.kind == "dirichlet_thompson"
     assert config.search.dirichlet_thompson.num_simulations == 16
     assert config.search.dirichlet_thompson.max_depth == 16
-    assert config.search.dirichlet_thompson.policy_samples == 1
-    assert config.search.dirichlet_thompson.policy_sample_chunk_size == 1
-    assert config.search.dirichlet_thompson.kappa == 4.0
+    assert (
+        config.search.dirichlet_thompson.posterior_update.monte_carlo.policy_samples
+        == 1
+    )
+    assert (
+        config.search.dirichlet_thompson.posterior_update.monte_carlo.policy_sample_chunk_size
+        == 1
+    )
+    assert config.search.dirichlet_thompson.posterior_update.monte_carlo.kappa == 4.0
     assert config.training.batch_size == 4096
     assert config.training.max_updates_per_iter == 1
     assert config.training.learning_rate == 1e-3
@@ -56,7 +99,6 @@ def test_config_yaml_loads_into_nested_runtime_config():
     assert config.training.losses.q_dir_kl_weight == 5.0
     assert config.training.losses.terminal_edge_targets is True
     assert config.training.losses.terminal_parent_targets is True
-    assert config.training.losses.categorical_epsilon == 1e-4
     assert config.training.regularization.dirichlet_concentration_clip == 300.0
     assert config.eval.interval == 10
     assert config.eval.batch_size == 1024
@@ -69,38 +111,60 @@ def test_config_yaml_loads_into_nested_runtime_config():
 
 def test_simple_policy_eval_fragment_overrides_eval_search_only():
     cfg_dir = Path(__file__).parents[1] / "scacchi" / "configs"
-    base = OmegaConf.load(cfg_dir / "hex5.yaml")
-    policy_eval = OmegaConf.load(cfg_dir / "eval_mode" / "simple_policy.yaml")
-
-    config = load_config(OmegaConf.merge(base, policy_eval))
+    with initialize_config_dir(config_dir=str(cfg_dir), version_base=None):
+        config = load_config(
+            compose(
+                config_name="hex5",
+                overrides=["+eval_mode=simple_policy"],
+            )
+        )
 
     assert config.selfplay.search.kind == "dirichlet_thompson"
     assert config.eval.player_search.kind == "policy"
     assert config.eval.player_search.policy.temperature == 1.0
     assert config.eval.baseline_search.kind == "policy"
     assert config.eval.baseline_search.policy.temperature == 1.0
-    assert config.eval.player_action_commitment_type == "posterior_sample"
-    assert config.eval.baseline_action_commitment_type == "posterior_sample"
+    assert config.eval.player_action_commitment.kind == "posterior_sample"
+    assert config.eval.baseline_action_commitment.kind == "posterior_sample"
 
 
 def test_hex5_uses_corrected_dirichlet_search_recipe():
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex5.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
+    config = _load_named_config("hex5")
 
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 16
     assert config.selfplay.search.dirichlet_thompson.max_depth == 16
-    assert config.selfplay.search.dirichlet_thompson.policy_samples == 32
-    assert config.selfplay.search.dirichlet_thompson.kappa == 4.0
+    assert (
+        config.selfplay.search.dirichlet_thompson.posterior_update.monte_carlo.policy_samples
+        == 32
+    )
+    assert (
+        config.selfplay.search.dirichlet_thompson.posterior_update.monte_carlo.kappa
+        == 4.0
+    )
     assert config.eval.player_search.dirichlet_thompson.num_simulations == 32
     assert config.eval.player_search.dirichlet_thompson.max_depth == 32
     assert config.model.compute_dtype == "bfloat16"
     assert config.training.batch_size == 2048
     assert config.training.learning_rate == 2e-3
     assert config.training.losses.q_dir_kl_weight == 1.0
-    assert config.training.losses.q_outcome_weight == 0.25
-    assert config.training.losses.categorical_epsilon == 0.01
+    assert config.training.losses.value_outcome_weight == 0.0
+    assert config.training.losses.q_outcome_weight == 0.0
+    assert config.model.dirichlet_head_parameterization == "log_concentration"
+    assert config.training.regularization.dirichlet_concentration_clip == 8.0
     assert config.checkpointing.max_to_keep == 1
     assert config.checkpointing.save_interval_steps == 10
+
+
+def test_hex9_restores_solved_run_policy_target_recipe():
+    config = _load_named_config("hex9")
+
+    selfplay_search = config.selfplay.search.dirichlet_thompson
+    assert selfplay_search.root_policy_support == "search_evidence"
+    assert selfplay_search.policy_target_temperature == 1.0
+    assert (
+        config.eval.player_search.dirichlet_thompson.root_policy_support
+        == "search_evidence"
+    )
 
 
 def test_policy_search_temperature_must_be_positive():
@@ -134,14 +198,26 @@ def test_removed_categorical_draw_rule_is_rejected():
     "kappa",
     [0.0, -1.0, float("nan"), float("inf"), -float("inf")],
 )
-def test_dirichlet_thompson_kappa_must_be_finite_and_positive(kappa: float):
-    with pytest.raises(ValueError, match="search.dirichlet_thompson.kappa"):
+@pytest.mark.parametrize("kind", ["monte_carlo", "numerical"])
+def test_dirichlet_thompson_kappa_must_be_finite_and_positive(
+    kappa: float,
+    kind: str,
+):
+    with pytest.raises(
+        ValueError,
+        match=rf"search.dirichlet_thompson.posterior_update.{kind}.kappa",
+    ):
         _config(
             {
                 "model": {"network": "boardlaw_dirichlet"},
                 "search": {
                     "kind": "dirichlet_thompson",
-                    "dirichlet_thompson": {"kappa": kappa},
+                    "dirichlet_thompson": {
+                        "posterior_update": {
+                            "kind": kind,
+                            kind: {"kappa": kappa},
+                        },
+                    },
                 },
             }
         )
@@ -176,13 +252,16 @@ def test_legacy_dirichlet_constants_block_is_rejected():
         )
 
 
-@pytest.mark.parametrize("epsilon", [0.0, 1.0 / 3.0, 0.5])
-def test_categorical_training_epsilon_must_stay_inside_simplex(epsilon: float):
-    with pytest.raises(ValueError, match="categorical_epsilon"):
-        _config({"training": {"losses": {"categorical_epsilon": epsilon}}})
+def test_deprecated_categorical_epsilon_selects_legacy_head_compatibility():
+    with pytest.warns(FutureWarning):
+        config = _config(
+            {"training": {"losses": {"categorical_epsilon": 0.01}}}
+        )
+
+    assert config.model.dirichlet_head_parameterization == "legacy"
 
 
-def test_categorical_density_training_requires_finite_concentration_cap():
+def test_full_categorical_dispersion_requires_finite_reference_concentration():
     with pytest.raises(ValueError, match="finite.*concentration_clip"):
         _config(
             {
@@ -194,6 +273,25 @@ def test_categorical_density_training_requires_finite_concentration_cap():
                 },
             }
         )
+
+
+def test_mean_categorical_training_does_not_require_reference_concentration():
+    with pytest.warns(UserWarning, match="mean"):
+        config = _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "search": {"kind": "dirichlet_thompson"},
+                "training": {
+                    "losses": {
+                        "value_dir_kl_weight": 1.0,
+                        "dirichlet_loss_mode": "mean",
+                    },
+                    "regularization": {"dirichlet_concentration_clip": None},
+                },
+            }
+        )
+
+    assert config.training.regularization.dirichlet_concentration_clip is None
 
 
 @pytest.mark.parametrize("clip", [math.inf, math.nan])
@@ -211,9 +309,42 @@ def test_dirichlet_concentration_cap_must_be_finite(clip: float):
 
 
 @pytest.mark.parametrize(
+    "initial_concentration",
+    [0.0, -1.0, math.inf, math.nan],
+)
+def test_direct_initial_concentration_must_be_finite_and_positive(
+    initial_concentration: float,
+):
+    with pytest.raises(ValueError, match="initial_concentration"):
+        _config(
+            {
+                "model": {
+                    "network": "boardlaw_dirichlet",
+                    "dirichlet_initial_concentration": (
+                        initial_concentration
+                    ),
+                }
+            }
+        )
+
+
+def test_direct_log_head_rejects_a_concentration_floor():
+    with pytest.raises(ValueError, match="incompatible"):
+        _config(
+            {
+                "model": {
+                    "network": "boardlaw_dirichlet",
+                    "dirichlet_head_parameterization": "log_concentration",
+                    "dirichlet_concentration_floor": 2.0,
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
     ("config_name", "eval_simulations"),
     [
-        ("hex", 32),
+        ("hex", 4),
         ("hex5", 4),
         ("hex6", 4),
         ("hex7", 32),
@@ -224,8 +355,7 @@ def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
     config_name: str,
     eval_simulations: int,
 ):
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / f"{config_name}.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
+    config = _load_named_config(config_name)
 
     assert config.selfplay.search.kind == "dirichlet_thompson"
     assert config.eval.baseline == "checkpoint"
@@ -233,18 +363,51 @@ def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
     assert config.eval.baseline_search.gumbel.num_simulations == eval_simulations
 
 
+def test_hex6_recipe_uses_q21_unit_temperature_commitment_and_wandb():
+    config = _load_named_config("hex6")
+
+    assert config.run.seed == 9105
+    assert config.run.max_num_iters == 201
+    assert config.env.num_outcomes == 2
+    assert config.selfplay.action_commitment.kind == "posterior_sample"
+    assert (
+        config.selfplay.action_commitment.posterior_update == "numerical"
+    )
+    assert (
+        config.selfplay.action_commitment.posterior_sample_temperature
+        == 1.0
+    )
+    selfplay_search = config.selfplay.search.dirichlet_thompson
+    assert selfplay_search.posterior_update.kind == "numerical"
+    assert selfplay_search.posterior_update.numerical.half_width == 10
+    assert (
+        selfplay_search.posterior_update.numerical.fallback_policy_samples
+        == 8
+    )
+    eval_search = config.eval.player_search.dirichlet_thompson
+    assert eval_search.posterior_update.kind == "numerical"
+    assert config.logging.wandb.enabled
+    assert config.checkpointing.max_to_keep == 0
+
+
 def test_hex7_uses_full_learned_concentration_head():
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex7.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
+    config = _load_named_config("hex7")
 
     assert config.run.seed == 7104
-    assert config.model.dirichlet_concentration_floor == 2.0
+    assert config.model.dirichlet_head_parameterization == "log_concentration"
+    assert config.model.dirichlet_concentration_floor is None
     assert config.model.dirichlet_initial_concentration == 2.1
     assert config.training.losses.dirichlet_loss_mode == "full"
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 64
-    assert config.selfplay.search.dirichlet_thompson.posterior_policy_samples == 32
+    assert (
+        config.selfplay.search.dirichlet_thompson.posterior_update.monte_carlo.policy_samples
+        == 32
+    )
     assert config.eval.player_search.dirichlet_thompson.num_simulations == 128
-    assert config.eval.player_search.dirichlet_thompson.policy_samples == 256
+    assert (
+        config.eval.player_search.dirichlet_thompson.posterior_update.monte_carlo.policy_samples
+        == 32
+    )
 
 
 def test_make_env_supports_custom_go8():
@@ -428,16 +591,30 @@ def test_dirichlet_network_allows_dirichlet_loss_weights():
     assert config.model.network == "boardlaw_dirichlet"
 
 
-@pytest.mark.parametrize("loss_mode", ["full", "mean"])
-def test_dirichlet_loss_modes_are_configurable(loss_mode: str):
+def test_full_dirichlet_loss_mode_is_configurable():
     config = _config(
         {
             "model": {"network": "boardlaw_dirichlet"},
-            "training": {"losses": {"dirichlet_loss_mode": loss_mode}},
+            "training": {"losses": {"dirichlet_loss_mode": "full"}},
         }
     )
 
-    assert config.training.losses.dirichlet_loss_mode == loss_mode
+    assert config.training.losses.dirichlet_loss_mode == "full"
+
+
+def test_mean_dirichlet_loss_mode_warns_that_it_is_comparison_only():
+    with pytest.warns(
+        UserWarning,
+        match="Use it only for comparisons or ablations",
+    ):
+        config = _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "training": {"losses": {"dirichlet_loss_mode": "mean"}},
+            }
+        )
+
+    assert config.training.losses.dirichlet_loss_mode == "mean"
 
 
 def test_num_search_blocks_is_not_a_public_config_field():
@@ -513,93 +690,333 @@ def test_dirichlet_thompson_zero_search_allows_zero_max_depth():
     assert config.search.dirichlet_thompson.max_depth == 0
 
 
-def test_dirichlet_thompson_allows_zero_policy_samples_for_search_policy_targets():
-    config = _config(
-        {
-            "model": {"network": "boardlaw_dirichlet"},
-            "search": {
-                "kind": "dirichlet_thompson",
-                "dirichlet_thompson": {"policy_samples": 0},
-            },
-        }
-    )
-
-    assert config.search.dirichlet_thompson.policy_samples == 0
-
-
-def test_dirichlet_thompson_policy_samples_must_be_non_negative():
-    with pytest.raises(ValueError, match="search.dirichlet_thompson.policy_samples"):
-        _config(
-            {
-                "model": {"network": "boardlaw_dirichlet"},
-                "search": {
-                    "kind": "dirichlet_thompson",
-                    "dirichlet_thompson": {"policy_samples": -1},
-                },
-            }
-        )
-
-
-def test_dirichlet_thompson_accepts_separate_posterior_policy_budget():
+def test_monte_carlo_posterior_update_owns_the_policy_budget():
     config = _config(
         {
             "model": {"network": "boardlaw_dirichlet"},
             "search": {
                 "kind": "dirichlet_thompson",
                 "dirichlet_thompson": {
-                    "policy_samples": 32,
-                    "posterior_policy_samples": 1,
+                    "posterior_update": {
+                        "kind": "monte_carlo",
+                        "monte_carlo": {
+                            "policy_samples": 1,
+                            "policy_sample_chunk_size": 1,
+                        },
+                    },
                 },
             },
         }
     )
 
     search = config.search.dirichlet_thompson
-    assert search.policy_samples == 32
-    assert search.posterior_policy_samples == 1
+    assert search.posterior_update.monte_carlo.policy_samples == 1
+    assert (
+        search.posterior_update.monte_carlo.policy_sample_chunk_size == 1
+    )
 
 
-def test_dirichlet_thompson_posterior_policy_budget_must_be_positive():
+def test_numerical_update_selects_numerical_root_readouts():
+    config = _config(
+        {
+            "env": {"id": "hex", "board_size": 6, "num_outcomes": 2},
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "posterior_update": {"kind": "numerical"},
+                    },
+                },
+            },
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.posterior_update.kind == "numerical"
+    assert isinstance(
+        search.posterior_update.active(),
+        NumericalPosteriorUpdateConfig,
+    )
+    assert search.posterior_update.numerical.half_width == 10
+
+
+def test_numerical_update_infers_binary_outcomes_for_hex():
+    config = _config(
+        {
+            "env": {"id": "hex", "board_size": 6},
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "posterior_update": {"kind": "numerical"},
+                    },
+                },
+            },
+        }
+    )
+
+    assert config.env.num_outcomes is None
+    assert config.env.resolved_num_outcomes() == 2
+
+
+def test_numerical_update_requires_binary_outcomes():
     with pytest.raises(
         ValueError,
-        match="search.dirichlet_thompson.posterior_policy_samples",
+        match="requires env.num_outcomes=2",
     ):
         _config(
             {
+                "env": {
+                    "id": "gardner_chess",
+                    "board_size": 5,
+                    "num_outcomes": 3,
+                },
                 "model": {"network": "boardlaw_dirichlet"},
-                "search": {
-                    "kind": "dirichlet_thompson",
-                    "dirichlet_thompson": {"posterior_policy_samples": 0},
+                "selfplay": {
+                    "search": {
+                        "kind": "dirichlet_thompson",
+                        "dirichlet_thompson": {
+                            "posterior_update": {"kind": "numerical"},
+                        },
+                    },
                 },
             }
         )
 
 
-def test_dirichlet_thompson_allows_null_policy_sample_chunk_size_for_full_chunk():
+def test_action_commitment_selects_its_own_posterior_update():
     config = _config(
         {
+            "env": {"id": "hex", "board_size": 6, "num_outcomes": 2},
             "model": {"network": "boardlaw_dirichlet"},
-            "search": {
-                "kind": "dirichlet_thompson",
-                "dirichlet_thompson": {"policy_sample_chunk_size": None},
+            "selfplay": {
+                "action_commitment": {
+                    "kind": "posterior_sample",
+                    "posterior_update": "monte_carlo",
+                },
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "posterior_update": {"kind": "numerical"},
+                    },
+                },
             },
         }
     )
 
-    assert config.search.dirichlet_thompson.policy_sample_chunk_size is None
+    assert (
+        config.selfplay.search.dirichlet_thompson.posterior_update.kind
+        == "numerical"
+    )
+    assert (
+        config.selfplay.action_commitment.posterior_update
+        == "monte_carlo"
+    )
 
 
-def test_dirichlet_thompson_policy_sample_chunk_size_must_be_positive_when_set():
+def test_action_commitment_posterior_update_requires_dirichlet_search():
     with pytest.raises(
         ValueError,
-        match="search.dirichlet_thompson.policy_sample_chunk_size",
+        match="posterior_update requires dirichlet_thompson search",
+    ):
+        _config(
+            {
+                "selfplay": {
+                    "action_commitment": {
+                        "posterior_update": "monte_carlo",
+                    },
+                    "search": {"kind": "policy"},
+                },
+            }
+        )
+
+
+def test_monte_carlo_update_allows_non_binary_outcomes():
+    config = _config(
+        {
+            "env": {
+                "id": "gardner_chess",
+                "board_size": 5,
+                "num_outcomes": 3,
+            },
+            "model": {"network": "boardlaw_dirichlet"},
+            "search": {"kind": "dirichlet_thompson"},
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.posterior_update.kind == "monte_carlo"
+
+
+def test_inactive_numerical_update_does_not_require_binary_outcomes():
+    config = _config(
+        {
+            "env": {"num_outcomes": 3},
+            "search": {
+                "kind": "gumbel",
+                "dirichlet_thompson": {
+                    "posterior_update": {"kind": "numerical"},
+                },
+            },
+        }
+    )
+
+    assert config.selfplay.search.kind == "gumbel"
+    assert (
+        config.selfplay.search.dirichlet_thompson.posterior_update.kind
+        == "numerical"
+    )
+
+
+def test_numerical_posterior_update_parameters_are_configurable():
+    config = _config(
+        {
+            "search": {
+                "dirichlet_thompson": {
+                    "posterior_update": {
+                        "kind": "numerical",
+                        "numerical": {
+                            "half_width": 11,
+                            "tail_scale": 7.0,
+                            "min_half_range": 5.0,
+                            "max_half_range": 9.0,
+                            "fallback_policy_samples": 3,
+                            "fallback_policy_sample_chunk_size": 2,
+                        },
+                    },
+                },
+            },
+        }
+    )
+
+    numerical = config.search.dirichlet_thompson.posterior_update.numerical
+    assert numerical.half_width == 11
+    assert numerical.tail_scale == 7.0
+    assert numerical.min_half_range == 5.0
+    assert numerical.max_half_range == 9.0
+    assert numerical.fallback_policy_samples == 3
+    assert numerical.fallback_policy_sample_chunk_size == 2
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("half_width", 0),
+        ("tail_scale", 0.0),
+        ("tail_scale", math.nan),
+        ("tail_scale", math.inf),
+        ("min_half_range", 0.0),
+        ("min_half_range", math.nan),
+        ("min_half_range", math.inf),
+        ("max_half_range", 5.0),
+        ("max_half_range", math.nan),
+        ("max_half_range", math.inf),
+    ],
+)
+def test_numerical_posterior_update_parameters_are_validated(
+    parameter: str,
+    value: float,
+):
+    with pytest.raises(ValueError, match=parameter):
+        _config(
+            {
+                "search": {
+                    "dirichlet_thompson": {
+                        "posterior_update": {
+                            "kind": "numerical",
+                            "numerical": {parameter: value},
+                        },
+                    },
+                },
+            }
+        )
+
+
+def test_monte_carlo_posterior_policy_budget_must_be_positive():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "search.dirichlet_thompson.posterior_update.monte_carlo."
+            "policy_samples"
+        ),
     ):
         _config(
             {
                 "model": {"network": "boardlaw_dirichlet"},
                 "search": {
                     "kind": "dirichlet_thompson",
-                    "dirichlet_thompson": {"policy_sample_chunk_size": 0},
+                    "dirichlet_thompson": {
+                        "posterior_update": {
+                            "monte_carlo": {"policy_samples": 0},
+                        },
+                    },
+                },
+            }
+        )
+
+
+def test_numerical_fallback_policy_budget_must_be_positive():
+    with pytest.raises(
+        ValueError,
+        match="fallback_policy_samples",
+    ):
+        _config(
+            {
+                "search": {
+                    "dirichlet_thompson": {
+                        "posterior_update": {
+                            "kind": "numerical",
+                            "numerical": {
+                                "fallback_policy_samples": 0,
+                            },
+                        },
+                    },
+                },
+            }
+        )
+
+
+def test_monte_carlo_posterior_update_allows_null_chunk_size():
+    config = _config(
+        {
+            "search": {
+                "dirichlet_thompson": {
+                    "posterior_update": {
+                        "monte_carlo": {
+                            "policy_sample_chunk_size": None,
+                        },
+                    },
+                },
+            },
+        }
+    )
+
+    assert (
+        config.search.dirichlet_thompson.posterior_update.monte_carlo.policy_sample_chunk_size
+        is None
+    )
+
+
+def test_monte_carlo_posterior_update_chunk_size_must_be_positive_when_set():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "search.dirichlet_thompson.posterior_update.monte_carlo."
+            "policy_sample_chunk_size"
+        ),
+    ):
+        _config(
+            {
+                "search": {
+                    "dirichlet_thompson": {
+                        "posterior_update": {
+                            "monte_carlo": {
+                                "policy_sample_chunk_size": 0,
+                            },
+                        },
+                    },
                 },
             }
         )
@@ -630,11 +1047,156 @@ def test_posterior_sample_action_commitment_type_is_valid():
     config = _config(
         {
             "model": {"network": "boardlaw_dirichlet"},
-            "selfplay": {"action_commitment_type": "posterior_sample"},
+            "selfplay": {
+                "action_commitment": {"kind": "posterior_sample"},
+            },
         }
     )
 
-    assert config.selfplay.action_commitment_type == "posterior_sample"
+    assert config.selfplay.action_commitment.kind == "posterior_sample"
+
+
+def test_posterior_sample_temperature_is_configurable():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "action_commitment": {
+                    "kind": "posterior_sample",
+                    "posterior_sample_temperature": 1.0 / 3.0,
+                },
+            },
+        }
+    )
+
+    assert (
+        config.selfplay.action_commitment.posterior_sample_temperature
+        == 1.0 / 3.0
+    )
+
+
+def test_posterior_sample_temperature_defaults_to_one():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "action_commitment": {"kind": "posterior_sample"},
+            },
+        }
+    )
+
+    assert (
+        config.selfplay.action_commitment.posterior_sample_temperature == 1.0
+    )
+
+
+def test_dirichlet_policy_target_controls_are_configurable():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "root_policy_support": "search_evidence",
+                        "policy_target_temperature": 1.0 / 3.0,
+                    },
+                },
+            },
+        }
+    )
+
+    search = config.selfplay.search.dirichlet_thompson
+    assert search.root_policy_support == "search_evidence"
+    assert search.policy_target_temperature == 1.0 / 3.0
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [0.0, -1.0, math.nan, math.inf, -math.inf],
+)
+def test_policy_target_temperature_must_be_finite_and_positive(
+    temperature: float,
+):
+    with pytest.raises(
+        ValueError,
+        match="search.dirichlet_thompson.policy_target_temperature",
+    ):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "selfplay": {
+                    "search": {
+                        "kind": "dirichlet_thompson",
+                        "dirichlet_thompson": {
+                            "policy_target_temperature": temperature,
+                        },
+                    },
+                },
+            }
+        )
+
+
+def test_legacy_action_commitment_fields_migrate_to_player_config():
+    config = _config(
+        {
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "action_commitment_type": "posterior_sample",
+                "search": {
+                    "posterior_sample_temperature": 0.5,
+                },
+            },
+        }
+    )
+
+    assert config.selfplay.action_commitment.kind == "posterior_sample"
+    assert (
+        config.selfplay.action_commitment.posterior_sample_temperature == 0.5
+    )
+
+
+def test_legacy_root_action_estimator_migrates_to_commitment_selector():
+    config = _config(
+        {
+            "env": {"id": "hex", "board_size": 6, "num_outcomes": 2},
+            "model": {"network": "boardlaw_dirichlet"},
+            "selfplay": {
+                "search": {
+                    "kind": "dirichlet_thompson",
+                    "dirichlet_thompson": {
+                        "root_action_estimator": "prefix_cdf",
+                    },
+                },
+            },
+        }
+    )
+
+    assert (
+        config.selfplay.action_commitment.posterior_update == "numerical"
+    )
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [0.0, -1.0, math.nan, math.inf, -math.inf],
+)
+def test_posterior_sample_temperature_must_be_finite_and_positive(
+    temperature: float,
+):
+    with pytest.raises(
+        ValueError,
+        match="action_commitment.posterior_sample_temperature",
+    ):
+        _config(
+            {
+                "selfplay": {
+                    "action_commitment": {
+                        "posterior_sample_temperature": temperature,
+                    },
+                },
+            }
+        )
 
 
 def test_legacy_action_source_is_rejected():
@@ -652,7 +1214,9 @@ def test_selfplay_action_commitment_type_must_be_known():
         _config(
             {
                 "model": {"network": "boardlaw_dirichlet"},
-                "selfplay": {"action_commitment_type": "posterior_best"},
+                "selfplay": {
+                    "action_commitment": {"kind": "posterior_best"},
+                },
             }
         )
 

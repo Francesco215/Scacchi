@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import math
 from typing import Any, cast
+import warnings
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -32,19 +33,46 @@ class SearchKind(StrEnum):
     dirichlet_thompson = "dirichlet_thompson"
 
 
-class QLossWeightMode(StrEnum):
-    policy = "policy"
-    evidence_mass = "evidence_mass"
+class PosteriorUpdateKind(StrEnum):
+    monte_carlo = "monte_carlo"
+    numerical = "numerical"
 
 
-class QDirKLReduction(StrEnum):
-    weighted = "weighted"
-    masked_mean = "masked_mean"
+class RootPolicySupport(StrEnum):
+    all_legal = "all_legal"
+    search_evidence = "search_evidence"
+
+
+class QActionSet(StrEnum):
+    positive_search_evidence_or_solved = (
+        "positive_search_evidence_or_solved"
+    )
+    positive_posterior_policy_or_solved = (
+        "positive_posterior_policy_or_solved"
+    )
+
+
+class QPairReduction(StrEnum):
+    mean_over_selected_state_action_pairs = (
+        "mean_over_selected_state_action_pairs"
+    )
+    # Deprecated: retained only so migrated historical configurations and
+    # checkpoint metadata reproduce their original normalized weighting.
+    legacy_normalized_source_weighted_mean = (
+        "legacy_normalized_source_weighted_mean"
+    )
 
 
 class DirichletLossMode(StrEnum):
     full = "full"
     mean = "mean"
+
+
+class DirichletHeadParameterization(StrEnum):
+    log_concentration = "log_concentration"
+    # Checkpoint-compatibility path for heads trained before the direct
+    # log-concentration parameterization was introduced.
+    legacy = "legacy"
 
 
 class LossMaskMode(StrEnum):
@@ -73,13 +101,10 @@ def _require_ge(name: str, value: int | None, minimum: int) -> None:
 
 
 def _require_gt(name: str, value: float | int | None, minimum: float) -> None:
-    if value is not None and value <= minimum:
+    if value is not None and (
+        not math.isfinite(float(value)) or value <= minimum
+    ):
         raise ValueError(f"{name} must be > {minimum}; got {value}.")
-
-
-def _require_range(name: str, value: float, *, lower: float, upper: float) -> None:
-    if not lower < value < upper:
-        raise ValueError(f"{name} must be > {lower} and < {upper}; got {value}.")
 
 
 @dataclass
@@ -94,6 +119,12 @@ class EnvConfig:
     board_size: int | None = None
     num_outcomes: int | None = None
 
+    def resolved_num_outcomes(self) -> int:
+        if self.num_outcomes is not None:
+            return int(self.num_outcomes)
+        return 2 if self.id == "hex" else 3
+
+
 @dataclass
 class ModelConfig:
     network: Network = Network.aznet
@@ -103,6 +134,10 @@ class ModelConfig:
     # TODO: remove the three config below and settle on some defaults in the code
     resnet_v2: bool = True
     legacy_dirichlet_head_init: bool = False
+    dirichlet_head_parameterization: DirichletHeadParameterization = (
+        DirichletHeadParameterization.log_concentration
+    )
+    # Used only by the legacy checkpoint-compatible parameterization.
     dirichlet_concentration_floor: float | None = None
     dirichlet_initial_concentration: float | None = None
     rezero_kernel_init: RezeroKernelInit = RezeroKernelInit.variance_scaling
@@ -118,6 +153,17 @@ class ModelConfig:
             self.dirichlet_initial_concentration,
             0.0,
         )
+        if (
+            self.dirichlet_head_parameterization
+            == DirichletHeadParameterization.log_concentration
+            and self.dirichlet_concentration_floor is not None
+        ):
+            raise ValueError(
+                "model.dirichlet_concentration_floor is incompatible with "
+                "the direct log-concentration head; remove the floor or set "
+                "model.dirichlet_head_parameterization='legacy' when loading "
+                "an old checkpoint."
+            )
 
 
 
@@ -140,18 +186,139 @@ class GumbelSearchConfig:
 
 
 @dataclass
+class MonteCarloPosteriorUpdateConfig:
+    # Prior mass in gamma = n / (kappa + n) for bottom-up cache repair.
+    kappa: float = 4.0
+    # Shared Monte Carlo budget for internal repair and the root readout.
+    policy_samples: int = 32
+    policy_sample_chunk_size: int | None = 32
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.kappa):
+            raise ValueError(
+                "search.dirichlet_thompson.posterior_update.monte_carlo.kappa "
+                f"must be finite; got {self.kappa}."
+            )
+        _require_gt(
+            "search.dirichlet_thompson.posterior_update.monte_carlo.kappa",
+            self.kappa,
+            0.0,
+        )
+        _require_ge(
+            "search.dirichlet_thompson.posterior_update.monte_carlo."
+            "policy_samples",
+            self.policy_samples,
+            1,
+        )
+        _require_ge(
+            "search.dirichlet_thompson.posterior_update.monte_carlo."
+            "policy_sample_chunk_size",
+            self.policy_sample_chunk_size,
+            1,
+        )
+
+
+@dataclass
+class NumericalPosteriorUpdateConfig:
+    # Prior mass in gamma = n / (kappa + n) for bottom-up cache repair.
+    kappa: float = 4.0
+    half_width: int = 10
+    tail_scale: float = 8.0
+    min_half_range: float = 6.0
+    max_half_range: float = 11.0
+    # An unsafe quadrature estimate falls back to winner Monte Carlo.
+    fallback_policy_samples: int = 32
+    fallback_policy_sample_chunk_size: int | None = 32
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.kappa):
+            raise ValueError(
+                "search.dirichlet_thompson.posterior_update.numerical.kappa "
+                f"must be finite; got {self.kappa}."
+            )
+        _require_gt(
+            "search.dirichlet_thompson.posterior_update.numerical.kappa",
+            self.kappa,
+            0.0,
+        )
+        _require_ge(
+            "search.dirichlet_thompson.posterior_update.numerical."
+            "fallback_policy_samples",
+            self.fallback_policy_samples,
+            1,
+        )
+        _require_ge(
+            "search.dirichlet_thompson.posterior_update.numerical."
+            "fallback_policy_sample_chunk_size",
+            self.fallback_policy_sample_chunk_size,
+            1,
+        )
+        _require_ge(
+            "search.dirichlet_thompson.posterior_update.numerical.half_width",
+            self.half_width,
+            1,
+        )
+        for name, value in (
+            (
+                "search.dirichlet_thompson.posterior_update.numerical."
+                "tail_scale",
+                self.tail_scale,
+            ),
+            (
+                "search.dirichlet_thompson.posterior_update.numerical."
+                "min_half_range",
+                self.min_half_range,
+            ),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0; got {value}.")
+        if (
+            not math.isfinite(self.max_half_range)
+            or self.max_half_range < self.min_half_range
+        ):
+            raise ValueError(
+                "search.dirichlet_thompson.posterior_update.numerical."
+                "max_half_range must be finite and >= min_half_range; got "
+                f"{self.max_half_range} and {self.min_half_range}."
+            )
+
+
+@dataclass
+class PosteriorUpdateConfig:
+    kind: PosteriorUpdateKind = PosteriorUpdateKind.monte_carlo
+    monte_carlo: MonteCarloPosteriorUpdateConfig = field(
+        default_factory=MonteCarloPosteriorUpdateConfig
+    )
+    numerical: NumericalPosteriorUpdateConfig = field(
+        default_factory=NumericalPosteriorUpdateConfig
+    )
+
+    def select(
+        self,
+        kind: PosteriorUpdateKind | None = None,
+    ) -> MonteCarloPosteriorUpdateConfig | NumericalPosteriorUpdateConfig:
+        selected = self.kind if kind is None else kind
+        return cast(
+            MonteCarloPosteriorUpdateConfig | NumericalPosteriorUpdateConfig,
+            getattr(self, str(selected)),
+        )
+
+    def active(
+        self,
+    ) -> MonteCarloPosteriorUpdateConfig | NumericalPosteriorUpdateConfig:
+        return self.select()
+
+
+@dataclass
 class DirichletThompsonSearchConfig:
     num_simulations: int = 32
     max_depth: int | None = None
-    # Prior mass in gamma = n / (kappa + n) for bottom-up cache repair.
-    kappa: float = 4.0
-    policy_samples: int = 32
-    # Monte Carlo budget for pi_search inside each bottom-up node repair.
-    # None keeps the public root-policy budget.  A smaller value remains an
-    # unbiased Thompson estimate and avoids multiplying every path repair by
-    # the full root readout budget.
-    posterior_policy_samples: int | None = None
-    policy_sample_chunk_size: int | None = 32
+    root_policy_support: RootPolicySupport = RootPolicySupport.all_legal
+    policy_target_temperature: float = 1.0
+    posterior_update: PosteriorUpdateConfig = field(
+        default_factory=PosteriorUpdateConfig
+    )
+
     def __post_init__(self) -> None:
         _require_ge(
             "search.dirichlet_thompson.num_simulations",
@@ -166,23 +333,15 @@ class DirichletThompsonSearchConfig:
             self.max_depth,
             minimum_depth,
         )
-        if not math.isfinite(self.kappa):
+        if (
+            not math.isfinite(self.policy_target_temperature)
+            or self.policy_target_temperature <= 0.0
+        ):
             raise ValueError(
-                "search.dirichlet_thompson.kappa must be finite; "
-                f"got {self.kappa}."
+                "search.dirichlet_thompson.policy_target_temperature must be "
+                "finite and > 0; got "
+                f"{self.policy_target_temperature}."
             )
-        _require_gt("search.dirichlet_thompson.kappa", self.kappa, 0.0)
-        _require_ge("search.dirichlet_thompson.policy_samples", self.policy_samples, 0)
-        _require_ge(
-            "search.dirichlet_thompson.posterior_policy_samples",
-            self.posterior_policy_samples,
-            1,
-        )
-        _require_ge(
-            "search.dirichlet_thompson.policy_sample_chunk_size",
-            self.policy_sample_chunk_size,
-            1,
-        )
 
 
 @dataclass
@@ -203,14 +362,45 @@ class SearchConfig:
 
 
 @dataclass
+class ActionCommitmentConfig:
+    kind: ActionCommitmentType = ActionCommitmentType.posterior_argmax
+    # None reuses the updater selected by Dirichlet Thompson search.
+    posterior_update: PosteriorUpdateKind | None = None
+    posterior_sample_temperature: float = 1.0
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.posterior_sample_temperature)
+            or self.posterior_sample_temperature <= 0.0
+        ):
+            raise ValueError(
+                "action_commitment.posterior_sample_temperature must be "
+                "finite and > 0; got "
+                f"{self.posterior_sample_temperature}."
+            )
+
+
+@dataclass
 class SelfplayConfig:
     batch_size: int = 1024
     max_num_steps: int = 256
     search: SearchConfig = field(default_factory=SearchConfig)
-    action_commitment_type: ActionCommitmentType = ActionCommitmentType.posterior_argmax
+    action_commitment: ActionCommitmentConfig = field(
+        default_factory=ActionCommitmentConfig
+    )
 
     def __post_init__(self) -> None:
         _require_ge("selfplay.batch_size", self.batch_size, 1)
+
+
+@dataclass
+class QSupervisionConfig:
+    action_set: QActionSet = (
+        QActionSet.positive_search_evidence_or_solved
+    )
+    reduction: QPairReduction = (
+        QPairReduction.mean_over_selected_state_action_pairs
+    )
 
 
 @dataclass
@@ -220,18 +410,28 @@ class TrainingLossConfig:
     q_dir_kl_weight: float = 0.0
     value_outcome_weight: float = 0.0
     q_outcome_weight: float = 0.0
-    q_loss_weight_mode: QLossWeightMode = QLossWeightMode.policy
-    q_dir_kl_reduction: QDirKLReduction = QDirKLReduction.weighted
-    # ``full`` trains the coupled Dirichlet density; ``mean`` ignores evidence
-    # mass.
+    q_supervision: QSupervisionConfig = field(
+        default_factory=QSupervisionConfig
+    )
+    # ``full`` trains the coupled mean/dispersion score; ``mean`` ignores
+    # concentration.
     dirichlet_loss_mode: DirichletLossMode = DirichletLossMode.full
     loss_mask_mode: LossMaskMode = LossMaskMode.search
     terminal_edge_targets: bool = False
     terminal_parent_targets: bool = False
     policy_target_mode: PolicyTargetMode = PolicyTargetMode.search
-    categorical_epsilon: float = 1e-4
 
     def __post_init__(self) -> None:
+        if self.dirichlet_loss_mode == DirichletLossMode.mean:
+            warnings.warn(
+                "training.losses.dirichlet_loss_mode='mean' discards "
+                "Dirichlet concentration (evidence mass) and is inconsistent "
+                "with the rigorous mathematical treatment documented in "
+                "math.md. Use it only for comparisons or ablations, not for "
+                "a real training run.",
+                UserWarning,
+                stacklevel=2,
+            )
         for name, value in (
             ("training.losses.policy_weight", self.policy_weight),
             ("training.losses.value_dir_kl_weight", self.value_dir_kl_weight),
@@ -240,13 +440,15 @@ class TrainingLossConfig:
             ("training.losses.q_outcome_weight", self.q_outcome_weight),
         ):
             _require_gt(name, value, -1.0)
-        _require_range(
-            "training.losses.categorical_epsilon",
-            self.categorical_epsilon,
-            lower=0.0,
-            upper=1.0 / 3.0,
-        )
 
+            
+        if self.value_outcome_weight != 0.0 or self.q_outcome_weight != 0.0 :
+            warnings.warn(
+                "with the rigorous math treatment documented in math.md; they should both be 0, instead got "
+                f"value_outcome_weight={self.value_outcome_weight}, "
+                f"q_outcome_weight={self.q_outcome_weight}."
+            )
+            
     def active_dirichlet_weights(self) -> list[str]:
         weights = (
             ("value_dir_kl_weight", self.value_dir_kl_weight),
@@ -259,6 +461,9 @@ class TrainingLossConfig:
 
 @dataclass
 class TrainingRegularizationConfig:
+    # Historical name retained for configuration compatibility. With the
+    # direct log-concentration head this is the finite categorical reference
+    # concentration c_cat; it no longer clips model outputs.
     dirichlet_concentration_clip: float | None = 8.0
 
     def __post_init__(self) -> None:
@@ -306,11 +511,11 @@ class EvalConfig:
     batch_size: int = 16
     player_search: SearchConfig = field(default_factory=SearchConfig)
     baseline_search: SearchConfig = field(default_factory=SearchConfig)
-    player_action_commitment_type: ActionCommitmentType = (
-        ActionCommitmentType.posterior_argmax
+    player_action_commitment: ActionCommitmentConfig = field(
+        default_factory=ActionCommitmentConfig
     )
-    baseline_action_commitment_type: ActionCommitmentType = (
-        ActionCommitmentType.posterior_argmax
+    baseline_action_commitment: ActionCommitmentConfig = field(
+        default_factory=ActionCommitmentConfig
     )
     baseline: EvalBaseline = EvalBaseline.checkpoint
     baseline_id: str | None = None
@@ -334,6 +539,8 @@ class LoggingConfig:
 
 @dataclass
 class CheckpointingConfig:
+    # Zero disables periodic retention but still writes the mandatory final
+    # checkpoint. Positive values retain that many periodic/final steps.
     max_to_keep: int | None = 3
     save_interval_steps: int = 50
     directory: str | None = None
@@ -357,6 +564,7 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         dirichlet_networks = {Network.aznet_dirichlet, Network.boardlaw_dirichlet}
+        num_outcomes = self.env.resolved_num_outcomes()
         active_weights = self.training.losses.active_dirichlet_weights()
         if self.model.network not in dirichlet_networks and active_weights:
             weights = ", ".join(active_weights)
@@ -376,26 +584,88 @@ class TrainConfig:
                     "model.network='aznet_dirichlet' or "
                     "model.network='boardlaw_dirichlet'."
                 )
+        for name, search in (
+            ("selfplay.search", self.selfplay.search),
+            ("eval.player_search", self.eval.player_search),
+            ("eval.baseline_search", self.eval.baseline_search),
+        ):
+            if search.kind != SearchKind.dirichlet_thompson:
+                continue
+            dirichlet = search.dirichlet_thompson
+            numerical_update_selected = (
+                dirichlet.posterior_update.kind == PosteriorUpdateKind.numerical
+            )
+            if numerical_update_selected and num_outcomes != 2:
+                raise ValueError(
+                    f"{name}.dirichlet_thompson numerical posterior update "
+                    "requires env.num_outcomes=2; use monte_carlo for "
+                    "non-binary outcome heads."
+                )
+        for name, search, commitment in (
+            (
+                "selfplay.action_commitment",
+                self.selfplay.search,
+                self.selfplay.action_commitment,
+            ),
+            (
+                "eval.player_action_commitment",
+                self.eval.player_search,
+                self.eval.player_action_commitment,
+            ),
+            (
+                "eval.baseline_action_commitment",
+                self.eval.baseline_search,
+                self.eval.baseline_action_commitment,
+            ),
+        ):
+            if (
+                commitment.posterior_update is not None
+                and search.kind != SearchKind.dirichlet_thompson
+            ):
+                raise ValueError(
+                    f"{name}.posterior_update requires "
+                    "dirichlet_thompson search."
+                )
+            if search.kind != SearchKind.dirichlet_thompson:
+                continue
+            selected_update = (
+                search.dirichlet_thompson.posterior_update.kind
+                if commitment.posterior_update is None
+                else commitment.posterior_update
+            )
+            if (
+                selected_update == PosteriorUpdateKind.numerical
+                and num_outcomes != 2
+            ):
+                raise ValueError(
+                    f"{name} numerical posterior update requires "
+                    "env.num_outcomes=2; use monte_carlo for non-binary "
+                    "outcome heads."
+                )
         losses = self.training.losses
         search_emits_categorical = (
             self.selfplay.search.kind == SearchKind.dirichlet_thompson
         )
         categorical_head_loss_active = (
-            losses.value_dir_kl_weight > 0.0
-            and (search_emits_categorical or losses.terminal_parent_targets)
-        ) or (
-            losses.q_dir_kl_weight > 0.0
-            and (search_emits_categorical or losses.terminal_edge_targets)
+            losses.dirichlet_loss_mode == DirichletLossMode.full
+        ) and (
+            (
+                losses.value_dir_kl_weight > 0.0
+                and (search_emits_categorical or losses.terminal_parent_targets)
+            )
+            or (
+                losses.q_dir_kl_weight > 0.0
+                and (search_emits_categorical or losses.terminal_edge_targets)
+            )
         )
         if (
             categorical_head_loss_active
             and self.training.regularization.dirichlet_concentration_clip is None
         ):
             raise ValueError(
-                "categorical Dirichlet-density NLL requires a finite "
-                "training.regularization.dirichlet_concentration_clip; "
-                "epsilon moves the target off the simplex boundary but does "
-                "not bound the density optimum."
+                "full categorical dispersion training requires a finite "
+                "training.regularization.dirichlet_concentration_clip to "
+                "serve as the categorical reference concentration."
             )
         if self.eval.baseline == EvalBaseline.none and self.eval.interval != 0:
             raise ValueError("eval.baseline=none requires eval.interval=0.")
@@ -411,6 +681,93 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
 
     def copy_node(value: Any) -> Any:
         return OmegaConf.create(OmegaConf.to_container(value, resolve=False))
+
+    training = aliased.get("training")
+    deprecated_density_loss = False
+    if isinstance(training, DictConfig):
+        losses = training.get("losses")
+        if isinstance(losses, DictConfig):
+            if "categorical_epsilon" in losses:
+                losses.pop("categorical_epsilon")
+                deprecated_density_loss = True
+                warnings.warn(
+                    "training.losses.categorical_epsilon is deprecated and "
+                    "ignored because categorical targets now use the finite "
+                    "log-dispersion score.",
+                    FutureWarning,
+                    stacklevel=3,
+                )
+            old_fields = {
+                "q_loss_weight_mode",
+                "q_dir_kl_reduction",
+            } & set(losses.keys())
+            if old_fields and "q_supervision" in losses:
+                fields = ", ".join(sorted(old_fields))
+                raise ValueError(
+                    "training.losses cannot mix q_supervision with deprecated "
+                    f"Q-supervision fields: {fields}."
+                )
+            if old_fields:
+                old_action_source = str(
+                    losses.pop("q_loss_weight_mode", "policy")
+                )
+                old_reduction = str(
+                    losses.pop("q_dir_kl_reduction", "weighted")
+                )
+                action_set = {
+                    "evidence_mass": (
+                        "positive_search_evidence_or_solved"
+                    ),
+                    "policy": (
+                        "positive_posterior_policy_or_solved"
+                    ),
+                }.get(old_action_source)
+                reduction = {
+                    "masked_mean": (
+                        "mean_over_selected_state_action_pairs"
+                    ),
+                    "weighted": (
+                        "legacy_normalized_source_weighted_mean"
+                    ),
+                }.get(old_reduction)
+                if action_set is None or reduction is None:
+                    raise ValueError(
+                        "cannot migrate deprecated Q-supervision fields "
+                        "training.losses.q_loss_weight_mode="
+                        f"{old_action_source!r}, "
+                        "training.losses.q_dir_kl_reduction="
+                        f"{old_reduction!r}."
+                    )
+                warnings.warn(
+                    "training.losses.q_loss_weight_mode and "
+                    "training.losses.q_dir_kl_reduction are deprecated; use "
+                    "training.losses.q_supervision.action_set and "
+                    "training.losses.q_supervision.reduction.",
+                    FutureWarning,
+                    stacklevel=3,
+                )
+                losses["q_supervision"] = {
+                    "action_set": action_set,
+                    "reduction": reduction,
+                }
+
+    model = aliased.get("model")
+    if model is None and deprecated_density_loss:
+        aliased["model"] = OmegaConf.create({})
+        model = aliased["model"]
+    if isinstance(model, DictConfig) and "dirichlet_head_parameterization" not in model:
+        legacy_floor = model.get("dirichlet_concentration_floor")
+        if deprecated_density_loss or legacy_floor is not None:
+            model["dirichlet_head_parameterization"] = "legacy"
+            warnings.warn(
+                "configuration predates the direct log-concentration head; "
+                "using the legacy concentration parameterization for "
+                "checkpoint compatibility. Set "
+                "model.dirichlet_head_parameterization='log_concentration' "
+                "for new training.",
+                FutureWarning,
+                stacklevel=3,
+            )
 
     selfplay = aliased.get("selfplay")
     if selfplay is None:
@@ -440,6 +797,107 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
     elif isinstance(eval_cfg, DictConfig) and "player_search" in eval_cfg:
         if "baseline_search" not in eval_cfg:
             eval_cfg["baseline_search"] = copy_node(eval_cfg["player_search"])
+
+    def migrate_action_commitment(
+        owner: Any,
+        *,
+        commitment_name: str,
+        legacy_kind_name: str,
+        search_name: str,
+    ) -> None:
+        if not isinstance(owner, DictConfig):
+            return
+        search = owner.get(search_name)
+        legacy_temperature = None
+        legacy_posterior_update = None
+        if isinstance(search, DictConfig):
+            legacy_temperature = search.pop(
+                "posterior_sample_temperature",
+                None,
+            )
+            dirichlet = search.get("dirichlet_thompson")
+            if isinstance(dirichlet, DictConfig):
+                legacy_action_estimator = dirichlet.pop(
+                    "root_action_estimator",
+                    None,
+                )
+                # Replay root behavior now follows the search updater.
+                dirichlet.pop("root_policy_target_estimator", None)
+                if legacy_action_estimator is not None:
+                    legacy_posterior_update = {
+                        "winner_mc": "monte_carlo",
+                        "prefix_cdf": "numerical",
+                    }.get(str(legacy_action_estimator))
+                    if legacy_posterior_update is None:
+                        raise ValueError(
+                            "cannot migrate deprecated "
+                            "root_action_estimator="
+                            f"{legacy_action_estimator!r}."
+                        )
+        legacy_kind = owner.pop(legacy_kind_name, None)
+        if (
+            legacy_kind is None
+            and legacy_temperature is None
+            and legacy_posterior_update is None
+        ):
+            return
+        commitment = owner.get(commitment_name)
+        if commitment is None:
+            owner[commitment_name] = OmegaConf.create({})
+            commitment = owner[commitment_name]
+        if not isinstance(commitment, DictConfig):
+            raise ValueError(f"{commitment_name} must be a mapping.")
+        if legacy_kind is not None:
+            if "kind" in commitment:
+                raise ValueError(
+                    f"cannot mix {commitment_name}.kind with deprecated "
+                    f"{legacy_kind_name}."
+                )
+            commitment["kind"] = legacy_kind
+        if legacy_temperature is not None:
+            if "posterior_sample_temperature" in commitment:
+                raise ValueError(
+                    f"cannot mix {commitment_name}."
+                    "posterior_sample_temperature with deprecated "
+                    f"{search_name}.posterior_sample_temperature."
+                )
+            commitment["posterior_sample_temperature"] = legacy_temperature
+        if legacy_posterior_update is not None:
+            if "posterior_update" in commitment:
+                raise ValueError(
+                    f"cannot mix {commitment_name}.posterior_update with "
+                    "deprecated root_action_estimator."
+                )
+            commitment["posterior_update"] = legacy_posterior_update
+
+    migrate_action_commitment(
+        selfplay,
+        commitment_name="action_commitment",
+        legacy_kind_name="action_commitment_type",
+        search_name="search",
+    )
+    migrate_action_commitment(
+        eval_cfg,
+        commitment_name="player_action_commitment",
+        legacy_kind_name="player_action_commitment_type",
+        search_name="player_search",
+    )
+    migrate_action_commitment(
+        eval_cfg,
+        commitment_name="baseline_action_commitment",
+        legacy_kind_name="baseline_action_commitment_type",
+        search_name="baseline_search",
+    )
+    top_level_search = aliased.get("search")
+    if isinstance(top_level_search, DictConfig):
+        top_level_search.pop("posterior_sample_temperature", None)
+        top_level_dirichlet = top_level_search.get("dirichlet_thompson")
+        if isinstance(top_level_dirichlet, DictConfig):
+            top_level_dirichlet.pop("root_action_estimator", None)
+            top_level_dirichlet.pop(
+                "root_policy_target_estimator",
+                None,
+            )
 
     def default_dirichlet_max_depth(search: Any) -> None:
         if not isinstance(search, DictConfig):

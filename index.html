@@ -4,779 +4,1109 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="A math-first explanation of Scacchi's Dirichlet Thompson tree search and bottom-up posterior repair.">
-    <title>Dirichlet Thompson Tree Search</title>
+    <title>Curious Tree Search</title>
     <script src="https://distill.pub/template.v2.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.css" integrity="sha384-zTROYFVGOfTw7JV7KUu8udsvW2fx4lWOsCEDqhBreBwlHI4ioVRtmIvEThzJHGET" crossorigin="anonymous">
+    <link rel="stylesheet" href="website/chess-dataset.css">
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.js" integrity="sha384-GxNFqL3r9uRJQhR+47eDxuPoNE7yLftQM8LcxzgS4HT73tp970WS/wV5p8UzCOmb" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/contrib/auto-render.min.js" integrity="sha384-vZTG03m+2yp6N6BNi5iM4rW4oIwk5DfcNdFfxkk9ZWpDriOkXX8voJBFrAO7MpVl" crossorigin="anonymous"></script>
+    <script src="website/chess-dataset.js"></script>
+    <script>
+      document.addEventListener("DOMContentLoaded", function () {
+        renderMathInElement(document.body, {
+          delimiters: [
+            { left: "$$", right: "$$", display: true },
+            { left: "$", right: "$", display: false },
+            { left: "\\(", right: "\\)", display: false },
+            { left: "\\[", right: "\\]", display: true }
+          ],
+          throwOnError: false
+        });
+      });
+
+      window.addEventListener("message", function (event) {
+        const demo = document.getElementById("tictactoe-demo");
+        if (
+          demo &&
+          event.source === demo.contentWindow &&
+          event.data?.type === "tictactoe-demo:resize"
+        ) {
+          demo.style.height = `${event.data.height}px`;
+        }
+      });
+
+      document.addEventListener("DOMContentLoaded", function () {
+        const svg = document.getElementById("hex-board-svg");
+        const cells = document.getElementById("hex-board-cells");
+        const rails = document.getElementById("hex-board-rails");
+        const slider = document.getElementById("hex-board-size");
+        const output = document.getElementById("hex-board-size-output");
+
+        if (!svg || !cells || !rails || !slider || !output) return;
+
+        const svgNamespace = "http://www.w3.org/2000/svg";
+        const radius = 18;
+        const columnStep = Math.sqrt(3) * radius;
+        const rowStep = 1.5 * radius;
+
+        function makeSvgElement(name, attributes) {
+          const element = document.createElementNS(svgNamespace, name);
+          Object.entries(attributes).forEach(([key, value]) => {
+            element.setAttribute(key, value);
+          });
+          return element;
+        }
+
+        function hexagonVertices(centerX, centerY) {
+          return Array.from({ length: 6 }, (_, index) => {
+            const angle = ((60 * index - 90) * Math.PI) / 180;
+            return {
+              x: centerX + radius * Math.cos(angle),
+              y: centerY + radius * Math.sin(angle)
+            };
+          });
+        }
+
+        function pointsAttribute(points) {
+          return points.map(({ x, y }) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+        }
+
+        function hexagonPoints(centerX, centerY) {
+          return pointsAttribute(hexagonVertices(centerX, centerY));
+        }
+
+        function drawBoard(size) {
+          cells.replaceChildren();
+          rails.replaceChildren();
+
+          const last = size - 1;
+          const cellHalfWidth = columnStep / 2;
+          const bottomRightX = columnStep * last * 1.5;
+          const bottomY = rowStep * last;
+          const borderGap = radius * 0.36;
+
+          function boardVertex(row, column, vertex) {
+            const centerX = columnStep * (column + row * 0.5);
+            const centerY = rowStep * row;
+            return hexagonVertices(centerX, centerY)[vertex];
+          }
+
+          function shifted(points, xOffset, yOffset) {
+            return points.map(({ x, y }) => ({ x: x + xOffset, y: y + yOffset }));
+          }
+
+          const topBorder = [boardVertex(0, 0, 5)];
+          const bottomBorder = [boardVertex(last, 0, 4)];
+          const leftBorder = [boardVertex(0, 0, 5)];
+          const rightBorder = [boardVertex(0, last, 1)];
+
+          for (let column = 0; column < size; column += 1) {
+            topBorder.push(boardVertex(0, column, 0), boardVertex(0, column, 1));
+            bottomBorder.push(boardVertex(last, column, 3), boardVertex(last, column, 2));
+          }
+
+          for (let row = 0; row < size; row += 1) {
+            leftBorder.push(boardVertex(row, 0, 4));
+            rightBorder.push(boardVertex(row, last, 2));
+            if (row < last) {
+              leftBorder.push(boardVertex(row + 1, 0, 5));
+              rightBorder.push(boardVertex(row + 1, last, 1));
+            }
+          }
+
+          [
+            [shifted(topBorder, 0, -borderGap), "hex-board-rail-red"],
+            [shifted(bottomBorder, 0, borderGap), "hex-board-rail-red"],
+            [shifted(leftBorder, -borderGap * Math.sqrt(3) / 2, borderGap / 2), "hex-board-rail-blue"],
+            [shifted(rightBorder, borderGap * Math.sqrt(3) / 2, -borderGap / 2), "hex-board-rail-blue"]
+          ].forEach(([points, className]) => {
+            rails.appendChild(makeSvgElement("polyline", {
+              points: pointsAttribute(points),
+              class: className
+            }));
+          });
+
+          for (let row = 0; row < size; row += 1) {
+            for (let column = 0; column < size; column += 1) {
+              const centerX = columnStep * (column + row * 0.5);
+              const centerY = rowStep * row;
+              cells.appendChild(makeSvgElement("polygon", {
+                points: hexagonPoints(centerX, centerY),
+                class: "hex-board-cell"
+              }));
+            }
+          }
+
+          const minX = -cellHalfWidth - radius * 1.15;
+          const maxX = bottomRightX + cellHalfWidth + radius * 1.15;
+          const minY = -radius * 1.7;
+          const maxY = bottomY + radius * 1.7;
+          svg.setAttribute("viewBox", `${minX} ${minY} ${maxX - minX} ${maxY - minY}`);
+          svg.setAttribute("aria-label", `Empty ${size} by ${size} Hex board`);
+          output.textContent = `${size} × ${size}`;
+          slider.setAttribute("aria-valuetext", `${size} by ${size}`);
+        }
+
+        slider.addEventListener("input", function () {
+          drawBoard(Number(slider.value));
+        });
+
+        drawBoard(Number(slider.value));
+      });
+    </script>
     <style>
-      :root {
-        --ink: #202124;
-        --muted: #646b73;
-        --accent: #356859;
-        --accent-soft: #eaf2ef;
-        --surface: #f5f7f6;
-        --rule: #d9dedb;
-        --warm: #fff8e7;
-        --warm-line: #c58b16;
+      .tictactoe-embed {
+        margin-bottom: 2.5rem;
+        margin-top: 2rem;
       }
 
-      html { scroll-behavior: smooth; }
-      body { color: var(--ink); }
-
-      d-title {
-        border-bottom: 1px solid var(--rule);
-        padding-bottom: 1.25rem;
-      }
-
-      d-title h1 {
-        letter-spacing: -0.025em;
-        max-width: 820px;
-      }
-
-      d-title p {
-        color: var(--muted);
-        max-width: 760px;
-      }
-
-      d-article h2 {
-        border-top: 1px solid var(--rule);
-        margin-top: 3.4rem;
-        padding-top: 1.2rem;
-      }
-
-      d-article h3 { margin-top: 2.2rem; }
-
-      d-article code {
-        background: var(--surface);
-        border-radius: 3px;
-        color: var(--accent);
-        padding: 0.12em 0.32em;
-      }
-
-      d-article li { margin-bottom: 0.4rem; }
-
-      .lead {
-        color: #38413e;
-        font-size: 1.1rem;
-        line-height: 1.65;
-      }
-
-      .correction {
-        background: var(--warm);
-        border-left: 3px solid var(--warm-line);
+      .tictactoe-embed iframe {
+        background: transparent;
+        border: 0;
         box-sizing: border-box;
-        grid-column: text;
-        margin: 1.6rem 0;
-        padding: 0.9rem 1rem;
+        display: block;
+        height: 860px;
+        max-width: 100%;
+        overflow: hidden;
         width: 100%;
       }
 
-      .correction p { margin: 0; }
+      .tictactoe-embed figcaption {
+        margin-top: 0.75rem;
+      }
 
-      .symbol-table {
-        border-collapse: collapse;
-        grid-column: text;
-        margin: 1.5rem 0 2rem;
+      .search-overview-figure {
+        margin-bottom: 2.25rem;
+        margin-top: 1.75rem;
+      }
+
+      .search-overview-figure img {
+        display: block;
+        height: auto;
         width: 100%;
       }
 
-      .symbol-table th,
-      .symbol-table td {
-        border-bottom: 1px solid var(--rule);
-        padding: 0.65rem 0.55rem;
-        text-align: left;
-        vertical-align: top;
+      .search-overview-figure figcaption {
+        margin-top: 0.8rem;
       }
 
-      .symbol-table th {
-        color: var(--muted);
-        font-size: 0.82rem;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
+      .l-side {
+        margin-bottom: 0 !important;
+        padding-bottom: 1em;
+        padding-left: 0;
+        width: 100%;
       }
 
-      .symbol-table td:first-child {
-        color: var(--accent);
-        white-space: nowrap;
-        width: 18%;
+      .l-side img {
+        display: block;
+        height: auto;
+        width: 100%;
       }
 
-      .stage-row {
+      .compact-list li {
+        margin-bottom: 0.2em;
+      }
+
+      .compact-list li:last-child {
+        margin-bottom: 0;
+      }
+
+      .tree-cycle-figure {
+        margin-bottom: 2.4rem;
+        margin-top: 1.8rem;
+      }
+
+      .tree-cycle-figure img {
+        display: block;
+        height: auto;
+        width: 100%;
+      }
+
+      .tree-cycle-figure figcaption {
+        margin-top: 0.8rem;
+      }
+
+      .results-figure {
+        clear: both;
+        margin-bottom: 2.5rem;
+        margin-top: 1.75rem;
+      }
+
+      .results-figure img {
+        display: block;
+        height: auto;
+        width: 100%;
+      }
+
+      .results-figure figcaption {
+        margin-top: 0.8rem;
+      }
+
+      .prediction-entropy-callout {
+        display: flow-root;
+        margin-top: 1.5rem;
+      }
+
+      .prediction-entropy-figure {
+        margin-top: 0;
+      }
+
+      .hex-board-figure {
+        color: #52596c;
+        margin-top: 0.35rem;
+      }
+
+      .hex-board-svg {
+        display: block;
+        height: 18rem;
+        overflow: visible;
+        width: 100%;
+      }
+
+      .hex-board-cell {
+        fill: #f2d39b;
+        stroke: #8d7147;
+        stroke-width: 1.25;
+      }
+
+      .hex-board-rail-red,
+      .hex-board-rail-blue {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 5;
+      }
+
+      .hex-board-rail-red {
+        stroke: #d95b59;
+      }
+
+      .hex-board-rail-blue {
+        stroke: #4c7fc1;
+      }
+
+      .hex-board-control {
+        align-items: center;
         display: grid;
-        gap: 0.85rem;
-        grid-column: text;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        margin: 1.7rem 0 2rem;
-        width: 100%;
+        gap: 0.55rem;
+        grid-template-columns: max-content minmax(6rem, 1fr) 3.4rem;
+        margin-top: 0.65rem;
       }
 
-      .stage {
-        background: var(--surface);
-        border-top: 3px solid var(--accent);
-        padding: 0.9rem 1rem;
-      }
-
-      .stage .number {
-        color: var(--accent);
-        font-size: 0.76rem;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-      }
-
-      .stage-title {
-        font-size: 1.02rem;
+      .hex-board-control label,
+      .hex-board-size-output {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 0.78rem;
         font-weight: 600;
-        margin: 0.25rem 0 0.45rem;
+        letter-spacing: 0.01em;
       }
 
-      .stage p {
-        color: #4e5552;
-        font-size: 0.9rem;
-        line-height: 1.5;
+      .hex-board-control input[type="range"] {
+        accent-color: #4c7fc1;
+        cursor: pointer;
         margin: 0;
-      }
-
-      .equation-note {
-        border-left: 2px solid var(--rule);
-        color: var(--muted);
-        font-size: 0.9rem;
-        margin: -0.5rem 0 1.75rem;
-        padding-left: 0.8rem;
-      }
-
-      .step-label {
-        color: var(--accent);
-        font-size: 0.8rem;
-        font-weight: 700;
-        letter-spacing: 0.06em;
-        margin-top: 2.1rem;
-        text-transform: uppercase;
-      }
-
-      .two-column {
-        display: grid;
-        gap: 1rem;
-        grid-column: text;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        margin: 1.5rem 0;
+        min-width: 0;
         width: 100%;
       }
 
-      .mini-card {
-        background: var(--accent-soft);
-        padding: 0.85rem 1rem;
+      .hex-board-size-output {
+        color: #303747;
+        font-variant-numeric: tabular-nums;
+        text-align: right;
       }
 
-      .mini-card p {
-        font-size: 0.9rem;
-        margin: 0.3rem 0;
+      .hex-board-figure figcaption {
+        margin-top: 0.7rem;
       }
 
-      .page-footer {
-        border-top: 1px solid var(--rule);
-        color: var(--muted);
-        font-size: 0.86rem;
-        margin-top: 4rem;
-        padding-top: 1rem;
+      .algorithm-figure {
+        margin-bottom: 2.6rem;
+        margin-top: 2rem;
       }
 
-      @media (max-width: 760px) {
-        d-title h1 {
-          font-size: 2.2rem;
-          line-height: 1.08;
+      .algorithm-code {
+        border-left: 1px solid #aeb9b5;
+        color: #3f465d;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 0.98rem;
+        line-height: 1.7;
+        overflow-x: auto;
+        padding: 0.35rem 0 0.35rem 1.35rem;
+      }
+
+      .algorithm-line {
+        min-width: max-content;
+        white-space: nowrap;
+      }
+
+      .algorithm-indent-1 { padding-left: 1.75rem; }
+      .algorithm-indent-2 { padding-left: 3.5rem; }
+      .algorithm-indent-3 { padding-left: 5.25rem; }
+
+      .algorithm-keyword {
+        color: #f05a13;
+      }
+
+      .algorithm-function {
+        color: #78a5ff;
+      }
+
+      .algorithm-code .katex {
+        font-size: 1.05em;
+      }
+
+      .algorithm-figure figcaption {
+        color: #6f7489;
+        margin-left: 1.35rem;
+        margin-top: 0.65rem;
+        text-align: left;
+      }
+
+      @media (min-width: 1180px) {
+        .l-side {
+          float: right;
+          left: 11em;
+          margin-left: -11em;
+          padding-left: 1em;
+          position: relative;
+          width: 450px;
         }
 
-        .stage-row,
-        .two-column {
-          grid-template-columns: 1fr;
-        }
+      }
 
-        .symbol-table {
-          font-size: 0.9rem;
-        }
-
-        d-article d-math[block] {
-          overflow-x: auto;
-          overflow-y: hidden;
+      @media (max-width: 860px) {
+        .tictactoe-embed iframe {
+          height: 1500px;
         }
       }
     </style>
   </head>
   <body>
+    <d-front-matter>
+      <script type="text/json">
+        {
+          "authors": [
+            {
+              "author": "Francesco Sacco",
+              "authorURL": "https://francesco215.github.io"
+            }
+          ]
+        }
+      </script>
+    </d-front-matter>
+
     <d-title>
-      <h1>Dirichlet Thompson Tree Search</h1>
-      <p>A math-first explanation of Scacchi's lightweight tree, its bottom-up message passing, and the targets returned to the network.</p>
+      <h1>Curiosity-Driven Tree Search</h1>
+      <p></p>
     </d-title>
+
+    <d-byline></d-byline>
 
     <d-article>
       <d-contents></d-contents>
 
-      <p class="lead">The search represents unresolved state and action values as learned Dirichlet beliefs over loss, draw, and win. Exact terminal and solved results live in categorical outcome/distance sidecars. A simulation walks unresolved edges by Thompson sampling, evaluates one frontier edge, and repairs every node on the path back to the root.</p>
+      <p>This is the second blog post of my series of "mathematical foundations of curiosity"</p>
+      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem<d-cite key="sacco2026Curiosity"></d-cite>. Here we are going to show how you can make a tree-search algorithm out of it for board games such as tic-tac-toe, hex, chess and go.</p>
+      <p>
+        This line of search-based game-playing systems includes
+        AlphaGo<d-cite key="silver2016AlphaGo"></d-cite>,
+        AlphaZero<d-cite key="silver2017AlphaZero"></d-cite>, and
+        MuZero<d-cite key="schrittwieser2019MuZero"></d-cite>. In this blog
+        post, I'm going to show you how it is possible to create an algorithm
+        competitive with AlphaZero from first principles.
+      </p>
 
-      <div class="correction">
-        <p><strong>The central idea:</strong> an unresolved edge stores the latest repaired Dirichlet message; it does not keep adding leaf evidence. A separate structural count controls prior mixing. Once an edge is categorical, its exact sidecar—not an artificially concentrated alpha—owns its semantics.</p>
+      <figure class="tictactoe-embed">
+        <iframe
+          id="tictactoe-demo"
+          src="website/tictactoe-demo/index.html"
+          title="Interactive Tic-Tac-Toe Dirichlet-Q demo"
+          scrolling="no"
+        ></iframe>
+        <figcaption>Figure 1: Curiosity-based search with an maximaly dumb model. Over time it finds the best move. Wanna know how it works? Read the blog!</figcaption>
+      </figure>
+
+      <h2>Games as unfair coin tosses</h2>
+
+      <p>
+        Suppose two players, $A$ and $B$, are given a particular board state $s$. We want to predict the probability that each player will win. <d-footnote>From simplicity, we are going to ignore draws to make the explanation simpler</d-footnote>
+      </p>
+
+      <p>
+        The game rules may be deterministic, but the players, are not. Each
+        follows a policy, $\pi_A$ and $\pi_B$.
+        From the current position, the eventual winner therefore behaves like the
+        outcome of an unfair coin.<d-footnote>
+          Mathematically, you can show how you can derive the probability of $A$ winning from state $s$ under the two policies the following way:<br><br>
+          Let $\tau=(s_0,a_0,s_1,a_1,\ldots)$ denote a complete game and let
+          $i_t\in\{A,B\}$ be the player who moves at time $t$. The probability
+          that $A$ wins from state $s$ under the two policies is
+          $$
+          p_A(s;\pi_A,\pi_B)
+          =\sum_{\tau\,:\,s_0=s}
+          \mathbf{1}\{\operatorname{winner}(\tau)=A\}
+          \prod_t \pi_{i_t}(a_t\mid s_t).
+          $$
+          Thus, if draws are excluded, the winner $Y$ satisfies
+          $p(Y\mid s,\pi_A,\pi_B)\sim\operatorname{Bernoulli}
+          (p_A(s;\pi_A,\pi_B))$, where $Y=1$ means that $A$ wins and
+          $1-p_A$ is the probability that $B$ wins.
+        </d-footnote>
+      </p>
+
+      <div>
+        <figure class="l-body side">
+          <img
+            src="website/beta-nll.svg"
+            alt="The predicted distribution Beta(· | θ), with the true probability p_A(s) marked by a solid orange line and the conditional mean E[p | θ] by a solid blue line"
+          >
+          <figcaption>
+            Figure 2: Here, the true odds $p_A(s)$ are shown by the solid orange line, while the blue curve is the model’s prediction $\operatorname{Beta}\!\left(\cdot  | \theta \right)$ and the solid blue line marks its mean. The model receives a lower loss when the curve places more density at the true odds.</figcaption>
+        </figure>
+        <p>
+          Let's say that we want to train a NN that predicts the probability $p_A(s)$ of the player $A$ winning given a board state $s$. What would be the correct way of parametrizing the problem?<br><br>
+          The thing we want to minimize is the Negative Log-Likelihood (NLL) of the actual real-world odds of $A$ winning. For this, we use a Beta distribution: the conjugate prior to the Bernoulli likelihood<d-footnote>The Beta distribution is a family of distributions over a probability $p\in(0,1)$. Its density is
+          $$
+          f(p;\alpha,\beta)
+          =\frac{p^{\alpha-1}(1-p)^{\beta-1}}{B(\alpha,\beta)},
+          \qquad \alpha,\beta&gt;0.
+          $$
+          <br>
+          Its two parameters have an intuitive decomposition:
+          $$
+          \underbrace{\frac{\alpha}{\alpha+\beta}}_{\text{mean: predicted odds}},
+          \qquad
+          \underbrace{\alpha+\beta}_{\text{concentration: confidence}}.
+          $$
+          <br>
+          This makes the Beta distribution a natural representation of uncertainty about an unknown Bernoulli probability. It has exactly the right support, and it expresses both where the win probability is believed to lie and how certain that belief is.<br><br>
+          It is also <em>conjugate</em> to the Bernoulli likelihood. If
+          $$
+          p\sim\operatorname{Beta}(\alpha,\beta)
+          $$
+          before observing any new games, then after $w$ wins by $A$ and $\ell$ losses,
+          $$
+          p\mid\text{data}
+          \sim\operatorname{Beta}(\alpha+w,\beta+\ell).
+          $$
+          <br>
+          In other words, every win adds one unit of evidence to $\alpha$, and every loss adds one to $\beta$. In this model the network outputs these two positive parameters for each board state, so its prediction is a full distribution over the latent win probability rather than only a point estimate.</d-footnote>
+          $$
+          \mathcal L(s)=-\log\operatorname{Beta}\!\left(p_A(s) | \theta \right).
+          $$
+          Where $\theta$ are trainable model parameters.
+        </p>
       </div>
 
-      <h2 id="1-network-beliefs">1. Network beliefs</h2>
+      <h3 id="a-ten-position-toy-dataset">A toy example</h3>
 
-      <p>At state <d-math>s</d-math>, the network predicts a policy together with one state Dirichlet and one Dirichlet for every action:</p>
+      <p>
+        Suppose our dataset contains several board positions. For every position, we let
+        the same two players play from there many times. Once we have enough games, we'll
+        have reasonably accurate empirical estimates of $p_A$ to use as training targets
+        for our model.
+      </p>
 
-      <d-math block>
-\pi_\theta(a\mid s),
-\qquad
-V_s=\alpha_\theta^V(s),
-\qquad
-Q_{s,a}=\alpha_\theta^Q(s,a).
-      </d-math>
+      <figure class="l-page-outset coin-dataset">
+        <div id="coin-dataset-grid" class="coin-dataset__interactive"></div>
+        <noscript>This figure needs JavaScript to draw its inline SVG chessboards and Beta curves.</noscript>
+        <figcaption>
+          Figure 3: A toy dataset of chess positions. Select a board to compare the
+          win rate estimated from repeated games with the model’s prediction. The
+          positions are adapted from the
+          <a href="https://lichess.org/study/KhHUn7L4">Lichess “10 Immortal Games” study</a>;
+          all odds and predictions are synthetic.
+        </figcaption>
+      </figure>
 
-      <p>A Dirichlet parameter vector <d-math>\alpha</d-math> represents uncertainty about an outcome distribution:</p>
+      <p>
+        In principle, a model can
+        learn the mapping from a board state to these outcome odds. After training,
+        we can give it a position it has never seen and ask it to predict how games
+        between players like $A$ and $B$ would usually end from that position.
+      </p>
 
-      <d-math block>
-\phi\sim\mathrm{Dirichlet}(\alpha),
-\qquad
-\mu(\alpha)=\mathbb E[\phi]
-=\frac{\alpha}{\sum_z\alpha_z}.
-      </d-math>
+      <p>
+        Let's be clear: <b>this is not how you train a chess engine</b>. The point of
+        this section was to show how a Beta distribution can represent both a
+        prediction and its uncertainty.
+      </p>
 
-      <p>The outcomes are ordered as <d-math>(L,W)</d-math> or <d-math>(L,D,W)</d-math>. Search compares samples with the same utility everywhere:</p>
+      <h2>What search does</h2>
+      <!--alternative titles: what's the point of doing search? a high level overview of tree-search algorithms -->
+      <p>
+          A tree-search algorithm estimates the probability of winning for each possible next move, assuming both players play optimally.<br>Because the optimal strategy is often unknown, the algorithm is uncertain about its evaluation, so its estimates must be represented as probability distributions.
+      </p>
 
-      <d-math block>
-U(\phi)=\phi_W-\phi_L.
-      </d-math>
+      <figure class="l-body search-overview-figure">
+        <img
+          src="website/search-beta-refinement.svg?v=20260831"
+          alt="A broad starting Beta distribution flowing through search into a taller, narrower Beta distribution"
+        >
+        <figcaption>
+          Figure 4: Search starts from the network’s broad Beta prediction. As it gathers evidence, the output becomes more concentrated, expressing greater confidence in the estimated win probability.
+        </figcaption>
+      </figure>
 
-      <h3 id="1-1-player-perspective">1.1 Player perspective</h3>
+      <p>
+          In a tree-search algorithm, the network provides
+          an initial distribution $q_\theta$ as a starting guess; search improves it, and the
+          improved prediction $q_\textrm{search}$ becomes the network's training target.
+      </p>
 
-      <p>Values belong to the player to move at their node. Moving a value to the opponent's perspective reverses loss and win:</p>
+      $$
+L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
+      $$
+      <p>
+          To me, this really feels like how search should work: it should produce a more precise evaluation of the position!<br>
+              Furthermore, the loss should be the amount of information gained from the search process, as a matter of fact the unit of measurement should be bits!<d-footnote>
+              This loss is effectively the same as the NLL shown in the previous section
+              $$
+              \mathbb E_{q_{\mathrm{search}}}\!\left[-\log q_\theta\right]=
+              D_{\mathrm{KL}}\!\left(q_{\mathrm{search}}\middle\|q_\theta\right)
+              +\underbrace{H\!\left(q_{\mathrm{search}}\right)}_{
+              \text{has zero gradient}}.
+              $$
+              If the tree-search algorithm proves that one of the players has a forced win opportunity, then the target becomes a Dirac delta function.
+              </d-footnote>
+      </p>
+      <p>But how does search work precisely?</p>
+      <h3>Move selection</h3>
+      <div>
+          <figure class="l-side">
+              <img
+                  src="website/son-to-father-beta-tree.svg"
+                  alt="A parent Beta distribution above three child distributions ordered from a terrible move, to a confidently good move, to an uncertain move"
+              >
+              <figcaption>Figure 5: The parent node is represented by the value distribution $V$, the children by $Q_a$ distributions.</figcaption>
+          </figure>
+        <p>
+          Let's suppose we only have a root node with an initial guess about its
+          value distribution $V$ and some children with value distributions $Q_a$.
+          We want to know is:
+        </p>
+        <blockquote>
+             What is the probability that a given action $a$ is the best action $a^\star$?
+        </blockquote>
+        <p>This can be written mathematically as follows:</p>
 
-      <d-math block>
-\mathrm{flip}(x_L,x_D,x_W)
-=(x_W,x_D,x_L).
-      </d-math>
+        $$
+        \mathbb P(a=a^\star)
+        =
+        \mathbb P\left(q_a \geq q_b\;\;\forall b\neq a\right),
+        \quad q_a\sim Q_a.
+        $$
+        <p>
+          This is the same question we asked in the first post when studying the
+          $K$-armed bandit problem<d-cite key="sacco2026Curiosity"></d-cite>.
+        </p>
 
-      <d-math block>
-\mathrm{Align}(x;p\to q)=
-\begin{cases}
-x,&p=q,\\
-\mathrm{flip}(x),&p\ne q.
-\end{cases}
-      </d-math>
+        <p>
+          We can compute the probability that "child $a$ is the best" directly from their densities like so:
+        </p>
 
-      <p class="equation-note">Every child-to-parent message is aligned before it is stored.</p>
+        $$
+        \mathbb P(a=a^\star)
+        =
+        \int_0^1
+        f_a(x)
+        \prod_{b\neq a} F_b(x)\,dx,
+        $$
 
-      <h2 id="2-what-the-tree-remembers">2. A compact tree layout</h2>
+        <p>
+          where $f_a$ is the density of $Q_a$ and $F_b$ is the cumulative
+          distribution function of $Q_b$. This integral is surprisingly GPU-friendly as well!
+          <d-footnote>
+          Here is why this integral is GPU-friendly:<br>
+          Pick a shared grid of $G$ points, $x_1,\ldots,x_G$, and then:<br><br>
 
-      <p>The equations use separate symbols for separate meanings, but the tree does not need one permanent array for every symbol. Its storage follows the state of each node and edge. When an unresolved object becomes categorical, information that will never be read again is overwritten in place by the exact certificate.</p>
+          <strong>1.</strong> Evaluate $f_a(x_g)$ for every action $a$ and grid
+          point $x_g$ at once. This gives one big $A\times G$ table whose entries
+          can be computed in parallel.<br><br>
 
-      <p>The tree has no nested <code>NodePosterior</code>. It stores the following arrays directly:</p>
+          <strong>2.</strong> Turn each row into its CDF $F_a(x_g)$ with a prefix
+          sum—a running numerical integral. GPUs implement these scans
+          efficiently for all actions in parallel.<br><br>
 
-      <table class="symbol-table">
-        <thead>
-          <tr>
-            <th>Physical slot</th>
-            <th>Unresolved interpretation</th>
-            <th>Categorical interpretation</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><d-math>H_{s,a}</d-math> · float <d-math>[A,O]</d-math></td>
-            <td>Network <d-math>Q_{s,a}</d-math> until repaired, then the latest message <d-math>B_{s,a}</d-math></td>
-            <td>Last learned alpha, retained only while an unresolved parent needs its concentration for the numeric cache mixture</td>
-          </tr>
-          <tr>
-            <td><d-math>V_s</d-math> · float <d-math>[O]</d-math></td>
-            <td>Fixed network value prior</td>
-            <td>Unused by search after the node becomes absorbing</td>
-          </tr>
-          <tr>
-            <td><d-math>C_s</d-math> · float <d-math>[O]</d-math></td>
-            <td>Current repaired node cache</td>
-            <td>Unused; the exact node certificate owns the value</td>
-          </tr>
-          <tr>
-            <td><d-math>z_{s,a}</d-math> · int8 <d-math>[A]</d-math></td>
-            <td><d-math>\bot</d-math></td>
-            <td>Exact edge outcome <d-math>L,D,</d-math> or <d-math>W</d-math></td>
-          </tr>
-          <tr>
-            <td><d-math>d_{s,a}</d-math> · int32 <d-math>[A]</d-math></td>
-            <td>Structural count <d-math>R_{s,a}</d-math></td>
-            <td>Certified edge distance <d-math>\tau_{s,a}</d-math></td>
-          </tr>
-          <tr>
-            <td><d-math>z_s</d-math> · int8</td>
-            <td><d-math>\bot</d-math></td>
-            <td>Exact node outcome</td>
-          </tr>
-          <tr>
-            <td><d-math>d_s</d-math> · int32</td>
-            <td>Total structural support <d-math>n_s</d-math></td>
-            <td>Certified node distance <d-math>\tau_s</d-math></td>
-          </tr>
-        </tbody>
-      </table>
+          <strong>3.</strong> At each grid point we need
+          $\prod_{b\neq a}F_b(x_g)$ for every action. Recomputing that whole
+          product separately for each action would be wasteful. Instead, add the
+          log-CDFs once and subtract the current action's term:
+          $$
+          S_g=\sum_b\log F_b(x_g),
+          \qquad
+          \prod_{b\neq a}F_b(x_g)
+          =\exp\!\left(S_g-\log F_a(x_g)\right).
+          $$
+          In practice, zero CDF values are handled separately so that we never
+          literally compute $\log 0$.<br><br>
 
-      <p>The outcome tag determines how each integer payload is decoded:</p>
+          <strong>4.</strong> Finally, multiply by $f_a(x_g)$ and sum over the
+          grid for every action at the same time. The whole calculation takes
+          $O(AG)$ work instead of the naive $O(A^2G)$.<br><br>
+          Empirically you also found we can get a quite good approximation of
+          this integral using a shared grid of just $G=21$ points, and it's much faster than monte carlo!
+          </d-footnote>
+        </p>
+        <p>
+          However, if we just want to do one sample from this distribution we don't even need to evaluate
+          this integral explicitly, we can just do a <b>Thompson-sample</b>: sample one possible value from
+          every child and choose the biggest one.
+        </p>
 
-      <d-math block>
-d_{s,a}=
-\begin{cases}
-R_{s,a},&z_{s,a}=\bot,\\
-\tau_{s,a},&z_{s,a}\ne\bot,
-\end{cases}
-\qquad
-d_s=
-\begin{cases}
-n_s,&z_s=\bot,\\
-\tau_s,&z_s\ne\bot.
-\end{cases}
-      </d-math>
+        $$
+        \tilde q_a\sim Q_a
+        \quad\text{for each }a,
+        \qquad
+        a_{\mathrm{TS}}=\arg\max_a\tilde q_a.
+        $$
 
-      <p>An unresolved node may have <d-math>n_s=0</d-math>, so zero alone cannot mean terminal once the slots are overlaid. The redundant terminal Boolean disappears, but the exact test is</p>
+        <p>
+          As a result, we can sample a policy equal to the probability
+          that each action is optimal under our current beliefs:
+        </p>
 
-      <d-math block>
-\mathrm{terminal}(s)
-\iff
-z_s\ne\bot\ \land\ d_s=0.
-      </d-math>
+        $$
+        \pi(a)
+        =\mathbb P(a=a^\star).
+        $$
+        <p>
+            <b>This policy is natively curious</b>. A child does not need to have the highest expected value to be worth exploring: it only needs enough uncertainty for there to be a meaningful chance that it is actually the best move
+        </p>
+        <figure class="l-body">
+          <img
+            src="website/curious-move-selection.svg"
+            alt="Three candidate Go moves with policy-probability bars: a terrible move, a confidently strong move, and an uncertain move that could be best"
+          >
+          <figcaption>Figure 6: Policy probabilities induced by uncertain value estimates. The model is inherently curious: uncertain beliefs encourage it to explore moves that may appear suboptimal but still have a meaningful chance of being the best.</figcaption>
+        </figure>
 
-      <p>This requires root evaluation to provide an exact terminal outcome whenever the root itself can be terminal. A Boolean terminal flag without its outcome is no longer a sufficient root contract.</p>
+        <p>
+          Unlike PUCT, which handles uncertainty indirectly through visit counts,
+          our model predicts its uncertainty explicitly.
+          This allows exploration to be guided by what the model does not yet know,
+          rather than only by how often a move has been examined.
+        </p>
 
-      <h3 id="2-1-effective-edge-posterior">2.1 Effective actions without duplicate posterior fields</h3>
-
-      <p>While an edge is unresolved, its integer payload is a count and its float slot changes meaning in place:</p>
-
-      <d-math block>
-A_{s,a}=
-\begin{cases}
-H_{s,a}=B_{s,a},
-&z_{s,a}=\bot\ \land\ d_{s,a}>0,\\[3pt]
-\mathrm{Align}(V_{s_a};p_{s_a}\to p_s),
-&z_{s,a}=\bot\ \land\ d_{s,a}=0\ \land\ s_a\text{ exists},\\[3pt]
-H_{s,a}=Q_{s,a},
-&z_{s,a}=\bot\ \land\ s_a\text{ does not exist}.
-\end{cases}
-      </d-math>
-
-      <p>Thus <d-math>Q</d-math> and <d-math>B</d-math> are successive contents of one float slot, while <d-math>A</d-math> is computed and never stored. The fixed <d-math>V_s</d-math> and mutable <d-math>C_s</d-math> cannot share a slot while the node is unresolved: every repair needs both at the same time.</p>
-
-      <p>Policy logits are not tree state. Legality is extracted during evaluation and stored as a compact mask. Categorical ties use the search RNG directly, so they never trigger another network evaluation.</p>
-
-      <h3 id="2-2-state-transitions">2.2 Safe integer-slot transitions</h3>
-
-      <p>The node total is maintained incrementally. For every unresolved edge-count change <d-math>r_{\mathrm{old}}\to r_{\mathrm{new}}</d-math>, update</p>
-
-      <d-math block>
-d_s\leftarrow d_s+r_{\mathrm{new}}-r_{\mathrm{old}}
-\qquad(z_s=\bot)
-      </d-math>
-
-      <p>before writing the new edge payload. The tree never recomputes <d-math>n_s</d-math> by summing a mixture of counts and distances.</p>
-
-      <p>When a child becomes categorical, publication is ordered as one transaction:</p>
-
-      <d-math block>
-\begin{aligned}
-r_{\mathrm{final}}&\leftarrow 1+n_{s_a},\\
-d_s&\leftarrow d_s+r_{\mathrm{final}}-r_{\mathrm{old}},\\
-z_{s,a}&\leftarrow \mathrm{Align}(z_{s_a};p_{s_a}\to p_s),\\
-d_{s,a}&\leftarrow \tau_{s_a}+1.
-\end{aligned}
-      </d-math>
-
-      <p>The first two lines preserve the child's final structural contribution in the unresolved parent. Only then may the edge count be overwritten by distance. Once <d-math>z_{s,a}\ne\bot</d-math>, that payload is never again read as a count.</p>
-
-      <p>When the node itself becomes categorical, first publish its final <d-math>1+n_s</d-math> contribution to its unresolved parent using the same transaction. After that value is safe in the parent total, overwrite</p>
-
-      <d-math block>
-z_s\leftarrow z_s^{\mathrm{cat}},
-\qquad
-d_s\leftarrow\tau_s.
-      </d-math>
-
-      <p>A terminal child is the base case: <d-math>\tau_{s_a}=0</d-math>, so its incoming edge receives distance one and contributes structural support one before the overwrite.</p>
-
-      <div class="correction">
-        <p><strong>Information that really is discarded:</strong> after an edge becomes categorical, its individual <d-math>R_{s,a}</d-math> no longer exists. Root summaries report structural counts only for unresolved edges, and categorical Q rows use their explicit categorical weight. The node total preserves mixing support but cannot reconstruct historical per-edge counts.</p>
       </div>
+      
+      <h3>Updating beliefs</h3>
+      <p>
+        Exploring a child is useful only if what we learn there can change
+        what we believe about its parent. Now we are going to see how we can use the information of the child to update our beliefs about the parent.
+      </p>
 
-      <h3 id="2-3-native-categorical-certificates">2.3 Native categorical certificates</h3>
+      <p>The previous section gave us</p>
 
-      <p>An action is still one of two logical objects even though its count and distance share storage:</p>
+      $$
+      \pi(a)=\mathbb P(a\text{ is the best move}).
+      $$
 
-      <d-math block>
-Y_{s,a}=
-\begin{cases}
-\mathrm{Cat}(z_{s,a},d_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
-\mathrm{Dir}(A_{s,a}),&z_{s,a}=\bot.
-\end{cases}
-      </d-math>
+      <p>We reuse those probabilities to combine the current beliefs about the moves:</p>
 
-      <p>The categorical tag is exact and absorbing. A certified edge is pruned from traversal. One certified win solves a node; a draw or loss is proved only after every legal edge is categorical.</p>
+      $$
+      \bar Q=\sum_a \pi(a)Q_a.
+      $$
 
-      <p>Certified wins choose a shortest winning edge and certified losses choose a longest losing edge. All certified draw edges are equivalent. Whenever more than one edge remains tied—including equal-distance win or loss edges—the engine samples uniformly among them with the existing search RNG. Policy logits, draw-distance preferences, and action order do not break categorical ties.</p>
+      <p>
+        Thus, a move that is very likely to be best has a large influence on
+        the position’s value. An uncertain move can still matter when there is
+        a meaningful chance that it is best.
+      </p>
+      
+      <figure class="l-page-outset">
+        <img
+          src="website/beta-mixture-summary.svg?v=20260831"
+          alt="Three action-value Beta distributions and a comparison between their exact policy-weighted mixture and the Beta obtained by averaging their parameter vectors"
+        >
+        <figcaption>
+          Figure 7: Three action beliefs and their probabilities of being the
+          best move. The exact weighted mixture is generally not a Beta
+          distribution; search keeps a Beta-shaped summary by averaging the
+          three parameter vectors with the same weights. I found this approximation to be good enough, and it keeps things simple.
+        </figcaption>
+      </figure>
 
-      <d-math block>
-u_{\mathrm{cat}}(L)=-1,
-\qquad
-u_{\mathrm{cat}}(D)=0,
-\qquad
-u_{\mathrm{cat}}(W)=1.
-      </d-math>
 
-      <h2 id="3-one-thompson-rule">3. One Thompson rule</h2>
+      <p>
+        We do not immediately throw away the network’s original prediction.
+        Instead, we blend it with the information obtained from search:
+      </p>
 
-      <p>At every node—root or internal—the same selector assigns one utility to each native action:</p>
+      $$
+      C
+      =
+      (1-\gamma)V
+      +
+      \gamma\bar Q,
+      \qquad
+      \gamma=\frac{n}{\kappa+n}.
+      $$
 
-      <d-math block>
-X(Y_{s,a})=
-\begin{cases}
-u_{\mathrm{cat}}(z_{s,a}),&z_{s,a}\ne\bot,\\[3pt]
-U(\phi_a),\quad \phi_a\sim\mathrm{Dirichlet}(A_{s,a}),&z_{s,a}=\bot,
-\end{cases}
-      </d-math>
+      <p>
+        Here $n$ measures how much search support has accumulated below the
+        position, while $\kappa$ controls how strongly we initially trust the
+        network.<d-footnote>
+        This has the same form as a Bayesian update with a Beta prior. A prior
+        with mean $V$ and concentration $\kappa=\alpha+\beta$ can be written
+        as $\operatorname{Beta}(\kappa V,\kappa(1-V))$. After $n$ Bernoulli
+        observations with empirical mean $\bar Q$, its posterior mean is
+        $$
+        \frac{\kappa V+n\bar Q}{\kappa+n}
+        =\frac{\kappa}{\kappa+n}V+\frac{n}{\kappa+n}\bar Q.
+        $$
+        Thus $\kappa$ behaves like a prior sample size: when $n=\kappa$, the
+        prior and the new evidence receive equal weight, while a larger
+        $\kappa$ means that more evidence is needed to move away from the
+        network's prediction.<br><br>
 
-      <p>and chooses the legal action with highest utility:</p>
+        The update here is only <em>pseudo-Bayesian</em>. Search backups are
+        not literally independent Bernoulli observations, so $n$ is best
+        understood as an effective amount of search evidence. We borrow the
+        weighting rule and its prior-strength interpretation without claiming
+        that the result is an exact Bayesian posterior.
+        </d-footnote>
+      </p>
 
-      <d-math block>
-a^*=\arg\max_{a\in\mathcal A(s)}X(Y_{s,a}).
-      </d-math>
 
-      <p>Repeating this same choice <d-math>M</d-math> times estimates the probability that each action is best:</p>
+      <h3 id="building-the-tree">Building the tree</h3>
 
-      <d-math block>
-\widehat\pi_M(a\mid s)
-=
-\frac1M
-\sum_{j=1}^{M}
-\mathbf 1\!\left[
-a=\arg\max_b X(Y_{s,b})^{(j)}
-\right].
-      </d-math>
+      <p>
+        Now we have everything needed to build a search tree. Thompson
+        sampling tells us where to look, while the update rule tells us how to
+        propagate the information we find back to the rest of the tree. Search builds the tree by repeatedly combining these
+        two operations.
+      </p>
 
-      <d-math block>
-X(\mathrm{Cat}(z,\tau))=u_{\mathrm{cat}}(z),
-\qquad
-X(\mathrm{Dir}(A))=U(\phi),\quad
-\phi\sim\mathrm{Dirichlet}(A).
-      </d-math>
+      $$
+      \text{sample downward}
+      \longrightarrow
+      \text{expand one position}
+      \longrightarrow
+      \text{update beliefs upward}.
+      $$
 
-      <p class="equation-note">Traversal applies this rule only to unresolved edges; mixed policy readout compares exact categorical utility with sampled Dirichlet utility. Node repair and root readout use populations of the same selector. There is no second action-selection algorithm.</p>
+      <figure class="l-page-outset tree-cycle-figure">
+        <img
+          src="website/tree-search-cycle.svg"
+          alt="Three stages of one search simulation: Thompson samples select a path down the tree, one new position is expanded and evaluated, and beliefs are updated along the selected path back to the root"
+        >
+        <figcaption>
+          Figure 8: One search simulation. Thompson samples choose a path from
+          the root to an unexplored move. Search evaluates at most one new
+          position, then updates beliefs along the same path from the deepest
+          node back to the root.
+        </figcaption>
+      </figure>
 
-      <h2 id="4-one-simulation">4. One simulation</h2>
-
-      <div class="stage-row">
-        <div class="stage">
-          <div class="number">Stage 1</div>
-          <div class="stage-title">Simulate</div>
-          <p>Thompson-sample at each node and follow existing children to an unexpanded, terminal, or depth-cutoff edge.</p>
+      <div>
+      <figure class="l-body side algorithm-figure">
+        <div
+          class="algorithm-code"
+          aria-label="Pseudocode for one tree-search simulation"
+        >
+          <div class="algorithm-line">
+            <span class="algorithm-keyword">def</span>
+            <span class="algorithm-function">search_simulation</span>($root$):
+          </div>
+          <div class="algorithm-line algorithm-indent-1">$s \leftarrow root$</div>
+          <div class="algorithm-line algorithm-indent-1">$path \leftarrow [\,]$</div>
+          <div class="algorithm-line algorithm-indent-1">
+            $a \leftarrow$ <span class="algorithm-function">thompson_sample</span>$(s)$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            <span class="algorithm-keyword">while</span> $(s,a)$ is explored:
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            <span class="algorithm-keyword">append</span> $(s,a)$ to $path$
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            $s \leftarrow$ <span class="algorithm-function">child</span>$(s,a)$
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            $a \leftarrow$ <span class="algorithm-function">thompson_sample</span>$(s)$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            <span class="algorithm-keyword">append</span> $(s,a)$ to $path$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            $s' \leftarrow$ <span class="algorithm-function">expand</span>$(s,a)$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            <span class="algorithm-keyword">for</span> each $(s,a)$ in
+            <span class="algorithm-function">reverse</span>$(path)$:
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            $Q_a \leftarrow$ belief of <span class="algorithm-function">child</span>$(s,a)$
+          </div>
+          <div class="algorithm-line algorithm-indent-2">
+            $C \leftarrow$ <span class="algorithm-function">update_belief</span>$(V,\{Q_b\})$
+          </div>
+          <div class="algorithm-line algorithm-indent-1">
+            <span class="algorithm-keyword">return</span> tree
+          </div>
         </div>
-        <div class="stage">
-          <div class="number">Stage 2</div>
-          <div class="stage-title">Expand</div>
-          <p>Step the environment and evaluate the child. Create a node only when the selected edge is new.</p>
-        </div>
-        <div class="stage">
-          <div class="number">Stage 3</div>
-          <div class="stage-title">Repair</div>
-          <p>Walk from the deepest parent back to the root and update every node with the same posterior rule.</p>
-        </div>
+      </figure>
+      <p>The whole procedure can be summarized in the algorithm to the side right here.</p>
+      <p>Typically, predictions become sharper as the search moves deeper into the tree because positions farther along in the game are, on average, easier to evaluate.</p>
+      <p>Empirically, this appears as an increasingly concentrated distribution over moves and a corresponding decline in policy entropy.</p>
+
+      <h3 id="one-last-thing">What about draws?</h3>
+      <p>
+        With only wins and losses, the outcome is Bernoulli: once we know
+        $p_{\mathrm W}$, the other probability is fixed by
+        $p_{\mathrm L}=1-p_{\mathrm W}$. A Beta distribution is therefore enough
+        to describe our uncertainty about the single free probability.
+      </p>
+
+      <p>
+        A draw adds a third possible outcome, so we use its multi-outcome generalization: the
+        <strong>Dirichlet distribution</strong>.
+      </p>
+
+      <figure class="l-page-outset outcome-distribution-comparison">
+        <div id="outcome-distribution-comparison"></div>
+        <noscript>This figure needs JavaScript to draw the Beta curve and Dirichlet simplex.</noscript>
+        <figcaption>Figure 9: A Beta distribution places density along the one-dimensional
+          win–loss line. Once draws are possible, the belief lives on a
+          two-dimensional simplex: every point in the triangle is one complete
+          win–draw–loss probability vector. Darker filled contours indicate
+          higher probability density, while the magenta marks show the means of the
+          example distributions.
+        </figcaption>
+      </figure>
+
+      <p>
+        The Dirichlet distribution has virtually all the same properties as the Beta distribution, so all the math we talked so far remains basically the same.
+      </p>
+      <p>The triangle in the tic-tac-toe demo visualizes this Dirichlet distribution: each point represents a different combination of win, draw, and loss probabilities.</p>
       </div>
 
-      <d-math block>
-\text{simulation}
-=
-\text{traversal}
-\longrightarrow
-\text{leaf evaluation}
-\longrightarrow
-\text{bottom-up repair}.
-      </d-math>
+      <h2 id="results">Results</h2>
+      <div class="results-intro">
+        <figure class="l-side hex-board-figure">
+          <div class="hex-board-shell">
+            <svg
+              id="hex-board-svg"
+              class="hex-board-svg"
+              role="img"
+              aria-label="Empty 6 by 6 Hex board"
+            >
+              <title>Interactive Hex board</title>
+              <desc>Use the slider to change the board from 3 by 3 to 9 by 9.</desc>
+              <g id="hex-board-rails" aria-hidden="true"></g>
+              <g id="hex-board-cells" aria-hidden="true"></g>
+            </svg>
+            <div class="hex-board-control">
+              <label for="hex-board-size">Board size</label>
+              <input id="hex-board-size" type="range" min="3" max="9" step="1" value="6">
+              <output id="hex-board-size-output" class="hex-board-size-output" for="hex-board-size">6 × 6</output>
+            </div>
+          </div>
+          <figcaption>
+            Figure 10: Players alternate claiming empty cells. Blue connects the
+            blue left and right edges; red connects the red top and bottom edges.
+            The first unbroken path wins, and Hex cannot end in a draw.
+          </figcaption>
+        </figure>
+        <p>
+          I decided to compare this Curiosity-Driven tree-search algorithm against
+          Gumbel-AlphaZero<d-cite key="danihelka2022Gumbel"></d-cite> (the latest iteration of the AlphaZero algorithm by Google-DeepMind)
+        </p>
+        <p>
+          For the experiments I was inspired by the paper "Scaling Scaling Laws
+          with Board Games"<d-cite key="jones2021Scaling"></d-cite>, where the author chose to train several models with different hex board sizes from $3\times3$ through $9\times9$ and measured scaling laws for both algorithms. 
 
-      <h3 id="4-1-leaf-result">4.1 Tagged leaf result</h3>
-
-      <p>A non-terminal frontier contributes its complete network value prior:</p>
-
-      <d-math block>
-L_{s'}=V_{s'}.
-      </d-math>
-
-      <p>Expansion also returns one exact tag:</p>
-
-      <d-math block>
-\mathrm{terminal\_outcome}(s')=
-\begin{cases}
-z_{s'},&s'\text{ is terminal},\\
-\mathrm{NO\_OUTCOME},&s'\text{ is non-terminal}.
-\end{cases}
-      </d-math>
-
-      <p>A terminal tag creates <d-math>\mathrm{Cat}(z_{s'},0)</d-math> on the child and the aligned distance-one certificate on its incoming edge. It does not create a terminal Dirichlet. Model alphas are used as unresolved leaf messages and caches only.</p>
-
-      <h2 id="5-bottom-up-posterior-repair">5. Bottom-up posterior repair</h2>
-
-      <p>The default rule is local: it receives one node, all of its child summaries, and the final leaf only when this is the deepest path node.</p>
-
-      <div class="step-label">Step A · write the final edge</div>
-
-      <p>At the deepest node <d-math>s_d</d-math>, an unresolved selected edge increments its structural count and replaces its alpha message:</p>
-
-      <d-math block>
-R_{s_d,a_d}\leftarrow R_{s_d,a_d}+1,
-      </d-math>
-
-      <d-math block>
-B_{s_d,a_d}\leftarrow
-\mathrm{Align}(V_{s'};p_{s'}\to p_{s_d})
-\quad\text{only when }z_{s_d,a_d}=\bot.
-      </d-math>
-
-      <p class="equation-note"><d-math>B</d-math> is replaced, not added. If expansion is terminal, the engine instead folds support one into <d-math>n_{s_d}</d-math> and overwrites the edge payload with distance one; the posterior callback never reads that distance as <d-math>R</d-math>.</p>
-
-      <div class="step-label">Step B · refresh from children</div>
-
-      <p>For every expanded, unresolved child with repaired information below it, replace the parent edge by the child's current cache. Its node payload still means <d-math>n_{s_a}</d-math>:</p>
-
-      <d-math block>
-B_{s,a}
-\leftarrow
-\mathrm{Align}(C_{s_a};p_{s_a}\to p_s),
-\qquad
-R_{s,a}
-\leftarrow
-1+n_{s_a},
-\quad n_{s_a}>0.
-      </d-math>
-
-      <p>When a child becomes categorical, the engine first commits the final <d-math>1+n_{s_a}</d-math> count delta to the parent total, then overwrites the incoming edge count with distance. Categorical children are never refreshed as Dirichlet messages afterwards.</p>
-
-      <div class="step-label">Step C · form a fresh node policy</div>
-
-      <p>Recompute all effective action posteriors and estimate a fresh posterior-best policy:</p>
-
-      <d-math block>
-\pi_s
-=
-\widehat\pi_{M_{\mathrm{node}}}
-(\,\cdot\mid s;Y_s).
-      </d-math>
-
-      <p>This is not a visit distribution or a running average. It is a new mixed-native population: categorical utilities are exact and unresolved utilities are freshly Thompson-sampled.</p>
-
-      <div class="step-label">Step D · repair the node value</div>
-
-      <p>While the node is unresolved, its node payload is the incrementally maintained total structural support</p>
-
-      <d-math block>
-\gamma_s=\frac{n_s}{\kappa+n_s}.
-      </d-math>
-
-      <p>The incremental form is necessary because categorical edge payloads now contain distance, not their discarded historical count.</p>
-
-      <p>For the numeric cache mixture only, preserve each categorical edge's learned effective-alpha mass but replace its direction by the exact sidecar outcome:</p>
-
-      <d-math block>
-\widetilde A_{s,a}=
-\begin{cases}
-A_{s,a},&z_{s,a}=\bot,\\[3pt]
-\left(\sum_i A_{s,a,i}\right)e_{z_{s,a}},&z_{s,a}\ne\bot.
-\end{cases}
-      </d-math>
-
-      <p>Average these cache operands with the fresh search policy:</p>
-
-      <d-math block>
-\bar A_s
-=
-\sum_{a\in\mathcal A(s)}
-\pi_s(a)\widetilde A_{s,a}.
-      </d-math>
-
-      <p>Then interpolate between the fixed network value and the repaired descendants:</p>
-
-      <d-math block>
-\boxed{
-C_s
-=
-(1-\gamma_s)V_s
-+
-\gamma_s\bar A_s
-}.
-      </d-math>
-
-      <p>If <d-math>n_s=0</d-math>, then <d-math>C_s=V_s</d-math>. The sole constant <d-math>\kappa&gt;0</d-math> is the strength of that learned value prior against repaired descendants. It is not leaf evidence or terminal confidence. The categorical projection does not mutate <d-math>A</d-math> and never replaces the exact sidecar or categorical training target.</p>
-
-      <h3 id="5-1-why-the-order-matters">5.1 Why the order matters</h3>
-
-      <p>For a selected path</p>
-
-      <d-math block>
-s_0\to s_1\to\cdots\to s_d,
-      </d-math>
-
-      <p>repair runs in the reverse order:</p>
-
-      <d-math block>
-s_d,\ s_{d-1},\ \ldots,\ s_0.
-      </d-math>
-
-      <p>When <d-math>s_i</d-math> is repaired, it therefore sees the new <d-math>C_{s_{i+1}}</d-math> computed moments earlier. This is how one local rule transports information all the way to the root.</p>
-
-      <h2 id="6-root-readout-and-training-targets">6. Root readout and training targets</h2>
-
-      <p>If the root remains unresolved, its policy is another mixed-native posterior-best population. If the root is categorical, the engine samples uniformly among tied certified actions and returns a one-hot policy on that sample:</p>
-
-      <d-math block>
-\pi_{\mathrm{search}}(a\mid s_0)
-=
-\begin{cases}
-\widehat\pi_{M_{\mathrm{root}}}(a\mid s_0;Y_{s_0}),
-&z_{s_0}=\bot,\\[3pt]
-\mathbf 1[a=a_{\mathrm{cat}}(s_0)],
-&z_{s_0}\ne\bot.
-\end{cases}
-      </d-math>
-
-      <p>The Q and V targets retain the same native tags used by search:</p>
-
-      <d-math block>
-T^Q_{s,a}=
-\begin{cases}
-\mathrm{Pad},&a\text{ illegal},\\
-\mathrm{Cat}(z_{s,a},\tau_{s,a}),&z_{s,a}\ne\bot,\\
-\mathrm{Dir}(A_{s,a}),&z_{s,a}=\bot,
-\end{cases}
-      </d-math>
-
-      <d-math block>
-T^V_s=
-\begin{cases}
-\mathrm{Cat}(z_s,\tau_s),&z_s\ne\bot,\\
-\mathrm{Dir}(C_s),&z_s=\bot.
-\end{cases}
-      </d-math>
-
-      <d-math block>
-\pi_{\mathrm{target}}(a\mid s_0)
-=
-\pi_{\mathrm{search}}(a\mid s_0).
-      </d-math>
-
-      <div class="correction">
-        <p>There is no root-only reconstruction <d-math>\beta_Q=\alpha_{\mathrm{base}}+E_Q</d-math>, and <d-math>R</d-math> is never added to Dirichlet concentration. A categorical target consumes the exact sidecar, not the numeric cache projection.</p>
+        </p>
+        <p><i>And it's scalable and competitive with Gumbel-AlphaZero!</i></p>
       </div>
 
-      <h3 id="6-1-losses">6.1 Losses</h3>
+      <figure class="l-page-outset results-figure">
+        <img
+          src="website/hex3-9-scaling-paper-logbins.svg"
+          alt="Two-panel compute-scaling plot for Hex boards 3 through 9. Curiosity-Driven is shown on the left and Gumbel-AlphaZero on the right. Learning transitions move to higher neural-network FLOPs as board size increases."
+        >
+        <figcaption>
+          Figure 11: Win rate against a roughly optimal-play baseline as a function of
+          neural-network FLOPs. Color denotes board size; faint points are raw
+          evaluations and solid curves are time-averages.
+          The dotted line marks a 50% win rate.
+        </figcaption>
+      </figure>
+      <p>
+        Gumbel-AlphaZero tends to converge faster, while
+        Curiosity-Driven seems to reach slightly better final performance (althought it's pretty negligible).
+      </p>
+      <figure class="results-figure">
+        <img
+          src="website/hex3-9-paired-paper-logbins.svg"
+          alt="Seven-panel comparison of Curiosity-Driven and Gumbel-AlphaZero compute-scaling curves, with one panel for each Hex board size from 3 through 9 and the legend in the eighth grid cell."
+        >
+        <figcaption>
+          Figure 12: Matched-board comparison of Curiosity-Driven and Gumbel-AlphaZero.
+        </figcaption>
+      </figure>
+      <div class="prediction-entropy-callout">
+        <figure class="l-side prediction-entropy-figure">
+          <img
+            src="website/hex3-9-dt-prediction-entropy-logbins.svg"
+            alt="Prediction entropy for Curiosity-Driven agents on Hex boards 3 through 9, plotted against neural-network FLOPs on a logarithmic scale"
+          >
+          <figcaption>
+            Figure 13: Prediction entropy for Curiosity-Driven agents as a function of
+            training FLOPs.
+          </figcaption>
+        </figure>
+        <p>Another interesting graph is the entropy of the predictions as the training goes on. You can clearly see how it learns smootly to predict with higher and higher accuracy (Figure 13).</p>
+        <h3>Experimental details</h3>
+        <p>I used a JAX-native stack made of:</p>
+        <ul class="compact-list">
+          <li>
+            PGX<d-cite key="koyamada2023PGX"></d-cite> for fast and parallelizable
+            environments;
+          </li>
+          <li>
+            MCTX<d-cite key="deepmindMctx"></d-cite> as the initial version of the
+            tree-search algorithm;
+          </li>
+          <li>
+              A custom adaptation of mctx for Curiosity-Driven search.
+          </li>
+        </ul>
+        <p>
+            Self-play/training batch sizes were 4,096/1,024; the network was a
+            128-channel ResNet<d-cite key="he2016ResNet"></d-cite> with six blocks,
+            trained with Muon<d-cite key="jordan2024Muon"></d-cite> at a fixed
+            $5\times 10^{-3}$ learning rate.
+        </p>
+      </div>
+      <h2>Conclusion</h2>
 
-      <p>The policy head distills the posterior-best distribution:</p>
+      <p>
+          The algorithm follows from a small set of simple axioms with minimal additional assumptions. I prioritized mathematical elegance over raw performance: a principled foundation can always be optimized later.
+      </p>
+      <p>
+         We have seen how the notion of <i>Curiosity</i>, introduced in the first post of this series<d-cite key="sacco2026Curiosity"></d-cite>, can be generalized into a complete and scalable tree-search algorithm that performs competitively with AlphaZero.
+      </p>
+      <p>
+          If you want to work on this kind of research and are curious about this stuff reach out! 🐝
+      </p>
 
-      <d-math block>
-\mathcal L_\pi
-=
--\sum_{a\in\mathcal A(s)}
-\mathrm{stopgrad}(\pi_{\mathrm{target}}(a\mid s))
-\log\pi_\theta(a\mid s).
-      </d-math>
-
-      <p>Full Dirichlet training matches both mean and concentration:</p>
-
-      <d-math block>
-\mathcal L_{\mathrm{full}}(\beta,\alpha_\theta)
-=
-D_{\mathrm{KL}}
-\left(
-\mathrm{Dirichlet}(\mathrm{stopgrad}\beta)
-\,\|\,
-\mathrm{Dirichlet}(\alpha_\theta)
-\right).
-      </d-math>
-
-      <p>Mean-only training ignores concentration and matches normalized outcome probabilities:</p>
-
-      <d-math block>
-\mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta)
-=
-D_{\mathrm{KL}}
-\left(
-\mathrm{stopgrad}\mu(\beta)
-\,\|\,
-\mu(\alpha_\theta)
-\right).
-      </d-math>
-
-      <p>For an exact categorical outcome <d-math>z</d-math>, move the point just inside the simplex and train the predicted Dirichlet by density likelihood:</p>
-
-      <d-math block>
-\phi_z^\epsilon
-=(1-K\epsilon)e_z+\epsilon\mathbf 1,
-\qquad
-\mathcal L_{\mathrm{cat}}(\alpha_\theta,z)
-=-\log p_{\mathrm{Dirichlet}(\alpha_\theta)}
-(\phi_z^\epsilon).
-      </d-math>
-
-      <p>Thus unresolved rows use full or mean Dirichlet matching, while categorical rows use this exact-outcome density loss in either mode. The concentration is learned by the model; no terminal concentration constant is injected by search.</p>
-
-      <p>For an unresolved Q target, the loss can be weighted by structural support or by root policy. A categorical row no longer owns an <d-math>R</d-math> value and receives an explicit unit categorical weight:</p>
-
-      <d-math block>
-w_a=
-\begin{cases}
-R_{s_0,a},
-&z_{s_0,a}=\bot\ \text{and evidence-mass mode},\\
-\pi_{\mathrm{search}}(a\mid s_0),
-&z_{s_0,a}=\bot\ \text{and policy mode},\\
-1,&z_{s_0,a}\ne\bot.
-\end{cases}
-      </d-math>
-
-      <h2 id="7-simulations-are-not-tree-size">7. Simulations are not tree size</h2>
-
-      <p>With <code>num_simulations = N</code>, search allocates <d-math>N</d-math> static iterations and performs at most <d-math>N</d-math> active traversal–evaluation–repair cycles on one persistent tree:</p>
-
-      <d-math block>
-\mathcal T_0
-\xrightarrow{\text{simulation }1}
-\mathcal T_1
-\xrightarrow{\text{simulation }2}
-\cdots
-\xrightarrow{\text{simulation }N}
-\mathcal T_N.
-      </d-math>
-
-      <p>JAX allocates a static upper bound of one possible new node per simulation, plus the root:</p>
-
-      <d-math block>
-N_{\mathrm{slots}}=N+1.
-      </d-math>
-
-      <p>A revisit or depth cutoff still evaluates and repairs the path but does not initialize a new node. Therefore</p>
-
-      <d-math block>
-N_{\mathrm{real\ nodes}}\le N+1.
-      </d-math>
-
-      <p>The fixed array is capacity, not a requirement to fill every slot. Once the root is categorical, later static iterations are inactive and do not call expansion. <code>max_depth</code> separately limits one traversal's length.</p>
-
-      <h2 id="8-the-replaceable-part">8. The replaceable part</h2>
-
-      <p>The tree-search engine owns traversal, exact terminal tags, categorical sidecars, proof propagation, storage, and bottom-up order. The posterior callback owns unresolved Dirichlet repair and the cache mixture:</p>
-
-      <d-math block>
-\mathcal F_{\mathrm{posterior}}:
-(\text{key},\ \text{node},\ \text{children},\ \text{leaf})
-\longmapsto
-(H_s,\ d_s^{\mathrm{edge}},\ C_s).
-      </d-math>
-
-      <p>It is called once for every node on the selected path and returns an ephemeral update; the persistent tree remains flat. A different rule can inspect the current node embedding and all child summaries, then replace unresolved alphas, counts, and the node cache without changing traversal. The engine owns count-delta accounting and categorical payload transitions. The default callback exposes its single prior-strength choice as <d-math>\kappa</d-math> in <d-math>\gamma=n/(\kappa+n)</d-math>.</p>
-
-      <d-math block>
-\text{search mechanics}
-\quad\perp\quad
-\text{posterior mathematics}.
-      </d-math>
-
-      <p class="page-footer">For field-level contracts, concentration parameterization, action commitment modes, and the full loss definition, see <a href="math.md"><code>math.md</code></a>. The algorithm follows the message-passing logic in <code>tictactoe-demo/app.js</code> and the active <code>scacchi.dirichlet_mctx</code> backend.</p>
     </d-article>
+
+    <d-appendix>
+      <h3>Acknowledgements</h3>
+      <p>
+          I want to thank <a href="https://x.com/HessianFree">Omehad Pooladzandi</a> for giving me access to compute.<br>I also want to thank (in no particular order) <a href="https://wtedw.com/">Ted Wong</a>, <a href="https://x.com/NMonti25537">Nicolò Monti</a>, <a href="https://www.diego-marti.com/">Diego Martì Monso</a>, <a href="https://the-puzzler.github.io/">Matteo Peluso</a> and <a href="https://x.com/evaninwords">Evan Walters</a> for the precious feedback and support.
+      </p>
+      <p>
+          A few words about the project: I’ve worked on it part-time over the past couple of months, and since I’ll have even less time going forward, I’ve decided to release it as it is. I’m very proud of how it turned out, though I wish I’d had more time to scale it to even more challenging environments.
+      </p>
+      <h3>Contact</h3>
+      <p>You can do so by sending an email to this address francesco215@live.it or by messaging on discord at sacco215</p>
+      <d-footnote-list></d-footnote-list>
+      <d-citation-list></d-citation-list>
+      <d-bibliography>
+        <script type="text/bibtex">
+          @article{sacco2026Curiosity,
+            author = {Sacco, Francesco},
+            title  = {The Bayes Bandit},
+            year   = {2026},
+            doi    = {10.5281/zenodo.20038430},
+            url    = {https://francesco215.github.io/Bayes-bandit/}
+          }
+
+          @article{silver2016AlphaGo,
+            author  = {Silver, David and Huang, Aja and Maddison, Chris J. and Guez, Arthur and Sifre, Laurent and van den Driessche, George and Schrittwieser, Julian and Antonoglou, Ioannis and Panneershelvam, Veda and Lanctot, Marc and Dieleman, Sander and Grewe, Dominik and Nham, John and Kalchbrenner, Nal and Sutskever, Ilya and Lillicrap, Timothy and Leach, Madeleine and Kavukcuoglu, Koray and Graepel, Thore and Hassabis, Demis},
+            title   = {Mastering the Game of Go with Deep Neural Networks and Tree Search},
+            journal = {Nature},
+            volume  = {529},
+            number  = {7587},
+            pages   = {484--489},
+            year    = {2016},
+            doi     = {10.1038/nature16961},
+            url     = {https://storage.googleapis.com/deepmind-media/alphago/AlphaGoNaturePaper.pdf}
+          }
+
+          @article{silver2017AlphaZero,
+            author        = {Silver, David and Hubert, Thomas and Schrittwieser, Julian and Antonoglou, Ioannis and Lai, Matthew and Guez, Arthur and Lanctot, Marc and Sifre, Laurent and Kumaran, Dharshan and Graepel, Thore and Lillicrap, Timothy and Simonyan, Karen and Hassabis, Demis},
+            title         = {Mastering Chess and Shogi by Self-Play with a General Reinforcement Learning Algorithm},
+            journal       = {arXiv preprint arXiv:1712.01815},
+            year          = {2017},
+            eprint        = {1712.01815},
+            archivePrefix = {arXiv},
+            primaryClass  = {cs.AI},
+            doi           = {10.48550/arXiv.1712.01815},
+            url           = {https://arxiv.org/pdf/1712.01815.pdf}
+          }
+
+          @article{schrittwieser2019MuZero,
+            author        = {Schrittwieser, Julian and Antonoglou, Ioannis and Hubert, Thomas and Simonyan, Karen and Sifre, Laurent and Schmitt, Simon and Guez, Arthur and Lockhart, Edward and Hassabis, Demis and Graepel, Thore and Lillicrap, Timothy and Silver, David},
+            title         = {Mastering Atari, Go, Chess and Shogi by Planning with a Learned Model},
+            journal       = {arXiv preprint arXiv:1911.08265},
+            year          = {2019},
+            eprint        = {1911.08265},
+            archivePrefix = {arXiv},
+            primaryClass  = {cs.LG},
+            doi           = {10.48550/arXiv.1911.08265},
+            url           = {https://arxiv.org/pdf/1911.08265.pdf}
+          }
+
+          @article{jones2021Scaling,
+            author        = {Jones, Andy L.},
+            title         = {Scaling Scaling Laws with Board Games},
+            journal       = {arXiv preprint arXiv:2104.03113},
+            year          = {2021},
+            eprint        = {2104.03113},
+            archivePrefix = {arXiv},
+            primaryClass  = {cs.LG},
+            doi           = {10.48550/arXiv.2104.03113},
+            url           = {https://arxiv.org/pdf/2104.03113.pdf}
+          }
+
+          @inproceedings{danihelka2022Gumbel,
+            author    = {Danihelka, Ivo and Guez, Arthur and Schrittwieser, Julian and Silver, David},
+            title     = {Policy Improvement by Planning with Gumbel},
+            booktitle = {International Conference on Learning Representations},
+            year      = {2022},
+            url       = {https://openreview.net/forum?id=bERaNdoegnO}
+          }
+
+          @inproceedings{koyamada2023PGX,
+            author    = {Koyamada, Sotetsu and Okano, Shinri and Nishimori, Soichiro and Murata, Yu and Habara, Keigo and Kita, Haruka and Ishii, Shin},
+            title     = {PGX: Hardware-Accelerated Parallel Game Simulators for Reinforcement Learning},
+            booktitle = {Advances in Neural Information Processing Systems},
+            volume    = {36},
+            pages     = {45716--45743},
+            year      = {2023},
+            url       = {https://github.com/sotetsuk/pgx}
+          }
+
+          @software{deepmindMctx,
+            author = {DeepMind and Babuschkin, Igor and Baumli, Kate and Bell, Alison and Bhupatiraju, Surya and Bruce, Jake and Buchlovsky, Peter and Budden, David and Cai, Trevor and Clark, Aidan and Danihelka, Ivo and Dedieu, Antoine and Fantacci, Claudio and Godwin, Jonathan and Jones, Chris and Hemsley, Ross and Hennigan, Tom and Hessel, Matteo and Hou, Shaobo and Kapturowski, Steven and Keck, Thomas and Kemaev, Iurii and King, Michael and Kunesch, Markus and Martens, Lena and Merzic, Hamza and Mikulik, Vladimir and Norman, Tamara and Papamakarios, George and Quan, John and Ring, Roman and Ruiz, Francisco and Sanchez, Alvaro and Sartran, Laurent and Schneider, Rosalia and Sezener, Eren and Spencer, Stephen and Srinivasan, Srivatsan and Stanojevi\'{c}, Milo\v{s} and Stokowiec, Wojciech and Wang, Luyu and Zhou, Guangyao and Viola, Fabio},
+            title  = {The {D}eep{M}ind {JAX} {E}cosystem},
+            year   = {2020},
+            url    = {https://github.com/google-deepmind/mctx}
+          }
+
+          @inproceedings{he2016ResNet,
+            author    = {He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+            title     = {Deep Residual Learning for Image Recognition},
+            booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition},
+            pages     = {770--778},
+            year      = {2016},
+            doi       = {10.1109/CVPR.2016.90},
+            url       = {https://openaccess.thecvf.com/content_cvpr_2016/papers/He_Deep_Residual_Learning_CVPR_2016_paper.pdf}
+          }
+
+          @misc{jordan2024Muon,
+            author = {Jordan, Keller and Jin, Yuchen and Boza, Vlado and You, Jiacheng and Cesista, Franz and Newhouse, Laker and Bernstein, Jeremy},
+            title  = {Muon: An Optimizer for Hidden Layers in Neural Networks},
+            year   = {2024},
+            url    = {https://kellerjordan.github.io/posts/muon/}
+          }
+        </script>
+      </d-bibliography>
+    </d-appendix>
   </body>
 </html>

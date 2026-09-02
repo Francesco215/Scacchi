@@ -59,6 +59,10 @@ checkpoint/
 baselines/
 third_party/
 
+# Local coding-agent configuration
+.agents/
+.codex/
+
 # Translations
 *.mo
 *.pot

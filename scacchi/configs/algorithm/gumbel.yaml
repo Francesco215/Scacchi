@@ -1,0 +1,54 @@
+# @package _global_
+#
+# Plain scalar Gumbel AlphaZero control for the numbered Hex recipes.
+# Apply after a board config, for example:
+#   uv run scacchi-train --config-name hex6 +algorithm=gumbel
+#
+# Board size, rollout length, architecture width/depth, optimizer, training
+# budget, evaluation checkpoint, and logging remain inherited from hexN.yaml.
+
+model:
+  # The Gumbel backend consumes scalar values and rejects Dirichlet Q outputs.
+  network: aznet
+  dirichlet_initial_concentration: null
+
+selfplay:
+  action_commitment:
+    # Commit the action selected by Gumbel sequential halving.
+    kind: search_action
+    posterior_update: null
+  search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0
+
+training:
+  losses:
+    # Scalar networks are trained by the policy CE and scalar value L2 path.
+    value_dir_kl_weight: 0.0
+    q_dir_kl_weight: 0.0
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
+    terminal_edge_targets: false
+    terminal_parent_targets: false
+  regularization:
+    dirichlet_concentration_clip: null
+
+eval:
+  player_action_commitment:
+    kind: search_action
+    posterior_update: null
+  baseline_action_commitment:
+    kind: search_action
+    posterior_update: null
+  player_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0
+  baseline_search:
+    kind: gumbel
+    gumbel:
+      num_simulations: 32
+      gumbel_scale: 1.0

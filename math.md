@@ -2,7 +2,7 @@
 
 This document describes the active `scacchi.dirichlet_mctx` algorithm. It is
 the JAX, fixed-capacity sister of MCTX used by `dirichlet_thompson` search. Its
-posterior repair follows `tictactoe-demo/app.js`: search stores replacement
+posterior repair follows `website/tictactoe-demo/app.js`: search stores replacement
 messages on edges, recomputes a posterior cache at every node on the selected
 path, and uses Thompson sampling both for traversal and for policy readout.
 
@@ -115,41 +115,45 @@ fixed, and certified distance is unchanged.
 
 ## 2. Dirichlet parameterization
 
-Each Dirichlet head predicts mean logits $r$ and a concentration logit $t$:
+Each Dirichlet head predicts mean logits $r$ and a raw log-concentration
+$\eta$:
 
 $$
 \mu=\operatorname{softmax}(r),
 \qquad
+c=\exp(\eta),
+\qquad
 \alpha=c\mu.
 $$
 
-The modern `boardlaw_dirichlet` head uses a configurable concentration floor
-$c_{\min}$ and optional ceiling $c_{\max}$:
+Equivalently, $s=-\eta=\log(1/c)$ is a log-dispersion variable:
 
 $$
-c=
-\begin{cases}
-c_{\min}+\operatorname{softplus}(t),
-& c_{\max}\text{ is absent},\\[4pt]
-c_{\min}+(c_{\max}-c_{\min})\operatorname{sigmoid}(t),
-& c_{\max}\text{ is present}.
-\end{cases}
+c=\exp(-s).
 $$
 
-The optional unfloored head parameterization is
+The head bias is initialized directly as
 
 $$
-c=\operatorname{softplus}(t)^2,
+\eta_{\mathrm{init}}=\log c_{\mathrm{init}}.
 $$
 
-optionally clipped above. In every case, search receives the resulting positive
-vector $\alpha$ and does not reinterpret its learned concentration.
+There is no learned floor, squared-softplus transform, bounded sigmoid, or
+training-time concentration ceiling in this parameterization. The
+implementation clips $\eta$ only at very broad floating-point safety limits
+before exponentiating and uses the identity derivative through that numerical
+guard, so leaving the safe exponent range cannot create a zero-gradient dead
+zone. Search receives the positive vector $\alpha$ and does not reinterpret it.
 
-When categorical density supervision is active, the concentration must have a
-finite ceiling or an explicit regularizer. Moving the target point into the
-simplex interior prevents $\log 0$, but by itself does not stop point-density
-likelihood from favoring unbounded concentration. Scacchi therefore requires a
-finite `dirichlet_concentration_clip` for an active categorical head loss.
+Historical checkpoints store concentration-head coordinates for the earlier
+softplus/floor/sigmoid transforms. They are loaded only through the explicit
+`legacy` parameterization; those coordinates must never be silently treated as
+log-concentrations.
+
+The historically named
+`training.regularization.dirichlet_concentration_clip` is no longer applied to
+the direct-log head. In `full` loss mode it supplies the finite categorical
+reference concentration $c_{\mathrm{cat}}$ defined in Section 11.2.
 
 ---
 
@@ -553,7 +557,7 @@ certificates, payload safety, or traversal pruning.
 ## 8. Default posterior repair
 
 The default `update_posterior` is the JAX translation of the message-passing
-logic in `tictactoe-demo/app.js`.
+logic in `website/tictactoe-demo/app.js`.
 
 ### 8.1 Write the final leaf message
 
@@ -688,14 +692,18 @@ $$
 Y_a^{\mathrm{root}}=Y_{s_0,a}.
 $$
 
-If the root remains unresolved, the public target is another fresh mixed-native
-population:
+If the root remains unresolved, the public target is computed by the selected
+posterior-update estimator from the root action posteriors:
 
 $$
 \pi_{\mathrm{search}}(a\mid s_0)
-=\widehat\pi_{M_{\mathrm{root}}}
+=\operatorname{PosteriorPolicy}
 (a\mid s_0;Y^{\mathrm{root}}).
 $$
+
+For Monte Carlo updates this is a fresh mixed-native population. For numerical
+updates it is the guarded prefix-CDF quadrature result, with the configured
+winner-sampling fallback.
 
 If the root is categorical, sample its certified action $a_{\mathrm{cat}}(s_0)$
 uniformly among equally good tagged edge certificates, then return
@@ -720,23 +728,103 @@ $$
 
 and the completed tree.
 
-$M_{\mathrm{node}}$ (`posterior_policy_samples`) and $M_{\mathrm{root}}$
-(`policy_samples`) estimate the same quantity but may use different Monte
-Carlo budgets. The internal budget affects the stochastic cache repair; the
-root budget affects the variance of the public policy and training target.
+The selected posterior-update configuration is used unchanged at internal
+nodes and at the root. In Monte Carlo mode, `policy_samples` and
+`policy_sample_chunk_size` therefore control both cache repair and the public
+root policy. In numerical mode, the same quadrature parameters and guarded
+Monte Carlo fallback budget are used in both places.
 
 ### 9.1 Committed self-play action
 
-Search output and game action are separate. Scacchi can commit by:
+Search output and game action are separate. For Dirichlet search, the player
+selects a posterior updater through
+`action_commitment.posterior_update`. That updater computes a fresh commitment
+policy \(q_{\mathrm{commit}}\) from the searched root action posteriors. A null
+selection reuses the updater selected by search. Scacchi then commits by:
 
-- `posterior_argmax`: $\arg\max_a\pi_{\mathrm{search}}(a)$;
-- `posterior_sample`: a categorical draw from $\pi_{\mathrm{search}}$;
+- `posterior_argmax`: $\arg\max_a q_{\mathrm{commit}}(a)$;
+- `posterior_sample`: a categorical draw from \(q_{\mathrm{commit}}\);
 - `search_action`: the backend action returned with the policy output.
 
-For this backend, `search_action` is also the masked argmax of the same public
-policy population. The separation is retained so all search backends share one
-self-play interface. At a categorical root the policy is one-hot, so all three
-commitment modes choose the same certified action.
+The search and commitment selectors use the same Monte Carlo and numerical
+parameter blocks but may choose different variants. The commitment policy is
+ephemeral and is not written to replay. At a categorical root it is the
+backend's certified one-hot action, so all three commitment modes preserve the
+exact solved action.
+
+### 9.2 Guarded binary prefix-CDF readout
+
+For a two-outcome head, let \(X_a\) be the win probability represented by the
+independent action posterior
+
+$$
+X_a\sim\operatorname{Beta}(\alpha_{a,\mathrm{win}},
+                           \alpha_{a,\mathrm{loss}}).
+$$
+
+Let \(\mathcal U\) be the unresolved legal actions. The exact posterior-best
+probability of \(a\in\mathcal U\) is
+
+$$
+q(a)=\Pr(X_a=\max_b X_b)
+    =\int_0^1 f_a(x)
+       \prod_{b\in\mathcal U\setminus\{a\}}F_b(x)\,dx.
+$$
+
+Categorical actions are compared through their exact outcome/distance
+semantics rather than inserted into this Beta product.
+
+The `prefix_cdf` estimator evaluates all \(F_a\) on one adaptive transformed
+grid
+
+$$
+x=\sigma(\sinh t),\qquad Q=2h+1.
+$$
+
+`posterior_update.numerical.half_width=10` therefore means Q21. Prefix products
+make the calculation \(O(AQ)\), and interval increments of the joint maximum
+CDF are allocated among their nonnegative action contributions. Those
+increments telescope, so the raw action mass is conserved up to floating-point
+error.
+
+The estimator is guarded by finite-value, adaptive-tail, and density-integral
+checks. These guards catch specified numerical failures, but do not certify a
+universal Q21 approximation-error bound outside the Hex6 envelope on which
+Q21 was selected. An unsafe batch lane uses the unchanged
+winner-Monte-Carlo repair with the identical RNG key while safe lanes remain
+on Q21. Root readout uses the same per-lane fallback.
+`posterior_update.kind` is the search estimator selection: it controls cache
+repair and the policy stored for replay.
+`action_commitment.posterior_update` independently selects the estimator used
+only to play.
+
+Changing the replay policy does not change the native search-derived Q-loss
+weight. At a solved root, the Q21 replay target is uniform over all
+distance-optimal certified actions, while commitment uses the backend's native
+sampled certified action. Thus exact tie semantics are preserved without
+storing a second policy tensor in replay.
+
+### 9.3 Power-temperature commitment
+
+For `posterior_sample`, the optional commitment temperature acts only on the
+selected ephemeral root policy \(q\):
+
+$$
+q_T(a)=
+\frac{\mathbf 1_{\{a\ \mathrm{legal},\ q(a)>0\}}
+      \operatorname{clip}(q(a),10^{-8},1)^{1/T}}
+     {\sum_{b\ \mathrm{legal},\ q(b)>0}
+      \operatorname{clip}(q(b),10^{-8},1)^{1/T}},
+\qquad T>0.
+$$
+
+One action is sampled from \(q_T\). In particular, \(T=1/3\) is the cubic
+law \(q_T(a)\propto q(a)^3\), a permutation-equivariant sharpening that
+requires no second vote population. The transform preserves exact zero
+support whenever at least one legal action has positive mass; an all-zero legal
+policy falls back to uniform legal sampling. An unsafe numerical commitment
+policy first uses its configured Monte Carlo fallback and is then committed
+normally. Solved roots remain the backend's certified one-hot action.
 
 ---
 
@@ -817,29 +905,51 @@ $$
 and no addition of $R$ to Dirichlet concentration. Doing either would train
 the network on a posterior different from the one search actually used.
 
-The Q-loss reduction weight is configurable:
+The default Q-supervision action set is explicit:
 
 $$
-w_a^{\mathrm{reduce}}=
-\begin{cases}
-R_{s_0,a}, & z_{s_0,a}=\bot\text{ and evidence-mass mode},\\
-\pi_{\mathrm{search}}(a\mid s_0),
-& z_{s_0,a}=\bot\text{ and policy mode},\\
-1,&z_{s_0,a}\ne\bot.
-\end{cases}
+M_{s,a}
+=
+\mathbf 1\!\left[
+\operatorname{legal}(s,a)
+\land
+\left(
+\operatorname{evidence}_{s,a}>0
+\lor
+\operatorname{solved}_{s,a}
+\right)
+\right].
 $$
 
-Here the name `evidence_mass` is historical: in this backend it receives the
-structural edge count $R$ only while that edge is unresolved, not added
-Dirichlet pseudo-count mass. Every legal categorical Q edge is given unit
-effective weight even if a
-one-hot solved policy assigns it zero probability, so exact alternative moves
-are not silently discarded.
+Here `evidence` is the structural root edge count $R$, not additional
+Dirichlet pseudo-count mass. Every legal categorical Q edge is selected even
+if it has zero evidence or a one-hot posterior policy gives it zero mass, so
+exact alternative moves are not silently discarded. The alternative
+`positive_posterior_policy_or_solved` action set replaces the positive-evidence
+condition with $\pi_{\mathrm{search}}(a\mid s)>0$ while retaining explicit
+solved-action inclusion.
 
-This reduction weight is distinct from replay's `q_target_weight`. The latter
-is a native-target validity/scale field and is one for every legal emitted Q
-row (zero for padding). The former is stored as `q_loss_weight` and determines
-how legal Q rows are combined by the configured Q-loss reduction.
+The default reduction is
+
+$$
+\mathcal L_Q
+=
+\frac{\sum_{s,a}M_{s,a}\ell_{s,a}}
+{\sum_{s,a}M_{s,a}}.
+$$
+
+Search evidence determines whether an action receives Q supervision. Its
+magnitude does not scale the loss. This is a mean over selected state-action
+pairs, not a mean over states; a state with more selected actions therefore
+contributes more pairs. The deprecated
+`legacy_normalized_source_weighted_mean` reduction exists only to reproduce
+historical configurations and checkpoints that normalized raw evidence or
+policy source weights.
+
+Q supervision is distinct from replay's `q_target_weight`. The latter is a
+native-target validity/scale field and is one for every legal emitted Q row
+(zero for padding). Replay stores Q selection and the numerical multiplier
+separately; the default multiplier is one for every selected pair.
 
 ### 11.1 Policy loss
 
@@ -854,52 +964,114 @@ $$
 
 ### 11.2 Typed Dirichlet-head loss
 
-In `full` mode, a search target $\beta$ trains both mean and concentration:
+The `full` objective uses concentration as a learned inverse-dispersion,
+analogous to heteroscedastic regression with a predicted log-variance. For a
+native Dirichlet target $\beta$, define
 
 $$
-\mathcal L_{\mathrm{full}}(\beta,\alpha_\theta)=
-D_{\mathrm{KL}}
-\left(
-\operatorname{Dirichlet}(\operatorname{stopgrad}\beta)
-\,\|\,
-\operatorname{Dirichlet}(\alpha_\theta)
-\right).
-$$
-
-In `mean` mode, only the categorical means are matched:
-
-$$
-\mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta)=
-D_{\mathrm{KL}}
-\left(
-\operatorname{stopgrad}\mu(\beta)
-\,\|\,
-\mu(\alpha_\theta)
-\right).
-$$
-
-For a categorical outcome $z$ in a $K$-outcome space, define the
-epsilon-interior point
-
-$$
-\phi_z^\epsilon=(1-K\epsilon)e_z+\epsilon\mathbf 1,
+\beta_0=\sum_i\beta_i,
 \qquad
-0<\epsilon<\frac1K.
+m=\frac{\beta}{\beta_0},
+\qquad
+v=\frac1{\beta_0},
 $$
 
-Its target coordinate is $1-(K-1)\epsilon$ and every other coordinate is
-$\epsilon$. This is `training.losses.categorical_epsilon`; search-time exact
-tags need no smoothing or message floor. The native categorical loss is the
-negative log density of the predicted Dirichlet at this stop-gradient point:
+where $v$ is the target inverse-concentration, not the literal coordinate
+variance of a Dirichlet. Let
 
 $$
-\begin{aligned}
-\mathcal L_{\mathrm{cat}}(\alpha_\theta,z)
-&=-\log p_{\operatorname{Dirichlet}(\alpha_\theta)}(\phi_z^\epsilon)\\
-&=-\log\Gamma(\alpha_0)
-+\sum_i\log\Gamma(\alpha_i)
--\sum_i(\alpha_i-1)\log\phi_{z,i}^\epsilon.
-\end{aligned}
+d(m,\mu_\theta)
+=D_{\mathrm{KL}}
+\left(
+\operatorname{stopgrad}(m)
+\,\|\,
+\mu_\theta
+\right).
+$$
+
+With $c_\theta=\exp(\eta_\theta)$, the coupled loss is
+
+$$
+\boxed{
+\mathcal L_{\mathrm{disp}}(\beta;\mu_\theta,c_\theta)
+=-\log(c_\theta v)
++c_\theta\left(v+d(m,\mu_\theta)\right)-1
+}.
+$$
+
+Writing $s_\theta=-\eta_\theta$ exposes the log-variance form directly:
+
+$$
+\mathcal L_{\mathrm{disp}}
+=s_\theta-\log v
++e^{-s_\theta}\left(v+d(m,\mu_\theta)\right)-1.
+$$
+
+For stable evaluation near $c_\theta=\beta_0$, the implementation uses
+
+$$
+x=\log c_\theta-\log\beta_0,
+\qquad
+\mathcal L_{\mathrm{disp}}
+=\operatorname{expm1}(x)-x+c_\theta d(m,\mu_\theta).
+$$
+
+The radial gradient and conditional optimum are
+
+$$
+\frac{\partial\mathcal L_{\mathrm{disp}}}{\partial\eta_\theta}
+=c_\theta\left(v+d(m,\mu_\theta)\right)-1,
+\qquad
+c_\theta^*=\frac1{v+d(m,\mu_\theta)}.
+$$
+
+At the joint optimum,
+
+$$
+\mu_\theta=m,
+\qquad
+c_\theta=\beta_0,
+\qquad
+\alpha_\theta=\beta.
+$$
+
+Mean error deliberately lowers the optimal concentration, just as residual
+error raises a learned Gaussian variance. Once the mean matches a target with
+$\beta_0=3$, the log-concentration gradients at $c_\theta=2,3,4$ are
+$-1/3,0,+1/3$ respectively. Thus a head initialized at two receives a direct
+signal toward three rather than a signal attenuated by an outer softplus or
+sigmoid.
+
+For an exact categorical outcome $z$, use the exact mean target $e_z$ and a
+finite loss-only reference concentration $c_{\mathrm{cat}}>0$:
+
+$$
+\boxed{
+\mathcal L_{\mathrm{cat,full}}(\alpha_\theta,z)
+=-\log\frac{c_\theta}{c_{\mathrm{cat}}}
++c_\theta
+\left(
+\frac1{c_{\mathrm{cat}}}-\log\mu_{\theta,z}
+\right)-1
+}.
+$$
+
+As $\mu_{\theta,z}\to1$, the optimum approaches
+$c_\theta=c_{\mathrm{cat}}$. This makes the deterministic target well posed
+without moving it to an arbitrary interior point and without evaluating a
+continuous Dirichlet density. The reference affects training only; search
+still treats the native categorical sidecar as exact.
+
+In `mean` mode concentration is ignored:
+
+$$
+\mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta)
+=D_{\mathrm{KL}}\left(
+\operatorname{stopgrad}\mu(\beta)\,\|\,\mu(\alpha_\theta)
+\right),
+\qquad
+\mathcal L_{\mathrm{cat,mean}}(\alpha_\theta,z)
+=-\log\mu_{\theta,z}.
 $$
 
 The complete typed loss is
@@ -907,23 +1079,22 @@ The complete typed loss is
 $$
 \mathcal L_{\mathrm{native}}(T,\alpha_\theta)=
 \begin{cases}
-\mathcal L_{\mathrm{full}}(\beta,\alpha_\theta),
+\mathcal L_{\mathrm{disp}}(\beta;\mu_\theta,c_\theta),
 &T=\operatorname{Dir}(\beta),\ \texttt{full},\\
 \mathcal L_{\mathrm{mean}}(\beta,\alpha_\theta),
 &T=\operatorname{Dir}(\beta),\ \texttt{mean},\\
-\mathcal L_{\mathrm{cat}}(\alpha_\theta,z),
-&T=\operatorname{Cat}(z,\tau)\text{ in either mode},\\
+\mathcal L_{\mathrm{cat,full}}(\alpha_\theta,z),
+&T=\operatorname{Cat}(z,\tau),\ \texttt{full},\\
+\mathcal L_{\mathrm{cat,mean}}(\alpha_\theta,z),
+&T=\operatorname{Cat}(z,\tau),\ \texttt{mean},\\
 0,&T=\operatorname{Pad}.
 \end{cases}
 $$
 
 No target Dirichlet is constructed for a categorical row. Distance controls
-proof propagation and action choice but not this neural NLL. As a continuous
-density NLL, the loss may legitimately be negative. Epsilon prevents boundary
-logs; the finite concentration ceiling from Section 2 makes the optimization
-well posed. For numerical defense, the implementation evaluates the formula at
-$\max(\alpha_{\theta,i},10^{-6})$ componentwise; this is inert for the positive,
-floored head outputs used in normal training.
+proof propagation and action choice but not this neural loss. Both full losses
+are nonnegative. There are no gamma/digamma terms, epsilon-interior targets, or
+large-loss cutoffs.
 
 The value loss applies this to $(T^V,\alpha_\theta^V)$. The Q loss applies it to
 $(T^Q(a),\alpha_\theta^Q(a))$ using `q_target_weight` to validate/scale each
@@ -948,7 +1119,8 @@ $$
 Optional terminal-edge and terminal-parent handling may additionally mark an
 exact replay target categorical. The auxiliary mean-outcome term is masked
 where the corresponding native target is already categorical, so that head's
-supervision is simply the density NLL rather than duplicated categorical loss.
+supervision is the typed categorical loss rather than duplicated mean
+supervision.
 
 The configured Dirichlet training objective is
 
@@ -1008,7 +1180,7 @@ DIRICHLET-THOMPSON-POLICY(root, N, posterior_update):
         root_policy <- one_hot(root_action)
     else:
         root_native <- categorical edges plus effective Dirichlet edges
-        root_policy <- repeated native utility samples from root_native
+        root_policy <- configured posterior policy from root_native
     return argmax(root_policy), root_policy, tree
 ```
 
@@ -1072,8 +1244,8 @@ A correct implementation maintains all of the following:
     certificates or become categorical targets.
 15. Categorical ties use the search RNG to sample uniformly among equally good
     certified actions; they never trigger a policy reevaluation.
-16. Categorical V/Q targets use density NLL in both Dirichlet loss modes;
-    unresolved targets retain the configured full/mean behavior.
+16. In `full` mode, unresolved and categorical V/Q targets use the coupled
+    log-dispersion score. In `mean` mode, both use mean-only KL/cross-entropy.
 17. Terminal means categorical tag plus node payload zero; zero support alone
     is not terminal.
 18. `num_simulations` and $N+1$ are static iteration/capacity bounds;
@@ -1081,35 +1253,41 @@ A correct implementation maintains all of the following:
 
 ---
 
-## Appendix A. Dirichlet KL
+## Appendix A. Properties of the log-dispersion score
 
-For $\operatorname{Dirichlet}(\beta)$ and
-$\operatorname{Dirichlet}(\alpha)$, with
+Write the full loss in terms of a target inverse-concentration $v>0$, a
+nonnegative mean discrepancy $d\ge0$, and predicted concentration $c>0$:
 
 $$
-\beta_0=\sum_i\beta_i,
+\mathcal L=-\log(cv)+c(v+d)-1.
+$$
+
+Let $a=cv$ and $t=d/v$. Then
+
+$$
+\mathcal L=(a-1-\log a)+at\ge0.
+$$
+
+For $\eta=\log c$,
+
+$$
+\frac{\partial\mathcal L}{\partial\eta}
+=c(v+d)-1,
 \qquad
-\alpha_0=\sum_i\alpha_i,
+\frac{\partial^2\mathcal L}{\partial\eta^2}
+=c(v+d)>0.
 $$
 
-the full target-to-prediction KL is
+Therefore the unique optimum for fixed mean is
 
 $$
-\begin{aligned}
-D_{\mathrm{KL}}
-\left(
-\operatorname{Dirichlet}(\beta)
-\,\|\,
-\operatorname{Dirichlet}(\alpha)
-\right)
-={}&
-\log\Gamma(\beta_0)-\log\Gamma(\alpha_0)\\
-&+\sum_i\left[\log\Gamma(\alpha_i)-\log\Gamma(\beta_i)\right]\\
-&+\sum_i(\beta_i-\alpha_i)
-\left[\psi(\beta_i)-\psi(\beta_0)\right].
-\end{aligned}
+c^*=\frac1{v+d},
+\qquad
+\mathcal L^*=\log\left(1+\frac d v\right).
 $$
 
-This appendix applies only to native Dirichlet targets, for which $\beta$ is
-stop-gradient. Native categorical targets have no $\beta$ and instead use the
-density NLL in Section 11.2.
+For a Dirichlet target, $v=1/\beta_0$ and
+$d=D_{\mathrm{KL}}(\mu(\beta)\|\mu_\theta)$. The unique joint optimum is
+$\mu_\theta=\mu(\beta)$ and $c_\theta=\beta_0$. For a categorical target,
+$v=1/c_{\mathrm{cat}}$ and $d=-\log\mu_{\theta,z}$; its infimum is approached
+as $\mu_{\theta,z}\to1$ and $c_\theta\to c_{\mathrm{cat}}$.

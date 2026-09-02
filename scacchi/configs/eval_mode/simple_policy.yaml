@@ -3,8 +3,12 @@
 # both players act directly from masked policy logits and skip tree search.
 
 eval:
-  player_action_commitment_type: posterior_sample
-  baseline_action_commitment_type: posterior_sample
+  player_action_commitment:
+    kind: posterior_sample
+    posterior_update: null
+  baseline_action_commitment:
+    kind: posterior_sample
+    posterior_update: null
   player_search:
     kind: policy
     policy:

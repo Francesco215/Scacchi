@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tic-Tac-Toe Search Demo</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="play-area" aria-labelledby="app-title">
+        <header class="topbar">
+          <div>
+            <h1 id="app-title">Tic-Tac-Toe</h1>
+          </div>
+          <div class="actions">
+            <button id="play-best" type="button">Play optimal move</button>
+            <button id="reset" type="button" class="secondary">Reset</button>
+          </div>
+        </header>
+
+        <div class="compute-control">
+          <label for="compute-slider">Sample rate</label>
+          <input
+            id="compute-slider"
+            type="range"
+            min="0"
+            max="300"
+            step="25"
+            value="100"
+          />
+          <output id="compute-value" for="compute-slider">100/s</output>
+        </div>
+
+        <div id="board" class="board" aria-label="Tic-Tac-Toe board"></div>
+      </section>
+
+      <aside class="posterior" aria-labelledby="posterior-title">
+        <div class="posterior-heading">
+          <h2 id="posterior-title">Estimated outcome</h2>
+          <p>Search distribution for this position</p>
+        </div>
+
+        <div class="bars" aria-label="Estimated outcome probabilities">
+          <div class="bar-row">
+            <span>X wins</span>
+            <div class="bar-track"><div id="x-win-bar" class="bar x-win"></div></div>
+            <strong id="x-win-pct"></strong>
+          </div>
+          <div class="bar-row">
+            <span>Draw</span>
+            <div class="bar-track"><div id="draw-bar" class="bar draw"></div></div>
+            <strong id="draw-pct"></strong>
+          </div>
+          <div class="bar-row">
+            <span>O wins</span>
+            <div class="bar-track"><div id="o-win-bar" class="bar o-win"></div></div>
+            <strong id="o-win-pct"></strong>
+          </div>
+        </div>
+
+        <canvas id="simplex" width="520" height="420" aria-label="Dirichlet samples simplex"></canvas>
+      </aside>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

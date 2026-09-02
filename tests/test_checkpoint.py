@@ -1,10 +1,14 @@
 from pathlib import Path
 from typing import Any
 
+from flax import nnx
 import jax
 import numpy as np
+import optax
+import pytest
 
 from scacchi import checkpoint
+from scacchi.network import BoardlawDirichletNet
 from scacchi.types import CheckpointingConfig, Config, RunConfig
 
 
@@ -50,6 +54,7 @@ def test_legacy_flat_checkpoint_config_loads_for_solved_baselines() -> None:
 def test_nested_checkpoint_migrates_legacy_search_blocks_to_total_simulations() -> None:
     config = checkpoint._load_checkpoint_config(
         {
+            "env": {"num_outcomes": 2},
             "model": {"network": "boardlaw_dirichlet"},
             "selfplay": {
                 "search": {
@@ -57,6 +62,12 @@ def test_nested_checkpoint_migrates_legacy_search_blocks_to_total_simulations() 
                     "dirichlet_thompson": {
                         "num_simulations": 4,
                         "num_blocks": 16,
+                        "kappa": 7.0,
+                        "policy_samples": 8,
+                        "posterior_policy_samples": 2,
+                        "policy_sample_chunk_size": 2,
+                        "posterior_policy_estimator": "prefix_cdf",
+                        "prefix_cdf_half_width": 11,
                     },
                 }
             },
@@ -64,8 +75,78 @@ def test_nested_checkpoint_migrates_legacy_search_blocks_to_total_simulations() 
     )
 
     search = config.selfplay.search.dirichlet_thompson
+    assert config.model.dirichlet_head_parameterization == "legacy"
     assert search.num_simulations == 64
     assert search.max_depth == 64
+    assert search.posterior_update.kind == "numerical"
+    assert search.posterior_update.numerical.kappa == 7.0
+    assert search.posterior_update.numerical.fallback_policy_samples == 2
+    assert (
+        search.posterior_update.numerical.fallback_policy_sample_chunk_size
+        == 2
+    )
+    assert search.posterior_update.numerical.half_width == 11
+
+
+def test_nested_checkpoint_preserves_explicit_log_concentration_marker() -> None:
+    config = checkpoint._load_checkpoint_config(
+        {
+            "env": {"num_outcomes": 2},
+            "model": {
+                "network": "boardlaw_dirichlet",
+                "dirichlet_head_parameterization": "log_concentration",
+                "dirichlet_initial_concentration": 3.0,
+            },
+        }
+    )
+
+    assert config.model.dirichlet_head_parameterization == "log_concentration"
+
+
+def test_restore_rejects_legacy_state_for_direct_log_head() -> None:
+    model = BoardlawDirichletNet(
+        num_actions=2,
+        observation_shape=(1, 1, 1),
+        width=4,
+        depth=1,
+        rngs=nnx.Rngs(0),
+    )
+    optimizer = nnx.Optimizer(
+        model,
+        optax.sgd(0.1),
+        wrt=nnx.Param,
+    )
+    rng_key = jax.random.PRNGKey(0)
+
+    class FakeManager:
+        def latest_step(self):
+            return 0
+
+        def restore(self, step, args):
+            del step, args
+            return {
+                "model": nnx.state(model),
+                "optimizer": nnx.state(optimizer),
+                "rngs": {
+                    "key": checkpoint._rng_key_to_checkpoint_value(rng_key)
+                },
+                "meta": {
+                    "config": {
+                        "env": {"id": "hex", "num_outcomes": 2},
+                        "model": {"network": "boardlaw_dirichlet"},
+                    },
+                    "hours": 0.0,
+                    "frames": 0,
+                },
+            }
+
+    with pytest.raises(ValueError, match="not interchangeable"):
+        checkpoint.restore(
+            FakeManager(),
+            model,
+            optimizer,
+            rng_key,
+        )
 
 
 def test_rng_key_checkpoint_value_is_host_numpy_array() -> None:
@@ -138,7 +219,7 @@ def test_build_checkpoint_manager_uses_multihost_orbax_options(
     options = captured["options"]
     assert options.max_to_keep == 3
     assert options.save_interval_steps == 7
-    assert options.save_on_steps == frozenset({10})
+    assert options.save_on_steps == frozenset()
     # Pod workers have private disks: process 0 saves alone, no collectives.
     assert options.single_host_load_and_broadcast is False
     assert options.enable_async_checkpointing is True
@@ -167,26 +248,33 @@ def test_build_checkpoint_manager_multihost_nonprimary_is_noop(
     assert isinstance(manager, checkpoint.NoOpCheckpointManager)
 
 
-def test_disabled_checkpoint_manager_does_not_construct_orbax(
+def test_zero_retention_builds_final_only_checkpoint_manager(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeCheckpointManager:
+        def __init__(
+            self,
+            directory: Path,
+            *,
+            options: Any,
+            item_names: tuple[str, ...],
+        ) -> None:
+            captured["directory"] = directory
+            captured["options"] = options
+            captured["item_names"] = item_names
+
     config = Config(
         run=RunConfig(max_num_iters=11),
         checkpointing=CheckpointingConfig(max_to_keep=0, save_interval_steps=7),
     )
-
-    def fail_if_constructed(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("Orbax CheckpointManager should not be constructed")
-
-    monkeypatch.setattr(checkpoint.ocp, "CheckpointManager", fail_if_constructed)
+    monkeypatch.setattr(checkpoint.ocp, "CheckpointManager", FakeCheckpointManager)
 
     manager = checkpoint.build_checkpoint_manager(config, tmp_path)
 
-    assert isinstance(manager, checkpoint.NoOpCheckpointManager)
-    assert manager.directory == tmp_path
-    assert manager.latest_step() is None
-    assert manager.should_save(10) is False
-    assert manager.save(10) is False
-    with manager as entered:
-        assert entered is manager
+    assert isinstance(manager, FakeCheckpointManager)
+    assert captured["directory"] == tmp_path
+    assert captured["item_names"] == ("model", "optimizer", "rngs", "meta")
+    assert captured["options"].max_to_keep == 1

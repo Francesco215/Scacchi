@@ -1,84 +1,23 @@
-# Corrected 5x5 Boardlaw-Dirichlet Thompson recipe.  Search uses one
-# persistent 16-expansion tree; evaluation keeps the reference run's larger
-# 32-expansion candidate budget against the same four-simulation opponent.
+# From-scratch Hex5 numerical-Q21 trial.
+
+defaults:
+  - hex
+  - _self_
 
 run:
-  seed: 9101
-  max_num_iters: 100
+  max_num_iters: 40
 
 env:
-  id: hex
   board_size: 5
-  num_outcomes: 3
 
-model:
-  network: boardlaw_dirichlet
-  num_channels: 128
-  num_layers: 8
-  compute_dtype: bfloat16
-  resnet_v2: true
 
 selfplay:
-  batch_size: 8192
   max_num_steps: 25
-  action_commitment_type: posterior_argmax
-  search:
-    kind: dirichlet_thompson
-
-    dirichlet_thompson:
-      num_simulations: 16
-      kappa: 4.0
-      # Final root policy population. Internal repair draws its own fresh
-      # population from each node's just-updated edge posteriors.
-      policy_samples: 32
-
-
-training:
-  batch_size: 2048
-  learning_rate: 2e-3
-  grad_clip_norm: 1.0
-
-  losses:
-    policy_weight: 1.0
-    value_dir_kl_weight: 1.0
-    # Keep the known-stable Q balance while testing the corrected search.
-    # Changing the updater and the target weighting in the same run made the
-    # earlier short experiment impossible to interpret.
-    q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 0.25
-    terminal_edge_targets: false
-    terminal_parent_targets: false
-    policy_target_mode: search
-    categorical_epsilon: 0.01
-
-  regularization:
-    dirichlet_concentration_clip: 8.0
 
 eval:
-  interval: 5
-  batch_size: 256
-  baseline: checkpoint
-  player_search:
-    kind: dirichlet_thompson
-    dirichlet_thompson:
-      num_simulations: 32
-      kappa: 4.0
-      policy_samples: 32
-  baseline_search:
-    kind: gumbel
-    gumbel:
-      num_simulations: 4
-
-logging:
-  interval: 1
-  wandb:
-    enabled: true
-    project: scacchi-az
+  checkpoint_path: checkpoints/5_solved
 
 checkpointing:
-  max_to_keep: 1
-  # Keep recovery distance small on workstations with a GPU watchdog.
-  save_interval_steps: 10
-  # Never resume the stale checkpoint produced by an earlier implementation.
-  directory: checkpoints/asd
+  max_to_keep: 0
+  save_interval_steps: 1
+  directory: checkpoints/hex5_aznet_dirichlet_c128_l6_seed0
