@@ -10,12 +10,8 @@ run:
 env:
   board_size: 5
 
-model:
-  num_channels: 128
-  num_layers: 8
 
 selfplay:
-  batch_size: 4096
   max_num_steps: 25
 
 eval:

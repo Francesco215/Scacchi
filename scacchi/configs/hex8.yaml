@@ -5,17 +5,13 @@ defaults:
   - _self_
 
 run:
-  max_num_iters: 300
+  max_num_iters: 200
 
 env:
   board_size: 8
 
-model:
-  num_channels: 128
-  num_layers: 6
 
 selfplay:
-  batch_size: 4096
   max_num_steps: 64
 
 eval:

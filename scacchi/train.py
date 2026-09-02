@@ -49,6 +49,36 @@ def _block_until_ready(value: Any) -> Any:
     return jax.tree.map(lambda leaf: leaf.block_until_ready() if hasattr(leaf, "block_until_ready") else leaf, value)
 
 
+def _path_parts(path: tuple[Any, ...]) -> tuple[Any, ...]:
+    return tuple(
+        getattr(
+            key,
+            "key",
+            getattr(key, "idx", getattr(key, "name", None)),
+        )
+        for key in path
+    )
+
+
+def _muon_weight_dimension_numbers(params: Any) -> Any:
+    """Use Muon for hidden block kernels and auxiliary Adam elsewhere."""
+
+    def dimension_numbers(path: tuple[Any, ...], value: Any):
+        parts = _path_parts(path)
+        is_kernel = parts[-1:] == ("kernel",) or parts[-2:] == (
+            "kernel",
+            "value",
+        )
+        if parts[:1] != ("blocks",) or not is_kernel or value.ndim < 2:
+            return None
+        return optax.contrib.MuonDimensionNumbers(
+            reduction_axis=tuple(range(value.ndim - 1)),
+            output_axis=value.ndim - 1,
+        )
+
+    return jax.tree_util.tree_map_with_path(dimension_numbers, params)
+
+
 def _build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
     transforms: list[optax.GradientTransformation] = []
     if config.training.grad_clip_norm is not None:
@@ -63,7 +93,14 @@ def _build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
         boundary = config.training.lr_decay_after_iters * updates_per_iteration
         learning_rate = optax.piecewise_constant_schedule(config.training.learning_rate, {boundary: config.training.lr_decay_factor})
 
-    transforms.append(optax.adam(learning_rate))
+    transforms.append(
+        optax.contrib.muon(
+            5e-3,
+            adam_learning_rate=learning_rate,
+            muon_weight_dimension_numbers=_muon_weight_dimension_numbers,
+            consistent_rms=0.2,
+        )
+    )
     return nnx.Optimizer(model, optax.chain(*transforms), wrt=nnx.Param)
 
 
@@ -123,7 +160,25 @@ def _run_loop(config: Config, model: nnx.Module, optimizer: nnx.Optimizer, train
             hours += seconds / 3600
             metrics.update(training_metrics(train_result, seconds=seconds, hours=hours, frames=frames, frames_this_iteration=frames_this_iteration))
             logger.log(iteration, metrics, prefix="")
-            maybe_save(checkpoint_manager, iteration, model, optimizer, rng_key, config, hours, frames)
+            maybe_save(
+                checkpoint_manager,
+                iteration,
+                model,
+                optimizer,
+                rng_key,
+                config,
+                hours,
+                frames,
+                force=iteration == config.run.max_num_iters - 1,
+            )
+
+        checkpoint_manager.wait_until_finished()
+        if jax.process_index() == 0 and start_iteration < config.run.max_num_iters:
+            print(
+                f"Saved final checkpoint at step {config.run.max_num_iters - 1} "
+                f"to {checkpoint_directory}",
+                flush=True,
+            )
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
