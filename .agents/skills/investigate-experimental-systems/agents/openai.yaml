@@ -1,4 +1,0 @@
-interface:
-  display_name: "Investigate Experimental Systems"
-  short_description: "Trace evidence and test falsifiable hypotheses"
-  default_prompt: "Use $investigate-experimental-systems to reconstruct this system’s information flow and design a decisive hypothesis test."
