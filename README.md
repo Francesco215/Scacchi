@@ -1,130 +1,182 @@
-# Scacchi
+# Scacchi — Curiosity-Driven Tree Search
 
-Scacchi is a JAX/PGX research codebase for AlphaZero-style self-play. The
-current experimental path is Dirichlet-Q AlphaZero: instead of treating search
-values as only scalar estimates, the search stores and trains against
-Dirichlet posteriors over win/draw/loss outcomes.
+Scacchi is the research implementation behind **Curiosity-Driven Tree
+Search**, the second post in the *Mathematical Foundations of Curiosity*
+series. It explores an AlphaZero-style self-play agent whose search operates on
+explicit probability distributions over game outcomes, rather than only on
+scalar value estimates and visit counts.
 
-## Math Reference
+The article source is [`index.html`](index.html), for the more in-depth treatment, see [`math.md`](math.md).
 
-[`math.md`](math.md) is the high-level math reference. In brief, the model
-predicts:
+> [!WARNING]
+> This repository is a research artifact and reference implementation for the
+> work described in the blog post. It is released as-is and is **not intended
+> to be production-ready software**. The code, configuration, hardware
+> assumptions, and internal APIs may contain rough edges and may change without
+> compatibility guarantees.
 
-- a policy head for move probabilities,
-- a state-value Dirichlet head for uncertainty over the current state's WDL
-  value,
-- an action Dirichlet-Q head for uncertainty over each legal move's WDL value.
+## The idea
 
-Search refines uncertain WDL beliefs by passing Dirichlet messages through the
-tree and propagates exact terminal results as native categorical
-outcome/distance certificates. Categorical branches are absorbing and pruned;
-the search-improved policy compares their exact utility with Thompson samples
-from unresolved branches. Value/Q heads predict log-concentration directly and
-use a coupled mean/dispersion score for unresolved and categorical targets.
+The network predicts three objects for each position:
 
-Q supervision selects legal actions with positive search evidence, together
-with legal solved actions:
+- policy logits over moves;
+- a state-value Dirichlet distribution over win/draw/loss outcomes;
+- one action-value Dirichlet distribution for each legal move.
+
+For binary games such as Hex, the outcome distribution is a Beta distribution,
+which is the two-outcome special case of the Dirichlet distribution. Keeping a
+full distribution allows the search to represent both its current estimate and
+its uncertainty.
+
+One search simulation has three stages:
+
+1. **Sample downward.** Thompson sampling draws one possible value for every
+   legal action and follows the best draw. An uncertain move is explored when
+   it still has a meaningful probability of being the best move.
+2. **Expand.** PGX advances the selected action and the network evaluates at
+   most one new position.
+3. **Repair upward.** Search recomputes the posterior-best policy and propagates
+   the resulting Dirichlet messages back to the root.
+
+At an unresolved node, the repaired belief has the form
+
+\[
+C=(1-\gamma)V+\gamma\sum_a \pi(a)Q_a,
+\qquad
+\gamma=\frac{n_{\mathrm{down}}}{\kappa+n_{\mathrm{down}}},
+\]
+
+where \(V\) is the network's value prior, \(Q_a\) is the current belief for
+action \(a\), \(\pi(a)\) is the posterior probability that the action is best,
+and \(n_{\mathrm{down}}\) is the amount of structural search support below the
+node. `kappa` is the single prior-strength constant used by the repair rule.
+
+Terminal results do not get converted into artificially concentrated
+Dirichlet distributions. The tree stores exact categorical outcome and
+distance certificates alongside unresolved Dirichlet beliefs. These
+certificates are propagated with minimax semantics, prune solved branches, and
+take precedence over sampled values during action selection.
+
+## Detailed mathematical reference
+
+[`math.md`](math.md) is the detailed, implementation-aligned mathematical
+reference for the project. It develops the Dirichlet value and Q
+parameterization, Thompson policy, bottom-up posterior repair, exact
+categorical targets, supervision masks, and training losses used by the code.
+The blog post provides the intuition; `math.md` records the precise definitions
+and equations.
+
+## Implementation details
+
+The implementation is JAX-native and designed around large, parallel self-play
+batches:
+
+- **Environment:** PGX supplies batched game states and transitions. The
+  experiments in the post train on Hex boards from 3×3 through 9×9.
+- **Network:** Flax NNX implements a residual policy/value/Q model. The shared
+  Hex recipe uses six 128-channel residual blocks and direct
+  log-concentration Dirichlet heads.
+- **Search:** `scacchi/dirichlet_mctx/` is a compact, fixed-capacity,
+  MCTX-shaped tree backend with a `simulate -> expand -> backward` flow. Tree
+  traversal and backup run in JAX control flow and are vectorized across batch
+  lanes.
+- **Posterior-best policies:** the general estimator uses populations of
+  Thompson samples. Binary games may instead use the guarded `prefix_cdf`
+  estimator, which evaluates the Beta densities and CDFs on an adaptive
+  21-point grid and falls back lane-by-lane when a numerical guard fails.
+- **Self-play and training:** search produces a policy target plus typed
+  Dirichlet or exact categorical targets for the value and Q heads. The
+  resulting trajectories are shuffled into minibatches and used to update the
+  network with Muon for hidden block kernels and its auxiliary Adam path for
+  other parameters.
+- **Action commitment:** the policy written to replay and the policy used to
+  choose the played move are separate. A run can reuse the search policy or
+  construct a fresh posterior-sample/posterior-argmax policy from the searched
+  root distributions.
+- **Evaluation and checkpoints:** Hydra recipes define self-play, training,
+  evaluation, logging, and checkpoint behavior. Orbax stores the model,
+  optimizer, RNG, configuration, and progress metadata; W&B logging is
+  configurable.
+
+Q targets are assigned only to legal actions with positive search evidence or
+to legal solved actions:
 
 \[
 M_{s,a}=\mathbf 1[\operatorname{legal}(s,a)\land
 (\operatorname{evidence}_{s,a}>0\lor\operatorname{solved}_{s,a})].
 \]
 
-The default Q loss is the mean over those selected state-action pairs,
-\[
-L_Q=\frac{\sum_{s,a}M_{s,a}\ell_{s,a}}{\sum_{s,a}M_{s,a}}.
-\]
-Search evidence determines whether an action receives Q supervision. Its
-magnitude does not scale the loss. The mean is over selected state-action
-pairs, not states, so states with more selected actions contribute more pairs.
+The default Q reduction is a mean over the selected state-action pairs. Search
+evidence controls whether a pair is supervised; its magnitude does not scale
+that pair's loss.
 
-Each posterior-update variant has one scalar repair constant, `kappa`, used
-only in the structural mixing weight
-`gamma = n_down / (kappa + n_down)`. Terminal expansion instead returns an
-exact `terminal_outcome` tag. It does not manufacture a terminal Dirichlet or
-inject a fixed concentration: model alphas remain the learned representation
-for unresolved leaves and caches, while categorical outcome/distance sidecars
-own solved semantics.
-For a mixed node-cache update, a categorical edge is projected temporarily as
-$(\sum_i A_i)e_z$: the exact tag supplies its direction and its existing
-effective alpha supplies the learned mass. This projection is neither stored
-nor used as a categorical target.
+## Repository map
 
-The Thompson tree-search backend lives in `scacchi/dirichlet_mctx/`;
-`scacchi/dirichlet_q_search.py` contains the shared leaf expansion,
-terminal-outcome extraction, and posterior-target helpers.
+- `scacchi/train.py`: Hydra entry point, accelerator setup, evaluation,
+  checkpointing, and the outer training loop.
+- `scacchi/network.py`: residual networks and policy/value/Q output heads.
+- `scacchi/play.py`: batched game and self-play loops.
+- `scacchi/play_search.py`: evaluator, search, replay-target, and action
+  commitment boundaries.
+- `scacchi/dirichlet_q_search.py`: leaf expansion, terminal extraction, and Q
+  supervision helpers.
+- `scacchi/dirichlet_mctx/`: Dirichlet Thompson tree search, exact outcome
+  propagation, posterior repair, and policy estimators.
+- `scacchi/pipeline.py`: trajectory preparation, minibatching, and one complete
+  self-play/training iteration.
+- `scacchi/loss.py`: policy and typed Dirichlet/categorical losses.
+- `scacchi/configs/`: shared and board-specific Hydra recipes, currently
+  centered on Hex.
+- `scripts/`: experiment launchers, benchmarks, checkpoint inspection, and
+  plotting utilities.
+- `tests/`: tests for configuration, losses, networks, play, checkpointing,
+  search, categorical outcomes, and numerical posterior repair.
+- `website/`: interactive article code and generated figures.
 
-## Guarded Q21 mode
+The lower-level search representation and callback contracts are documented in
+[`scacchi/dirichlet_mctx/README.md`](scacchi/dirichlet_mctx/README.md).
 
-For binary games such as Hex, the optional `prefix_cdf` estimator computes
-posterior-best action probabilities on an adaptive 21-point grid. Search and
-action commitment select their posterior updater independently:
+## Running the reference code
 
-```yaml
-selfplay:
-  action_commitment:
-    kind: posterior_sample
-    posterior_update: numerical
-    posterior_sample_temperature: 0.3333333333333333
-  search:
-    dirichlet_thompson:
-      posterior_update:
-        kind: numerical
-        numerical:
-          half_width: 10  # Q = 2 * half_width + 1 = 21
-```
+The project currently requires Python 3.13 and uses `uv` for dependency and
+command management. Training is intended for a GPU or TPU. The current
+dependency set explicitly selects JAX's CUDA 13 build, so it is not portable to
+every platform without editing the environment definition. The checked-in Hex
+recipes also use the large batch sizes from the experiments and several of
+them refer to external evaluation checkpoints that are not included in this
+repository.
 
-The search selection controls internal repair and the replay target. The
-action-commitment selection builds a fresh action-only policy from the searched
-root posteriors; `null` reuses the search selection. Both selectors use the
-Monte Carlo and numerical parameter blocks under the Dirichlet search config.
-Each numerically unsafe batch lane falls back to the unchanged winner-sampling
-path while safe lanes remain on Q21. The action-only policy is not written to
-replay. With
-`posterior_sample`, temperature \(T\) samples on the positive support
-from \(q_T(a)\propto\operatorname{clip}(q(a),10^{-8},1)^{1/T}\); exact zeros
-stay zero whenever the legal policy has positive support. An all-zero legal
-policy falls back to uniform legal sampling. Prefix-CDF requires a two-outcome
-head.
-The Hex6 recipe enables Q21, cubic (`T=1/3`) commitment, and W&B logging.
-The numerical guards detect specified integration failures, not arbitrary
-quadrature error outside the Hex6 envelope used to select Q21.
-
-## Codebase Structure
-
-- `scacchi/`: main Python package.
-- `scacchi/train.py`: Hydra entry point, config validation, model setup,
-  checkpointing, evaluation, and training loop.
-- `scacchi/network.py`: neural network definitions, including the
-  policy/value/Q Dirichlet model.
-- `scacchi/play.py`: training and evaluation play loops.
-- `scacchi/play_search.py`: evaluator, search, player, and action commitment
-  boundaries.
-- `scacchi/dirichlet_mctx/`: lightweight MCTX-shaped Dirichlet Thompson search.
-- `scacchi/pipeline.py`: replay/minibatch handling and per-iteration training.
-- `scacchi/loss.py`: policy, scalar value, typed Dirichlet/categorical, and
-  outcome losses.
-- `scacchi/configs/`: Hydra YAML configs, currently centered on Hex.
-- `scripts/`: benchmarks, sweeps, and plotting utilities.
-- `tests/`: unit tests for config validation, losses, network behavior, and
-  search utilities.
-
-## Common Commands
+On a compatible environment:
 
 ```bash
 uv sync
 uv run pytest
-uv run scacchi-train
+```
+
+To start a from-scratch Hex 6 run without the external evaluation checkpoint
+or W&B logging:
+
+```bash
+uv run scacchi-train --config-name hex6 \
+  eval.baseline=none eval.interval=0 logging.wandb.enabled=false
+```
+
+Useful experiment commands include:
+
+```bash
 scripts/train_all_hex.sh
 uv run python scripts/checkpoint_moves.py checkpoints/<run-directory>
 ```
 
-Training always writes its final checkpoint. Setting
-`checkpointing.max_to_keep: 0` disables periodic checkpoints and retains only
-that final step. `checkpoint_moves.py` restores the latest Hex model, plays one
-self-play game with the stored search settings, and prints its coordinates as
-a JSON list; pass `--seed` to choose a reproducible game.
+`train_all_hex.sh` runs the numbered Hex recipes sequentially. Training always
+writes a final checkpoint; `checkpointing.max_to_keep: 0` disables periodic
+retention but still keeps that final step. `checkpoint_moves.py` restores the
+latest model in a run directory, plays one self-play game with the stored
+search settings, and prints the moves as JSON. Pass `--seed` for a reproducible
+game.
 
-`train_all_hex.sh` runs the numbered Hex configs sequentially for board sizes
-3, 4, 5, 6, 7, 8, 9, and 11. Every run uses the same 128-channel, 6-layer
-network and writes its final checkpoint to a board-specific directory.
+## Getting help
+
+If you want to understand, reproduce, adapt, or build on any part of this code,
+please get in touch. I am happy to help with its use despite the repository's
+reference-only status.
