@@ -8,9 +8,9 @@
   --strong-line: #29313d;
   --accent: #1f7a8c;
   --accent-dark: #14586a;
-  --x: #2563eb;
+  --x: #648fff;
   --draw: #767c87;
-  --o: #d97706;
+  --o: #fe6100;
 }
 
 * {
@@ -46,6 +46,15 @@ button {
 
 button:not(.cell):hover:not(:disabled) {
   background: var(--accent-dark);
+}
+
+#play-best {
+  background: rgb(0, 114, 237);
+  border-color: rgb(0, 91, 190);
+}
+
+#play-best:hover:not(:disabled) {
+  background: rgb(0, 96, 200);
 }
 
 button:disabled {
@@ -172,13 +181,13 @@ input[type="range"] {
 
 @media (hover: hover) {
   .board[data-player="X"] .cell:hover:not(:disabled)::after {
-    color: #1d4ed8;
+    color: var(--x);
     content: "X";
     opacity: 0.22;
   }
 
   .board[data-player="O"] .cell:hover:not(:disabled)::after {
-    color: #b45309;
+    color: var(--o);
     content: "O";
     opacity: 0.22;
   }
@@ -194,11 +203,11 @@ input[type="range"] {
 }
 
 .cell.mark-x {
-  color: #1d4ed8;
+  color: var(--x);
 }
 
 .cell.mark-o {
-  color: #b45309;
+  color: var(--o);
 }
 
 .posterior {

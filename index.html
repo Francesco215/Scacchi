@@ -406,7 +406,7 @@
       <d-contents></d-contents>
 
       <p>This is the second blog post of my series of "mathematical foundations of curiosity"</p>
-      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem. Here we are going to show how you can make a tree-search algorithm out of it for board games such as tic-tac-toe, hex, chess and go.</p>
+      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem<d-cite key="sacco2026Curiosity"></d-cite>. Here we are going to show how you can make a tree-search algorithm out of it for board games such as tic-tac-toe, hex, chess and go.</p>
       <p>
         This line of search-based game-playing systems includes
         AlphaGo<d-cite key="silver2016AlphaGo"></d-cite>,
@@ -576,7 +576,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
           <figure class="l-side">
               <img
                   src="son-to-father-beta-tree.svg"
-                  alt="A parent Beta distribution above three child distributions ordered from a terrible move, to an uncertain move, to a confidently good move"
+                  alt="A parent Beta distribution above three child distributions ordered from a terrible move, to a confidently good move, to an uncertain move"
               >
               <figcaption>Figure 5: The parent node is represented by the value distribution $V$, the children by $Q_a$ distributions.</figcaption>
           </figure>
@@ -676,7 +676,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
         <figure class="l-body">
           <img
             src="curious-move-selection.svg"
-            alt="Three candidate Go moves with policy-probability bars: a terrible move, an uncertain move that could be best, and a confidently strong move"
+            alt="Three candidate Go moves with policy-probability bars: a terrible move, a confidently strong move, and an uncertain move that could be best"
           >
           <figcaption>Figure 6: Policy probabilities induced by uncertain value estimates. The model is inherently curious: uncertain beliefs encourage it to explore moves that may appear suboptimal but still have a meaningful chance of being the best.</figcaption>
         </figure>

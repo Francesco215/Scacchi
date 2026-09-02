@@ -65,7 +65,7 @@
 }
 
 .coin-position-button[aria-selected="true"]::after {
-  background: #1f7a8c;
+  background: #648fff;
   bottom: 0;
   content: "";
   height: 2px;
@@ -76,7 +76,7 @@
 }
 
 .coin-position-button:focus-visible {
-  outline: 2px solid #2563a9;
+  outline: 2px solid #648fff;
   outline-offset: 2px;
 }
 
@@ -94,7 +94,7 @@
 }
 
 .coin-position-button[aria-selected="true"] .coin-position-button__label {
-  color: #1f6f61;
+  color: #648fff;
 }
 
 .coin-detail {
@@ -193,11 +193,11 @@
   margin-top: 0.25rem;
 }
 
-.coin-sample__odds span:first-child { color: #b84f0b; }
-.coin-sample__odds span:last-child { color: #9b602d; }
+.coin-sample__odds span:first-child { color: #fe6100; }
+.coin-sample__odds span:last-child { color: #fe6100; }
 
 .coin-sample__odds-bar {
-  background: #e2a15f;
+  background: rgba(254, 97, 0, 0.38);
   border-radius: 999px;
   display: flex;
   height: 7px;
@@ -206,7 +206,7 @@
 }
 
 .coin-sample__odds-bar span {
-  background: #c45d19;
+  background: #fe6100;
   display: block;
   height: 100%;
 }
@@ -218,7 +218,7 @@
   margin: 0;
 }
 
-.coin-sample__model strong { color: #1e6861; }
+.coin-sample__model strong { color: #648fff; }
 
 .coin-detail .coin-sample__odds {
   font-size: 0.9rem;
@@ -274,11 +274,11 @@ d-article figure.side {
   stroke-width: 1;
 }
 
-.beta-area { fill: rgba(31, 122, 140, 0.14); }
+.beta-area { fill: rgba(100, 143, 255, 0.14); }
 
 .beta-curve {
   fill: none;
-  stroke: #1f7a8c;
+  stroke: #648fff;
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 2.25;
@@ -287,10 +287,10 @@ d-article figure.side {
 .beta-marker { stroke-width: 1.4; }
 
 .beta-marker--target {
-  stroke: #d97706;
+  stroke: #fe6100;
 }
 
-.beta-marker--mean { stroke: #2563a9; }
+.beta-marker--mean { stroke: #648fff; }
 
 .beta-tick,
 .beta-axis-label {
@@ -330,12 +330,12 @@ d-article figure.side {
 }
 
 .coin-sample__key-density-area {
-  fill: rgba(31, 122, 140, 0.14);
+  fill: rgba(100, 143, 255, 0.14);
 }
 
 .coin-sample__key-density-curve {
   fill: none;
-  stroke: #397f91;
+  stroke: #648fff;
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 2.5;
@@ -345,8 +345,8 @@ d-article figure.side {
   stroke-width: 3;
 }
 
-.coin-sample__key-marker--target { stroke: #d97706; }
-.coin-sample__key-marker--mean { stroke: #2563a9; }
+.coin-sample__key-marker--target { stroke: #fe6100; }
+.coin-sample__key-marker--mean { stroke: #648fff; }
 
 .coin-formula {
   letter-spacing: normal;
