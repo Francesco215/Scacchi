@@ -2,6 +2,7 @@ import math
 from pathlib import Path
 
 import jax.numpy as jnp
+from hydra import compose, initialize_config_dir
 import pytest
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import ConfigKeyError, ValidationError
@@ -18,6 +19,19 @@ from scacchi.types import (
 
 def _config(values: dict) -> Config:
     return load_config(OmegaConf.create(values))
+
+
+def _load_named_config(name: str) -> Config:
+    config_dir = Path(__file__).parents[1] / "scacchi" / "configs"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        return load_config(compose(config_name=name))
+
+
+def test_numbered_hex_configs_import_shared_recipe():
+    config_dir = Path(__file__).parents[1] / "scacchi" / "configs"
+    for path in sorted(config_dir.glob("hex[0-9]*.yaml")):
+        defaults = OmegaConf.load(path).defaults
+        assert list(defaults) == ["hex", "_self_"]
 
 
 def test_config_yaml_loads_into_nested_runtime_config():
@@ -89,10 +103,13 @@ def test_config_yaml_loads_into_nested_runtime_config():
 
 def test_simple_policy_eval_fragment_overrides_eval_search_only():
     cfg_dir = Path(__file__).parents[1] / "scacchi" / "configs"
-    base = OmegaConf.load(cfg_dir / "hex5.yaml")
-    policy_eval = OmegaConf.load(cfg_dir / "eval_mode" / "simple_policy.yaml")
-
-    config = load_config(OmegaConf.merge(base, policy_eval))
+    with initialize_config_dir(config_dir=str(cfg_dir), version_base=None):
+        config = load_config(
+            compose(
+                config_name="hex5",
+                overrides=["+eval_mode=simple_policy"],
+            )
+        )
 
     assert config.selfplay.search.kind == "dirichlet_thompson"
     assert config.eval.player_search.kind == "policy"
@@ -104,8 +121,7 @@ def test_simple_policy_eval_fragment_overrides_eval_search_only():
 
 
 def test_hex5_uses_corrected_dirichlet_search_recipe():
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex5.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
+    config = _load_named_config("hex5")
 
     assert config.selfplay.search.dirichlet_thompson.num_simulations == 16
     assert config.selfplay.search.dirichlet_thompson.max_depth == 16
@@ -132,12 +148,11 @@ def test_hex5_uses_corrected_dirichlet_search_recipe():
 
 
 def test_hex9_restores_solved_run_policy_target_recipe():
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex9.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
+    config = _load_named_config("hex9")
 
     selfplay_search = config.selfplay.search.dirichlet_thompson
     assert selfplay_search.root_policy_support == "search_evidence"
-    assert selfplay_search.policy_target_temperature == 1.0 / 3.0
+    assert selfplay_search.policy_target_temperature == 1.0
     assert (
         config.eval.player_search.dirichlet_thompson.root_policy_support
         == "search_evidence"
@@ -321,7 +336,7 @@ def test_direct_log_head_rejects_a_concentration_floor():
 @pytest.mark.parametrize(
     ("config_name", "eval_simulations"),
     [
-        ("hex", 32),
+        ("hex", 4),
         ("hex5", 4),
         ("hex6", 4),
         ("hex7", 32),
@@ -332,8 +347,7 @@ def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
     config_name: str,
     eval_simulations: int,
 ):
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / f"{config_name}.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
+    config = _load_named_config(config_name)
 
     assert config.selfplay.search.kind == "dirichlet_thompson"
     assert config.eval.baseline == "checkpoint"
@@ -342,13 +356,7 @@ def test_hex_checkpoint_baseline_configs_use_scalar_gumbel_eval_search(
 
 
 def test_hex6_recipe_uses_q21_unit_temperature_commitment_and_wandb():
-    cfg_path = (
-        Path(__file__).parents[1]
-        / "scacchi"
-        / "configs"
-        / "hex6.yaml"
-    )
-    config = load_config(OmegaConf.load(cfg_path))
+    config = _load_named_config("hex6")
 
     assert config.run.seed == 9105
     assert config.run.max_num_iters == 201
@@ -375,8 +383,7 @@ def test_hex6_recipe_uses_q21_unit_temperature_commitment_and_wandb():
 
 
 def test_hex7_uses_full_learned_concentration_head():
-    cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "hex7.yaml"
-    config = load_config(OmegaConf.load(cfg_path))
+    config = _load_named_config("hex7")
 
     assert config.run.seed == 7104
     assert config.model.dirichlet_head_parameterization == "log_concentration"

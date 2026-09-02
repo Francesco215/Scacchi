@@ -1,4 +1,4 @@
-# Wide Hex 11 scratch run against the published PGX hex_v0 anchor.
+# Hex 11 scratch run against the published PGX hex_v0 anchor.
 
 defaults:
   - hex
@@ -11,12 +11,11 @@ env:
   board_size: 11
 
 model:
-  num_channels: 256
+  num_channels: 128
   num_layers: 6
 
 selfplay:
-  batch_size: 2048
-  max_num_steps: 128
+  max_num_steps: 121
 
 eval:
   baseline: pgx
@@ -28,4 +27,4 @@ eval:
 checkpointing:
   max_to_keep: 3
   save_interval_steps: 5
-  directory: checkpoints/hex11_azdirichlet_c256_l6_kl_t1_dt32_pgx_seed9105
+  directory: checkpoints/hex11_azdirichlet_c128_l6_kl_t1_dt32_pgx_seed9105

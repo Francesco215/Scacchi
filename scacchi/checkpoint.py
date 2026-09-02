@@ -37,7 +37,7 @@ def _suppress_orbax_logs() -> None:
 
 
 class NoOpCheckpointManager(ocp.CheckpointManager):
-    """Drops all saves — returned when max_to_keep == 0."""
+    """Drops all saves on non-primary distributed workers."""
 
     def __init__(self, directory: Path, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
@@ -68,6 +68,9 @@ class NoOpCheckpointManager(ocp.CheckpointManager):
     def save(self, *args: Any, **kwargs: Any) -> bool:
         del args, kwargs
         return False
+
+    def wait_until_finished(self) -> None:
+        return None
 
 
 def _checkpoint_manager_options(
@@ -114,14 +117,15 @@ def build_checkpoint_manager(
 ) -> ocp.CheckpointManager:
     _suppress_orbax_logs()
     options = _checkpoint_manager_options(
-        max_to_keep=config.checkpointing.max_to_keep,
+        max_to_keep=(
+            1
+            if config.checkpointing.max_to_keep == 0
+            else config.checkpointing.max_to_keep
+        ),
         save_interval_steps=config.checkpointing.save_interval_steps,
-        save_on_steps=(config.run.max_num_iters - 1,),
         primary_only=True,
     )
     item_names = ("model", "optimizer", "rngs", "meta")
-    if config.checkpointing.max_to_keep == 0:
-        return NoOpCheckpointManager(ckpt_dir)
     if jax.process_count() > 1 and jax.process_index() != 0:
         # Pod workers have private local disks: only process 0 saves (its
         # manager uses active_processes={0}); the rest must not construct a
@@ -352,8 +356,12 @@ def maybe_save(
     config: Config,
     hours: float,
     frames: int,
+    *,
+    force: bool = False,
 ) -> None:
-    if not manager.should_save(step):
+    if not force and config.checkpointing.max_to_keep == 0:
+        return
+    if not force and not manager.should_save(step):
         return
     meta: dict[str, Any] = {
         "config": config_to_dict(config),
@@ -367,7 +375,24 @@ def maybe_save(
         rngs=ocp.args.StandardSave({"key": _rng_key_to_checkpoint_value(rng_key)}),
         meta=ocp.args.JsonSave(meta),
     )
-    manager.save(step, args=save_args)
+    manager.save(step, args=save_args, force=force)
+
+
+def config_from_checkpoint(checkpoint_path: str | Path) -> Config:
+    """Load the runtime configuration stored with the latest checkpoint."""
+
+    _suppress_orbax_logs()
+    checkpoint_path = Path(checkpoint_path).resolve()
+    options = _checkpoint_manager_options(read_only=True)
+    with ocp.CheckpointManager(str(checkpoint_path), options=options) as manager:
+        step = manager.latest_step()
+        if step is None:
+            raise FileNotFoundError(f"No checkpoint found in {checkpoint_path}")
+        restored = manager.restore(
+            step,
+            args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
+        )
+    return _load_checkpoint_config(restored["meta"]["config"])
 
 
 def restore(

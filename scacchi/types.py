@@ -539,6 +539,8 @@ class LoggingConfig:
 
 @dataclass
 class CheckpointingConfig:
+    # Zero disables periodic retention but still writes the mandatory final
+    # checkpoint. Positive values retain that many periodic/final steps.
     max_to_keep: int | None = 3
     save_interval_steps: int = 50
     directory: str | None = None

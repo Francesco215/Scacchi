@@ -19,8 +19,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Read selfplay.batch_size / selfplay.max_num_steps from the hex config so the iter
-# budget stays in sync with whatever the trainer actually consumes.
+# Read the generic self-play batch size from the shared Hex config. Rollout
+# length is board-specific and is set to the number of cells below.
 CONFIG_PATH="${ROOT_DIR}/scacchi/configs/hex.yaml"
 read_yaml_int() {
     uv run python - "$CONFIG_PATH" "$1" <<'PY'
@@ -36,10 +36,7 @@ print(str(value).replace("_", ""))
 PY
 }
 SELFPLAY_BATCH_SIZE="$(read_yaml_int selfplay.batch_size)"
-MAX_NUM_STEPS="$(read_yaml_int selfplay.max_num_steps)"
 : "${SELFPLAY_BATCH_SIZE:?could not read selfplay.batch_size from ${CONFIG_PATH}}"
-: "${MAX_NUM_STEPS:?could not read selfplay.max_num_steps from ${CONFIG_PATH}}"
-SAMPLES_PER_ITER=$(( SELFPLAY_BATCH_SIZE * MAX_NUM_STEPS ))
 
 # Widths and depths per board size — powers of two, capped by Table II.
 WIDTHS_3="1 2"
@@ -110,9 +107,11 @@ for bs in "${BOARD_SIZES[@]}"; do
     widths="${!widths_var}"
     depths="${!depths_var}"
     samples="${!samples_var}"
+    max_num_steps=$(( bs * bs ))
+    samples_per_iter=$(( SELFPLAY_BATCH_SIZE * max_num_steps ))
 
     # Ceiling division so we don't under-shoot the sample budget.
-    max_num_iters=$(( (samples + SAMPLES_PER_ITER - 1) / SAMPLES_PER_ITER ))
+    max_num_iters=$(( (samples + samples_per_iter - 1) / samples_per_iter ))
 
     for nc in $widths; do
         for nl in $depths; do
@@ -121,6 +120,7 @@ for bs in "${BOARD_SIZES[@]}"; do
                 env.board_size="${bs}" \
                 model.num_channels="${nc}" \
                 model.num_layers="${nl}" \
+                selfplay.max_num_steps="${max_num_steps}" \
                 run.max_num_iters="${max_num_iters}" \
                 "${HYDRA_ARGS[@]}"
         done
