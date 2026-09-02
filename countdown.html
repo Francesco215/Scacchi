@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Countdown to September 9, 2026 at midnight Pacific time.">
+    <title>Fortuna — countdown</title>
+    <script src="https://unpkg.com/powerglitch@2.5.0/dist/powerglitch.min.js"></script>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        background:
+          radial-gradient(circle at 50% 44%, rgba(37, 37, 37, 0.44), transparent 35%),
+          #050505;
+        color: #eaeaea;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        margin: 0;
+        min-height: 100vh;
+        overflow: hidden;
+      }
+
+      body::before {
+        animation: scan-jump 480ms infinite steps(2, end);
+        background: repeating-linear-gradient(to bottom, transparent 0 3px, #fff 4px);
+        content: "";
+        inset: 0;
+        mix-blend-mode: overlay;
+        opacity: 0.14;
+        pointer-events: none;
+        position: fixed;
+      }
+
+      body::after {
+        animation: signal-burst 2.2s infinite steps(1, end);
+        background: linear-gradient(
+          90deg,
+          rgba(0, 217, 255, 0.2),
+          transparent 38%,
+          rgba(255, 23, 79, 0.22)
+        );
+        content: "";
+        inset: 0;
+        opacity: 0;
+        pointer-events: none;
+        position: fixed;
+        z-index: 4;
+      }
+
+      .back {
+        color: #737373;
+        font-size: 11px;
+        left: 30px;
+        letter-spacing: 0.13em;
+        position: fixed;
+        text-decoration: none;
+        text-transform: uppercase;
+        top: 28px;
+        z-index: 5;
+      }
+
+      .back:hover,
+      .back:focus-visible {
+        color: #ddd;
+      }
+
+      main {
+        display: grid;
+        min-height: 100vh;
+        padding: 64px 24px;
+        place-items: center;
+      }
+
+      .countdown {
+        text-align: center;
+        width: min(920px, 100%);
+      }
+
+      .wordmark-heading {
+        font: inherit;
+        margin: 0 0 54px;
+      }
+
+      .wordmark {
+        color: #f5f5f5;
+        display: inline-block;
+        font-size: clamp(19px, 2.2vw, 26px);
+        font-weight: 700;
+        letter-spacing: 0.48em;
+        line-height: 1;
+        margin: 0;
+        position: relative;
+        text-indent: 0.48em;
+        text-transform: lowercase;
+      }
+
+      .eyebrow {
+        color: #5f5f5f;
+        font-size: 10px;
+        letter-spacing: 0.24em;
+        margin-bottom: 22px;
+        text-transform: uppercase;
+      }
+
+      .digits {
+        border-block: 1px solid #292929;
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        margin: 0 auto;
+      }
+
+      .unit {
+        padding: 32px 12px 27px;
+        position: relative;
+      }
+
+      .unit + .unit::before {
+        background: #292929;
+        bottom: 25%;
+        content: "";
+        left: 0;
+        position: absolute;
+        top: 25%;
+        width: 1px;
+      }
+
+      .number {
+        display: block;
+        font-size: clamp(46px, 10vw, 112px);
+        font-variant-numeric: tabular-nums;
+        font-weight: 300;
+        letter-spacing: -0.08em;
+        line-height: 0.9;
+        text-shadow:
+          2px 0 rgba(0, 217, 255, 0.22),
+          -2px 0 rgba(255, 23, 79, 0.22);
+      }
+
+      .name {
+        color: #646464;
+        display: block;
+        font-size: 9px;
+        letter-spacing: 0.2em;
+        margin-top: 18px;
+        text-transform: uppercase;
+      }
+
+      .date {
+        color: #8d8d8d;
+        font-size: 11px;
+        letter-spacing: 0.16em;
+        margin-top: 27px;
+        text-transform: uppercase;
+      }
+
+      .pulse {
+        animation: pulse 1.4s infinite;
+        background: #ff174f;
+        border-radius: 50%;
+        box-shadow: 0 0 12px #ff174f;
+        display: inline-block;
+        height: 5px;
+        margin: 0 11px 2px 0;
+        width: 5px;
+      }
+
+      .countdown.is-complete .pulse {
+        background: #00d9ff;
+        box-shadow: 0 0 12px #00d9ff;
+      }
+
+      @keyframes pulse {
+        50% {
+          opacity: 0.25;
+        }
+      }
+
+      @keyframes scan-jump {
+        0%,
+        86%,
+        100% {
+          transform: translateY(0);
+        }
+        88% {
+          transform: translateY(3px);
+        }
+        92% {
+          transform: translateY(-2px);
+        }
+      }
+
+      @keyframes signal-burst {
+        0%,
+        82%,
+        100% {
+          opacity: 0;
+          transform: translateX(0);
+        }
+        83% {
+          opacity: 0.85;
+          transform: translateX(12px);
+        }
+        85% {
+          opacity: 0.12;
+          transform: translateX(-18px);
+        }
+        87% {
+          opacity: 0.55;
+          transform: translateX(4px);
+        }
+        89% {
+          opacity: 0;
+        }
+      }
+
+      @media (max-width: 620px) {
+        .digits {
+          grid-template-columns: repeat(2, 1fr);
+        }
+
+        .unit:nth-child(3),
+        .unit:nth-child(4) {
+          border-top: 1px solid #292929;
+        }
+
+        .unit:nth-child(3)::before {
+          display: none;
+        }
+
+        .wordmark-heading {
+          margin-bottom: 38px;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        body::before,
+        body::after,
+        .pulse {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <a class="back" href="index.html">← article</a>
+    <main>
+      <section class="countdown" aria-labelledby="fortuna-title">
+        <h1 id="fortuna-title" class="wordmark-heading" aria-label="Fortuna">
+          <span class="wordmark" aria-hidden="true">Fortuna</span>
+        </h1>
+        <div class="eyebrow" id="status">Transmission begins in</div>
+        <div
+          class="digits"
+          role="timer"
+          aria-label="Countdown to September 9, 2026 at midnight Pacific time"
+        >
+          <div class="unit">
+            <span class="number" id="days">00</span>
+            <span class="name">Days</span>
+          </div>
+          <div class="unit">
+            <span class="number" id="hours">00</span>
+            <span class="name">Hours</span>
+          </div>
+          <div class="unit">
+            <span class="number" id="minutes">00</span>
+            <span class="name">Minutes</span>
+          </div>
+          <div class="unit">
+            <span class="number" id="seconds">00</span>
+            <span class="name">Seconds</span>
+          </div>
+        </div>
+        <div class="date"><span class="pulse"></span>Wed · 09 Sep 2026 · 00:00 PT</div>
+      </section>
+    </main>
+    <script>
+      const target = new Date("2026-09-09T00:00:00-07:00");
+      const countdown = document.querySelector(".countdown");
+      const status = document.getElementById("status");
+      const parts = {
+        days: document.getElementById("days"),
+        hours: document.getElementById("hours"),
+        minutes: document.getElementById("minutes"),
+        seconds: document.getElementById("seconds")
+      };
+
+      function updateCountdown() {
+        const remaining = Math.max(0, target.getTime() - Date.now());
+        const days = Math.floor(remaining / 86400000);
+        const hours = Math.floor(remaining / 3600000) % 24;
+        const minutes = Math.floor(remaining / 60000) % 60;
+        const seconds = Math.floor(remaining / 1000) % 60;
+
+        parts.days.textContent = String(days).padStart(2, "0");
+        parts.hours.textContent = String(hours).padStart(2, "0");
+        parts.minutes.textContent = String(minutes).padStart(2, "0");
+        parts.seconds.textContent = String(seconds).padStart(2, "0");
+
+        if (remaining === 0) {
+          countdown.classList.add("is-complete");
+          status.textContent = "Transmission live";
+        }
+      }
+
+      updateCountdown();
+      window.setInterval(updateCountdown, 1000);
+
+      if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        PowerGlitch.glitch(".wordmark", {
+          playMode: "always",
+          optimizeSeo: true,
+          timing: { duration: 460, iterations: Infinity },
+          glitchTimeSpan: false,
+          shake: { velocity: 72, amplitudeX: 0.75, amplitudeY: 0.28 },
+          slice: {
+            count: 32,
+            velocity: 80,
+            minHeight: 0.005,
+            maxHeight: 0.42,
+            hueRotate: false,
+            cssFilters: "drop-shadow(11px 0 #00d9ff) drop-shadow(-11px 0 #ff174f) saturate(2) contrast(1.8)"
+          },
+          pulse: { scale: 1.28 }
+        });
+      }
+    </script>
+  </body>
+</html>

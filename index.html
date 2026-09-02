@@ -11,6 +11,7 @@
     <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.js" integrity="sha384-GxNFqL3r9uRJQhR+47eDxuPoNE7yLftQM8LcxzgS4HT73tp970WS/wV5p8UzCOmb" crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/contrib/auto-render.min.js" integrity="sha384-vZTG03m+2yp6N6BNi5iM4rW4oIwk5DfcNdFfxkk9ZWpDriOkXX8voJBFrAO7MpVl" crossorigin="anonymous"></script>
     <script src="website/chess-dataset.js"></script>
+    <script src="https://unpkg.com/powerglitch@2.5.0/dist/powerglitch.min.js"></script>
     <script>
       document.addEventListener("DOMContentLoaded", function () {
         renderMathInElement(document.body, {
@@ -152,6 +153,42 @@
         });
 
         drawBoard(Number(slider.value));
+      });
+
+      window.addEventListener("load", function () {
+        if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+        const affiliationLink = Array.from(
+          document.querySelectorAll("d-byline .affiliation a")
+        ).find((link) => link.textContent.trim().toLowerCase() === "fortuna");
+
+        if (!affiliationLink || affiliationLink.querySelector(".fortuna-affiliation-glitch")) return;
+
+        const glitchTarget = document.createElement("span");
+        glitchTarget.className = "fortuna-affiliation-glitch";
+        glitchTarget.setAttribute("aria-hidden", "true");
+        glitchTarget.textContent = "Fortuna";
+
+        affiliationLink.replaceChildren(glitchTarget);
+        affiliationLink.classList.add("fortuna-affiliation-link");
+        affiliationLink.setAttribute("aria-label", "Fortuna");
+
+        PowerGlitch.glitch(glitchTarget, {
+          playMode: "always",
+          optimizeSeo: true,
+          timing: { duration: 520, iterations: Infinity },
+          glitchTimeSpan: false,
+          shake: { velocity: 58, amplitudeX: 0.55, amplitudeY: 0.2 },
+          slice: {
+            count: 22,
+            velocity: 64,
+            minHeight: 0.006,
+            maxHeight: 0.42,
+            hueRotate: false,
+            cssFilters: "drop-shadow(7px 0 #00d9ff) drop-shadow(-7px 0 #ff174f) contrast(2)"
+          },
+          pulse: { scale: 1.22 }
+        });
       });
     </script>
     <style>
@@ -362,6 +399,21 @@
         text-align: left;
       }
 
+      .fortuna-affiliation-link {
+        color: #111;
+        display: inline-block;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-weight: 700;
+        letter-spacing: 0.11em;
+        line-height: 1;
+        text-decoration: none;
+        text-transform: lowercase;
+      }
+
+      .fortuna-affiliation-glitch {
+        display: inline-block;
+      }
+
       @media (min-width: 1180px) {
         .l-side {
           float: right;
@@ -388,7 +440,9 @@
           "authors": [
             {
               "author": "Francesco Sacco",
-              "authorURL": "https://francesco215.github.io"
+              "authorURL": "https://francesco215.github.io",
+              "affiliation": "Fortuna",
+              "affiliationURL": "countdown.html"
             }
           ]
         }
@@ -406,7 +460,7 @@
       <d-contents></d-contents>
 
       <p>This is the second blog post of my series of "mathematical foundations of curiosity"</p>
-      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem<d-cite key="sacco2026Curiosity"></d-cite>. Here we are going to show how you can make a tree-search algorithm out of it for board games such as tic-tac-toe, hex, chess and go.</p>
+      <p>In the previous blog post we examined what curiosity is in the context of the $K$-armed bandits problem<d-cite key="sacco2026Curiosity"></d-cite>. Here we are going to show how you can make a scalable tree-search algorithm out of it, and use it for board games such as tic-tac-toe, hex, chess and go.</p>
       <p>
         This line of search-based game-playing systems includes
         AlphaGo<d-cite key="silver2016AlphaGo"></d-cite>,
@@ -515,7 +569,7 @@
           win rate estimated from repeated games with the model’s prediction. The
           positions are adapted from the
           <a href="https://lichess.org/study/KhHUn7L4">Lichess “10 Immortal Games” study</a>;
-          all odds and predictions are synthetic.
+          all odds and predictions are made up.
         </figcaption>
       </figure>
 
@@ -768,7 +822,6 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
         </d-footnote>
       </p>
 
-
       <h3 id="building-the-tree">Building the tree</h3>
 
       <p>
@@ -997,11 +1050,13 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
     <d-appendix>
       <h3>Acknowledgements</h3>
       <p>
-          I want to thank <a href="https://x.com/HessianFree">Omehad Pooladzandi</a> for giving me access to compute.<br>I also want to thank (in no particular order) <a href="https://wtedw.com/">Ted Wong</a>, <a href="https://x.com/NMonti25537">Nicolò Monti</a>, <a href="https://www.diego-marti.com/">Diego Martì Monso</a>, <a href="https://the-puzzler.github.io/">Matteo Peluso</a> and <a href="https://x.com/evaninwords">Evan Walters</a> for the precious feedback and support.
+          I want to thank (in no particular order) <a href="https://x.com/HessianFree">Omead Pooladzandi</a>, <a href="https://wtedw.com/">Ted Wong</a>, <a href="https://x.com/NMonti25537">Nicolò Monti</a>, <a href="https://www.diego-marti.com/">Diego Martì Monso</a>, <a href="https://the-puzzler.github.io/">Matteo Peluso</a> and <a href="https://x.com/evaninwords">Evan Walters</a> for the precious feedback and support.
       </p>
       <p>
           A few words about the project: I’ve worked on it part-time over the past couple of months, and since I’ll have even less time going forward, I’ve decided to release it as it is. I’m very proud of how it turned out, though I wish I’d had more time to scale it to even more challenging environments.
       </p>
+      <h3>Further resources</h3>
+      <p>Some really cool resources on the field are <a href="https://github.com/wtedw/nanoAlphaZero">NanoAlphaZero</a>, a high-performance, game-agnostic AlphaZero implementation that achieves grandmaster-level strength in chess, and <a href="https://github.com/lightvector/KataGo">KataGo</a>, one of the strongest open-source Go engines and a remarkably efficient system for training superhuman models through self-play.</p>
       <h3>Contact</h3>
       <p>You can do so by sending an email to this address francesco215@live.it or by messaging on discord at sacco215</p>
       <d-footnote-list></d-footnote-list>
