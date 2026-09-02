@@ -39,7 +39,7 @@ The module map is also parallel to MCTX:
 - `policies.py`: the public `dirichlet_thompson_policy` wrapper.
 - `posterior_updates.py`: the replaceable node-posterior repair rule.
 
-The stored search state follows `tictactoe-demo/app.js`, but disjoint logical
+The stored search state follows `website/tictactoe-demo/app.js`, but disjoint logical
 values share physical buffers. Every edge owns one alpha slot containing its
 network Q fallback before repair and message `B` afterwards. An `int32` edge
 payload is count `R` while the edge outcome tag is `NO_OUTCOME`, then certified

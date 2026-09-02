@@ -7,10 +7,10 @@
     <title>Curious Tree Search</title>
     <script src="https://distill.pub/template.v2.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.css" integrity="sha384-zTROYFVGOfTw7JV7KUu8udsvW2fx4lWOsCEDqhBreBwlHI4ioVRtmIvEThzJHGET" crossorigin="anonymous">
-    <link rel="stylesheet" href="chess-dataset.css">
+    <link rel="stylesheet" href="website/chess-dataset.css">
     <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/katex.min.js" integrity="sha384-GxNFqL3r9uRJQhR+47eDxuPoNE7yLftQM8LcxzgS4HT73tp970WS/wV5p8UzCOmb" crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/katex@0.13.18/dist/contrib/auto-render.min.js" integrity="sha384-vZTG03m+2yp6N6BNi5iM4rW4oIwk5DfcNdFfxkk9ZWpDriOkXX8voJBFrAO7MpVl" crossorigin="anonymous"></script>
-    <script src="chess-dataset.js"></script>
+    <script src="website/chess-dataset.js"></script>
     <script>
       document.addEventListener("DOMContentLoaded", function () {
         renderMathInElement(document.body, {
@@ -419,7 +419,7 @@
       <figure class="tictactoe-embed">
         <iframe
           id="tictactoe-demo"
-          src="tictactoe-demo/index.html"
+          src="website/tictactoe-demo/index.html"
           title="Interactive Tic-Tac-Toe Dirichlet-Q demo"
           scrolling="no"
         ></iframe>
@@ -457,7 +457,7 @@
       <div>
         <figure class="l-body side">
           <img
-            src="beta-nll.svg"
+            src="website/beta-nll.svg"
             alt="The predicted distribution Beta(· | θ), with the true probability p_A(s) marked by a solid orange line and the conditional mean E[p | θ] by a solid blue line"
           >
           <figcaption>
@@ -540,7 +540,7 @@
 
       <figure class="l-body search-overview-figure">
         <img
-          src="search-beta-refinement.svg?v=20260831"
+          src="website/search-beta-refinement.svg?v=20260831"
           alt="A broad starting Beta distribution flowing through search into a taller, narrower Beta distribution"
         >
         <figcaption>
@@ -575,7 +575,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       <div>
           <figure class="l-side">
               <img
-                  src="son-to-father-beta-tree.svg"
+                  src="website/son-to-father-beta-tree.svg"
                   alt="A parent Beta distribution above three child distributions ordered from a terrible move, to a confidently good move, to an uncertain move"
               >
               <figcaption>Figure 5: The parent node is represented by the value distribution $V$, the children by $Q_a$ distributions.</figcaption>
@@ -675,7 +675,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
         </p>
         <figure class="l-body">
           <img
-            src="curious-move-selection.svg"
+            src="website/curious-move-selection.svg"
             alt="Three candidate Go moves with policy-probability bars: a terrible move, a confidently strong move, and an uncertain move that could be best"
           >
           <figcaption>Figure 6: Policy probabilities induced by uncertain value estimates. The model is inherently curious: uncertain beliefs encourage it to explore moves that may appear suboptimal but still have a meaningful chance of being the best.</figcaption>
@@ -716,7 +716,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       
       <figure class="l-page-outset">
         <img
-          src="beta-mixture-summary.svg?v=20260831"
+          src="website/beta-mixture-summary.svg?v=20260831"
           alt="Three action-value Beta distributions and a comparison between their exact policy-weighted mixture and the Beta obtained by averaging their parameter vectors"
         >
         <figcaption>
@@ -788,7 +788,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
 
       <figure class="l-page-outset tree-cycle-figure">
         <img
-          src="tree-search-cycle.svg"
+          src="website/tree-search-cycle.svg"
           alt="Three stages of one search simulation: Thompson samples select a path down the tree, one new position is expanded and evaluated, and beliefs are updated along the selected path back to the root"
         >
         <figcaption>
@@ -923,7 +923,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
 
       <figure class="l-page-outset results-figure">
         <img
-          src="hex3-9-scaling-paper-logbins.svg"
+          src="website/hex3-9-scaling-paper-logbins.svg"
           alt="Two-panel compute-scaling plot for Hex boards 3 through 9. Curiosity-Driven is shown on the left and Gumbel-AlphaZero on the right. Learning transitions move to higher neural-network FLOPs as board size increases."
         >
         <figcaption>
@@ -939,7 +939,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       </p>
       <figure class="results-figure">
         <img
-          src="hex3-9-paired-paper-logbins.svg"
+          src="website/hex3-9-paired-paper-logbins.svg"
           alt="Seven-panel comparison of Curiosity-Driven and Gumbel-AlphaZero compute-scaling curves, with one panel for each Hex board size from 3 through 9 and the legend in the eighth grid cell."
         >
         <figcaption>
@@ -949,7 +949,7 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
       <div class="prediction-entropy-callout">
         <figure class="l-side prediction-entropy-figure">
           <img
-            src="hex3-9-dt-prediction-entropy-logbins.svg"
+            src="website/hex3-9-dt-prediction-entropy-logbins.svg"
             alt="Prediction entropy for Curiosity-Driven agents on Hex boards 3 through 9, plotted against neural-network FLOPs on a logarithmic scale"
           >
           <figcaption>

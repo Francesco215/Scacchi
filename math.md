@@ -2,7 +2,7 @@
 
 This document describes the active `scacchi.dirichlet_mctx` algorithm. It is
 the JAX, fixed-capacity sister of MCTX used by `dirichlet_thompson` search. Its
-posterior repair follows `tictactoe-demo/app.js`: search stores replacement
+posterior repair follows `website/tictactoe-demo/app.js`: search stores replacement
 messages on edges, recomputes a posterior cache at every node on the selected
 path, and uses Thompson sampling both for traversal and for policy readout.
 
@@ -557,7 +557,7 @@ certificates, payload safety, or traversal pruning.
 ## 8. Default posterior repair
 
 The default `update_posterior` is the JAX translation of the message-passing
-logic in `tictactoe-demo/app.js`.
+logic in `website/tictactoe-demo/app.js`.
 
 ### 8.1 Write the final leaf message
 

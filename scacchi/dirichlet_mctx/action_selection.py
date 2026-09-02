@@ -101,7 +101,7 @@ def masked_argmax(scores: Float[Array, "*batch action"], invalid_actions: Bool[A
 def sample_dirichlet(rng_key: base.PRNGKey, alpha: Float[Array, "*batch outcome"]) -> Float[Array, "*batch outcome"]:
     """Draw a bounded-work Marsaglia--Tsang Dirichlet sample.
 
-    The north-star implementation in ``tictactoe-demo/app.js`` samples each
+    The north-star implementation in ``website/tictactoe-demo/app.js`` samples each
     gamma variate with Marsaglia--Tsang acceptance/rejection and applies the
     exact shape-augmentation identity below one. A single uncorrected
     Wilson--Hilferty proposal is measurably biased, especially when Thompson
