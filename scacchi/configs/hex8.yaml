@@ -20,4 +20,4 @@ eval:
 checkpointing:
   max_to_keep: 0
   save_interval_steps: 10
-  directory: checkpoints/asd
+  directory: checkpoints/hex8_aznet_dirichlet_c128_l6_seed0

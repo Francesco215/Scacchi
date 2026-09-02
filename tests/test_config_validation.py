@@ -34,6 +34,14 @@ def test_numbered_hex_configs_import_shared_recipe():
         assert list(defaults) == ["hex", "_self_"]
 
 
+def test_numbered_hex_configs_use_uniform_network_architecture():
+    config_dir = Path(__file__).parents[1] / "scacchi" / "configs"
+    for path in sorted(config_dir.glob("hex[0-9]*.yaml")):
+        config = _load_named_config(path.stem)
+        assert config.model.num_channels == 128, path.name
+        assert config.model.num_layers == 6, path.name
+
+
 def test_config_yaml_loads_into_nested_runtime_config():
     cfg_path = Path(__file__).parents[1] / "scacchi" / "configs" / "config.yaml"
     loaded = OmegaConf.load(cfg_path)

@@ -115,4 +115,16 @@ quadrature error outside the Hex6 envelope used to select Q21.
 uv sync
 uv run pytest
 uv run scacchi-train
+scripts/train_all_hex.sh
+uv run python scripts/checkpoint_moves.py checkpoints/<run-directory>
 ```
+
+Training always writes its final checkpoint. Setting
+`checkpointing.max_to_keep: 0` disables periodic checkpoints and retains only
+that final step. `checkpoint_moves.py` restores the latest Hex model, plays one
+self-play game with the stored search settings, and prints its coordinates as
+a JSON list; pass `--seed` to choose a reproducible game.
+
+`train_all_hex.sh` runs the numbered Hex configs sequentially for board sizes
+3, 4, 5, 6, 7, 8, 9, and 11. Every run uses the same 128-channel, 6-layer
+network and writes its final checkpoint to a board-specific directory.
