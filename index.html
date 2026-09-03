@@ -868,8 +868,9 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
           alt="Three stages of one search simulation: Thompson samples select a path down the tree, one new position is expanded and evaluated, and beliefs are updated along the selected path back to the root"
         >
         <figcaption>
-          Figure 8: One search simulation. Thompson samples choose a path from
-          the root to an unexplored move. Search evaluates at most one new
+          Figure 8: One search simulation. In the first panel, Thompson sampling
+          draws one value from each distribution and selects the largest one,
+          choosing a path from the root to an unexplored move. Search evaluates at most one new
           position, then updates beliefs along the same path from the deepest
           node back to the root.
         </figcaption>
