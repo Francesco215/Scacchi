@@ -904,6 +904,7 @@ function interpolateDensityColor(amount) {
 function drawSimplex(alpha, categoricalOutcome = null) {
   const canvas = els.simplex;
   const context = canvas.getContext("2d");
+  const playerToMove = currentPlayer;
   const rect = canvas.getBoundingClientRect();
   const ratio = window.devicePixelRatio || 1;
   const width = Math.max(1, Math.round(rect.width * ratio));
@@ -919,18 +920,18 @@ function drawSimplex(alpha, categoricalOutcome = null) {
 
   const margin = 34;
   const vertices = {
-    L: { x: margin, y: rect.height - margin },
+    O: { x: margin, y: rect.height - margin },
     D: { x: rect.width / 2, y: margin },
-    W: { x: rect.width - margin, y: rect.height - margin },
+    X: { x: rect.width - margin, y: rect.height - margin },
   };
 
   context.lineWidth = 1.4;
   context.strokeStyle = "#252a32";
   context.fillStyle = "#fbfbfc";
   context.beginPath();
-  context.moveTo(vertices.L.x, vertices.L.y);
+  context.moveTo(vertices.O.x, vertices.O.y);
   context.lineTo(vertices.D.x, vertices.D.y);
-  context.lineTo(vertices.W.x, vertices.W.y);
+  context.lineTo(vertices.X.x, vertices.X.y);
   context.closePath();
   context.fill();
   context.stroke();
@@ -938,11 +939,9 @@ function drawSimplex(alpha, categoricalOutcome = null) {
   context.font = "12px ui-sans-serif, system-ui, sans-serif";
   context.fillStyle = "#4b5563";
   context.textAlign = "center";
-  const lossLabel = currentPlayer === "X" ? "O" : "X";
-  const winLabel = currentPlayer;
   context.fillText("Draw", vertices.D.x, vertices.D.y - 10);
-  context.fillText(`${lossLabel} wins`, vertices.L.x + 4, vertices.L.y + 18);
-  context.fillText(`${winLabel} wins`, vertices.W.x - 4, vertices.W.y + 18);
+  context.fillText("O wins", vertices.O.x + 4, vertices.O.y + 18);
+  context.fillText("X wins", vertices.X.x - 4, vertices.X.y + 18);
 
   if (categoricalOutcome === null) {
     const samples = Array.from(
@@ -965,7 +964,7 @@ function drawSimplex(alpha, categoricalOutcome = null) {
     const densityContrast = densitySpread / (densitySpread + 1);
 
     samples.forEach((sample, index) => {
-      const point = simplexPoint(sample, vertices);
+      const point = simplexPoint(sample, vertices, playerToMove);
       const centeredDensity = 1 / (
         1 + Math.exp(
           -(logDensities[index] - meanLogDensity) /
@@ -985,7 +984,7 @@ function drawSimplex(alpha, categoricalOutcome = null) {
     categoricalOutcome === null
       ? alphaMean(alpha)
       : categoricalMean(categoricalOutcome);
-  const meanPoint = simplexPoint(mean, vertices);
+  const meanPoint = simplexPoint(mean, vertices, playerToMove);
   context.fillStyle = "#dc267f";
   context.strokeStyle = "#ffffff";
   context.lineWidth = 2;
@@ -995,16 +994,25 @@ function drawSimplex(alpha, categoricalOutcome = null) {
   context.stroke();
 }
 
-function simplexPoint(probabilities, vertices) {
+function simplexPoint(probabilities, vertices, playerToMove) {
+  const xWinProbability =
+    probabilities[
+      playerToMove === "X" ? OUTCOME.WIN : OUTCOME.LOSS
+    ];
+  const oWinProbability =
+    probabilities[
+      playerToMove === "O" ? OUTCOME.WIN : OUTCOME.LOSS
+    ];
+
   return {
     x:
-      probabilities[OUTCOME.LOSS] * vertices.L.x +
+      oWinProbability * vertices.O.x +
       probabilities[OUTCOME.DRAW] * vertices.D.x +
-      probabilities[OUTCOME.WIN] * vertices.W.x,
+      xWinProbability * vertices.X.x,
     y:
-      probabilities[OUTCOME.LOSS] * vertices.L.y +
+      oWinProbability * vertices.O.y +
       probabilities[OUTCOME.DRAW] * vertices.D.y +
-      probabilities[OUTCOME.WIN] * vertices.W.y,
+      xWinProbability * vertices.X.y,
   };
 }
 

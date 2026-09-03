@@ -438,6 +438,12 @@
 
       }
 
+      @media (min-width: 768px) and (max-width: 1179px) {
+        .tictactoe-embed {
+          grid-column: page;
+        }
+      }
+
       @media (max-width: 860px) {
         .tictactoe-embed iframe {
           height: 1500px;
@@ -457,7 +463,7 @@
               "affiliationURL": "countdown.html"
             }
           ],
-          "publishedDate": "September 2, 2026",
+          "publishedDate": "September 3, 2026",
           "doi": "10.5281/zenodo.22248598"
         }
       </script>
@@ -563,6 +569,9 @@
           \mathcal L(s)=-\log\operatorname{Beta}\!\left(p_A(s) | \theta \right).
           $$
           Where $\theta$ are trainable model parameters.
+        </p>
+        <p>
+          This NLL lets us learn a full predictive distribution, which gives us an estimate of the model's uncertainty<d-cite key="sacco2026Uncertainty"></d-cite>.
         </p>
       </div>
 
@@ -1098,7 +1107,16 @@ L = D_{\mathrm{KL}}\!\left(q_{\mathrm{search}} \;\middle\|\; q_\theta\right).
             url    = {https://francesco215.github.io/Bayes-bandit/}
           }
 
-          @article{silver2016AlphaGo,
+          @article{sacco2026Uncertainty,
+            author  = {Sacco, Francesco},
+            title   = {How to Predict Uncertainty},
+            journal = {Zenodo},
+            year    = {2026},
+            doi     = {10.5281/zenodo.22261724},
+            url     = {https://francesco215.github.io/autoregressive_diffusion/uncertainty.html}
+          }
+
+	 @article{silver2016AlphaGo,
             author  = {Silver, David and Huang, Aja and Maddison, Chris J. and Guez, Arthur and Sifre, Laurent and van den Driessche, George and Schrittwieser, Julian and Antonoglou, Ioannis and Panneershelvam, Veda and Lanctot, Marc and Dieleman, Sander and Grewe, Dominik and Nham, John and Kalchbrenner, Nal and Sutskever, Ilya and Lillicrap, Timothy and Leach, Madeleine and Kavukcuoglu, Koray and Graepel, Thore and Hassabis, Demis},
             title   = {Mastering the Game of Go with Deep Neural Networks and Tree Search},
             journal = {Nature},

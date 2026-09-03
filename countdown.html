@@ -4,257 +4,398 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="Countdown to September 9, 2026 at midnight Pacific time.">
-    <title>Fortuna — countdown</title>
-    <script src="https://unpkg.com/powerglitch@2.5.0/dist/powerglitch.min.js"></script>
+    <title>Countdown</title>
     <style>
       :root {
-        color-scheme: dark;
+        color-scheme: light;
+        --paper: #f7ede5;
+        --navy: #273f67;
+        --navy-soft: #536481;
+        --gold: #b58a4e;
+        --gold-soft: rgba(181, 138, 78, 0.38);
+        --terracotta: #b86d55;
+        --ink: #392f26;
       }
 
       * {
         box-sizing: border-box;
       }
 
+      html {
+        background: var(--paper);
+      }
+
       body {
         background:
-          radial-gradient(circle at 50% 44%, rgba(37, 37, 37, 0.44), transparent 35%),
-          #050505;
-        color: #eaeaea;
-        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+          radial-gradient(circle at 11% 86%, rgba(184, 109, 85, 0.07), transparent 21rem),
+          linear-gradient(115deg, transparent 0 49.8%, rgba(181, 138, 78, 0.035) 50%, transparent 50.2%),
+          var(--paper);
+        color: var(--ink);
+        font-family: Georgia, "Times New Roman", serif;
         margin: 0;
         min-height: 100vh;
-        overflow: hidden;
+        min-height: 100svh;
+        overflow-x: hidden;
+        position: relative;
       }
 
       body::before {
-        animation: scan-jump 480ms infinite steps(2, end);
-        background: repeating-linear-gradient(to bottom, transparent 0 3px, #fff 4px);
+        background-image:
+          repeating-linear-gradient(0deg, rgba(94, 69, 43, 0.018) 0 1px, transparent 1px 4px),
+          repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.06) 0 1px, transparent 1px 5px);
         content: "";
         inset: 0;
-        mix-blend-mode: overlay;
-        opacity: 0.14;
+        mix-blend-mode: multiply;
+        opacity: 0.65;
         pointer-events: none;
         position: fixed;
+        z-index: 3;
       }
 
-      body::after {
-        animation: signal-burst 2.2s infinite steps(1, end);
-        background: linear-gradient(
-          90deg,
-          rgba(0, 217, 255, 0.2),
-          transparent 38%,
-          rgba(255, 23, 79, 0.22)
-        );
-        content: "";
-        inset: 0;
-        opacity: 0;
+      .constellation {
+        height: 190px;
+        opacity: 0.38;
         pointer-events: none;
         position: fixed;
-        z-index: 4;
+        width: 250px;
+        z-index: 0;
+      }
+
+      .constellation::before,
+      .constellation::after {
+        content: "";
+        position: absolute;
+      }
+
+      .constellation::before {
+        background:
+          radial-gradient(circle at 9% 71%, var(--navy-soft) 0 3px, transparent 4px),
+          radial-gradient(circle at 35% 30%, var(--navy-soft) 0 4px, transparent 5px),
+          radial-gradient(circle at 65% 44%, var(--navy-soft) 0 3px, transparent 4px),
+          radial-gradient(circle at 93% 10%, transparent 0 3px, var(--navy-soft) 4px 5px, transparent 6px);
+        inset: 0;
+      }
+
+      .constellation::after {
+        border-top: 1px dashed rgba(39, 63, 103, 0.3);
+        height: 95px;
+        left: 20px;
+        top: 102px;
+        transform: rotate(-12deg);
+        width: 220px;
+      }
+
+      .constellation--north {
+        left: -28px;
+        top: 8px;
+        transform: rotate(-8deg);
+      }
+
+      .constellation--south {
+        bottom: -30px;
+        right: -30px;
+        transform: rotate(172deg);
       }
 
       .back {
-        color: #737373;
-        font-size: 11px;
-        left: 30px;
-        letter-spacing: 0.13em;
+        align-items: center;
+        color: var(--navy);
+        display: inline-flex;
+        font-family: Arial, Helvetica, sans-serif;
+        font-size: 0.72rem;
+        gap: 0.6rem;
+        left: clamp(20px, 3vw, 44px);
+        letter-spacing: 0.18em;
+        padding: 8px 0;
         position: fixed;
         text-decoration: none;
         text-transform: uppercase;
-        top: 28px;
+        top: clamp(16px, 3vw, 34px);
+        transition: color 180ms ease;
         z-index: 5;
+      }
+
+      .back::before {
+        background: var(--terracotta);
+        content: "";
+        height: 1px;
+        transition: width 180ms ease;
+        width: 24px;
       }
 
       .back:hover,
       .back:focus-visible {
-        color: #ddd;
+        color: var(--terracotta);
+      }
+
+      .back:hover::before,
+      .back:focus-visible::before {
+        width: 34px;
+      }
+
+      .back:focus-visible {
+        outline: 2px solid var(--gold);
+        outline-offset: 5px;
       }
 
       main {
         display: grid;
         min-height: 100vh;
-        padding: 64px 24px;
+        min-height: 100svh;
+        padding: clamp(72px, 8vh, 108px) 24px clamp(34px, 6vh, 72px);
         place-items: center;
+        position: relative;
+        z-index: 1;
       }
 
       .countdown {
         text-align: center;
-        width: min(920px, 100%);
+        width: min(980px, 100%);
       }
 
-      .wordmark-heading {
-        font: inherit;
-        margin: 0 0 54px;
-      }
-
-      .wordmark {
-        color: #f5f5f5;
-        display: inline-block;
-        font-size: clamp(19px, 2.2vw, 26px);
-        font-weight: 700;
-        letter-spacing: 0.48em;
-        line-height: 1;
-        margin: 0;
+      .emblem {
+        height: 214px;
+        margin: 0 auto 8px;
+        overflow: hidden;
         position: relative;
-        text-indent: 0.48em;
-        text-transform: lowercase;
+        width: 300px;
       }
 
-      .eyebrow {
-        color: #5f5f5f;
-        font-size: 10px;
-        letter-spacing: 0.24em;
-        margin-bottom: 22px;
-        text-transform: uppercase;
+      .emblem img {
+        height: auto;
+        left: 50%;
+        max-width: none;
+        position: absolute;
+        top: -40px;
+        transform: translateX(-50%);
+        width: 860px;
+      }
+
+      .ornament {
+        align-items: center;
+        color: var(--gold);
+        display: flex;
+        font-size: 1rem;
+        gap: 12px;
+        justify-content: center;
+        line-height: 1;
+        margin: 6px auto 25px;
+        width: min(220px, 65%);
+      }
+
+      .ornament::before,
+      .ornament::after {
+        background: linear-gradient(90deg, transparent, var(--gold));
+        content: "";
+        height: 1px;
+        width: 72px;
+      }
+
+      .ornament::after {
+        background: linear-gradient(90deg, var(--gold), transparent);
       }
 
       .digits {
-        border-block: 1px solid #292929;
+        background: rgba(255, 251, 245, 0.42);
+        border-block: 1px solid var(--gold-soft);
         display: grid;
         grid-template-columns: repeat(4, 1fr);
         margin: 0 auto;
+        position: relative;
+      }
+
+      .digits::before,
+      .digits::after {
+        color: var(--gold);
+        content: "◆";
+        font-size: 0.62rem;
+        line-height: 1;
+        position: absolute;
+        top: 0;
+        transform: translateY(-50%) rotate(45deg);
+      }
+
+      .digits::before {
+        left: -4px;
+      }
+
+      .digits::after {
+        right: -4px;
       }
 
       .unit {
-        padding: 32px 12px 27px;
+        padding: clamp(25px, 4.5vw, 46px) 12px clamp(22px, 3.5vw, 34px);
         position: relative;
       }
 
       .unit + .unit::before {
-        background: #292929;
-        bottom: 25%;
+        background: linear-gradient(transparent, var(--gold-soft), transparent);
+        bottom: 17%;
         content: "";
         left: 0;
         position: absolute;
-        top: 25%;
+        top: 17%;
         width: 1px;
       }
 
       .number {
+        color: var(--navy);
         display: block;
-        font-size: clamp(46px, 10vw, 112px);
-        font-variant-numeric: tabular-nums;
-        font-weight: 300;
-        letter-spacing: -0.08em;
+        font-family: Didot, "Bodoni 72", "Bodoni MT", Georgia, serif;
+        font-size: clamp(3rem, 8.2vw, 6.4rem);
+        font-variant-numeric: lining-nums tabular-nums;
+        font-weight: 400;
+        letter-spacing: -0.055em;
         line-height: 0.9;
-        text-shadow:
-          2px 0 rgba(0, 217, 255, 0.22),
-          -2px 0 rgba(255, 23, 79, 0.22);
       }
 
       .name {
-        color: #646464;
+        color: var(--gold);
         display: block;
-        font-size: 9px;
+        font-family: Arial, Helvetica, sans-serif;
+        font-size: 0.72rem;
+        font-weight: 600;
         letter-spacing: 0.2em;
-        margin-top: 18px;
+        margin-top: 17px;
         text-transform: uppercase;
       }
 
       .date {
-        color: #8d8d8d;
-        font-size: 11px;
+        color: var(--ink);
+        font-family: Arial, Helvetica, sans-serif;
+        font-size: 0.76rem;
         letter-spacing: 0.16em;
         margin-top: 27px;
         text-transform: uppercase;
       }
 
       .pulse {
-        animation: pulse 1.4s infinite;
-        background: #ff174f;
+        animation: pulse 1.8s ease-in-out infinite;
+        background: var(--terracotta);
+        border: 1px solid rgba(184, 109, 85, 0.28);
         border-radius: 50%;
-        box-shadow: 0 0 12px #ff174f;
+        box-shadow: 0 0 0 4px rgba(184, 109, 85, 0.1);
         display: inline-block;
-        height: 5px;
-        margin: 0 11px 2px 0;
-        width: 5px;
+        height: 7px;
+        margin: 0 12px 1px 0;
+        width: 7px;
       }
 
       .countdown.is-complete .pulse {
-        background: #00d9ff;
-        box-shadow: 0 0 12px #00d9ff;
+        background: var(--navy);
+        border-color: rgba(39, 63, 103, 0.25);
+        box-shadow: 0 0 0 4px rgba(39, 63, 103, 0.09);
+      }
+
+      .sr-only {
+        clip: rect(0, 0, 0, 0);
+        clip-path: inset(50%);
+        height: 1px;
+        overflow: hidden;
+        position: absolute;
+        white-space: nowrap;
+        width: 1px;
       }
 
       @keyframes pulse {
         50% {
-          opacity: 0.25;
-        }
-      }
-
-      @keyframes scan-jump {
-        0%,
-        86%,
-        100% {
-          transform: translateY(0);
-        }
-        88% {
-          transform: translateY(3px);
-        }
-        92% {
-          transform: translateY(-2px);
-        }
-      }
-
-      @keyframes signal-burst {
-        0%,
-        82%,
-        100% {
-          opacity: 0;
-          transform: translateX(0);
-        }
-        83% {
-          opacity: 0.85;
-          transform: translateX(12px);
-        }
-        85% {
-          opacity: 0.12;
-          transform: translateX(-18px);
-        }
-        87% {
-          opacity: 0.55;
-          transform: translateX(4px);
-        }
-        89% {
-          opacity: 0;
+          opacity: 0.42;
+          transform: scale(0.78);
         }
       }
 
       @media (max-width: 620px) {
+        main {
+          padding-inline: 18px;
+        }
+
+        .constellation {
+          opacity: 0.2;
+        }
+
+        .emblem {
+          height: 169px;
+          width: 230px;
+        }
+
+        .emblem img {
+          top: -32px;
+          width: 680px;
+        }
+
+        .ornament {
+          margin-bottom: 21px;
+        }
+
         .digits {
           grid-template-columns: repeat(2, 1fr);
         }
 
         .unit:nth-child(3),
         .unit:nth-child(4) {
-          border-top: 1px solid #292929;
+          border-top: 1px solid var(--gold-soft);
         }
 
         .unit:nth-child(3)::before {
           display: none;
         }
 
-        .wordmark-heading {
-          margin-bottom: 38px;
+        .number {
+          font-size: clamp(3.2rem, 18vw, 4.8rem);
+        }
+
+        .date {
+          line-height: 1.7;
+        }
+      }
+
+      @media (max-height: 720px) and (min-width: 621px) {
+        main {
+          padding-block: 58px 28px;
+        }
+
+        .emblem {
+          height: 158px;
+          width: 230px;
+        }
+
+        .emblem img {
+          top: -31px;
+          width: 660px;
+        }
+
+        .ornament {
+          margin-bottom: 16px;
+        }
+
+        .unit {
+          padding-block: 25px 22px;
         }
       }
 
       @media (prefers-reduced-motion: reduce) {
-        body::before,
-        body::after,
         .pulse {
           animation: none;
+        }
+
+        .back,
+        .back::before {
+          transition: none;
         }
       }
     </style>
   </head>
   <body>
-    <a class="back" href="index.html">← article</a>
+    <div class="constellation constellation--north" aria-hidden="true"></div>
+    <div class="constellation constellation--south" aria-hidden="true"></div>
+    <a class="back" href="index.html">Article</a>
     <main>
-      <section class="countdown" aria-labelledby="fortuna-title">
-        <h1 id="fortuna-title" class="wordmark-heading" aria-label="Fortuna">
-          <span class="wordmark" aria-hidden="true">Fortuna</span>
-        </h1>
-        <div class="eyebrow" id="status">Transmission begins in</div>
+      <section class="countdown" aria-labelledby="countdown-title">
+        <h1 id="countdown-title" class="sr-only">Countdown</h1>
+        <div class="emblem" role="img" aria-label="Blindfolded figure holding a cornucopia">
+          <img src="website/fortuna-brand-reference.jpg" alt="">
+        </div>
+        <div class="ornament" aria-hidden="true">✦</div>
         <div
           class="digits"
           role="timer"
@@ -283,7 +424,6 @@
     <script>
       const target = new Date("2026-09-09T00:00:00-07:00");
       const countdown = document.querySelector(".countdown");
-      const status = document.getElementById("status");
       const parts = {
         days: document.getElementById("days"),
         hours: document.getElementById("hours"),
@@ -305,31 +445,11 @@
 
         if (remaining === 0) {
           countdown.classList.add("is-complete");
-          status.textContent = "Transmission live";
         }
       }
 
       updateCountdown();
       window.setInterval(updateCountdown, 1000);
-
-      if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-        PowerGlitch.glitch(".wordmark", {
-          playMode: "always",
-          optimizeSeo: true,
-          timing: { duration: 460, iterations: Infinity },
-          glitchTimeSpan: false,
-          shake: { velocity: 72, amplitudeX: 0.75, amplitudeY: 0.28 },
-          slice: {
-            count: 32,
-            velocity: 80,
-            minHeight: 0.005,
-            maxHeight: 0.42,
-            hueRotate: false,
-            cssFilters: "drop-shadow(11px 0 #00d9ff) drop-shadow(-11px 0 #ff174f) saturate(2) contrast(1.8)"
-          },
-          pulse: { scale: 1.28 }
-        });
-      }
     </script>
   </body>
 </html>
