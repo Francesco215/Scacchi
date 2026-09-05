@@ -38,10 +38,7 @@ def dirichlet_thompson_policy(params: base.Params, rng_key: base.PRNGKey, *, roo
         sampled_policy = action_selection.posterior_best_policy(policy_key, alpha, invalid_actions, max(1, policy_samples), chunk_size=policy_sample_chunk_size, categorical_outcome=root_edge_categorical_outcome)
         return jnp.where(root_is_categorical[:, None], categorical_policy, sampled_policy)
 
-    def categorical_policy_only(_: None) -> Float[Array, "batch action"]:
-        return categorical_policy
-
-    action_weights = jax.lax.cond(jnp.all(root_is_categorical), categorical_policy_only, unresolved_policy, operand=None)
+    action_weights = jax.lax.cond(jnp.all(root_is_categorical), lambda _: categorical_policy, unresolved_policy, operand=None)
     action = action_selection.masked_argmax(action_weights, invalid_actions)
 
     return base.PolicyOutput(

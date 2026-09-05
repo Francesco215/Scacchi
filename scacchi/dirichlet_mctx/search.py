@@ -18,7 +18,7 @@ from .tree import (
 )
 
 
-def _simulate_one(rng_key: base.PRNGKey, tree: UnbatchedTree, action_selection_fn: base.ActionSelectionFn, max_depth: int) -> base._ScalarSimulation:
+def _simulate_one(rng_key: base.PRNGKey, tree: UnbatchedTree, action_selection_fn: base.ActionSelectionFn, max_depth: int) -> base.Simulation:
     """Traverse one unbatched tree to an unvisited or cutoff edge."""
 
     root_index = jnp.asarray(Tree.ROOT_INDEX, dtype=jnp.int32)
@@ -59,22 +59,18 @@ def _simulate_one(rng_key: base.PRNGKey, tree: UnbatchedTree, action_selection_f
         is_continuing=root_active,
     )
 
-    def cond_fn(state: base._SimulationState) -> Bool[Array, ""]:
-        return state.is_continuing
+    end = jax.lax.while_loop(lambda state: state.is_continuing, body_fn, initial)
 
-    end = jax.lax.while_loop(cond_fn, body_fn, initial)
-
-    return base._ScalarSimulation(parent_index=end.node_index, action=end.action, active=root_active)
+    return base.Simulation(parent_index=end.node_index, action=end.action, active=root_active)
 
 
 def simulate(rng_key: base.BatchedPRNGKey, tree: Tree, action_selection_fn: base.ActionSelectionFn, max_depth: int) -> base.Simulation:
-    """Traverse every lane of a batched tree with exact per-lane types."""
+    """Traverse every lane of a batched tree."""
 
-    def simulate_one(key: base.PRNGKey, lane_tree: UnbatchedTree) -> base._ScalarSimulation:
+    def simulate_one(key: base.PRNGKey, lane_tree: UnbatchedTree) -> base.Simulation:
         return _simulate_one(key, lane_tree, action_selection_fn, max_depth)
 
-    result = jax.vmap(simulate_one)(rng_key, tree)
-    return base.Simulation(parent_index=result.parent_index, action=result.action, active=result.active)
+    return jax.vmap(simulate_one)(rng_key, tree)
 
 
 def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn: base.RecurrentFn, simulation: base.Simulation, new_node_index: Int32[Array, ""]) -> tuple[Tree, base.RecurrentFnOutput]:
@@ -84,11 +80,8 @@ def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn:
     parent_index = jnp.where(simulation.active, simulation.parent_index, 0)
     action = jnp.where(simulation.active, simulation.action, 0)
 
-    def gather_parent_embedding(table: Shaped[Array, "batch node *embedding_axes"]) -> Shaped[Array, "batch *embedding_axes"]:
-        return table[batch, parent_index]
-
-    embedding = jax.tree.map(gather_parent_embedding, tree.embeddings)
-    step, child_embedding = recurrent_fn(params, rng_key, action, embedding) #TODO: remove the params argument from recurrent_fn. just use nnx (low-priority)
+    embedding = jax.tree.map(lambda table: table[batch, parent_index], tree.embeddings)
+    step, child_embedding = recurrent_fn(params, rng_key, action, embedding)
     child_index = tree.children_index[batch, parent_index, action]
     initialize = simulation.active & (child_index == Tree.UNVISITED)
     child_outcome = step.terminal_outcome.astype(jnp.int8)
@@ -105,21 +98,21 @@ def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn:
     new_node_indices = jnp.broadcast_to(new_node_index, parent_index.shape)
 
     def set_child_embedding(table: Shaped[Array, "batch node *embedding_axes"], value: Shaped[Array, "batch *embedding_axes"]) -> Shaped[Array, "batch node *embedding_axes"]:
-        return utils._set_embedding_node(table, new_node_indices, value, initialize)
+        return utils._set_node(table, new_node_indices, value, initialize)
 
     tree = replace(
         tree,
-        parents=utils._set_scalar_node(tree.parents, new_node_indices, parent_index, initialize),
+        parents=utils._set_node(tree.parents, new_node_indices, parent_index, initialize),
         children_index=utils._set_edge(tree.children_index, parent_index, action, new_node_indices, initialize),
-        node_to_play=utils._set_scalar_node(tree.node_to_play, new_node_indices, step.to_play, initialize),
-        node_categorical_outcome=utils._set_scalar_node(tree.node_categorical_outcome, new_node_indices, child_outcome, initialize),
-        node_payload=utils._set_scalar_node(tree.node_payload, parent_index, parent_support, publish_terminal),
+        node_to_play=utils._set_node(tree.node_to_play, new_node_indices, step.to_play, initialize),
+        node_categorical_outcome=utils._set_node(tree.node_categorical_outcome, new_node_indices, child_outcome, initialize),
+        node_payload=utils._set_node(tree.node_payload, parent_index, parent_support, publish_terminal),
         edge_categorical_outcome=utils._set_edge(tree.edge_categorical_outcome, parent_index, action, aligned_outcome, publish_terminal),
         edge_payload=utils._set_edge(tree.edge_payload, parent_index, action, jnp.ones_like(aligned_outcome, dtype=jnp.int32), publish_terminal),
-        node_value_priors=utils._set_outcome_node(tree.node_value_priors, new_node_indices, step.value, initialize),
-        node_value_alpha=utils._set_outcome_node(tree.node_value_alpha, new_node_indices, step.value, initialize),
-        edge_alpha=utils._set_action_outcome_node(tree.edge_alpha, new_node_indices, step.action_values, initialize),
-        invalid_actions=utils._set_action_node(tree.invalid_actions, new_node_indices, step.invalid_actions, initialize),
+        node_value_priors=utils._set_node(tree.node_value_priors, new_node_indices, step.value, initialize),
+        node_value_alpha=utils._set_node(tree.node_value_alpha, new_node_indices, step.value, initialize),
+        edge_alpha=utils._set_node(tree.edge_alpha, new_node_indices, step.action_values, initialize),
+        invalid_actions=utils._set_node(tree.invalid_actions, new_node_indices, step.invalid_actions, initialize),
         embeddings=jax.tree.map(set_child_embedding, tree.embeddings, child_embedding),
     )
     return tree, step
@@ -181,10 +174,7 @@ def search(params: base.Params, rng_key: base.PRNGKey, *, root: base.RootFnOutpu
             tree, step = expand(params, expand_key, tree, recurrent_fn, simulation, new_node)
             return backward(backward_key, tree, simulation, step, posterior_update)
 
-        def keep_tree(current_tree: Tree) -> Tree:
-            return current_tree
-
-        tree = jax.lax.cond(jnp.any(simulation.active), run_active_simulation, keep_tree, tree)
+        tree = jax.lax.cond(jnp.any(simulation.active), run_active_simulation, lambda tree: tree, tree)
         return key, tree
 
     _, tree = loop_fn(0, num_simulations, body_fn, (rng_key, tree))

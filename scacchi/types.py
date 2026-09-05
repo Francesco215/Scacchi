@@ -357,9 +357,6 @@ class SearchConfig:
             getattr(self, str(self.kind)),
         )
 
-    def value(self, name: str, default: Any) -> Any:
-        return getattr(self.active(), name, default)
-
 
 @dataclass
 class ActionCommitmentConfig:
@@ -802,7 +799,6 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
         owner: Any,
         *,
         commitment_name: str,
-        legacy_kind_name: str,
         search_name: str,
     ) -> None:
         if not isinstance(owner, DictConfig):
@@ -834,6 +830,7 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
                             "root_action_estimator="
                             f"{legacy_action_estimator!r}."
                         )
+        legacy_kind_name = f"{commitment_name}_type"
         legacy_kind = owner.pop(legacy_kind_name, None)
         if (
             legacy_kind is None
@@ -847,47 +844,33 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
             commitment = owner[commitment_name]
         if not isinstance(commitment, DictConfig):
             raise ValueError(f"{commitment_name} must be a mapping.")
-        if legacy_kind is not None:
-            if "kind" in commitment:
+        for field, value, legacy_field in (
+            ("kind", legacy_kind, legacy_kind_name),
+            (
+                "posterior_sample_temperature",
+                legacy_temperature,
+                f"{search_name}.posterior_sample_temperature",
+            ),
+            ("posterior_update", legacy_posterior_update, "root_action_estimator"),
+        ):
+            if value is None:
+                continue
+            if field in commitment:
                 raise ValueError(
-                    f"cannot mix {commitment_name}.kind with deprecated "
-                    f"{legacy_kind_name}."
+                    f"cannot mix {commitment_name}.{field} with deprecated "
+                    f"{legacy_field}."
                 )
-            commitment["kind"] = legacy_kind
-        if legacy_temperature is not None:
-            if "posterior_sample_temperature" in commitment:
-                raise ValueError(
-                    f"cannot mix {commitment_name}."
-                    "posterior_sample_temperature with deprecated "
-                    f"{search_name}.posterior_sample_temperature."
-                )
-            commitment["posterior_sample_temperature"] = legacy_temperature
-        if legacy_posterior_update is not None:
-            if "posterior_update" in commitment:
-                raise ValueError(
-                    f"cannot mix {commitment_name}.posterior_update with "
-                    "deprecated root_action_estimator."
-                )
-            commitment["posterior_update"] = legacy_posterior_update
+            commitment[field] = value
 
-    migrate_action_commitment(
-        selfplay,
-        commitment_name="action_commitment",
-        legacy_kind_name="action_commitment_type",
-        search_name="search",
+    play_modes = (
+        (selfplay, "search", "action_commitment"),
+        (eval_cfg, "player_search", "player_action_commitment"),
+        (eval_cfg, "baseline_search", "baseline_action_commitment"),
     )
-    migrate_action_commitment(
-        eval_cfg,
-        commitment_name="player_action_commitment",
-        legacy_kind_name="player_action_commitment_type",
-        search_name="player_search",
-    )
-    migrate_action_commitment(
-        eval_cfg,
-        commitment_name="baseline_action_commitment",
-        legacy_kind_name="baseline_action_commitment_type",
-        search_name="baseline_search",
-    )
+    for owner, search_name, commitment_name in play_modes:
+        migrate_action_commitment(
+            owner, commitment_name=commitment_name, search_name=search_name
+        )
     top_level_search = aliased.get("search")
     if isinstance(top_level_search, DictConfig):
         top_level_search.pop("posterior_sample_temperature", None)
@@ -899,23 +882,22 @@ def _apply_config_aliases(cfg: DictConfig) -> DictConfig:
                 None,
             )
 
-    def default_dirichlet_max_depth(search: Any) -> None:
+    searches = [top_level_search] + [
+        owner.get(search_name)
+        for owner, search_name, _ in play_modes
+        if isinstance(owner, DictConfig)
+    ]
+    for search in searches:
         if not isinstance(search, DictConfig):
-            return
+            continue
         dirichlet_cfg = search.get("dirichlet_thompson")
         if not isinstance(dirichlet_cfg, DictConfig):
-            return
+            continue
         if "num_simulations" in dirichlet_cfg and (
             "max_depth" not in dirichlet_cfg or dirichlet_cfg.get("max_depth") is None
         ):
             dirichlet_cfg["max_depth"] = dirichlet_cfg["num_simulations"]
 
-    default_dirichlet_max_depth(aliased.get("search"))
-    if isinstance(selfplay, DictConfig):
-        default_dirichlet_max_depth(selfplay.get("search"))
-    if isinstance(eval_cfg, DictConfig):
-        default_dirichlet_max_depth(eval_cfg.get("player_search"))
-        default_dirichlet_max_depth(eval_cfg.get("baseline_search"))
     return aliased
 
 

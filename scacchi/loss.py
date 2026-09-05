@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import math
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, Int8, Int32
+from jaxtyping import Array, Bool, Float, Int
 import optax
 
 from .dirichlet_mctx.native_targets import (
@@ -15,32 +17,14 @@ from .dirichlet_mctx.native_targets import (
     native_fields_from_beta,
 )
 from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, assert_batch_axis_sharded
-from .play import TrainingSamples
-
-
-# A fixed, config-independent grid makes concentration histograms directly
-# comparable across runs.  The first interval covers concentrations close to
-# zero; the remaining intervals are approximately uniform in log2 space.
-# `_masked_concentration_histogram_counts` deliberately folds large finite
-# values into the final bin instead of dropping observations.
-CONCENTRATION_HISTOGRAM_NUM_BINS = 100
-CONCENTRATION_HISTOGRAM_BIN_EDGES: tuple[float, ...] = (
-    0.0,
-    *(
-        2.0
-        ** (
-            -10.0
-            + 20.0 * index / (CONCENTRATION_HISTOGRAM_NUM_BINS - 1)
-        )
-        for index in range(CONCENTRATION_HISTOGRAM_NUM_BINS)
-    ),
+from .histogram import (
+    CONCENTRATION_HISTOGRAM_BIN_EDGES,
+    CONCENTRATION_HISTOGRAM_NUM_BINS,
+    CONCENTRATION_HISTOGRAM_SERIES,
 )
-CONCENTRATION_HISTOGRAM_SERIES = (
-    "V_prior",
-    "V_posterior",
-    "Q_prior",
-    "Q_posterior",
-)
+
+if TYPE_CHECKING:
+    from .play import TrainingSamples
 
 
 class Sample(NamedTuple):
@@ -69,19 +53,6 @@ class Sample(NamedTuple):
     v_target_outcome: Int[Array, "*batch"] | None = None
     v_target_distance: Int[Array, "*batch"] | None = None
 
-
-class _NativeTargetFields(NamedTuple):
-    q_target_kind: Int8[Array, "*batch action"]
-    q_target_weight: Float[Array, "*batch action"]
-    q_target_outcome: Int8[Array, "*batch action"]
-    q_target_distance: Int32[Array, "*batch action"]
-    v_target_kind: Int8[Array, "*batch"]
-    v_target_weight: Float[Array, "*batch"]
-    v_target_outcome: Int8[Array, "*batch"]
-    v_target_distance: Int32[Array, "*batch"]
-
-
-_NATIVE_TARGET_FIELD_NAMES = _NativeTargetFields._fields
 
 class TrainMetrics(NamedTuple):
     policy_loss: Float[Array, "*batch"]
@@ -147,8 +118,26 @@ class TrainMetrics(NamedTuple):
     data_terminations_per_row: Float[Array, "*batch"]
     data_psk_termination_fraction: Float[Array, "*batch"]
 
-def _num_outcomes_for_config(config: Any) -> int:
-    return config.env.resolved_num_outcomes()
+
+def _with_categorical_targets(
+    targets: NativeTargetFields,
+    head: Literal["q", "v"],
+    mask: jax.Array,
+    outcome: jax.Array,
+) -> NativeTargetFields:
+    """Replace selected V or Q targets with exact one-step outcomes."""
+
+    updated = dict(targets)
+    for field, value in (
+        ("kind", TARGET_CATEGORICAL),
+        ("weight", 1),
+        ("outcome", outcome),
+        ("distance", 1),
+    ):
+        name = f"{head}_target_{field}"
+        previous = updated[name]
+        updated[name] = jnp.where(mask, jnp.asarray(value, dtype=previous.dtype), previous)
+    return cast(NativeTargetFields, updated)
 
 
 def _empty_posterior_targets(
@@ -207,7 +196,7 @@ def make_compute_input_for_lossfn(
                 q_pair_weight,
             ) = _empty_posterior_targets(
                 policy,
-                _num_outcomes_for_config(config),
+                config.env.resolved_num_outcomes(),
             )
         else:
             q_supervised_pair_mask = q_supervision.selected
@@ -231,8 +220,8 @@ def make_compute_input_for_lossfn(
 
         def assert_native_targets(
             label: str,
-            native_fields: _NativeTargetFields,
-        ) -> _NativeTargetFields:
+            native_fields: NativeTargetFields,
+        ) -> NativeTargetFields:
             return assert_batch_axis_sharded(native_fields, parallel, batch_axis=0, label=label)
 
         value_mask = jnp.cumsum(source.terminated[:, ::-1], axis=1)[:, ::-1] >= 1
@@ -281,65 +270,23 @@ def make_compute_input_for_lossfn(
             )
             policy_loss_mask = legal_policy_mask & value_mask & (value_tgt > 0)
 
-        native_target_values = {
-            field: metadata_value(field) for field in _NATIVE_TARGET_FIELD_NAMES
-        }
+        native_targets = _native_target_fields(metadata, beta_q_target, beta_v_target)
+        native_targets = assert_native_targets("loss native_targets after defaults", native_targets)
 
         terminal_edge_targets = config.training.losses.terminal_edge_targets
         terminal_parent_targets = config.training.losses.terminal_parent_targets
         if terminal_edge_targets or terminal_parent_targets:
-            native_defaults = native_fields_from_beta(beta_q_target, beta_v_target)
-            native_defaults = assert_batch_axis_sharded(native_defaults, parallel, batch_axis=0, label="loss native_defaults")
-            native_targets = _native_fields_from_values(
-                native_target_values,
-                native_defaults,
-            )
-            num_outcomes = beta_v_target.shape[-1]
-            rounded_reward = jnp.round(source.reward).astype(jnp.int32)
-            if num_outcomes == 2:
-                outcome_index = (rounded_reward + 1) // 2
-            elif num_outcomes == 3:
-                outcome_index = rounded_reward + 1
-            else:
-                raise ValueError(f"unsupported outcome count: {num_outcomes}")
+            outcome_index = _outcome_index(source.reward, beta_v_target.shape[-1])
             played_action_mask = jax.nn.one_hot(
                 source.played_action,
                 beta_q_target.shape[-2],
                 dtype=bool,
             )
             terminal_action_mask = source.terminated[..., None] & played_action_mask
-            native_targets = assert_native_targets(
-                "loss native_targets after defaults",
-                native_targets,
-            )
 
         if terminal_edge_targets:
-            native_targets = native_targets._replace(
-                q_target_kind=jnp.where(
-                    terminal_action_mask,
-                    jnp.asarray(
-                        int(TARGET_CATEGORICAL),
-                        dtype=native_targets.q_target_kind.dtype,
-                    ),
-                    native_targets.q_target_kind,
-                ),
-                q_target_weight=jnp.where(
-                    terminal_action_mask,
-                    jnp.ones((), dtype=native_targets.q_target_weight.dtype),
-                    native_targets.q_target_weight,
-                ),
-                q_target_outcome=jnp.where(
-                    terminal_action_mask,
-                    outcome_index[..., None].astype(
-                        native_targets.q_target_outcome.dtype,
-                    ),
-                    native_targets.q_target_outcome,
-                ),
-                q_target_distance=jnp.where(
-                    terminal_action_mask,
-                    jnp.ones((), dtype=native_targets.q_target_distance.dtype),
-                    native_targets.q_target_distance,
-                ),
+            native_targets = _with_categorical_targets(
+                native_targets, "q", terminal_action_mask, outcome_index[..., None],
             )
             q_supervised_pair_mask = (
                 q_supervised_pair_mask | terminal_action_mask
@@ -376,38 +323,13 @@ def make_compute_input_for_lossfn(
             )
             policy_loss_mask = policy_loss_mask | (terminal_win_mask & legal_policy_mask)
             value_loss_mask = value_loss_mask | terminal_win_mask
-            native_targets = native_targets._replace(
-                v_target_kind=jnp.where(
-                    terminal_win_mask,
-                    jnp.asarray(
-                        int(TARGET_CATEGORICAL),
-                        dtype=native_targets.v_target_kind.dtype,
-                    ),
-                    native_targets.v_target_kind,
-                ),
-                v_target_weight=jnp.where(
-                    terminal_win_mask,
-                    jnp.ones((), dtype=native_targets.v_target_weight.dtype),
-                    native_targets.v_target_weight,
-                ),
-                v_target_outcome=jnp.where(
-                    terminal_win_mask,
-                    outcome_index.astype(native_targets.v_target_outcome.dtype),
-                    native_targets.v_target_outcome,
-                ),
-                v_target_distance=jnp.where(
-                    terminal_win_mask,
-                    jnp.ones((), dtype=native_targets.v_target_distance.dtype),
-                    native_targets.v_target_distance,
-                ),
+            native_targets = _with_categorical_targets(
+                native_targets, "v", terminal_win_mask, outcome_index,
             )
             native_targets = assert_native_targets(
                 "loss native_targets after terminal_parent_targets",
                 native_targets,
             )
-
-        if terminal_edge_targets or terminal_parent_targets:
-            native_target_values = native_targets._asdict()
 
         sample = Sample(
             obs=source.obs,
@@ -428,12 +350,8 @@ def make_compute_input_for_lossfn(
             value_loss_mask=value_loss_mask,
             search_loss_mask=search_loss_mask,
             outcome_mask=value_mask,
-            **native_target_values,
+            **native_targets,
         )
-        sample = assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="loss sample before native defaults")
-        native_fields = _native_target_fields(sample)
-        native_fields = assert_batch_axis_sharded(native_fields, parallel, batch_axis=0, label="loss native_fields final")
-        sample = _with_native_defaults(sample, native_fields)
         return assert_batch_axis_sharded(sample, parallel, batch_axis=0, label="loss sample after native defaults")
 
     return compute_loss_input
@@ -491,42 +409,18 @@ def _mask_or(mask: jax.Array | None, fallback: jax.Array) -> jax.Array:
     return fallback if mask is None else mask
 
 
-def _native_target_values(source: Any) -> dict[str, jax.Array | None]:
-    return {field: getattr(source, field) for field in _NATIVE_TARGET_FIELD_NAMES}
+def _native_target_fields(
+    source: Any, beta_q: jax.Array, beta_v: jax.Array,
+) -> NativeTargetFields:
+    """Fill missing sidecars while leaving complete samples unchanged."""
 
-
-def _native_fields_from_values(
-    values: dict[str, jax.Array | None],
-    defaults: NativeTargetFields,
-) -> _NativeTargetFields:
-    def value_or_default(field: str, default: jax.Array) -> jax.Array:
-        value = values[field]
-        return default if value is None else value
-
-    return _NativeTargetFields(
-        q_target_kind=value_or_default("q_target_kind", defaults["q_target_kind"]),
-        q_target_weight=value_or_default("q_target_weight", defaults["q_target_weight"]),
-        q_target_outcome=value_or_default("q_target_outcome", defaults["q_target_outcome"]),
-        q_target_distance=value_or_default("q_target_distance", defaults["q_target_distance"]),
-        v_target_kind=value_or_default("v_target_kind", defaults["v_target_kind"]),
-        v_target_weight=value_or_default("v_target_weight", defaults["v_target_weight"]),
-        v_target_outcome=value_or_default("v_target_outcome", defaults["v_target_outcome"]),
-        v_target_distance=value_or_default("v_target_distance", defaults["v_target_distance"]),
-    )
-
-
-def _native_target_fields(sample: Sample) -> _NativeTargetFields:
-    defaults = native_fields_from_beta(sample.beta_Q_target, sample.beta_V_target)
-    return _native_fields_from_values(_native_target_values(sample), defaults)
-
-
-def _with_native_defaults(
-    sample: Sample,
-    native_fields: _NativeTargetFields | None = None,
-) -> Sample:
-    if native_fields is None:
-        native_fields = _native_target_fields(sample)
-    return sample._replace(**native_fields._asdict())
+    values = {field: getattr(source, field, None) for field in NativeTargetFields.__annotations__}
+    if any(value is None for value in values.values()):
+        values = {
+            field: default if values[field] is None else values[field]
+            for field, default in native_fields_from_beta(beta_q, beta_v).items()
+        }
+    return cast(NativeTargetFields, values)
 
 
 def _zero_train_metrics_like(reference: jax.Array, **values: jax.Array) -> TrainMetrics:
@@ -822,6 +716,73 @@ def _weighted_loss_term(weight: float, loss: jax.Array) -> jax.Array:
     return jnp.asarray(weight, dtype=loss.dtype) * loss
 
 
+def _head_concentration_metrics(
+    head: Literal["V", "Q"],
+    alpha: jax.Array,
+    beta: jax.Array,
+    target_kind: jax.Array,
+    mask: jax.Array,
+    config,
+    count_dtype: jnp.dtype,
+) -> tuple[dict[str, jax.Array], tuple[jax.Array, jax.Array]]:
+    """Compute the same concentration diagnostics for either V or Q."""
+
+    mass = jnp.sum(alpha, axis=-1)
+    target_mass = jnp.sum(beta, axis=-1)
+    dirichlet = mask & (target_kind == int(TARGET_DIRICHLET))
+    categorical = mask & (target_kind == int(TARGET_CATEGORICAL))
+    native = mask & (target_kind != int(TARGET_PAD))
+    tiny = jnp.asarray(jnp.finfo(count_dtype).tiny, dtype=count_dtype)
+    log_error = jnp.abs(
+        jnp.log(jnp.maximum(mass, tiny))
+        - jnp.log(jnp.maximum(target_mass, tiny))
+    )
+    concentration = _masked_mean(mass, mask)
+    zero = jnp.zeros_like(concentration)
+    floor_fraction = clip_fraction = dirichlet_clip_fraction = reference_fraction = zero
+    floor = config.model.dirichlet_concentration_floor
+    clip = config.training.regularization.dirichlet_concentration_clip
+    if floor is not None:
+        threshold = jnp.asarray(float(floor) + max(1e-3, 0.01 * float(floor)), dtype=count_dtype)
+        floor_fraction = _masked_mean((mass <= threshold).astype(mass.dtype), dirichlet)
+    if clip is not None:
+        threshold = jnp.asarray(float(clip) - 0.01 * float(clip), dtype=count_dtype)
+        reference_fraction = _masked_mean((mass >= threshold).astype(mass.dtype), categorical)
+        if str(config.model.dirichlet_head_parameterization) == "legacy":
+            clip_range = float(clip) if floor is None else float(clip) - float(floor)
+            threshold = jnp.asarray(float(clip) - 0.01 * clip_range, dtype=count_dtype)
+            at_clip = (mass >= threshold).astype(mass.dtype)
+            clip_fraction = _masked_mean(at_clip, mask)
+            dirichlet_clip_fraction = _masked_mean(at_clip, dirichlet)
+
+    lower = head.lower()
+    metrics: dict[str, jax.Array] = {
+        f"alpha_{head}_concentration": concentration,
+        f"alpha_{head}_concentration_std": _masked_std(mass, mask),
+        f"alpha_{head}_dirichlet_concentration": _masked_mean(mass, dirichlet),
+        f"alpha_{head}_dirichlet_concentration_std": _masked_std(mass, dirichlet),
+        f"alpha_{head}_categorical_concentration": _masked_mean(mass, categorical),
+        f"beta_{head}_concentration": _masked_mean(target_mass, dirichlet),
+        f"beta_{head}_concentration_std": _masked_std(target_mass, dirichlet),
+        f"{lower}_dirichlet_log_concentration_mae": _masked_mean(log_error, dirichlet),
+        f"{lower}_categorical_target_fraction": _masked_mean(categorical.astype(alpha.dtype), native),
+        f"{lower}_dirichlet_target_count": jnp.sum(dirichlet.astype(count_dtype)),
+        f"{lower}_categorical_target_count": jnp.sum(categorical.astype(count_dtype)),
+        f"{lower}_native_target_count": jnp.sum(native.astype(count_dtype)),
+        f"alpha_{head}_dirichlet_concentration_floor_fraction": floor_fraction,
+        f"alpha_{head}_dirichlet_concentration_clip_fraction": dirichlet_clip_fraction,
+        f"alpha_{head}_concentration_clip_fraction": clip_fraction,
+        f"alpha_{head}_categorical_concentration_reference_fraction": reference_fraction,
+    }
+    # Compare prior and posterior on the same finite population.
+    histogram_mask = dirichlet & jnp.isfinite(mass) & jnp.isfinite(target_mass)
+    histograms = (
+        _masked_concentration_histogram_counts(mass, histogram_mask),
+        _masked_concentration_histogram_counts(target_mass, histogram_mask),
+    )
+    return metrics, histograms
+
+
 def _compute_dirichlet_losses(
     logits: jax.Array,
     alpha_v: jax.Array,
@@ -829,8 +790,7 @@ def _compute_dirichlet_losses(
     data: Sample,
     config,
 ) -> tuple[jax.Array, TrainMetrics]:
-    native_fields = _native_target_fields(data)
-    data = _with_native_defaults(data, native_fields)
+    native_fields = _native_target_fields(data, data.beta_Q_target, data.beta_V_target)
     policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
     value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
     search_loss_mask = _mask_or(data.search_loss_mask, policy_loss_mask)
@@ -847,24 +807,24 @@ def _compute_dirichlet_losses(
     value_dir_kl = _native_dirichlet_loss(
         data.beta_V_target,
         alpha_v,
-        native_fields.v_target_kind,
-        native_fields.v_target_outcome,
-        native_fields.v_target_weight,
+        native_fields["v_target_kind"],
+        native_fields["v_target_outcome"],
+        native_fields["v_target_weight"],
         categorical_reference_concentration,
         dirichlet_loss_mode,
     )
     value_dir_kl_loss = _native_masked_mean(
         value_dir_kl,
         value_loss_mask,
-        native_fields.v_target_kind,
+        native_fields["v_target_kind"],
     )
 
     q_dir_kl = _native_dirichlet_loss(
         data.beta_Q_target,
         alpha_q,
-        native_fields.q_target_kind,
-        native_fields.q_target_outcome,
-        native_fields.q_target_weight,
+        native_fields["q_target_kind"],
+        native_fields["q_target_outcome"],
+        native_fields["q_target_weight"],
         categorical_reference_concentration,
         dirichlet_loss_mode,
     )
@@ -886,14 +846,14 @@ def _compute_dirichlet_losses(
     q_dir_kl_mask = _native_loss_mask(
         q_dir_kl,
         q_supervised_pair_mask,
-        native_fields.q_target_kind,
+        native_fields["q_target_kind"],
     )
     q_pair_reduction = config.training.losses.q_supervision.reduction
     if q_pair_reduction == "mean_over_selected_state_action_pairs":
         q_dir_kl_loss = _native_masked_mean(
             q_dir_kl,
             q_supervised_pair_mask,
-            native_fields.q_target_kind,
+            native_fields["q_target_kind"],
         )
     elif q_pair_reduction == "legacy_normalized_source_weighted_mean":
         q_pair_weights = jnp.where(
@@ -923,13 +883,13 @@ def _compute_dirichlet_losses(
     outcome_index = _outcome_index(data.value_tgt, alpha_v.shape[-1])
     value_outcome = _dirichlet_mean_categorical_nll(alpha_v, outcome_index)
     value_outcome_mask = outcome_mask & (
-        native_fields.v_target_kind != int(TARGET_CATEGORICAL)
+        native_fields["v_target_kind"] != int(TARGET_CATEGORICAL)
     )
     value_outcome_loss = _masked_mean(value_outcome, value_outcome_mask)
     played_alpha_q = _gather_played_action(alpha_q, data.played_action)
     q_outcome = _dirichlet_mean_categorical_nll(played_alpha_q, outcome_index)
     played_q_target_kind = _gather_played_action_field(
-        native_fields.q_target_kind,
+        native_fields["q_target_kind"],
         data.played_action,
     )
     q_outcome_mask = outcome_mask & (
@@ -937,239 +897,19 @@ def _compute_dirichlet_losses(
     )
     q_outcome_loss = _masked_mean(q_outcome, q_outcome_mask)
 
-    alpha_v_mass = jnp.sum(alpha_v, axis=-1)
-    alpha_q_mass = jnp.sum(alpha_q, axis=-1)
-    beta_v_mass = jnp.sum(data.beta_V_target, axis=-1)
-    beta_q_mass = jnp.sum(data.beta_Q_target, axis=-1)
-    v_dirichlet_mask = value_loss_mask & (
-        native_fields.v_target_kind == int(TARGET_DIRICHLET)
-    )
-    q_dirichlet_mask = q_supervised_pair_mask & (
-        native_fields.q_target_kind == int(TARGET_DIRICHLET)
-    )
-    v_categorical_mask = value_loss_mask & (
-        native_fields.v_target_kind == int(TARGET_CATEGORICAL)
-    )
-    q_categorical_mask = q_supervised_pair_mask & (
-        native_fields.q_target_kind == int(TARGET_CATEGORICAL)
-    )
-    # Keep each prior/posterior pair on exactly the same population.  This is
-    # normally identical to the unresolved mask, while also ensuring that a
-    # corrupted non-finite member cannot make the two histogram totals differ.
-    v_concentration_histogram_mask = (
-        v_dirichlet_mask
-        & jnp.isfinite(alpha_v_mass)
-        & jnp.isfinite(beta_v_mass)
-    )
-    q_concentration_histogram_mask = (
-        q_dirichlet_mask
-        & jnp.isfinite(alpha_q_mass)
-        & jnp.isfinite(beta_q_mass)
-    )
-    dirichlet_concentration_histogram_counts = jnp.stack(
-        (
-            _masked_concentration_histogram_counts(
-                alpha_v_mass,
-                v_concentration_histogram_mask,
-            ),
-            _masked_concentration_histogram_counts(
-                beta_v_mass,
-                v_concentration_histogram_mask,
-            ),
-            _masked_concentration_histogram_counts(
-                alpha_q_mass,
-                q_concentration_histogram_mask,
-            ),
-            _masked_concentration_histogram_counts(
-                beta_q_mass,
-                q_concentration_histogram_mask,
-            ),
-        ),
-        axis=0,
-    )
-    alpha_v_concentration = _masked_mean(alpha_v_mass, value_loss_mask)
-    alpha_q_concentration = _masked_mean(
-        alpha_q_mass,
-        q_supervised_pair_mask,
-    )
-    alpha_v_concentration_std = _masked_std(alpha_v_mass, value_loss_mask)
-    alpha_q_concentration_std = _masked_std(
-        alpha_q_mass,
-        q_supervised_pair_mask,
-    )
-    alpha_v_dirichlet_concentration = _masked_mean(
-        alpha_v_mass,
-        v_dirichlet_mask,
-    )
-    alpha_q_dirichlet_concentration = _masked_mean(
-        alpha_q_mass,
-        q_dirichlet_mask,
-    )
-    alpha_v_dirichlet_concentration_std = _masked_std(
-        alpha_v_mass,
-        v_dirichlet_mask,
-    )
-    alpha_q_dirichlet_concentration_std = _masked_std(
-        alpha_q_mass,
-        q_dirichlet_mask,
-    )
-    alpha_v_categorical_concentration = _masked_mean(
-        alpha_v_mass,
-        v_categorical_mask,
-    )
-    alpha_q_categorical_concentration = _masked_mean(
-        alpha_q_mass,
-        q_categorical_mask,
-    )
-    beta_v_concentration = _masked_mean(beta_v_mass, v_dirichlet_mask)
-    beta_q_concentration = _masked_mean(beta_q_mass, q_dirichlet_mask)
-    beta_v_concentration_std = _masked_std(beta_v_mass, v_dirichlet_mask)
-    beta_q_concentration_std = _masked_std(beta_q_mass, q_dirichlet_mask)
-    tiny = jnp.asarray(jnp.finfo(alpha_v_mass.dtype).tiny, alpha_v_mass.dtype)
-    v_log_concentration_error = jnp.abs(
-        jnp.log(jnp.maximum(alpha_v_mass, tiny))
-        - jnp.log(jnp.maximum(beta_v_mass, tiny))
-    )
-    q_log_concentration_error = jnp.abs(
-        jnp.log(jnp.maximum(alpha_q_mass, tiny))
-        - jnp.log(jnp.maximum(beta_q_mass, tiny))
-    )
-    v_dirichlet_log_concentration_mae = _masked_mean(
-        v_log_concentration_error,
-        v_dirichlet_mask,
-    )
-    q_dirichlet_log_concentration_mae = _masked_mean(
-        q_log_concentration_error,
-        q_dirichlet_mask,
-    )
-    v_native_mask = value_loss_mask & (
-        native_fields.v_target_kind != int(TARGET_PAD)
-    )
-    q_native_mask = q_supervised_pair_mask & (
-        native_fields.q_target_kind != int(TARGET_PAD)
-    )
-    count_dtype = alpha_v_mass.dtype
-    v_dirichlet_target_count = jnp.sum(
-        v_dirichlet_mask.astype(count_dtype)
-    )
-    q_dirichlet_target_count = jnp.sum(
-        q_dirichlet_mask.astype(count_dtype)
-    )
-    v_categorical_target_count = jnp.sum(
-        v_categorical_mask.astype(count_dtype)
-    )
-    q_categorical_target_count = jnp.sum(
-        q_categorical_mask.astype(count_dtype)
-    )
-    v_native_target_count = jnp.sum(v_native_mask.astype(count_dtype))
-    q_native_target_count = jnp.sum(q_native_mask.astype(count_dtype))
-    v_categorical_target_fraction = _masked_mean(
-        v_categorical_mask.astype(alpha_v.dtype),
-        v_native_mask,
-    )
-    q_categorical_target_fraction = _masked_mean(
-        q_categorical_mask.astype(alpha_q.dtype),
-        q_native_mask,
-    )
-    concentration_clip = config.training.regularization.dirichlet_concentration_clip
-    concentration_floor = config.model.dirichlet_concentration_floor
-    if concentration_floor is None:
-        alpha_v_dirichlet_concentration_floor_fraction = jnp.zeros_like(
-            alpha_v_concentration
+    count_dtype = alpha_v.dtype
+    concentration_metrics = {}
+    histograms = []
+    for head, alpha, beta, kind, mask in (
+        ("V", alpha_v, data.beta_V_target, native_fields["v_target_kind"], value_loss_mask),
+        ("Q", alpha_q, data.beta_Q_target, native_fields["q_target_kind"], q_supervised_pair_mask),
+    ):
+        head_metrics, head_histograms = _head_concentration_metrics(
+            head, alpha, beta, kind, mask, config, count_dtype,
         )
-        alpha_q_dirichlet_concentration_floor_fraction = jnp.zeros_like(
-            alpha_q_concentration
-        )
-    else:
-        floor_tolerance = max(1e-3, 0.01 * float(concentration_floor))
-        floor_threshold = jnp.asarray(
-            float(concentration_floor) + floor_tolerance,
-            dtype=alpha_v_mass.dtype,
-        )
-        alpha_v_dirichlet_concentration_floor_fraction = _masked_mean(
-            (alpha_v_mass <= floor_threshold).astype(alpha_v_mass.dtype),
-            v_dirichlet_mask,
-        )
-        alpha_q_dirichlet_concentration_floor_fraction = _masked_mean(
-            (alpha_q_mass <= floor_threshold).astype(alpha_q_mass.dtype),
-            q_dirichlet_mask,
-        )
-    is_legacy_head = (
-        str(config.model.dirichlet_head_parameterization) == "legacy"
-    )
-    if concentration_clip is None:
-        alpha_v_concentration_clip_fraction = jnp.zeros_like(
-            alpha_v_concentration
-        )
-        alpha_q_concentration_clip_fraction = jnp.zeros_like(
-            alpha_q_concentration
-        )
-        alpha_v_categorical_concentration_reference_fraction = jnp.zeros_like(
-            alpha_v_concentration
-        )
-        alpha_q_categorical_concentration_reference_fraction = jnp.zeros_like(
-            alpha_q_concentration
-        )
-        alpha_v_dirichlet_concentration_clip_fraction = jnp.zeros_like(
-            alpha_v_concentration
-        )
-        alpha_q_dirichlet_concentration_clip_fraction = jnp.zeros_like(
-            alpha_q_concentration
-        )
-    else:
-        reference_tolerance = 0.01 * float(concentration_clip)
-        reference_threshold = jnp.asarray(
-            float(concentration_clip) - reference_tolerance,
-            dtype=alpha_v_mass.dtype,
-        )
-        alpha_v_categorical_concentration_reference_fraction = _masked_mean(
-            (alpha_v_mass >= reference_threshold).astype(alpha_v_mass.dtype),
-            v_categorical_mask,
-        )
-        alpha_q_categorical_concentration_reference_fraction = _masked_mean(
-            (alpha_q_mass >= reference_threshold).astype(alpha_q_mass.dtype),
-            q_categorical_mask,
-        )
-        if not is_legacy_head:
-            alpha_v_concentration_clip_fraction = jnp.zeros_like(
-                alpha_v_concentration
-            )
-            alpha_q_concentration_clip_fraction = jnp.zeros_like(
-                alpha_q_concentration
-            )
-            alpha_v_dirichlet_concentration_clip_fraction = jnp.zeros_like(
-                alpha_v_concentration
-            )
-            alpha_q_dirichlet_concentration_clip_fraction = jnp.zeros_like(
-                alpha_q_concentration
-            )
-        else:
-            clip_range = (
-                float(concentration_clip)
-                if concentration_floor is None
-                else float(concentration_clip) - float(concentration_floor)
-            )
-            clip_tolerance = 0.01 * clip_range
-            clip_threshold = jnp.asarray(
-                float(concentration_clip) - clip_tolerance,
-                dtype=alpha_v_mass.dtype,
-            )
-            alpha_v_concentration_clip_fraction = _masked_mean(
-                (alpha_v_mass >= clip_threshold).astype(alpha_v_mass.dtype),
-                value_loss_mask,
-            )
-            alpha_q_concentration_clip_fraction = _masked_mean(
-                (alpha_q_mass >= clip_threshold).astype(alpha_q_mass.dtype),
-                q_supervised_pair_mask,
-            )
-            alpha_v_dirichlet_concentration_clip_fraction = _masked_mean(
-                (alpha_v_mass >= clip_threshold).astype(alpha_v_mass.dtype),
-                v_dirichlet_mask,
-            )
-            alpha_q_dirichlet_concentration_clip_fraction = _masked_mean(
-                (alpha_q_mass >= clip_threshold).astype(alpha_q_mass.dtype),
-                q_dirichlet_mask,
-            )
+        concentration_metrics.update(head_metrics)
+        histograms.extend(head_histograms)
+
     q_supervised_actions_per_row = _masked_mean(
         jnp.sum(q_supervised_pair_mask.astype(count_dtype), axis=-1),
         q_row_mask,
@@ -1190,7 +930,7 @@ def _compute_dirichlet_losses(
         & q_population_mask
     )
     q_solved_action_mask = q_population_mask & (
-        native_fields.q_target_kind == int(TARGET_CATEGORICAL)
+        native_fields["q_target_kind"] == int(TARGET_CATEGORICAL)
     )
     q_positive_evidence_action_count = jnp.sum(
         q_positive_evidence_action_mask.astype(count_dtype)
@@ -1245,69 +985,12 @@ def _compute_dirichlet_losses(
         q_dir_kl_loss=q_dir_kl_loss,
         value_outcome_loss=value_outcome_loss,
         q_outcome_loss=q_outcome_loss,
-        dirichlet_concentration_histogram_counts=(
-            dirichlet_concentration_histogram_counts
-        ),
-        alpha_V_concentration=alpha_v_concentration,
-        alpha_Q_concentration=alpha_q_concentration,
-        alpha_V_concentration_std=alpha_v_concentration_std,
-        alpha_Q_concentration_std=alpha_q_concentration_std,
-        alpha_V_dirichlet_concentration=alpha_v_dirichlet_concentration,
-        alpha_Q_dirichlet_concentration=alpha_q_dirichlet_concentration,
-        alpha_V_dirichlet_concentration_std=(
-            alpha_v_dirichlet_concentration_std
-        ),
-        alpha_Q_dirichlet_concentration_std=(
-            alpha_q_dirichlet_concentration_std
-        ),
-        alpha_V_categorical_concentration=alpha_v_categorical_concentration,
-        alpha_Q_categorical_concentration=alpha_q_categorical_concentration,
-        beta_V_concentration=beta_v_concentration,
-        beta_Q_concentration=beta_q_concentration,
-        beta_V_concentration_std=beta_v_concentration_std,
-        beta_Q_concentration_std=beta_q_concentration_std,
-        v_dirichlet_log_concentration_mae=(
-            v_dirichlet_log_concentration_mae
-        ),
-        q_dirichlet_log_concentration_mae=(
-            q_dirichlet_log_concentration_mae
-        ),
-        v_categorical_target_fraction=v_categorical_target_fraction,
-        q_categorical_target_fraction=q_categorical_target_fraction,
-        alpha_V_dirichlet_concentration_floor_fraction=(
-            alpha_v_dirichlet_concentration_floor_fraction
-        ),
-        alpha_Q_dirichlet_concentration_floor_fraction=(
-            alpha_q_dirichlet_concentration_floor_fraction
-        ),
-        alpha_V_dirichlet_concentration_clip_fraction=(
-            alpha_v_dirichlet_concentration_clip_fraction
-        ),
-        alpha_Q_dirichlet_concentration_clip_fraction=(
-            alpha_q_dirichlet_concentration_clip_fraction
-        ),
-        alpha_V_concentration_clip_fraction=(
-            alpha_v_concentration_clip_fraction
-        ),
-        alpha_Q_concentration_clip_fraction=(
-            alpha_q_concentration_clip_fraction
-        ),
-        alpha_V_categorical_concentration_reference_fraction=(
-            alpha_v_categorical_concentration_reference_fraction
-        ),
-        alpha_Q_categorical_concentration_reference_fraction=(
-            alpha_q_categorical_concentration_reference_fraction
-        ),
+        dirichlet_concentration_histogram_counts=jnp.stack(histograms, axis=0),
         dirichlet_head_is_legacy=jnp.asarray(
-            is_legacy_head,
-            dtype=alpha_v_mass.dtype,
+            str(config.model.dirichlet_head_parameterization) == "legacy",
+            dtype=count_dtype,
         ),
-        v_dirichlet_target_count=v_dirichlet_target_count,
-        q_dirichlet_target_count=q_dirichlet_target_count,
-        v_categorical_target_count=v_categorical_target_count,
-        q_categorical_target_count=q_categorical_target_count,
-        v_native_target_count=v_native_target_count,
-        q_native_target_count=q_native_target_count,
+        **concentration_metrics,
         q_supervised_actions_per_row=q_supervised_actions_per_row,
         q_positive_evidence_action_count=q_positive_evidence_action_count,
         q_positive_policy_action_count=q_positive_policy_action_count,

@@ -13,31 +13,13 @@ from .outcomes import NO_OUTCOME, align_categorical_outcome
 from .tree import ChildrenView, NodeView, PosteriorUpdate, Tree
 
 
-def _set_scalar_node(array: Shaped[Array, "batch node"], node_index: Int32[Array, "batch"], value: Shaped[Array, "batch"], active: Bool[Array, "batch"]) -> Shaped[Array, "batch node"]:
-    batch = jnp.arange(array.shape[0])
-    old = array[batch, node_index]
-    return array.at[batch, node_index].set(jnp.where(active, value, old))
-
-
-def _set_action_node(array: Shaped[Array, "batch node action"], node_index: Int32[Array, "batch"], value: Shaped[Array, "batch action"], active: Bool[Array, "batch"]) -> Shaped[Array, "batch node action"]:
-    batch = jnp.arange(array.shape[0])
-    old = array[batch, node_index]
-    return array.at[batch, node_index].set(jnp.where(active[:, None], value, old))
-
-
-def _set_outcome_node(array: Shaped[Array, "batch node outcome"], node_index: Int32[Array, "batch"], value: Shaped[Array, "batch outcome"], active: Bool[Array, "batch"]) -> Shaped[Array, "batch node outcome"]:
-    batch = jnp.arange(array.shape[0])
-    old = array[batch, node_index]
-    return array.at[batch, node_index].set(jnp.where(active[:, None], value, old))
-
-
-def _set_action_outcome_node(array: Shaped[Array, "batch node action outcome"], node_index: Int32[Array, "batch"], value: Shaped[Array, "batch action outcome"], active: Bool[Array, "batch"]) -> Shaped[Array, "batch node action outcome"]:
-    batch = jnp.arange(array.shape[0])
-    old = array[batch, node_index]
-    return array.at[batch, node_index].set(jnp.where(active[:, None, None], value, old))
-
-
-def _set_embedding_node(array: Shaped[Array, "batch node *embedding_axes"], node_index: Int32[Array, "batch"], value: Shaped[Array, "batch *embedding_axes"], active: Bool[Array, "batch"]) -> Shaped[Array, "batch node *embedding_axes"]:
+def _set_node(
+    array: Shaped[Array, "batch node *payload"],
+    node_index: Int32[Array, "batch"],
+    value: Shaped[Array, "batch *payload"],
+    active: Bool[Array, "batch"],
+) -> Shaped[Array, "batch node *payload"]:
+    """Update active nodes, broadcasting the mask over any payload shape."""
     batch = jnp.arange(array.shape[0])
     old = array[batch, node_index]
     mask = active.reshape(active.shape + (1,) * (old.ndim - 1))
@@ -79,7 +61,7 @@ def _set_node_update(tree: Tree, node_index: Int32[Array, "batch"], update: Post
     count_delta = jnp.sum(jnp.where(legal, new_payload - old_payload, 0), axis=-1)
     new_node_payload = tree.node_payload[batch, node_index] + count_delta
     edge_alpha = jnp.where(unresolved[..., None], update.edge_alpha, tree.edge_alpha[batch, node_index])
-    return replace(tree, node_payload=_set_scalar_node(tree.node_payload, node_index, new_node_payload, active), edge_alpha=_set_action_outcome_node(tree.edge_alpha, node_index, edge_alpha, active), edge_payload=_set_action_node(tree.edge_payload, node_index, new_payload, active), node_value_alpha=_set_outcome_node(tree.node_value_alpha, node_index, update.value_alpha, active))
+    return replace(tree, node_payload=_set_node(tree.node_payload, node_index, new_node_payload, active), edge_alpha=_set_node(tree.edge_alpha, node_index, edge_alpha, active), edge_payload=_set_node(tree.edge_payload, node_index, new_payload, active), node_value_alpha=_set_node(tree.node_value_alpha, node_index, update.value_alpha, active))
 
 
 def _categorize_node_and_publish(rng_key: base.PRNGKey, tree: Tree, node_index: Int32[Array, "batch"], active: Bool[Array, "batch"]) -> Tree:
@@ -115,6 +97,6 @@ def _categorize_node_and_publish(rng_key: base.PRNGKey, tree: Tree, node_index: 
     node_player = tree.node_to_play[batch, node_index]
     parent_player = tree.node_to_play[batch, safe_parent]
     aligned_outcome = align_categorical_outcome(candidate_outcome, node_player, parent_player, num_outcomes)
-    node_payload = _set_scalar_node(tree.node_payload, safe_parent, new_parent_support, publish_edge)
-    node_payload = _set_scalar_node(node_payload, node_index, candidate_distance, publish_node)
-    return replace(tree, node_payload=node_payload, node_categorical_outcome=_set_scalar_node(tree.node_categorical_outcome, node_index, candidate_outcome, publish_node), edge_categorical_outcome=_set_edge(tree.edge_categorical_outcome, safe_parent, incoming_action, aligned_outcome, publish_edge), edge_payload=_set_edge(tree.edge_payload, safe_parent, incoming_action, candidate_distance + jnp.asarray(1, dtype=jnp.int32), publish_edge))
+    node_payload = _set_node(tree.node_payload, safe_parent, new_parent_support, publish_edge)
+    node_payload = _set_node(node_payload, node_index, candidate_distance, publish_node)
+    return replace(tree, node_payload=node_payload, node_categorical_outcome=_set_node(tree.node_categorical_outcome, node_index, candidate_outcome, publish_node), edge_categorical_outcome=_set_edge(tree.edge_categorical_outcome, safe_parent, incoming_action, aligned_outcome, publish_edge), edge_payload=_set_edge(tree.edge_payload, safe_parent, incoming_action, candidate_distance + jnp.asarray(1, dtype=jnp.int32), publish_edge))

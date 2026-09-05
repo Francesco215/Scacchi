@@ -1,12 +1,60 @@
+from typing import Any
+
 from flax import nnx
 import jax
 import jax.numpy as jnp
 from einops import rearrange
+import optax
 
 from .loss import Sample, TrainMetrics, make_compute_input_for_lossfn, train
 from .play import make_selfplay
 from .play import TrainingSamples
 from .distributed import DISABLED_BATCH_PARALLEL, BatchParallel, assert_batch_axis_sharded
+from .types import Config
+
+
+def _muon_weight_dimension_numbers(params: Any) -> Any:
+    """Use Muon for hidden block kernels and auxiliary Adam elsewhere."""
+
+    def dimension_numbers(path: tuple[Any, ...], value: Any):
+        parts = tuple(getattr(key, "key", getattr(key, "idx", getattr(key, "name", None))) for key in path)
+        is_kernel = parts[-1:] == ("kernel",) or parts[-2:] == (
+            "kernel",
+            "value",
+        )
+        if parts[:1] != ("blocks",) or not is_kernel or value.ndim < 2:
+            return None
+        return optax.contrib.MuonDimensionNumbers(
+            reduction_axis=tuple(range(value.ndim - 1)),
+            output_axis=value.ndim - 1,
+        )
+
+    return jax.tree_util.tree_map_with_path(dimension_numbers, params)
+
+
+def build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
+    transforms: list[optax.GradientTransformation] = []
+    if config.training.grad_clip_norm is not None:
+        transforms.append(optax.clip_by_global_norm(config.training.grad_clip_norm))
+
+    learning_rate: float | optax.Schedule = config.training.learning_rate
+    if config.training.lr_decay_after_iters is not None and config.training.lr_decay_factor != 1.0:
+        rows_per_iteration = max(1, config.selfplay.batch_size * config.selfplay.max_num_steps)
+        updates_per_iteration = max(1, rows_per_iteration // config.training.batch_size)
+        if config.training.max_updates_per_iter is not None:
+            updates_per_iteration = min(updates_per_iteration, config.training.max_updates_per_iter)
+        boundary = config.training.lr_decay_after_iters * updates_per_iteration
+        learning_rate = optax.piecewise_constant_schedule(config.training.learning_rate, {boundary: config.training.lr_decay_factor})
+
+    transforms.append(
+        optax.contrib.muon(
+            5e-3,
+            adam_learning_rate=learning_rate,
+            muon_weight_dimension_numbers=_muon_weight_dimension_numbers,
+            consistent_rms=0.2,
+        )
+    )
+    return nnx.Optimizer(model, optax.chain(*transforms), wrt=nnx.Param)
 
 
 def make_minibatches(

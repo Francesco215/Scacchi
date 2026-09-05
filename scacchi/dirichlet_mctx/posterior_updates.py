@@ -101,14 +101,10 @@ def _repair_inputs(
         + direct_is_dirichlet.astype(edge_payload.dtype)
     )
 
-    child_target_player = jnp.broadcast_to(
-        node.to_play[:, None],
-        children.to_play.shape,
-    )
     child_value = align_outcome(
         children.value_alpha,
         children.to_play,
-        child_target_player,
+        node.to_play[:, None],
     )
     refresh = (
         active[:, None]
@@ -132,20 +128,10 @@ def _repair_inputs(
     child_prior = align_outcome(
         children.value_prior,
         children.to_play,
-        child_target_player,
+        node.to_play[:, None],
     )
-    fallback = jnp.where(
-        children.visited[..., None],
-        child_prior,
-        edge_alpha,
-    )
-    unresolved_count = jnp.where(unresolved, edge_payload, 0)
-    use_stored = ~unresolved | (unresolved_count > 0)
-    effective_alpha = jnp.where(
-        use_stored[..., None],
-        edge_alpha,
-        fallback,
-    )
+    use_child_prior = children.visited & unresolved & (edge_payload <= 0)
+    effective_alpha = jnp.where(use_child_prior[..., None], child_prior, edge_alpha)
 
     categorical = ~unresolved
     safe_categorical_outcome = jnp.where(
@@ -170,16 +156,10 @@ def _repair_inputs(
         effective_alpha,
     )
 
-    old_unresolved_count = jnp.where(
-        unresolved,
-        node.edge_payload,
-        0,
-    )
-    legal = ~node.invalid_actions
     count_delta = jnp.sum(
         jnp.where(
-            legal,
-            unresolved_count - old_unresolved_count,
+            unresolved & ~node.invalid_actions,
+            edge_payload - node.edge_payload,
             0,
         ),
         axis=-1,
@@ -302,26 +282,24 @@ def update_posterior_prefix_cdf(
     def mixed_fallback(
         accepted: PosteriorUpdate,
     ) -> PosteriorUpdate:
-        native = update_posterior(
+        native_policy = posterior_best_policy(
             rng_key,
-            context,
-            kappa=kappa,
-            policy_samples=fallback_policy_samples,
-            policy_sample_chunk_size=(
-                fallback_policy_sample_chunk_size
-            ),
+            prepared.effective_alpha,
+            context.node.invalid_actions,
+            fallback_policy_samples,
+            chunk_size=fallback_policy_sample_chunk_size,
+            categorical_outcome=context.node.edge_categorical_outcome,
         )
+        native = _repair_from_policy(
+            context,
+            prepared,
+            native_policy,
+            kappa=kappa,
+        )
+        # Both policies share the same edge repair; only the value differs.
         return PosteriorUpdate(
-            edge_alpha=jnp.where(
-                unsafe[:, None, None],
-                native.edge_alpha,
-                accepted.edge_alpha,
-            ),
-            edge_payload=jnp.where(
-                unsafe[:, None],
-                native.edge_payload,
-                accepted.edge_payload,
-            ),
+            edge_alpha=accepted.edge_alpha,
+            edge_payload=accepted.edge_payload,
             value_alpha=jnp.where(
                 unsafe[:, None],
                 native.value_alpha,

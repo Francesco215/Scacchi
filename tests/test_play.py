@@ -211,10 +211,10 @@ def test_scalar_gumbel_search_preserves_batch_sharding_without_collectives():
 
     output = jax.jit(run)(env_state, rng_key)
     output = assert_batch_axis_sharded(output, parallel, batch_axis=0, label="scalar gumbel output")
-    metadata = output.posterior.metadata
+    metadata = output.metadata
     assert metadata is not None
     assert metadata.search_action is not None
-    assert output.posterior.prediction.policy.shape == (batch_size, num_actions)
+    assert output.prediction.policy.shape == (batch_size, num_actions)
     assert metadata.search_action.shape == (batch_size,)
 
 
@@ -274,8 +274,8 @@ def test_dirichlet_thompson_prior_only_search_preserves_rng_and_targets():
         dtype=root_prediction.alpha_q.dtype,
     )
 
-    prediction = output.posterior.prediction
-    metadata = output.posterior.metadata
+    prediction = output.prediction
+    metadata = output.metadata
     assert metadata is not None
     assert jnp.array_equal(prediction.policy, expected_policy)
     assert jnp.array_equal(prediction.alpha_q, root_prediction.alpha_q)
@@ -338,28 +338,28 @@ def test_numerical_update_drives_q21_root_target():
         q_supervision_config=_POLICY_Q_SUPERVISION,
     )(env_state, key)
 
-    native_metadata = native.posterior.metadata
-    numerical_metadata = numerical.posterior.metadata
+    native_metadata = native.metadata
+    numerical_metadata = numerical.metadata
     assert native_metadata is not None
     assert numerical_metadata is not None
     assert native_metadata.q_supervision is not None
     assert numerical_metadata.q_supervision is not None
     assert not jnp.array_equal(
-        numerical.posterior.prediction.policy,
-        native.posterior.prediction.policy,
+        numerical.prediction.policy,
+        native.prediction.policy,
     )
     assert jnp.array_equal(
         native_metadata.q_supervision.selected,
-        native.posterior.prediction.policy > 0,
+        native.prediction.policy > 0,
     )
     assert jnp.array_equal(
         numerical_metadata.q_supervision.selected,
-        numerical.posterior.prediction.policy > 0,
+        numerical.prediction.policy > 0,
     )
     assert jnp.array_equal(
         numerical_metadata.q_supervision.pair_weight,
         numerical_metadata.q_supervision.selected.astype(
-            numerical.posterior.prediction.policy.dtype
+            numerical.prediction.policy.dtype
         ),
     )
 
@@ -392,7 +392,7 @@ def test_search_player_composes_q21_action_with_cubic_sampling():
     )(env_state, search_key)
     policy_key, sample_key = jax.random.split(action_key)
     commitment_policy = _dirichlet_commitment_policy(
-        search_output.posterior,
+        search_output,
         env_state.legal_action_mask,
         policy_key,
         search_config.dirichlet_thompson,
@@ -451,7 +451,7 @@ def test_action_commitment_can_select_a_different_posterior_update():
     )(env_state, search_key)
     policy_key, sample_key = jax.random.split(action_key)
     expected_policy = _dirichlet_commitment_policy(
-        search_output.posterior,
+        search_output,
         env_state.legal_action_mask,
         policy_key,
         search_config.dirichlet_thompson,
@@ -654,7 +654,7 @@ def test_search_player_preserves_solved_native_action_under_temperature():
         _toy_dirichlet_evaluator,
         search_config,
     )(env_state, search_key)
-    metadata = search_output.posterior.metadata
+    metadata = search_output.metadata
     assert metadata is not None
     assert metadata.search_action is not None
 
@@ -715,19 +715,19 @@ def test_unsafe_q21_action_update_uses_its_monte_carlo_fallback():
         extreme_evaluator,
         search_config,
     )(env_state, jax.random.PRNGKey(92))
-    metadata = output.posterior.metadata
+    metadata = output.metadata
     assert metadata is not None
     assert metadata.search_action is not None
     key = jax.random.PRNGKey(123)
     numerical = _dirichlet_commitment_policy(
-        output.posterior,
+        output,
         env_state.legal_action_mask,
         key,
         search_config.dirichlet_thompson,
         PosteriorUpdateKind.numerical,
     )
     native = _dirichlet_commitment_policy(
-        output.posterior,
+        output,
         env_state.legal_action_mask,
         key,
         search_config.dirichlet_thompson,
@@ -834,8 +834,8 @@ def test_dirichlet_thompson_tree_search_builds_legal_targets(
 
     output = search(env_state, jax.random.PRNGKey(23))
 
-    prediction = output.posterior.prediction
-    metadata = output.posterior.metadata
+    prediction = output.prediction
+    metadata = output.metadata
     assert metadata is not None
     assert prediction.alpha_v is not None
     assert prediction.alpha_q is not None
@@ -883,8 +883,8 @@ def test_dirichlet_thompson_exports_categorical_root_and_q_targets():
     )
 
     output = search(env_state, jax.random.PRNGKey(29))
-    prediction = output.posterior.prediction
-    metadata = output.posterior.metadata
+    prediction = output.prediction
+    metadata = output.metadata
     assert metadata is not None
     assert metadata.search_action is not None
     assert metadata.q_target_kind is not None

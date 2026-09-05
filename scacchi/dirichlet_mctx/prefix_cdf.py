@@ -137,37 +137,28 @@ def _finalize_policy(
         certified_win.astype(jnp.int32),
         axis=-1,
     )
-    win_policy = jax.nn.one_hot(
-        first_certified_win,
-        num_actions,
-        dtype=dtype,
-    )
-    win_policy = jnp.where(legal, win_policy, 0.0)
 
-    # This branch applies only when no unresolved legal action remains.
-    # It intentionally matches masked_argmax: highest exact binary outcome,
-    # with the lowest action index resolving equal outcomes.
+    # Without a certified win or unresolved legal action, match masked_argmax:
+    # highest exact binary outcome, with the lowest index resolving ties.
     categorical_score = jnp.where(
         legal,
         categorical_outcome.astype(dtype),
         -jnp.inf,
     )
     categorical_best = jnp.argmax(categorical_score, axis=-1)
+    categorical_best = jnp.where(
+        has_certified_win, first_certified_win, categorical_best
+    )
     categorical_policy = jax.nn.one_hot(
         categorical_best,
         num_actions,
         dtype=dtype,
     )
-    categorical_policy = jnp.where(legal, categorical_policy, 0.0)
 
     raw_policy = jnp.where(
-        has_certified_win[..., None],
-        win_policy,
-        jnp.where(
-            has_unresolved[..., None],
-            unresolved_probability,
-            categorical_policy,
-        ),
+        (has_certified_win | ~has_unresolved)[..., None],
+        categorical_policy,
+        unresolved_probability,
     )
     raw_policy = jnp.where(legal, raw_policy, 0.0)
     raw_mass = jnp.sum(raw_policy, axis=-1)

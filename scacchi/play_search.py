@@ -84,9 +84,7 @@ class PosteriorTargets(NamedTuple):
     metadata: TargetMetadata | None = None
 
 
-class SearchOutput(NamedTuple):
-    posterior: PosteriorTargets
-Search = Callable[[pgx.State, chex.PRNGKey], SearchOutput]
+Search = Callable[[pgx.State, chex.PRNGKey], PosteriorTargets]
 
 
 class PlayerOutput(NamedTuple):
@@ -341,7 +339,7 @@ def _dirichlet_root_policy_readout(
     )
 
 
-def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_supervision_config: QSupervisionConfig) -> SearchOutput:
+def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_supervision_config: QSupervisionConfig) -> PosteriorTargets:
     del q_supervision_config
     value = _required_output(prediction.value, "value")
     root = mctx.RootFnOutput(prior_logits=prediction.logits, value=value, embedding=env_state)
@@ -359,7 +357,7 @@ def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput,
     search_action = cast(jax.Array, policy_output.action)
     posterior_prediction = PosteriorPrediction(policy=policy_target, value=value)
     metadata = TargetMetadata(mask=_search_loss_mask(policy_target), search_action=search_action)
-    return SearchOutput(PosteriorTargets(prediction=posterior_prediction, metadata=metadata))
+    return PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
 
 
 def _posterior_policy_sampling_budget(
@@ -416,7 +414,7 @@ def _run_dirichlet_thompson_search(
     rng_key: jax.Array,
     search_cfg: DirichletThompsonSearchConfig,
     q_supervision_config: QSupervisionConfig,
-) -> SearchOutput:
+) -> PosteriorTargets:
     """Run the MCTX-shaped Dirichlet Thompson backend."""
 
     alpha_v = _required_output(prediction.alpha_v, "alpha_v")
@@ -522,15 +520,13 @@ def _run_dirichlet_thompson_search(
         v_target_outcome=summary.v_categorical_outcome,
         v_target_distance=summary.v_categorical_distance,
     )
-    return SearchOutput(
-        PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
-    )
+    return PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
 
 
 def _make_dirichlet_thompson_search(env, evaluator: Evaluator, search_cfg: DirichletThompsonSearchConfig, q_supervision_config: QSupervisionConfig) -> Search:
     expand_fn = make_dirichlet_expand_fn(env, evaluator)
 
-    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
+    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> PosteriorTargets:
         prediction = evaluator(root_state.observation)
         return _run_dirichlet_thompson_search(
             root_state,
@@ -545,7 +541,7 @@ def _make_dirichlet_thompson_search(env, evaluator: Evaluator, search_cfg: Diric
 
 
 def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfig, *args, **kwargs) -> Search:
-    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
+    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> PosteriorTargets:
         prediction = evaluator(root_state.observation)
         policy = _masked_policy(prediction.logits, root_state.legal_action_mask, temperature=float(search_cfg.temperature))
         search_action = posterior_sample_action(
@@ -558,7 +554,7 @@ def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfi
             mask=_search_loss_mask(policy),
             search_action=search_action,
         )
-        return SearchOutput(PosteriorTargets(prediction=prediction, metadata=metadata))
+        return PosteriorTargets(prediction=prediction, metadata=metadata)
 
     return search
 
@@ -566,7 +562,7 @@ def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfi
 def _make_gumbel_search(env, evaluator: Evaluator, search_cfg: GumbelSearchConfig, q_supervision_config: QSupervisionConfig) -> Search:
     scalar_expand_fn = make_gumbel_expand_fn(env, evaluator)
 
-    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
+    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> PosteriorTargets:
         prediction = evaluator(root_state.observation)
         if prediction.alpha_q is not None:
             raise ValueError(
@@ -781,12 +777,12 @@ def make_search_player(
 
     def player(env_state: pgx.State, rng_key: jax.Array) -> PlayerOutput:
         search_key, action_key = jax.random.split(rng_key)
-        search_output = search(env_state, search_key)
+        posterior = search(env_state, search_key)
         action = action_committer(
-            search_output.posterior,
+            posterior,
             env_state.legal_action_mask,
             action_key,
         )
-        return PlayerOutput(action=action, posterior=search_output.posterior)
+        return PlayerOutput(action=action, posterior=posterior)
 
     return player

@@ -32,11 +32,6 @@ def _squared_softplus_concentration_logit(concentration: float) -> float:
     return math.log(math.expm1(math.sqrt(concentration)))
 
 
-def _unit_dirichlet_concentration_logit(num_outcomes: int) -> float:
-    """Legacy logit whose squared-softplus transform totals ``num_outcomes``."""
-    return _squared_softplus_concentration_logit(float(num_outcomes))
-
-
 _DIRICHLET_INITIAL_EXCESS_CONCENTRATION = 0.1
 _LOG_CONCENTRATION_MIN = -80.0
 _LOG_CONCENTRATION_MAX = 80.0
@@ -97,6 +92,59 @@ def _smooth_dirichlet_concentration_logit(
         )
     fraction = initial_excess / concentration_range
     return math.log(fraction / (1.0 - fraction))
+
+
+def _initial_dirichlet_concentration_logit(
+    parameterization: str,
+    *,
+    concentration_floor: float | None,
+    concentration_clip: float | None,
+    initial_concentration: float | None,
+    default_concentration: float,
+) -> float:
+    """Resolve the shared head bias while preserving each network's default."""
+    if parameterization == "log_concentration":
+        if concentration_floor is not None:
+            raise ValueError(
+                "direct log-concentration heads do not support a "
+                "concentration floor"
+            )
+    elif parameterization != "legacy":
+        raise ValueError(
+            "unknown Dirichlet concentration parameterization: "
+            f"{parameterization!r}"
+        )
+
+    if concentration_floor is None:
+        concentration = (
+            default_concentration
+            if initial_concentration is None
+            else float(initial_concentration)
+        )
+        if parameterization == "log_concentration":
+            return _direct_log_concentration(concentration)
+        if concentration_clip is not None and concentration >= float(concentration_clip):
+            raise ValueError(
+                "dirichlet_concentration_clip must exceed "
+                "dirichlet_initial_concentration; got "
+                f"initial={concentration}, clip={concentration_clip}"
+            )
+        return _squared_softplus_concentration_logit(concentration)
+
+    initial_excess = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+    if initial_concentration is not None:
+        initial_excess = float(initial_concentration) - concentration_floor
+        if initial_excess <= 0.0:
+            raise ValueError(
+                "dirichlet_initial_concentration must exceed the "
+                f"configured floor {concentration_floor}; got "
+                f"{initial_concentration}"
+            )
+    return _smooth_dirichlet_concentration_logit(
+        concentration_floor,
+        concentration_clip,
+        initial_excess=initial_excess,
+    )
 
 
 def dirichlet_from_logits(
@@ -324,70 +372,13 @@ class AZDirichletNet(nnx.Module):
         self.dirichlet_concentration_clip = dirichlet_concentration_clip
         self.dirichlet_initial_concentration = dirichlet_initial_concentration
 
-        if self.dirichlet_head_parameterization == "log_concentration":
-            if self.dirichlet_concentration_floor is not None:
-                raise ValueError(
-                    "direct log-concentration heads do not support a "
-                    "concentration floor"
-                )
-            initial_concentration = (
-                float(num_outcomes)
-                if dirichlet_initial_concentration is None
-                else float(dirichlet_initial_concentration)
-            )
-            concentration_logit = _direct_log_concentration(
-                initial_concentration
-            )
-        elif (
-            self.dirichlet_head_parameterization == "legacy"
-            and self.dirichlet_concentration_floor is None
-        ):
-            initial_concentration = (
-                float(num_outcomes)
-                if dirichlet_initial_concentration is None
-                else float(dirichlet_initial_concentration)
-            )
-            if (
-                self.dirichlet_concentration_clip is not None
-                and initial_concentration
-                >= float(self.dirichlet_concentration_clip)
-            ):
-                raise ValueError(
-                    "dirichlet_concentration_clip must exceed "
-                    "dirichlet_initial_concentration; got "
-                    f"initial={initial_concentration}, "
-                    f"clip={self.dirichlet_concentration_clip}"
-                )
-            concentration_logit = _squared_softplus_concentration_logit(
-                initial_concentration
-            )
-        elif self.dirichlet_head_parameterization == "legacy":
-            legacy_floor = self.dirichlet_concentration_floor
-            if legacy_floor is None:
-                raise AssertionError("legacy floor branch requires a floor")
-            initial_excess = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
-            if dirichlet_initial_concentration is not None:
-                initial_excess = (
-                    float(dirichlet_initial_concentration)
-                    - legacy_floor
-                )
-                if initial_excess <= 0.0:
-                    raise ValueError(
-                        "dirichlet_initial_concentration must exceed the "
-                        f"configured floor "
-                        f"{legacy_floor}; got "
-                        f"{dirichlet_initial_concentration}"
-                    )
-            concentration_logit = _smooth_dirichlet_concentration_logit(
-                legacy_floor,
-                self.dirichlet_concentration_clip,
-                initial_excess=initial_excess,
-            )
-        else:
-            raise ValueError(
-                "unknown Dirichlet concentration parameterization: "
-                f"{self.dirichlet_head_parameterization!r}"
-            )
+        concentration_logit = _initial_dirichlet_concentration_logit(
+            self.dirichlet_head_parameterization,
+            concentration_floor=self.dirichlet_concentration_floor,
+            concentration_clip=self.dirichlet_concentration_clip,
+            initial_concentration=dirichlet_initial_concentration,
+            default_concentration=float(num_outcomes),
+        )
 
         self.conv = nnx.Conv(input_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         if not resnet_v2:
@@ -713,54 +704,15 @@ class BoardlawDirichletNet(nnx.Module):
                 bias_init=jax.nn.initializers.zeros,
                 rngs=rngs,
             )
-            if self.dirichlet_head_parameterization == "log_concentration":
-                initial_concentration = (
-                    float(num_outcomes)
-                    + _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
-                    if dirichlet_initial_concentration is None
-                    else float(dirichlet_initial_concentration)
-                )
-                concentration_logit = _direct_log_concentration(
-                    initial_concentration
-                )
-            elif concentration_floor is None:
-                initial_concentration = (
-                    float(num_outcomes)
-                    + _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
-                    if dirichlet_initial_concentration is None
-                    else float(dirichlet_initial_concentration)
-                )
-                if (
-                    self.dirichlet_concentration_clip is not None
-                    and initial_concentration
-                    >= float(self.dirichlet_concentration_clip)
-                ):
-                    raise ValueError(
-                        "dirichlet_concentration_clip must exceed "
-                        "dirichlet_initial_concentration; got "
-                        f"initial={initial_concentration}, "
-                        f"clip={self.dirichlet_concentration_clip}"
-                    )
-                concentration_logit = _squared_softplus_concentration_logit(
-                    initial_concentration
-                )
-            else:
-                initial_excess = _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
-                if dirichlet_initial_concentration is not None:
-                    initial_excess = (
-                        float(dirichlet_initial_concentration) - concentration_floor
-                    )
-                    if initial_excess <= 0.0:
-                        raise ValueError(
-                            "dirichlet_initial_concentration must exceed the "
-                            f"configured floor {concentration_floor}; got "
-                            f"{dirichlet_initial_concentration}"
-                        )
-                concentration_logit = _smooth_dirichlet_concentration_logit(
-                    concentration_floor,
-                    self.dirichlet_concentration_clip,
-                    initial_excess=initial_excess,
-                )
+            concentration_logit = _initial_dirichlet_concentration_logit(
+                self.dirichlet_head_parameterization,
+                concentration_floor=concentration_floor,
+                concentration_clip=self.dirichlet_concentration_clip,
+                initial_concentration=dirichlet_initial_concentration,
+                default_concentration=(
+                    float(num_outcomes) + _DIRICHLET_INITIAL_EXCESS_CONCENTRATION
+                ),
+            )
             concentration_bias_init = jax.nn.initializers.constant(
                 concentration_logit
             )
