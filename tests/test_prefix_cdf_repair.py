@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import pytest
 
 from scacchi import dirichlet_mctx
+from scacchi.dirichlet_mctx import posterior_updates
 from scacchi.dirichlet_mctx.action_selection import (
     categorical_action_population,
     posterior_best_policy,
@@ -420,6 +421,83 @@ def test_one_unsafe_lane_falls_back_without_changing_safe_lane():
     assert jnp.array_equal(guarded.value_alpha[1], native.value_alpha[1])
     assert jnp.array_equal(guarded.edge_alpha, native.edge_alpha)
     assert jnp.array_equal(guarded.edge_payload, native.edge_payload)
+
+
+def test_inactive_unsafe_lane_does_not_execute_fallback_under_jit(monkeypatch):
+    context = _context(
+        jnp.asarray(
+            [
+                [[2.0, 3.0], [4.0, 1.0], [1.0, 2.0]],
+                [[1e-5, 1.0], [2.0, 1.0], [1.0, 3.0]],
+            ],
+            dtype=jnp.float32,
+        )
+    )
+    inactive_context = context.replace(active=jnp.asarray([True, False]))
+    key = jax.random.PRNGKey(442)
+    samples = 11
+    chunk_size = 4
+    native = jax.jit(
+        lambda key, context: dirichlet_mctx.update_posterior(
+            key,
+            context,
+            policy_samples=samples,
+            policy_sample_chunk_size=chunk_size,
+        )
+    )(key, context)
+    estimate = binary_posterior_best_policy_prefix_quadrature(
+        context.node.edge_alpha,
+        context.node.invalid_actions,
+        context.node.edge_categorical_outcome,
+    )
+    expected_prefix_value = mix_value_prior(
+        context.node.value_prior,
+        context.node.edge_alpha,
+        estimate.policy,
+        context.node.node_payload,
+    )
+    assert jnp.array_equal(
+        estimate.tail_range_clipped, jnp.asarray([False, True])
+    )
+
+    fallback_calls = []
+    original_sampler = posterior_updates.posterior_best_policy
+
+    def recorded_sampler(*args, **kwargs):
+        # Observe execution of the compiled branch, not Python tracing.
+        jax.debug.callback(lambda: fallback_calls.append(True), ordered=True)
+        return original_sampler(*args, **kwargs)
+
+    monkeypatch.setattr(
+        posterior_updates, "posterior_best_policy", recorded_sampler
+    )
+    repair = jax.jit(
+        lambda key, context: dirichlet_mctx.update_posterior_prefix_cdf(
+            key,
+            context,
+            fallback_policy_samples=samples,
+            fallback_policy_sample_chunk_size=chunk_size,
+        )
+    )
+
+    inactive = jax.block_until_ready(repair(key, inactive_context))
+    jax.effects_barrier()
+    assert fallback_calls == []
+    assert jnp.allclose(
+        inactive.value_alpha[0], expected_prefix_value[0], atol=1e-6
+    )
+    assert jnp.array_equal(
+        inactive.value_alpha[1], context.node.value_alpha[1]
+    )
+
+    # The same compiled function must still sample when that row is active.
+    active = jax.block_until_ready(repair(key, context))
+    jax.effects_barrier()
+    assert fallback_calls == [True]
+    assert jnp.array_equal(active.value_alpha[0], inactive.value_alpha[0])
+    assert jnp.array_equal(active.value_alpha[1], native.value_alpha[1])
+    assert jnp.array_equal(active.edge_alpha, inactive.edge_alpha)
+    assert jnp.array_equal(active.edge_payload, inactive.edge_payload)
 
 
 def test_prefix_repair_projects_categorical_cache_without_mutating_edge():

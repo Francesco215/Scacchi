@@ -159,7 +159,7 @@ def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
 
 
 def _numerical_policy_readout(
-    native_policy: jax.Array,
+    native_policy: jax.Array | Callable[[jax.Array], jax.Array],
     *,
     alpha: jax.Array,
     q_categorical_outcome: jax.Array,
@@ -167,6 +167,14 @@ def _numerical_policy_readout(
     legal_action_mask: jax.Array,
     config: NumericalPosteriorUpdateConfig,
 ) -> jax.Array:
+    """Use Q21 where safe, requesting native policies only for rejected rows.
+
+    A callable receives the fallback-row mask so it can also skip sampling
+    when only categorical or empty-support rows need their native readout.
+    Already computed native policies remain supported by the search backend,
+    which also needs them for its public sampled ``search_action``.
+    """
+
     invalid_actions = ~legal_action_mask
     estimate = (
         dirichlet_mctx.binary_posterior_best_policy_prefix_quadrature(
@@ -196,6 +204,23 @@ def _numerical_policy_readout(
     root_is_categorical = v_categorical_outcome != int(NO_OUTCOME)
     unresolved_root = has_legal_action & ~root_is_categorical
     accepted = unresolved_root & ~unsafe
+
+    if callable(native_policy):
+        native_policy_fn = cast(Callable[[jax.Array], jax.Array], native_policy)
+
+        def fallback(_: None) -> jax.Array:
+            return jnp.where(
+                accepted[:, None],
+                estimate.policy,
+                native_policy_fn(~accepted),
+            )
+
+        return jax.lax.cond(
+            jnp.all(accepted),
+            lambda _: estimate.policy,
+            fallback,
+            operand=None,
+        )
 
     return jnp.where(
         accepted[:, None],
@@ -635,14 +660,6 @@ def _dirichlet_commitment_policy(
         search_config.root_policy_support,
     )
     invalid_actions = ~commitment_support
-    native_policy = posterior_best_policy(
-        rng_key,
-        alpha,
-        invalid_actions,
-        policy_samples,
-        chunk_size=chunk_size,
-        categorical_outcome=metadata.q_target_outcome,
-    )
     root_is_categorical = (
         metadata.v_target_outcome != int(NO_OUTCOME)
     )
@@ -651,15 +668,41 @@ def _dirichlet_commitment_policy(
         alpha.shape[-2],
         dtype=alpha.dtype,
     )
-    native_policy = jnp.where(
-        root_is_categorical[:, None],
-        solved_policy,
-        native_policy,
-    )
-    native_policy = _normalize_policy_on_support(
-        native_policy,
-        commitment_support,
-    )
+
+    def native_policy(required: jax.Array) -> jax.Array:
+        needs_sampling = (
+            required
+            & ~root_is_categorical
+            & jnp.any(commitment_support, axis=-1)
+        )
+
+        def sample(_: None) -> jax.Array:
+            # Keep the original key and complete batch shape: fallback rows
+            # must receive exactly the same samples as the eager readout.
+            return posterior_best_policy(
+                rng_key,
+                alpha,
+                invalid_actions,
+                policy_samples,
+                chunk_size=chunk_size,
+                categorical_outcome=metadata.q_target_outcome,
+            )
+
+        sampled_policy = jax.lax.cond(
+            jnp.any(needs_sampling),
+            sample,
+            lambda _: solved_policy,
+            operand=None,
+        )
+        return _normalize_policy_on_support(
+            jnp.where(
+                root_is_categorical[:, None],
+                solved_policy,
+                sampled_policy,
+            ),
+            commitment_support,
+        )
+
     if isinstance(update_config, NumericalPosteriorUpdateConfig):
         return _numerical_policy_readout(
             native_policy,
@@ -669,7 +712,7 @@ def _dirichlet_commitment_policy(
             legal_action_mask=commitment_support,
             config=update_config,
         )
-    return native_policy
+    return native_policy(jnp.ones_like(root_is_categorical))
 
 
 def make_action_committer(

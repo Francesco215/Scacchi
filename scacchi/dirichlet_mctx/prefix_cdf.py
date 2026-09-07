@@ -183,6 +183,37 @@ def _finalize_policy(
     )
 
 
+def _maximum_cdf(
+    finite_log_cdf: jax.Array,
+    positive_cdf: jax.Array,
+    unresolved: jax.Array,
+) -> jax.Array:
+    """Build the maximum CDF from the already computed action log-CDFs.
+
+    For positive x, log(clip(x, 0, 1)) = min(log(x), 0). Reusing
+    these logs avoids a second action-by-grid logarithm and endpoint scatters.
+    Pin the endpoints of the product directly: unresolved action CDFs start
+    at zero and finish at one; the empty product is one. The final pin also
+    preserves the endpoint contract if an interior value is non-finite.
+    """
+    log_joint_cdf = jnp.sum(
+        jnp.where(
+            unresolved[..., None],
+            jnp.where(positive_cdf, jnp.minimum(finite_log_cdf, 0.0), -jnp.inf),
+            0.0,
+        ),
+        axis=-2,
+    )
+    joint_cdf = jnp.exp(log_joint_cdf)
+    first = jnp.where(jnp.any(unresolved, axis=-1), 0.0, 1.0).astype(joint_cdf.dtype)
+    last = jnp.ones_like(joint_cdf[..., -1:])
+    joint_cdf = jnp.concatenate((first[..., None], joint_cdf[..., 1:-1], last), axis=-1)
+    # maximum.accumulate lowers to a sequential loop on the grid; cummax
+    # performs the same monotonicity repair with a parallel prefix primitive.
+    joint_cdf = jax.lax.cummax(joint_cdf, axis=joint_cdf.ndim - 1)
+    return jnp.concatenate((joint_cdf[..., :-1], last), axis=-1)
+
+
 def binary_posterior_best_policy_prefix_quadrature(
     alpha: Float[Array, "*batch action 2"],
     invalid_actions: Bool[Array, "*batch action"],
@@ -326,11 +357,10 @@ def binary_posterior_best_policy_prefix_quadrature(
     other_has_zero = (
         zero_count - zero_factor.astype(jnp.int32)
     ) > 0
-    self_log = jnp.where(zero_factor, 0.0, finite_log_cdf)
     other_log_product = jnp.where(
         other_has_zero,
         -jnp.inf,
-        finite_log_product - self_log,
+        finite_log_product - finite_log_cdf,
     )
     integrand = normalized_density * jnp.exp(other_log_product)
     interval_contribution = (
@@ -342,27 +372,7 @@ def binary_posterior_best_policy_prefix_quadrature(
 
     # The independently normalized CDFs define a discrete maximum
     # distribution.  Pin its endpoints so increments telescope exactly.
-    cdf = jnp.clip(cdf, 0.0, 1.0)
-    cdf = cdf.at[..., 0].set(0.0)
-    cdf = cdf.at[..., -1].set(
-        jnp.where(unresolved, 1.0, 0.0)
-    )
-    positive_cdf = cdf > 0.0
-    log_joint_cdf = jnp.sum(
-        jnp.where(
-            unresolved[..., None],
-            jnp.where(positive_cdf, jnp.log(cdf), -jnp.inf),
-            0.0,
-        ),
-        axis=-2,
-    )
-    joint_cdf = jnp.exp(log_joint_cdf)
-    joint_cdf = jnp.maximum.accumulate(joint_cdf, axis=-1)
-    has_unresolved = jnp.any(unresolved, axis=-1)
-    joint_cdf = joint_cdf.at[..., 0].set(
-        jnp.where(has_unresolved, 0.0, 1.0)
-    )
-    joint_cdf = joint_cdf.at[..., -1].set(1.0)
+    joint_cdf = _maximum_cdf(finite_log_cdf, positive_cdf, unresolved)
     joint_increment = jnp.maximum(
         joint_cdf[..., 1:] - joint_cdf[..., :-1],
         0.0,
