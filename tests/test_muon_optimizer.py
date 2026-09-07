@@ -6,7 +6,7 @@ import optax
 import pytest
 
 from scacchi.network import AZDirichletNet, BoardlawDirichletNet
-from scacchi.train import _build_optimizer, _muon_weight_dimension_numbers
+from scacchi.pipeline import build_optimizer, _muon_weight_dimension_numbers
 from scacchi.types import Config, TrainingConfig
 
 
@@ -69,7 +69,7 @@ def test_muon_selects_only_hidden_block_kernels(
 @pytest.mark.parametrize("model_factory", [_az_model, _boardlaw_model])
 def test_hybrid_muon_optimizer_update_runs_under_nnx_jit(model_factory):
     model = model_factory()
-    optimizer = _build_optimizer(model, Config(training=TrainingConfig()))
+    optimizer = build_optimizer(model, Config(training=TrainingConfig()))
     grads = jax.tree.map(
         lambda value: 1e-3 * (jnp.sin(value * 7.0) + 0.1),
         nnx.state(model, nnx.Param),

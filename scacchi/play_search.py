@@ -84,9 +84,7 @@ class PosteriorTargets(NamedTuple):
     metadata: TargetMetadata | None = None
 
 
-class SearchOutput(NamedTuple):
-    posterior: PosteriorTargets
-Search = Callable[[pgx.State, chex.PRNGKey], SearchOutput]
+Search = Callable[[pgx.State, chex.PRNGKey], PosteriorTargets]
 
 
 class PlayerOutput(NamedTuple):
@@ -161,7 +159,7 @@ def _search_loss_mask(action_weights: jax.Array) -> jax.Array:
 
 
 def _numerical_policy_readout(
-    native_policy: jax.Array,
+    native_policy: jax.Array | Callable[[jax.Array], jax.Array],
     *,
     alpha: jax.Array,
     q_categorical_outcome: jax.Array,
@@ -169,6 +167,14 @@ def _numerical_policy_readout(
     legal_action_mask: jax.Array,
     config: NumericalPosteriorUpdateConfig,
 ) -> jax.Array:
+    """Use Q21 where safe, requesting native policies only for rejected rows.
+
+    A callable receives the fallback-row mask so it can also skip sampling
+    when only categorical or empty-support rows need their native readout.
+    Already computed native policies remain supported by the search backend,
+    which also needs them for its public sampled ``search_action``.
+    """
+
     invalid_actions = ~legal_action_mask
     estimate = (
         dirichlet_mctx.binary_posterior_best_policy_prefix_quadrature(
@@ -198,6 +204,23 @@ def _numerical_policy_readout(
     root_is_categorical = v_categorical_outcome != int(NO_OUTCOME)
     unresolved_root = has_legal_action & ~root_is_categorical
     accepted = unresolved_root & ~unsafe
+
+    if callable(native_policy):
+        native_policy_fn = cast(Callable[[jax.Array], jax.Array], native_policy)
+
+        def fallback(_: None) -> jax.Array:
+            return jnp.where(
+                accepted[:, None],
+                estimate.policy,
+                native_policy_fn(~accepted),
+            )
+
+        return jax.lax.cond(
+            jnp.all(accepted),
+            lambda _: estimate.policy,
+            fallback,
+            operand=None,
+        )
 
     return jnp.where(
         accepted[:, None],
@@ -341,7 +364,7 @@ def _dirichlet_root_policy_readout(
     )
 
 
-def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_supervision_config: QSupervisionConfig) -> SearchOutput:
+def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput, expand_fn, rng_key: jax.Array, search_cfg: GumbelSearchConfig, q_supervision_config: QSupervisionConfig) -> PosteriorTargets:
     del q_supervision_config
     value = _required_output(prediction.value, "value")
     root = mctx.RootFnOutput(prior_logits=prediction.logits, value=value, embedding=env_state)
@@ -359,7 +382,7 @@ def _run_scalar_gumbel_search(env_state: pgx.State, prediction: EvaluatorOutput,
     search_action = cast(jax.Array, policy_output.action)
     posterior_prediction = PosteriorPrediction(policy=policy_target, value=value)
     metadata = TargetMetadata(mask=_search_loss_mask(policy_target), search_action=search_action)
-    return SearchOutput(PosteriorTargets(prediction=posterior_prediction, metadata=metadata))
+    return PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
 
 
 def _posterior_policy_sampling_budget(
@@ -416,7 +439,7 @@ def _run_dirichlet_thompson_search(
     rng_key: jax.Array,
     search_cfg: DirichletThompsonSearchConfig,
     q_supervision_config: QSupervisionConfig,
-) -> SearchOutput:
+) -> PosteriorTargets:
     """Run the MCTX-shaped Dirichlet Thompson backend."""
 
     alpha_v = _required_output(prediction.alpha_v, "alpha_v")
@@ -522,15 +545,13 @@ def _run_dirichlet_thompson_search(
         v_target_outcome=summary.v_categorical_outcome,
         v_target_distance=summary.v_categorical_distance,
     )
-    return SearchOutput(
-        PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
-    )
+    return PosteriorTargets(prediction=posterior_prediction, metadata=metadata)
 
 
 def _make_dirichlet_thompson_search(env, evaluator: Evaluator, search_cfg: DirichletThompsonSearchConfig, q_supervision_config: QSupervisionConfig) -> Search:
     expand_fn = make_dirichlet_expand_fn(env, evaluator)
 
-    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
+    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> PosteriorTargets:
         prediction = evaluator(root_state.observation)
         return _run_dirichlet_thompson_search(
             root_state,
@@ -545,7 +566,7 @@ def _make_dirichlet_thompson_search(env, evaluator: Evaluator, search_cfg: Diric
 
 
 def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfig, *args, **kwargs) -> Search:
-    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
+    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> PosteriorTargets:
         prediction = evaluator(root_state.observation)
         policy = _masked_policy(prediction.logits, root_state.legal_action_mask, temperature=float(search_cfg.temperature))
         search_action = posterior_sample_action(
@@ -558,7 +579,7 @@ def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfi
             mask=_search_loss_mask(policy),
             search_action=search_action,
         )
-        return SearchOutput(PosteriorTargets(prediction=prediction, metadata=metadata))
+        return PosteriorTargets(prediction=prediction, metadata=metadata)
 
     return search
 
@@ -566,7 +587,7 @@ def _make_policy_search(env, evaluator: Evaluator, search_cfg: PolicySearchConfi
 def _make_gumbel_search(env, evaluator: Evaluator, search_cfg: GumbelSearchConfig, q_supervision_config: QSupervisionConfig) -> Search:
     scalar_expand_fn = make_gumbel_expand_fn(env, evaluator)
 
-    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> SearchOutput:
+    def search(root_state: pgx.State, rng_key: chex.PRNGKey) -> PosteriorTargets:
         prediction = evaluator(root_state.observation)
         if prediction.alpha_q is not None:
             raise ValueError(
@@ -639,14 +660,6 @@ def _dirichlet_commitment_policy(
         search_config.root_policy_support,
     )
     invalid_actions = ~commitment_support
-    native_policy = posterior_best_policy(
-        rng_key,
-        alpha,
-        invalid_actions,
-        policy_samples,
-        chunk_size=chunk_size,
-        categorical_outcome=metadata.q_target_outcome,
-    )
     root_is_categorical = (
         metadata.v_target_outcome != int(NO_OUTCOME)
     )
@@ -655,15 +668,41 @@ def _dirichlet_commitment_policy(
         alpha.shape[-2],
         dtype=alpha.dtype,
     )
-    native_policy = jnp.where(
-        root_is_categorical[:, None],
-        solved_policy,
-        native_policy,
-    )
-    native_policy = _normalize_policy_on_support(
-        native_policy,
-        commitment_support,
-    )
+
+    def native_policy(required: jax.Array) -> jax.Array:
+        needs_sampling = (
+            required
+            & ~root_is_categorical
+            & jnp.any(commitment_support, axis=-1)
+        )
+
+        def sample(_: None) -> jax.Array:
+            # Keep the original key and complete batch shape: fallback rows
+            # must receive exactly the same samples as the eager readout.
+            return posterior_best_policy(
+                rng_key,
+                alpha,
+                invalid_actions,
+                policy_samples,
+                chunk_size=chunk_size,
+                categorical_outcome=metadata.q_target_outcome,
+            )
+
+        sampled_policy = jax.lax.cond(
+            jnp.any(needs_sampling),
+            sample,
+            lambda _: solved_policy,
+            operand=None,
+        )
+        return _normalize_policy_on_support(
+            jnp.where(
+                root_is_categorical[:, None],
+                solved_policy,
+                sampled_policy,
+            ),
+            commitment_support,
+        )
+
     if isinstance(update_config, NumericalPosteriorUpdateConfig):
         return _numerical_policy_readout(
             native_policy,
@@ -673,7 +712,7 @@ def _dirichlet_commitment_policy(
             legal_action_mask=commitment_support,
             config=update_config,
         )
-    return native_policy
+    return native_policy(jnp.ones_like(root_is_categorical))
 
 
 def make_action_committer(
@@ -781,12 +820,12 @@ def make_search_player(
 
     def player(env_state: pgx.State, rng_key: jax.Array) -> PlayerOutput:
         search_key, action_key = jax.random.split(rng_key)
-        search_output = search(env_state, search_key)
+        posterior = search(env_state, search_key)
         action = action_committer(
-            search_output.posterior,
+            posterior,
             env_state.legal_action_mask,
             action_key,
         )
-        return PlayerOutput(action=action, posterior=search_output.posterior)
+        return PlayerOutput(action=action, posterior=posterior)
 
     return player

@@ -16,24 +16,16 @@ Action = Int32[Array, "batch"]
 RecurrentState = PyTree[Shaped[Array, "batch *?state_axes"], "State"]
 StoredRecurrentState = PyTree[Shaped[Array, "batch node *?state_axes"], "State"]
 UnbatchedRecurrentState = PyTree[Shaped[Array, "*?state_axes"], "State"]
-TypedPRNGKey = Key[Array, ""]
-LegacyPRNGKey = UInt32[Array, "2"]
-PRNGKey = TypedPRNGKey | LegacyPRNGKey
-TypedBatchedPRNGKey = Key[Array, "batch"]
-LegacyBatchedPRNGKey = UInt32[Array, "batch 2"]
-BatchedPRNGKey = TypedBatchedPRNGKey | LegacyBatchedPRNGKey
-
-
-class _ScalarSimulation(NamedTuple):
-    parent_index: Int32[Array, ""]
-    action: Int32[Array, ""]
-    active: Bool[Array, ""]
+PRNGKey = Key[Array, ""] | UInt32[Array, "2"]
+BatchedPRNGKey = Key[Array, "batch"] | UInt32[Array, "batch 2"]
 
 
 class Simulation(NamedTuple):
-    parent_index: Int32[Array, "batch"]
-    action: Int32[Array, "batch"]
-    active: Bool[Array, "batch"]
+    """Selected edge for one lane or a batch of lanes under ``vmap``."""
+
+    parent_index: Int32[Array, "*batch"]
+    action: Int32[Array, "*batch"]
+    active: Bool[Array, "*batch"]
 
 
 class _SimulationState(NamedTuple):

@@ -6,7 +6,7 @@ import copy
 import logging
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -18,9 +18,6 @@ from flax import nnx
 
 from .network import build_model
 from .types import Config, config_to_dict, load_config
-
-if TYPE_CHECKING:
-    from .types import Config
 
 
 def _suppress_orbax_logs() -> None:
@@ -82,33 +79,31 @@ def _checkpoint_manager_options(
     primary_only: bool = False,
 ) -> ocp.CheckpointManagerOptions:
     is_multihost = jax.process_count() > 1
-    if primary_only and is_multihost:
-        # Pod workers have private local disks, so cross-host barriers can
-        # never complete: process 0 saves alone, with no collective calls.
-        # The caller must pre-create the directory and give every other
-        # process a NoOpCheckpointManager.
-        return ocp.CheckpointManagerOptions(
-            max_to_keep=max_to_keep,
-            save_interval_steps=save_interval_steps,
-            save_on_steps=save_on_steps,
-            single_host_load_and_broadcast=False,
-            enable_async_checkpointing=True,
-            multiprocessing_options=ocp.options.MultiprocessingOptions(
-                primary_host=0,
-                active_processes={0},
-            ),
-            create=False,
-            read_only=read_only,
-        )
+    primary_saves_alone = primary_only and is_multihost
+    # Pod workers have private disks: process 0 saves without collective calls.
+    # The caller pre-creates its directory and uses NoOpCheckpointManager elsewhere.
     return ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         save_interval_steps=save_interval_steps,
         save_on_steps=save_on_steps,
-        single_host_load_and_broadcast=is_multihost,
+        single_host_load_and_broadcast=is_multihost and not primary_saves_alone,
         enable_async_checkpointing=True,
-        multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
+        multiprocessing_options=ocp.options.MultiprocessingOptions(
+            primary_host=0,
+            active_processes={0} if primary_saves_alone else None,
+        ),
+        create=not primary_saves_alone,
         read_only=read_only,
     )
+
+
+def resolve_checkpoint_directory(config: Config, root: Path) -> Path:
+    """Resolve an explicit or generated checkpoint path against the run root."""
+    if config.checkpointing.directory is not None:
+        return (root / config.checkpointing.directory).resolve()
+    board_size = "none" if config.env.board_size is None else str(config.env.board_size)
+    run_name = f"{config.env.id}_bs{board_size}_{config.model.network}_c{config.model.num_channels}_l{config.model.num_layers}_seed{config.run.seed}"
+    return (root / "checkpoints" / run_name).resolve()
 
 
 def build_checkpoint_manager(

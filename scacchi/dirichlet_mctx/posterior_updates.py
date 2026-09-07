@@ -79,36 +79,49 @@ def _repair_inputs(
 
     # The deepest direct leaf message replaces only an unresolved edge.
     # Categorical payloads already contain exact distance and stay untouched.
-    batch = jnp.arange(edge_payload.shape[0])
-    leaf_action = jnp.where(leaf.active, leaf.action, 0)
+    num_actions = edge_payload.shape[-1]
+    leaf_action = jnp.where(
+        leaf.action < 0,
+        leaf.action + num_actions,
+        leaf.action,
+    )
+    direct_is_dirichlet = (
+        leaf.active[:, None]
+        & (jnp.arange(num_actions) == leaf_action[:, None])
+        & unresolved
+    )
     direct_alpha = align_outcome(
         leaf.value_alpha,
         leaf.to_play,
         node.to_play,
     )
-    old_direct_alpha = edge_alpha[batch, leaf_action]
-    old_direct_count = edge_payload[batch, leaf_action]
-    direct_is_dirichlet = leaf.active & unresolved[batch, leaf_action]
-    edge_alpha = edge_alpha.at[batch, leaf_action].set(
-        jnp.where(
-            direct_is_dirichlet[..., None],
-            direct_alpha,
-            old_direct_alpha,
+    if jnp.result_type(edge_alpha, direct_alpha) != edge_alpha.dtype:
+        # Preserve the original scatter/promotion boundary for mixed-precision
+        # recurrent callbacks. A manual early cast is not equivalent under all
+        # compiler fusion/precision settings. This is a static dtype branch.
+        batch = jnp.arange(edge_payload.shape[0])
+        action = jnp.where(leaf.active, leaf.action, 0)
+        direct = leaf.active & unresolved[batch, action]
+        edge_alpha = edge_alpha.at[batch, action].set(
+            jnp.where(direct[:, None], direct_alpha, edge_alpha[batch, action])
         )
-    )
-    edge_payload = edge_payload.at[batch, leaf_action].set(
-        old_direct_count
-        + direct_is_dirichlet.astype(edge_payload.dtype)
-    )
+        edge_payload = edge_payload.at[batch, action].set(
+            edge_payload[batch, action] + direct.astype(edge_payload.dtype)
+        )
+    else:
+        # This action mask fuses with child refresh. Gathering and scattering
+        # the single direct edge would materialize both payload rows.
+        edge_alpha = jnp.where(
+            direct_is_dirichlet[..., None],
+            direct_alpha[:, None, :],
+            edge_alpha,
+        )
+        edge_payload = edge_payload + direct_is_dirichlet.astype(edge_payload.dtype)
 
-    child_target_player = jnp.broadcast_to(
-        node.to_play[:, None],
-        children.to_play.shape,
-    )
     child_value = align_outcome(
         children.value_alpha,
         children.to_play,
-        child_target_player,
+        node.to_play[:, None],
     )
     refresh = (
         active[:, None]
@@ -132,20 +145,10 @@ def _repair_inputs(
     child_prior = align_outcome(
         children.value_prior,
         children.to_play,
-        child_target_player,
+        node.to_play[:, None],
     )
-    fallback = jnp.where(
-        children.visited[..., None],
-        child_prior,
-        edge_alpha,
-    )
-    unresolved_count = jnp.where(unresolved, edge_payload, 0)
-    use_stored = ~unresolved | (unresolved_count > 0)
-    effective_alpha = jnp.where(
-        use_stored[..., None],
-        edge_alpha,
-        fallback,
-    )
+    use_child_prior = children.visited & unresolved & (edge_payload <= 0)
+    effective_alpha = jnp.where(use_child_prior[..., None], child_prior, edge_alpha)
 
     categorical = ~unresolved
     safe_categorical_outcome = jnp.where(
@@ -170,16 +173,10 @@ def _repair_inputs(
         effective_alpha,
     )
 
-    old_unresolved_count = jnp.where(
-        unresolved,
-        node.edge_payload,
-        0,
-    )
-    legal = ~node.invalid_actions
     count_delta = jnp.sum(
         jnp.where(
-            legal,
-            unresolved_count - old_unresolved_count,
+            unresolved & ~node.invalid_actions,
+            edge_payload - node.edge_payload,
             0,
         ),
         axis=-1,
@@ -243,8 +240,8 @@ def update_posterior_prefix_cdf(
     mixture changes. A lane that clips its adaptive range, produces a
     non-finite estimate, or exceeds the density-integral tolerance falls back
     to :func:`update_posterior` with the original key. Safe lanes remain on
-    Q21. The default winner-MC path and all persistent tree semantics are
-    unchanged.
+    Q21. Inactive lanes retain their cached values without triggering MC.
+    The default winner-MC path and all persistent tree semantics are unchanged.
     """
 
     _validate_kappa(kappa)
@@ -286,7 +283,7 @@ def update_posterior_prefix_cdf(
         jnp.abs(estimate.density_log_integral),
         axis=-1,
     )
-    unsafe = (
+    unsafe = context.active & (
         estimate.tail_range_clipped
         | ~estimate.finite
         | (density_error > density_log_integral_tolerance)
@@ -302,26 +299,24 @@ def update_posterior_prefix_cdf(
     def mixed_fallback(
         accepted: PosteriorUpdate,
     ) -> PosteriorUpdate:
-        native = update_posterior(
+        native_policy = posterior_best_policy(
             rng_key,
-            context,
-            kappa=kappa,
-            policy_samples=fallback_policy_samples,
-            policy_sample_chunk_size=(
-                fallback_policy_sample_chunk_size
-            ),
+            prepared.effective_alpha,
+            context.node.invalid_actions,
+            fallback_policy_samples,
+            chunk_size=fallback_policy_sample_chunk_size,
+            categorical_outcome=context.node.edge_categorical_outcome,
         )
+        native = _repair_from_policy(
+            context,
+            prepared,
+            native_policy,
+            kappa=kappa,
+        )
+        # Both policies share the same edge repair; only the value differs.
         return PosteriorUpdate(
-            edge_alpha=jnp.where(
-                unsafe[:, None, None],
-                native.edge_alpha,
-                accepted.edge_alpha,
-            ),
-            edge_payload=jnp.where(
-                unsafe[:, None],
-                native.edge_payload,
-                accepted.edge_payload,
-            ),
+            edge_alpha=accepted.edge_alpha,
+            edge_payload=accepted.edge_payload,
             value_alpha=jnp.where(
                 unsafe[:, None],
                 native.value_alpha,

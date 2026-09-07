@@ -21,14 +21,15 @@ _GAMMA_PROPOSALS = 4
 type _SamplePRNGKeys = Key[Array, "sample"] | UInt32[Array, "sample 2"]
 
 
-def categorical_action(rng_key: base.PRNGKey, node_outcome: Int8[Array, "*batch"], edge_outcome: Int8[Array, "*batch action"], edge_distance: Int32[Array, "*batch action"], invalid_actions: Bool[Array, "*batch action"], *, num_outcomes: int) -> Int32[Array, "*batch"]:
-    """Sample a certified action uniformly among equally good candidates.
-
-    Win certificates prefer the shortest edge and loss certificates the
-    longest. All certified draw actions are equivalent. Ties at each of those
-    outcomes are sampled uniformly instead of consulting policy logits or
-    action order.
-    """
+def _categorical_candidates(
+    node_outcome: Int8[Array, "*batch"],
+    edge_outcome: Int8[Array, "*batch action"],
+    edge_distance: Int32[Array, "*batch action"],
+    invalid_actions: Bool[Array, "*batch action"],
+    *,
+    num_outcomes: int,
+) -> Bool[Array, "*batch action"]:
+    """Select shortest certified wins, longest losses, or every certified draw."""
 
     legal = ~invalid_actions
     win_index = int(num_outcomes) - 1
@@ -45,7 +46,13 @@ def categorical_action(rng_key: base.PRNGKey, node_outcome: Int8[Array, "*batch"
     is_loss = node_outcome == 0
     scores = jnp.where(is_win[..., None], win_scores, jnp.where(is_loss[..., None], loss_scores, draw_scores))
     best = jnp.max(scores, axis=-1, keepdims=True)
-    tied = jnp.isfinite(scores) & (scores == best)
+    return jnp.isfinite(scores) & (scores == best)
+
+
+def categorical_action(rng_key: base.PRNGKey, node_outcome: Int8[Array, "*batch"], edge_outcome: Int8[Array, "*batch action"], edge_distance: Int32[Array, "*batch action"], invalid_actions: Bool[Array, "*batch action"], *, num_outcomes: int) -> Int32[Array, "*batch"]:
+    """Sample uniformly among optimal certified actions; return zero if absent."""
+
+    tied = _categorical_candidates(node_outcome, edge_outcome, edge_distance, invalid_actions, num_outcomes=num_outcomes)
     tie_logits = jnp.where(tied, 0.0, -jnp.inf)
     sampled = jax.random.categorical(rng_key, tie_logits, axis=-1)
     has_candidate = jnp.any(tied, axis=-1)
@@ -61,35 +68,9 @@ def categorical_action_population(
     num_outcomes: int,
     dtype: jnp.dtype = jnp.float32,
 ) -> Float[Array, "*batch action"]:
-    """Return uniform mass over every native distance-optimal action.
+    """Return the population of :func:`categorical_action`, or zero if absent."""
 
-    This is the deterministic population corresponding to
-    :func:`categorical_action`: shortest certified wins, longest certified
-    losses, and every certified draw.  Illegal actions receive zero mass.
-    A row with no matching candidate is the zero policy.
-    """
-
-    legal = ~invalid_actions
-    win_index = int(num_outcomes) - 1
-    win_candidates = legal & (edge_outcome == win_index)
-    loss_candidates = legal & (edge_outcome == 0)
-    draw_candidates = legal & (edge_outcome == 1)
-
-    distance = edge_distance.astype(jnp.float32)
-    win_scores = jnp.where(win_candidates, -distance, -jnp.inf)
-    loss_scores = jnp.where(loss_candidates, distance, -jnp.inf)
-    draw_scores = jnp.where(draw_candidates, 0.0, -jnp.inf)
-    scores = jnp.where(
-        (node_outcome == win_index)[..., None],
-        win_scores,
-        jnp.where(
-            (node_outcome == 0)[..., None],
-            loss_scores,
-            draw_scores,
-        ),
-    )
-    best = jnp.max(scores, axis=-1, keepdims=True)
-    tied = jnp.isfinite(scores) & (scores == best)
+    tied = _categorical_candidates(node_outcome, edge_outcome, edge_distance, invalid_actions, num_outcomes=num_outcomes)
     count = jnp.sum(tied, axis=-1, keepdims=True)
     return tied.astype(dtype) / jnp.maximum(count, 1).astype(dtype)
 
@@ -226,14 +207,12 @@ def effective_action_alpha(tree: UnbatchedTree, node_index: Int32[Array, ""]) ->
     safe_child = jnp.where(visited, child_index, Tree.ROOT_INDEX)
     child_value = tree.node_value_priors[safe_child]
     child_player = tree.node_to_play[safe_child]
-    target_player = jnp.broadcast_to(tree.node_to_play[node_index], child_player.shape)
-    child_fallback = align_outcome(child_value, child_player, target_player)
+    child_fallback = align_outcome(child_value, child_player, tree.node_to_play[node_index])
     stored = tree.edge_alpha[node_index]
     edge_outcome = tree.edge_categorical_outcome[node_index]
     unresolved = edge_outcome == int(NO_OUTCOME)
-    count = jnp.where(unresolved, tree.edge_payload[node_index], 0)
-    fallback = jnp.where(visited[..., None], child_fallback, stored)
-    return jnp.where(((~unresolved) | (count > 0))[..., None], stored, fallback)
+    use_child_prior = visited & unresolved & (tree.edge_payload[node_index] <= 0)
+    return jnp.where(use_child_prior[..., None], child_fallback, stored)
 
 
 def thompson_action_selection(rng_key: base.PRNGKey, tree: UnbatchedTree, node_index: Int32[Array, ""]) -> Int32[Array, ""]:

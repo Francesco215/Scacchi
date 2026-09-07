@@ -225,9 +225,8 @@ class Tree:
         child_player = self.node_to_play[batch, safe_child]
         root_player = self.node_to_play[:, root, None]
         child_prior = align_outcome(child_prior, child_player, root_player)
-        fallback = jnp.where(visited[..., None], child_prior, stored)
-        use_stored = ~unresolved | (counts > 0)
-        alpha = jnp.where(use_stored[..., None], stored, fallback)
+        use_child_prior = visited & unresolved & (edge_payload <= 0)
+        alpha = jnp.where(use_child_prior[..., None], child_prior, stored)
 
         edge_distance = jnp.where(unresolved, jnp.asarray(int(NO_DISTANCE), dtype=jnp.int32), edge_payload)
         node_outcome = self.node_categorical_outcome[:, root]

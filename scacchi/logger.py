@@ -12,7 +12,7 @@ import jax
 import numpy as np
 from tqdm import tqdm
 
-from .loss import CONCENTRATION_HISTOGRAM_BIN_EDGES, CONCENTRATION_HISTOGRAM_NUM_BINS, CONCENTRATION_HISTOGRAM_SERIES
+from .histogram import CONCENTRATION_HISTOGRAM_BIN_EDGES, CONCENTRATION_HISTOGRAM_NUM_BINS, CONCENTRATION_HISTOGRAM_SERIES
 from .types import config_to_dict
 
 Scalar = float | int
