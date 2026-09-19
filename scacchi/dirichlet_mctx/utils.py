@@ -79,8 +79,30 @@ def _categorize_node_and_publish(rng_key: base.PRNGKey, tree: Tree, node_index: 
     has_win = jnp.any(known & (edge_outcome == win_index), axis=-1)
     has_draw = jnp.any(known & (edge_outcome == 1), axis=-1) if num_outcomes == 3 else jnp.zeros_like(has_win)
     candidate_outcome = jnp.where(has_win, jnp.asarray(win_index, dtype=jnp.int8), jnp.where(all_categorical & has_draw, jnp.asarray(1, dtype=jnp.int8), jnp.where(all_categorical, jnp.asarray(0, dtype=jnp.int8), jnp.asarray(int(NO_OUTCOME), dtype=jnp.int8))))
-    candidate_action = action_selection.categorical_action(rng_key, candidate_outcome, edge_outcome, edge_distance, invalid_actions, num_outcomes=num_outcomes)
-    candidate_distance = edge_distance[batch, candidate_action]
+    if num_outcomes == 2 and tree.parents.shape[1] <= 2**24:
+        # Binary ties have identical distances, so publication needs no sampled
+        # action. Above float32's exact integer range, retain the sampler's tie
+        # semantics; draw ties likewise may have different stored distances.
+        shortest_win = jnp.min(
+            jnp.where(
+                known & (edge_outcome == win_index),
+                edge_distance,
+                jnp.iinfo(edge_distance.dtype).max,
+            ),
+            axis=-1,
+        )
+        longest_loss = jnp.max(
+            jnp.where(
+                known & (edge_outcome == 0),
+                edge_distance,
+                jnp.iinfo(edge_distance.dtype).min,
+            ),
+            axis=-1,
+        )
+        candidate_distance = jnp.where(has_win, shortest_win, longest_loss)
+    else:
+        candidate_action = action_selection.categorical_action(rng_key, candidate_outcome, edge_outcome, edge_distance, invalid_actions, num_outcomes=num_outcomes)
+        candidate_distance = edge_distance[batch, candidate_action]
     old_outcome = tree.node_categorical_outcome[batch, node_index]
     old_support = tree.node_payload[batch, node_index]
     publish_node = active & (old_outcome == int(NO_OUTCOME)) & (candidate_outcome != int(NO_OUTCOME))

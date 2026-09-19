@@ -463,6 +463,9 @@ def _masked_concentration_histogram_counts(
         edges[1:-1],
         safe_concentration,
         side="right",
+        # Identical binary-search comparisons, unrolled to avoid seven tiny
+        # GPU loop iterations for each of the four diagnostic histograms.
+        method="scan_unrolled",
     )
     return jnp.bincount(
         bin_index.reshape((-1,)),
