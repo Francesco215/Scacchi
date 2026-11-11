@@ -15,11 +15,12 @@ selfplay:
       max_depth: 32
       root_policy_support: search_evidence
       policy_target_temperature: 1.0
-      # xla; cuda for the same backup as one CUDA kernel (scacchi/native_binned);
-      # fused for the whole search step as one kernel per simulation (Hex only,
-      # same trees as cuda).
-      backup_kernel: xla
-      # backup_kernel=fused only: 2 overlaps half the lanes' network with the
+      # auto: fused on Hex, else cuda, with a CUDA GPU and nvcc; xla otherwise.
+      # fused: the whole search step as one CUDA kernel per simulation (Hex only);
+      # cuda: JAX search with the backup as one CUDA kernel (same trees as fused);
+      # xla: all JAX. See scacchi/types.py.
+      search_kernel: auto
+      # search_kernel=fused only: 2 overlaps half the lanes' network with the
       # other half's tree step; see scacchi/types.py for when trees stay identical.
       fused_cohorts: 1
       # xla (flax), cuda (scacchi/native_binned/network.cu, same precision), or
@@ -35,7 +36,7 @@ eval:
       num_simulations: 32
       max_depth: 32
       root_policy_support: search_evidence
-      backup_kernel: ${selfplay.search.binned_thompson.backup_kernel}
+      search_kernel: ${selfplay.search.binned_thompson.search_kernel}
       fused_cohorts: 1
       network_kernel: ${selfplay.search.binned_thompson.network_kernel}
   player_action_commitment:

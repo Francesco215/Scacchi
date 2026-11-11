@@ -1,4 +1,4 @@
-"""Opt-in CUDA kernel for the weighted-sum backup.
+"""CUDA kernel for the weighted-sum backup.
 
 ``fused_backup(edges, invalid, points, repaired)`` computes, for the lanes in
 ``repaired`` and zeros elsewhere::
@@ -7,7 +7,8 @@
 
 as one XLA FFI custom call on the GPU, callable inside ``jit``,
 ``lax.while_loop`` and ``shard_map``. The search uses it when
-``search.binned_thompson.backup_kernel=cuda``; the default stays the JAX code.
+``search.binned_thompson.search_kernel=cuda``; ``search_kernel=fused`` (the
+default on Hex with a CUDA GPU) runs the same backup code inside its step kernel.
 Same sums in a different order, float32 throughout, no truncation.
 
 Limits: CUDA GPUs only; at most 128 moves (Hex up to 11x11) and 2-129 atoms on

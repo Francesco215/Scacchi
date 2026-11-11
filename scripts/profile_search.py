@@ -79,7 +79,7 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=4096)
     parser.add_argument("--plies", type=int, default=8)
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--backup", choices=["xla", "cuda", "fused"], default="cuda")
+    parser.add_argument("--search-kernel", choices=["auto", "fused", "cuda", "xla"], default="cuda")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--override", action="append", default=[])
     parser.add_argument("--output", type=Path, default=None)
@@ -91,7 +91,7 @@ def main() -> None:
     from scacchi.network import build_model
     from scacchi.play_search import make_search, make_evaluator
 
-    extra = [f"selfplay.search.binned_thompson.backup_kernel={args.backup}", *args.override]
+    extra = [f"selfplay.search.binned_thompson.search_kernel={args.search_kernel}", *args.override]
     if args.what == "eval":
         extra.append(f"eval.batch_size={args.batch}")
     config = load_config(args.config_name, args.batch, extra)
@@ -141,7 +141,7 @@ def main() -> None:
         times.append(time.perf_counter() - started)
     lib.cudaProfilerStop()
     result = {
-        "what": args.what, "batch": args.batch, "plies": args.plies, "backup": args.backup,
+        "what": args.what, "batch": args.batch, "plies": args.plies, "search_kernel": args.search_kernel,
         "first_s": first, "median_s": statistics.median(times), "min_s": min(times), "times_s": times,
     }
     print(json.dumps(result))

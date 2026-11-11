@@ -2,7 +2,7 @@
 
 Reference: ``dirichlet_mctx.search.search`` with ``binned_search.action_selection``
 and ``binned_search.update_posterior(kernel="cuda")`` (what
-``backup_kernel=cuda`` runs). Same positions, same keys, same network; every
+``search_kernel=cuda`` runs). Same positions, same keys, same network; every
 tree array must match exactly.
 """
 

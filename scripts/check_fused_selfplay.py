@@ -1,4 +1,4 @@
-"""End-to-end check of backup_kernel=fused against backup_kernel=cuda.
+"""End-to-end check of search_kernel=fused against search_kernel=cuda.
 
 Runs the trainer's own functions (``make_selfplay``, the training iteration,
 ``make_mcts_evaluate``) under both settings with the same keys and model, then
@@ -67,7 +67,7 @@ def main() -> None:
     parser.add_argument("--eval-batch", type=int, default=512)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--kernels", nargs="+", default=["cuda", "fused"],
-                        help="variants: a backup_kernel name, optionally label=kernel;key=value;...")
+                        help="variants: a search_kernel name, optionally label=kernel;key=value;...")
     parser.add_argument("--what", nargs="+", default=["selfplay", "iteration", "eval"])
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--override", action="append", default=[])
@@ -90,7 +90,7 @@ def main() -> None:
             label, kernel = kernel.split("=", 1)
             extra = [f"selfplay.search.binned_thompson.{item}" for item in extra]
         config = load_config(args.config_name, args.batch, [
-            f"selfplay.search.binned_thompson.backup_kernel={kernel}", f"eval.batch_size={args.eval_batch}", *extra, *args.override])
+            f"selfplay.search.binned_thompson.search_kernel={kernel}", f"eval.batch_size={args.eval_batch}", *extra, *args.override])
         kernel = label
         env = make_env(config.env.id, config.env.board_size)
         if args.checkpoint:

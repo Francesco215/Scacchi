@@ -3,7 +3,7 @@
 Both run from the same positions with the same keys and the same network. The
 reference is ``dirichlet_mctx.search.search`` with ``binned_search.action_selection``
 and ``binned_search.update_posterior(kernel="cuda")``, i.e. the search that
-``backup_kernel=cuda`` runs today. Every tree array is compared bitwise; the
+``search_kernel=cuda`` runs today. Every tree array is compared bitwise; the
 script reports, per array, how many lanes differ and the first one.
 """
 

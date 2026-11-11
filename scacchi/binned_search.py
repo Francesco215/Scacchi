@@ -78,17 +78,42 @@ def update_posterior(key, context, *, points, kernel: str = "xla"):
     return PosteriorUpdate(edge_alpha=prepared.edge_alpha, edge_payload=prepared.edge_payload, value_alpha=value)
 
 
+def _kernels_available() -> bool:
+    if jax.default_backend() != "gpu":
+        return False
+    from .native_binned._library import find_nvcc
+
+    try:
+        find_nvcc()
+    except RuntimeError:
+        return False
+    return True
+
+
+def resolve_search_kernel(kernel: str, env, atoms: int) -> str:
+    """``search_kernel`` with "auto" replaced by what runs: fused, cuda or xla."""
+    hex_env = getattr(env, "id", None) == "hex"
+    if kernel == "fused" and not hex_env:
+        raise ValueError("search.binned_thompson.search_kernel=fused supports Hex only")
+    if kernel != "auto":
+        return kernel
+    if env.num_actions > 128 or not 2 <= atoms <= 129 or not _kernels_available():
+        return "xla"
+    return "fused" if hex_env else "cuda"
+
+
 def make_binned_search(env, evaluator, config, q_supervision_config):
     from .play_search import _normalize_policy_on_support, _root_policy_support, targets_from_summary
 
     expand = make_dirichlet_expand_fn(env, evaluator, num_outcomes=2)
-    fused = config.backup_kernel == "fused"
-    if fused and getattr(env, "id", None) != "hex":
-        raise ValueError("search.binned_thompson.backup_kernel=fused supports Hex only")
+    if config.search_kernel == "fused":
+        resolve_search_kernel("fused", env, 9)  # fail at construction, not at the first trace
 
     def search(state, key):
         prediction = evaluator(state.observation)
-        repair = functools.partial(update_posterior, points=prediction.support, kernel="cuda" if fused else config.backup_kernel)
+        kernel = resolve_search_kernel(config.search_kernel, env, prediction.support.shape[-1])
+        fused = kernel == "fused"
+        repair = functools.partial(update_posterior, points=prediction.support, kernel="cuda" if fused else kernel)
         reward = state.rewards[jnp.arange(state.rewards.shape[0]), state.current_player]
         root = RootFnOutput(
             prior_logits=prediction.logits,
