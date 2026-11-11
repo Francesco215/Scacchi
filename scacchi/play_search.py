@@ -10,6 +10,7 @@ import mctx
 import pgx
 
 from . import dirichlet_mctx
+from .binned import BinnedOutput, mean as binned_mean
 from .dirichlet_mctx.action_selection import (
     categorical_action_population,
     posterior_best_policy,
@@ -54,6 +55,8 @@ class EvaluatorOutput(NamedTuple):
     value: Float[Array, "*batch"] | None = None
     alpha_v: Float[Array, "*batch outcome"] | None = None
     alpha_q: Float[Array, "*batch action outcome"] | None = None
+    # Atom locations of binned beliefs; None for Dirichlet heads.
+    support: Float[Array, "outcome"] | None = None
 Evaluator = Callable[[jax.Array], EvaluatorOutput]
 
 class PosteriorPrediction(NamedTuple):
@@ -95,6 +98,14 @@ class PlayerOutput(NamedTuple):
 def evaluator_output_from_model_output(model_output: Any) -> EvaluatorOutput:
     if isinstance(model_output, EvaluatorOutput):
         return model_output
+    if isinstance(model_output, BinnedOutput):
+        return EvaluatorOutput(
+            logits=model_output.logits,
+            value=2.0 * binned_mean(model_output.value_probs, model_output.support) - 1.0,
+            alpha_v=model_output.value_probs,
+            alpha_q=model_output.action_probs,
+            support=model_output.support,
+        )
     if isinstance(model_output, jax.Array):
         return EvaluatorOutput(logits=model_output)
     if len(model_output) == 2:
@@ -487,6 +498,11 @@ def _run_dirichlet_thompson_search(
         legal_action_mask=env_state.legal_action_mask,
         search_cfg=search_cfg,
     )
+    return targets_from_summary(summary, policy_target, search_action, env_state.legal_action_mask, q_supervision_config)
+
+
+def targets_from_summary(summary, policy_target, search_action, legal, q_supervision_config, *, unresolved_kind: int = TARGET_DIRICHLET) -> PosteriorTargets:
+    """Encode common tree/proof metadata independently of belief representation."""
     # These are the actual replacement-style B/cache posteriors exposed by
     # search. Unresolved R remains structural metadata; categorical payloads
     # hold distance. Neither changes Dirichlet concentration.
@@ -495,20 +511,19 @@ def _run_dirichlet_thompson_search(
     q_search_count = summary.visit_counts[..., None]
     q_is_categorical = summary.q_categorical_outcome != int(NO_OUTCOME)
     v_is_categorical = summary.v_categorical_outcome != int(NO_OUTCOME)
-    legal = env_state.legal_action_mask
     q_target_kind = jnp.where(
         legal,
         jnp.where(
             q_is_categorical,
             jnp.asarray(int(TARGET_CATEGORICAL), dtype=jnp.int8),
-            jnp.asarray(int(TARGET_DIRICHLET), dtype=jnp.int8),
+            jnp.asarray(int(unresolved_kind), dtype=jnp.int8),
         ),
         jnp.asarray(int(TARGET_PAD), dtype=jnp.int8),
     )
     v_target_kind = jnp.where(
         v_is_categorical,
         jnp.asarray(int(TARGET_CATEGORICAL), dtype=jnp.int8),
-        jnp.asarray(int(TARGET_DIRICHLET), dtype=jnp.int8),
+        jnp.asarray(int(unresolved_kind), dtype=jnp.int8),
     )
     q_supervision = build_q_supervision(
         q_supervision_config.action_set,
@@ -614,6 +629,9 @@ def make_search(
 ) -> Search:
     if q_supervision_config is None:
         q_supervision_config = QSupervisionConfig()
+    if search_cfg.kind == SearchKind.binned_thompson:
+        from .binned_search import make_binned_search
+        return make_binned_search(env, evaluator, search_cfg.binned_thompson, q_supervision_config)
     
     active_search_cfg, _make_search_function = {
         SearchKind.policy: (search_cfg.policy, _make_policy_search),

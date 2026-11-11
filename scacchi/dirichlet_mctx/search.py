@@ -98,7 +98,7 @@ def _set_expanded_node(
     return jax.lax.dynamic_update_slice_in_dim(array, updated, index, axis=1)
 
 
-def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn: base.RecurrentFn, simulation: base.Simulation, new_node_index: Int32[Array, ""]) -> tuple[Tree, base.RecurrentFnOutput]:
+def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn: base.RecurrentFn, simulation: base.Simulation, new_node_index: Int32[Array, ""], *, num_outcomes: int | None = None) -> tuple[Tree, base.RecurrentFnOutput]:
     """Evaluate selected edges and initialize genuinely new child nodes."""
 
     batch = jnp.arange(tree.parents.shape[0])
@@ -111,7 +111,7 @@ def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn:
     initialize = simulation.active & (child_index == Tree.UNVISITED)
     child_outcome = step.terminal_outcome.astype(jnp.int8)
     parent_player = tree.node_to_play[batch, parent_index]
-    num_outcomes = tree.node_value_alpha.shape[-1]
+    num_outcomes = tree.node_value_alpha.shape[-1] if num_outcomes is None else num_outcomes
     aligned_outcome = align_categorical_outcome(child_outcome, step.to_play, parent_player, num_outcomes)
     publish_terminal = (simulation.active & (child_outcome != int(NO_OUTCOME)))
 
@@ -143,7 +143,7 @@ def expand(params: base.Params, rng_key: base.PRNGKey, tree: Tree, recurrent_fn:
     return tree, step
 
 
-def backward(rng_key: base.PRNGKey, tree: Tree, simulation: base.Simulation, step: base.RecurrentFnOutput, posterior_update: base.PosteriorUpdateFn) -> Tree:
+def backward(rng_key: base.PRNGKey, tree: Tree, simulation: base.Simulation, step: base.RecurrentFnOutput, posterior_update: base.PosteriorUpdateFn, *, num_outcomes: int | None = None) -> Tree:
     """Repair uncertain posteriors and propagate exact certificates upward."""
 
     batch = jnp.arange(tree.parents.shape[0])
@@ -161,7 +161,7 @@ def backward(rng_key: base.PRNGKey, tree: Tree, simulation: base.Simulation, ste
         context = PosteriorUpdateContext(node=utils._gather_node(tree, node_index), children=utils._gather_children(tree, node_index), leaf=leaf, active=active)
         update = posterior_update(update_key, context)
         tree = utils._set_node_update(tree, node_index, update, active)
-        tree = utils._categorize_node_and_publish(tie_break_key, tree, node_index, active)
+        tree = utils._categorize_node_and_publish(tie_break_key, tree, node_index, active, num_outcomes=num_outcomes)
         continue_up = active & (node_index != Tree.ROOT_INDEX)
         parent = tree.parents[batch, node_index]
         next_node = jnp.where(continue_up, parent, Tree.ROOT_INDEX)
@@ -186,7 +186,7 @@ def _recurrent_dtypes_fit_storage(root: base.RootFnOutput, output_shapes) -> boo
     )
 
 
-def search(params: base.Params, rng_key: base.PRNGKey, *, root: base.RootFnOutput, recurrent_fn: base.RecurrentFn, action_selection_fn: base.ActionSelectionFn, posterior_update: base.PosteriorUpdateFn, num_simulations: int, max_depth: int | None = None, invalid_actions: Bool[Array, "batch action"] | None = None, loop_fn: base.LoopFn = jax.lax.fori_loop) -> Tree:
+def search(params: base.Params, rng_key: base.PRNGKey, *, root: base.RootFnOutput, recurrent_fn: base.RecurrentFn, action_selection_fn: base.ActionSelectionFn, posterior_update: base.PosteriorUpdateFn, num_simulations: int, max_depth: int | None = None, invalid_actions: Bool[Array, "batch action"] | None = None, loop_fn: base.LoopFn = jax.lax.fori_loop, num_outcomes: int | None = None) -> Tree:
     """Run ``simulate -> expand -> bottom-up repair`` a fixed number of times."""
 
     if num_simulations < 0:
@@ -235,12 +235,12 @@ def search(params: base.Params, rng_key: base.PRNGKey, *, root: base.RootFnOutpu
             # Branch over the recurrent result, not the entire allocated tree.
             # Publication masks preserve inactive rows; backward already skips
             # an all-inactive batch. This permits reuse of the large tree buffers.
-            tree, step = expand(params, expand_key, tree, guarded_recurrent, simulation, new_node)
-            return key, backward(backward_key, tree, simulation, step, posterior_update)
+            tree, step = expand(params, expand_key, tree, guarded_recurrent, simulation, new_node, num_outcomes=num_outcomes)
+            return key, backward(backward_key, tree, simulation, step, posterior_update, num_outcomes=num_outcomes)
 
         def run_active_simulation(tree: Tree) -> Tree:
-            tree, step = expand(params, expand_key, tree, recurrent_fn, simulation, new_node)
-            return backward(backward_key, tree, simulation, step, posterior_update)
+            tree, step = expand(params, expand_key, tree, recurrent_fn, simulation, new_node, num_outcomes=num_outcomes)
+            return backward(backward_key, tree, simulation, step, posterior_update, num_outcomes=num_outcomes)
 
         # Unusual callback dtypes can round inactive values through promotion.
         # Preserve the original whole-tree skip behavior for those callbacks.

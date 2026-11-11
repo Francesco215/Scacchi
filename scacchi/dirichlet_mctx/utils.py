@@ -64,7 +64,7 @@ def _set_node_update(tree: Tree, node_index: Int32[Array, "batch"], update: Post
     return replace(tree, node_payload=_set_node(tree.node_payload, node_index, new_node_payload, active), edge_alpha=_set_node(tree.edge_alpha, node_index, edge_alpha, active), edge_payload=_set_node(tree.edge_payload, node_index, new_payload, active), node_value_alpha=_set_node(tree.node_value_alpha, node_index, update.value_alpha, active))
 
 
-def _categorize_node_and_publish(rng_key: base.PRNGKey, tree: Tree, node_index: Int32[Array, "batch"], active: Bool[Array, "batch"]) -> Tree:
+def _categorize_node_and_publish(rng_key: base.PRNGKey, tree: Tree, node_index: Int32[Array, "batch"], active: Bool[Array, "batch"], *, num_outcomes: int | None = None) -> Tree:
     """Publish a node certificate after preserving its final parent support."""
     batch = jnp.arange(tree.parents.shape[0])
     edge_outcome = tree.edge_categorical_outcome[batch, node_index]
@@ -74,7 +74,7 @@ def _categorize_node_and_publish(rng_key: base.PRNGKey, tree: Tree, node_index: 
     known = legal & (edge_outcome != int(NO_OUTCOME))
     has_legal = jnp.any(legal, axis=-1)
     all_categorical = has_legal & jnp.all(~legal | known, axis=-1)
-    num_outcomes = tree.node_value_alpha.shape[-1]
+    num_outcomes = tree.node_value_alpha.shape[-1] if num_outcomes is None else num_outcomes
     win_index = num_outcomes - 1
     has_win = jnp.any(known & (edge_outcome == win_index), axis=-1)
     has_draw = jnp.any(known & (edge_outcome == 1), axis=-1) if num_outcomes == 3 else jnp.zeros_like(has_win)

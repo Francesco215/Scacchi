@@ -14,6 +14,12 @@ if __package__ in {None, ""}:
 if any(Path("/dev").glob("accel*")):
     os.environ.setdefault("JAX_PLATFORMS", "tpu,cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Capture GPU control flow; an existing XLA_FLAGS (including "") opts out.
+os.environ.setdefault(
+    "XLA_FLAGS",
+    "--xla_gpu_enable_command_buffer=+WHILE,+CONDITIONAL,+CONVOLUTION "
+    "--xla_gpu_graph_min_graph_size=1",
+)
 
 from flax import nnx
 import hydra

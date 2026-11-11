@@ -9,9 +9,10 @@ import jax.numpy as jnp
 from flax import nnx
 
 from .dirichlet_mctx import outcomes
+from . import binned
 
 if TYPE_CHECKING:
-    from .types import Config
+    from .types import BinConfig, Config
 
 
 def _dtype_from_name(name: str):
@@ -213,6 +214,8 @@ def dirichlet_from_logits(
 
 
 def policy_value_from_output(output):
+    if isinstance(output, binned.BinnedOutput):
+        return output.logits, 2.0 * binned.mean(output.value_probs, output.support) - 1.0
     if len(output) == 2:
         return output
     logits, alpha_v, _alpha_q = output
@@ -335,8 +338,12 @@ class AZNet(nnx.Module):
         return logits.astype(jnp.float32), value.astype(jnp.float32)
 
 
-class AZDirichletNet(nnx.Module):
-    """AlphaZero convolutional trunk with policy, value-Dirichlet, and Q heads."""
+class AZBeliefNet(nnx.Module):
+    """Shared AlphaZero features with Dirichlet or binned V/Q projections.
+
+    Existing Dirichlet parameter names/shapes stay checkpoint-compatible.
+    Binned heads keep feature widths fixed as the output resolution changes.
+    """
 
     def __init__(
         self,
@@ -352,6 +359,7 @@ class AZDirichletNet(nnx.Module):
         dirichlet_concentration_floor: float | None = None,
         dirichlet_initial_concentration: float | None = None,
         dirichlet_head_parameterization: str = "log_concentration",
+        bins: BinConfig | None = None,
         rngs: nnx.Rngs,
     ):
         height, width, input_channels = observation_shape
@@ -361,6 +369,8 @@ class AZDirichletNet(nnx.Module):
         self.num_blocks = num_blocks
         self.resnet_v2 = resnet_v2
         self.dtype = dtype
+        self.bins = bins
+        output_size = num_outcomes if bins is None else bins.count
         self.dirichlet_head_parameterization = str(
             dirichlet_head_parameterization
         )
@@ -379,6 +389,14 @@ class AZDirichletNet(nnx.Module):
             initial_concentration=dirichlet_initial_concentration,
             default_concentration=float(num_outcomes),
         )
+        if bins is None:
+            belief_bias_init = jax.nn.initializers.zeros
+        else:
+            # Start every belief as a uniform density over win probability.
+            initial_bias = binned.initial_logits(bins)
+            def belief_bias_init(key, shape, dtype=jnp.float32, **kwargs):
+                del key, kwargs
+                return jnp.broadcast_to(jnp.asarray(initial_bias, dtype=dtype), (shape[0] // output_size, output_size)).reshape(shape)
 
         self.conv = nnx.Conv(input_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         if not resnet_v2:
@@ -406,16 +424,16 @@ class AZDirichletNet(nnx.Module):
         self.value_linear = nnx.Linear(height * width, num_channels, dtype=dtype, rngs=rngs)
         self.value_dir_out = nnx.Linear(
             num_channels,
-            num_outcomes,
-            dtype=dtype,
+            output_size,
+            dtype=jnp.float32 if bins is not None else dtype,
             kernel_init=jax.nn.initializers.zeros,
-            bias_init=jax.nn.initializers.zeros,
+            bias_init=belief_bias_init,
             rngs=rngs,
         )
         concentration_bias_init = jax.nn.initializers.constant(
             concentration_logit
         )
-        self.value_conc_out = nnx.Linear(
+        self.value_conc_out = None if bins is not None else nnx.Linear(
             num_channels,
             1,
             dtype=dtype,
@@ -434,21 +452,21 @@ class AZDirichletNet(nnx.Module):
         )
         self.q_dir_out = nnx.Linear(
             num_channels,
-            num_actions * num_outcomes,
-            dtype=dtype,
+            num_actions * output_size,
+            dtype=jnp.float32 if bins is not None else dtype,
             kernel_init=jax.nn.initializers.zeros,
-            bias_init=jax.nn.initializers.zeros,
+            bias_init=belief_bias_init,
             rngs=rngs,
         )
-        self.q_conc_conv = nnx.Conv(num_channels, 1, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
-        self.q_conc_bn = nnx.BatchNorm(1, momentum=0.9, dtype=dtype, rngs=rngs)
-        self.q_conc_linear = nnx.Linear(
+        self.q_conc_conv = None if bins is not None else nnx.Conv(num_channels, 1, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs)
+        self.q_conc_bn = None if bins is not None else nnx.BatchNorm(1, momentum=0.9, dtype=dtype, rngs=rngs)
+        self.q_conc_linear = None if bins is not None else nnx.Linear(
             height * width,
             num_channels,
             dtype=dtype,
             rngs=rngs,
         )
-        self.q_conc_out = nnx.Linear(
+        self.q_conc_out = None if bins is not None else nnx.Linear(
             num_channels,
             num_actions,
             dtype=dtype,
@@ -474,7 +492,7 @@ class AZDirichletNet(nnx.Module):
 
         return x
 
-    def __call__(self, x: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def __call__(self, x: jax.Array, *, train: bool) -> tuple[jax.Array, jax.Array, jax.Array] | binned.BinnedOutput:
         x = self._trunk(x, train=train)
 
         logits = self.policy_conv(x)
@@ -489,13 +507,7 @@ class AZDirichletNet(nnx.Module):
         value_features = value_features.reshape((value_features.shape[0], -1))
         value_features = self.value_linear(value_features)
         value_features = jax.nn.relu(value_features)
-        alpha_v = dirichlet_from_logits(
-            self.value_dir_out(value_features),
-            self.value_conc_out(value_features).reshape((value_features.shape[0],)),
-            parameterization=self.dirichlet_head_parameterization,
-            concentration_floor=self.dirichlet_concentration_floor,
-            concentration_clip=self.dirichlet_concentration_clip,
-        )
+        value_logits = self.value_dir_out(value_features)
 
         q_mean_logits = self.q_dir_conv(x)
         q_mean_logits = self.q_dir_bn(q_mean_logits, use_running_average=not train)
@@ -504,7 +516,23 @@ class AZDirichletNet(nnx.Module):
         q_mean_logits = self.q_dir_linear(q_mean_logits)
         q_mean_logits = jax.nn.relu(q_mean_logits)
         q_mean_logits = self.q_dir_out(q_mean_logits).reshape(
-            (x.shape[0], self.num_actions, self.num_outcomes)
+            (x.shape[0], self.num_actions, -1)
+        )
+
+        if self.bins is not None:
+            return binned.BinnedOutput(
+                logits.astype(jnp.float32),
+                binned.from_logits(value_logits),
+                binned.from_logits(q_mean_logits),
+                jnp.asarray(binned.support(self.bins)),
+            )
+
+        alpha_v = dirichlet_from_logits(
+            value_logits,
+            self.value_conc_out(value_features).reshape((value_features.shape[0],)),
+            parameterization=self.dirichlet_head_parameterization,
+            concentration_floor=self.dirichlet_concentration_floor,
+            concentration_clip=self.dirichlet_concentration_clip,
         )
 
         q_concentration_logit = self.q_conc_conv(x)
@@ -522,6 +550,20 @@ class AZDirichletNet(nnx.Module):
             concentration_clip=self.dirichlet_concentration_clip,
         )
         return logits.astype(jnp.float32), alpha_v, alpha_q
+
+
+class AZDirichletNet(AZBeliefNet):
+    """AlphaZero features with positive Dirichlet V/Q heads."""
+
+
+class AZBinnedNet(AZBeliefNet):
+    """AlphaZero features with categorical beliefs over win probability."""
+
+    def __init__(self, *args, bins: BinConfig, **kwargs):
+        if kwargs.get("num_outcomes", 2) != 2:
+            raise ValueError("AZBinnedNet requires binary outcomes")
+        kwargs["num_outcomes"] = 2
+        super().__init__(*args, bins=bins, **kwargs)
 
 
 class ReZeroResidual(nnx.Module):
@@ -800,8 +842,9 @@ def build_model(
             dtype=compute_dtype,
             rngs=rngs,
         )
-    if config.model.network == "aznet_dirichlet":
-        return AZDirichletNet(
+    if config.model.network in {"aznet_dirichlet", "aznet_binned"}:
+        model_class = AZBinnedNet if config.model.network == "aznet_binned" else AZDirichletNet
+        return model_class(
             num_actions=num_actions,
             observation_shape=observation_shape,
             num_outcomes=config.env.resolved_num_outcomes(),
@@ -817,6 +860,7 @@ def build_model(
                 config.model.dirichlet_initial_concentration
             ),
             dirichlet_head_parameterization=head_parameterization,
+            bins=config.model.bins if config.model.network == "aznet_binned" else None,
             rngs=rngs,
         )
     if config.model.network == "boardlaw":

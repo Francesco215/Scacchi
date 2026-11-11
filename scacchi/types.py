@@ -12,6 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 class Network(StrEnum):
     aznet = "aznet"
     aznet_dirichlet = "aznet_dirichlet"
+    aznet_binned = "aznet_binned"
     boardlaw = "boardlaw"
     boardlaw_dirichlet = "boardlaw_dirichlet"
 
@@ -31,6 +32,7 @@ class SearchKind(StrEnum):
     policy = "policy"
     gumbel = "gumbel"
     dirichlet_thompson = "dirichlet_thompson"
+    binned_thompson = "binned_thompson"
 
 
 class PosteriorUpdateKind(StrEnum):
@@ -126,6 +128,18 @@ class EnvConfig:
 
 
 @dataclass
+class BinConfig:
+    """Evenly spaced atoms on [0, 1] that carry a belief over win probability."""
+
+    # Odd, so that 0, 0.5 and 1 are all atoms.
+    count: int = 9
+
+    def __post_init__(self) -> None:
+        if self.count < 3 or self.count % 2 != 1:
+            raise ValueError("model.bins.count must be odd and >= 3")
+
+
+@dataclass
 class ModelConfig:
     network: Network = Network.aznet
     num_channels: int = 128
@@ -141,6 +155,7 @@ class ModelConfig:
     dirichlet_concentration_floor: float | None = None
     dirichlet_initial_concentration: float | None = None
     rezero_kernel_init: RezeroKernelInit = RezeroKernelInit.variance_scaling
+    bins: BinConfig = field(default_factory=BinConfig)
 
     def __post_init__(self) -> None:
         _require_gt(
@@ -345,15 +360,36 @@ class DirichletThompsonSearchConfig:
 
 
 @dataclass
+class BinnedThompsonSearchConfig:
+    num_simulations: int = 32
+    max_depth: int | None = None
+    root_policy_support: RootPolicySupport = RootPolicySupport.all_legal
+    policy_target_temperature: float = 1.0
+    # "xla" runs the backup as JAX code; "cuda" runs the same backup through
+    # the opt-in kernel in scacchi.native_binned (CUDA GPUs, at most 128 moves).
+    backup_kernel: str = "xla"
+
+    def __post_init__(self) -> None:
+        _require_ge("search.binned_thompson.num_simulations", self.num_simulations, 0)
+        if self.max_depth is None:
+            self.max_depth = self.num_simulations
+        _require_ge("search.binned_thompson.max_depth", self.max_depth, int(self.num_simulations > 0))
+        _require_gt("search.binned_thompson.policy_target_temperature", self.policy_target_temperature, 0.0)
+        if self.backup_kernel not in {"xla", "cuda"}:
+            raise ValueError("search.binned_thompson.backup_kernel must be xla or cuda")
+
+
+@dataclass
 class SearchConfig:
     kind: SearchKind = SearchKind.gumbel
     policy: PolicySearchConfig = field(default_factory=PolicySearchConfig)
     gumbel: GumbelSearchConfig = field(default_factory=GumbelSearchConfig)
     dirichlet_thompson: DirichletThompsonSearchConfig = field(default_factory=DirichletThompsonSearchConfig)
+    binned_thompson: BinnedThompsonSearchConfig = field(default_factory=BinnedThompsonSearchConfig)
 
-    def active(self) -> PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig:
+    def active(self) -> PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig | BinnedThompsonSearchConfig:
         return cast(
-            PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig,
+            PolicySearchConfig | GumbelSearchConfig | DirichletThompsonSearchConfig | BinnedThompsonSearchConfig,
             getattr(self, str(self.kind)),
         )
 
@@ -532,6 +568,7 @@ class WandbConfig:
 class LoggingConfig:
     interval: int = 1
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    jsonl_path: str | None = None
 
 
 @dataclass
@@ -561,9 +598,10 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         dirichlet_networks = {Network.aznet_dirichlet, Network.boardlaw_dirichlet}
+        belief_networks = dirichlet_networks | {Network.aznet_binned}
         num_outcomes = self.env.resolved_num_outcomes()
         active_weights = self.training.losses.active_dirichlet_weights()
-        if self.model.network not in dirichlet_networks and active_weights:
+        if self.model.network not in belief_networks and active_weights:
             weights = ", ".join(active_weights)
             raise ValueError(
                 "Dirichlet loss weights require a Dirichlet network; "
@@ -575,6 +613,14 @@ class TrainConfig:
             ("selfplay.search", self.selfplay.search),
             ("eval.player_search", self.eval.player_search),
         ):
+            if search.kind == SearchKind.binned_thompson:
+                if self.model.network != Network.aznet_binned:
+                    raise ValueError(f"{name}.kind=binned_thompson requires model.network=aznet_binned")
+            if self.model.network == Network.aznet_binned:
+                if num_outcomes != 2:
+                    raise ValueError("binned win-probability heads require env.num_outcomes=2")
+                if search.kind not in {SearchKind.binned_thompson, SearchKind.policy}:
+                    raise ValueError(f"{name} requires binned_thompson or policy search for binned heads")
             if search.kind == SearchKind.dirichlet_thompson:
                 assert self.model.network in dirichlet_networks, (
                     f"{name}.kind={search.kind!r} requires "
@@ -657,6 +703,7 @@ class TrainConfig:
         )
         if (
             categorical_head_loss_active
+            and self.model.network in dirichlet_networks
             and self.training.regularization.dirichlet_concentration_clip is None
         ):
             raise ValueError(

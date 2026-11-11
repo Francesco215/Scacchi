@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -152,6 +153,12 @@ def training_metrics(train_metrics: Any, *, seconds: float, hours: float, frames
         "train/q_dir_kl_loss": train_metrics.q_dir_kl_loss.mean().item(),
         "train/value_outcome_loss": train_metrics.value_outcome_loss.mean().item(),
         "train/q_outcome_loss": train_metrics.q_outcome_loss.mean().item(),
+        "train/value_binned_loss": train_metrics.value_binned_loss.mean().item(),
+        "train/q_binned_loss": train_metrics.q_binned_loss.mean().item(),
+        "train/value_belief_entropy": train_metrics.value_belief_entropy.mean().item(),
+        "train/value_belief_variance": train_metrics.value_belief_variance.mean().item(),
+        "train/q_belief_entropy": train_metrics.q_belief_entropy.mean().item(),
+        "train/q_belief_variance": train_metrics.q_belief_variance.mean().item(),
         "train/q_supervised_actions_per_row": (
             train_metrics.q_supervised_actions_per_row.mean().item()
         ),
@@ -179,8 +186,19 @@ def training_metrics(train_metrics: Any, *, seconds: float, hours: float, frames
         "train/hours": hours,
         "train/frames": frames,
     }
-    metrics.update(_concentration_metrics(train_metrics))
-    metrics.update(concentration_histograms(train_metrics))
+    is_binned = bool(np.all(np.asarray(jax.device_get(train_metrics.belief_head_is_binned))))
+    if is_binned:
+        metrics.pop("train/value_dir_kl_loss")
+        metrics.pop("train/q_dir_kl_loss")
+        for head in ("v", "q"):
+            categorical = _count(getattr(train_metrics, f"{head}_categorical_target_count"))
+            native = _count(getattr(train_metrics, f"{head}_native_target_count"))
+            metrics[f"data/{head}_categorical_target_fraction"] = categorical / max(native, 1.0)
+    else:
+        for key in ("train/value_binned_loss", "train/q_binned_loss", "train/value_belief_entropy", "train/value_belief_variance", "train/q_belief_entropy", "train/q_belief_variance"):
+            metrics.pop(key)
+        metrics.update(_concentration_metrics(train_metrics))
+        metrics.update(concentration_histograms(train_metrics))
     return metrics
 
 
@@ -229,6 +247,7 @@ class Logger:
         self.log_every = log_every
         self.max_steps = max_steps
         self._initialized = False
+        self.jsonl_path: Path | None = None
         self.run_name: str = f"local-{time.strftime('%Y%m%d-%H%M%S')}"
 
     def should_log(self, step: int) -> bool:
@@ -291,6 +310,12 @@ class Logger:
             self._update_pbar(pbar, clean, float_fmt, pbar_filter)
 
         self.log_metrics(step, clean, prefix)
+        if self.jsonl_path is not None:
+            self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            row = {"step": step, "timestamp": time.time()}
+            row.update({f"{prefix}{key}": value for key, value in clean.items() if isinstance(value, (int, float))})
+            with self.jsonl_path.open("a") as stream:
+                stream.write(json.dumps(row) + "\n")
 
     def _convert_metrics(self, metrics: dict[str, Any]) -> dict[str, Metric]:
         clean: dict[str, Metric] = {}
@@ -440,11 +465,15 @@ def build_logger(
     config = _config_to_dict(training_config)
 
     if wandb_enabled:
-        return WandbLogger(
+        logger = WandbLogger(
             wandb_project,
             log_every=log_every,
             max_steps=max_steps,
             config=config,
             dir=dir,
         )
-    return Logger(log_every=log_every, max_steps=max_steps)
+    else:
+        logger = Logger(log_every=log_every, max_steps=max_steps)
+    jsonl_path = getattr(training_config.logging, "jsonl_path", None)
+    logger.jsonl_path = None if jsonl_path is None else Path(jsonl_path)
+    return logger
