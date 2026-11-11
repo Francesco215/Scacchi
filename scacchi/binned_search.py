@@ -82,10 +82,13 @@ def make_binned_search(env, evaluator, config, q_supervision_config):
     from .play_search import _normalize_policy_on_support, _root_policy_support, targets_from_summary
 
     expand = make_dirichlet_expand_fn(env, evaluator, num_outcomes=2)
+    fused = config.backup_kernel == "fused"
+    if fused and getattr(env, "id", None) != "hex":
+        raise ValueError("search.binned_thompson.backup_kernel=fused supports Hex only")
 
     def search(state, key):
         prediction = evaluator(state.observation)
-        repair = functools.partial(update_posterior, points=prediction.support, kernel=config.backup_kernel)
+        repair = functools.partial(update_posterior, points=prediction.support, kernel="cuda" if fused else config.backup_kernel)
         reward = state.rewards[jnp.arange(state.rewards.shape[0]), state.current_player]
         root = RootFnOutput(
             prior_logits=prediction.logits,
@@ -96,12 +99,21 @@ def make_binned_search(env, evaluator, config, q_supervision_config):
             to_play=state.current_player,
         )
         search_key, tie_key = jax.random.split(key)
-        tree = tree_search(
-            params=(), rng_key=search_key, root=root, recurrent_fn=expand,
-            action_selection_fn=action_selection, posterior_update=repair,
-            num_simulations=config.num_simulations, max_depth=config.max_depth,
-            invalid_actions=~state.legal_action_mask, num_outcomes=2,
-        )
+        if fused:
+            from .native_binned.search import fused_search
+
+            tree = fused_search(
+                evaluator, state, root, search_key, points=prediction.support,
+                num_simulations=config.num_simulations, max_depth=config.max_depth,
+                cohorts=config.fused_cohorts,
+            )
+        else:
+            tree = tree_search(
+                params=(), rng_key=search_key, root=root, recurrent_fn=expand,
+                action_selection_fn=action_selection, posterior_update=repair,
+                num_simulations=config.num_simulations, max_depth=config.max_depth,
+                invalid_actions=~state.legal_action_mask, num_outcomes=2,
+            )
         summary = tree.summary()
         support = _root_policy_support(state.legal_action_mask, summary.visit_counts > 0, summary.q_categorical_outcome, config.root_policy_support)
         probs = binned.categorical_edges(summary.alpha, summary.q_categorical_outcome)

@@ -366,17 +366,32 @@ class BinnedThompsonSearchConfig:
     root_policy_support: RootPolicySupport = RootPolicySupport.all_legal
     policy_target_temperature: float = 1.0
     # "xla" runs the backup as JAX code; "cuda" runs the same backup through
-    # the opt-in kernel in scacchi.native_binned (CUDA GPUs, at most 128 moves).
+    # the opt-in kernel in scacchi.native_binned (CUDA GPUs, at most 128 moves);
+    # "fused" runs the whole search step (expand, backup, descent, Hex move) as
+    # one kernel per simulation (scacchi.native_binned.search; Hex only), with
+    # the same trees as "cuda".
     backup_kernel: str = "xla"
+    # Lane cohorts of backup_kernel=fused. 2 runs one half's network next to the
+    # other half's tree step (faster on large batches). Trees then match
+    # backup_kernel=cuda only if cuDNN gives each position the same bits at half
+    # the batch size, which depends on the convolution algorithm it picks.
+    fused_cohorts: int = 1
+    # "xla" evaluates the network with the flax module; "cuda" with the kernels in
+    # scacchi.native_binned.network (AZBinnedNet, 128 channels, 6 blocks): same
+    # precision, f32 sums in another order, so outputs match to bf16 rounding.
+    network_kernel: str = "xla"
 
     def __post_init__(self) -> None:
         _require_ge("search.binned_thompson.num_simulations", self.num_simulations, 0)
+        _require_ge("search.binned_thompson.fused_cohorts", self.fused_cohorts, 1)
         if self.max_depth is None:
             self.max_depth = self.num_simulations
         _require_ge("search.binned_thompson.max_depth", self.max_depth, int(self.num_simulations > 0))
         _require_gt("search.binned_thompson.policy_target_temperature", self.policy_target_temperature, 0.0)
-        if self.backup_kernel not in {"xla", "cuda"}:
-            raise ValueError("search.binned_thompson.backup_kernel must be xla or cuda")
+        if self.network_kernel not in {"xla", "cuda"}:
+            raise ValueError("search.binned_thompson.network_kernel must be xla or cuda")
+        if self.backup_kernel not in {"xla", "cuda", "fused"}:
+            raise ValueError("search.binned_thompson.backup_kernel must be xla, cuda or fused")
 
 
 @dataclass
