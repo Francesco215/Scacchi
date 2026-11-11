@@ -101,6 +101,8 @@ eval:
 
 logging:
   interval: 1
+  # Optional local copy of the scalar metrics, one JSON object per step.
+  jsonl_path: null
   wandb:
     enabled: true
     project: scacchi-az

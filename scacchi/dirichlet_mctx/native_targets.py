@@ -14,6 +14,7 @@ from .outcomes import NO_DISTANCE, NO_OUTCOME
 TARGET_PAD = 0
 TARGET_DIRICHLET = 1
 TARGET_CATEGORICAL = 2
+TARGET_BINNED = 3
 
 
 class NativeTargetFields(TypedDict):
@@ -67,6 +68,7 @@ def native_fields_from_beta(beta_q: Float[Array, "*batch action outcome"], beta_
 __all__ = [
     "NativeTargetFields",
     "TARGET_CATEGORICAL",
+    "TARGET_BINNED",
     "TARGET_DIRICHLET",
     "TARGET_PAD",
     "native_fields_from_beta",

@@ -10,6 +10,7 @@ from jaxtyping import Array, Bool, Float, Int
 import optax
 
 from .dirichlet_mctx.native_targets import (
+    TARGET_BINNED,
     TARGET_PAD,
     TARGET_CATEGORICAL,
     TARGET_DIRICHLET,
@@ -22,6 +23,7 @@ from .histogram import (
     CONCENTRATION_HISTOGRAM_NUM_BINS,
     CONCENTRATION_HISTOGRAM_SERIES,
 )
+from . import binned
 
 if TYPE_CHECKING:
     from .play import TrainingSamples
@@ -64,6 +66,13 @@ class TrainMetrics(NamedTuple):
     q_dir_kl_loss: Float[Array, "*batch"]
     value_outcome_loss: Float[Array, "*batch"]
     q_outcome_loss: Float[Array, "*batch"]
+    value_binned_loss: Float[Array, "*batch"]
+    q_binned_loss: Float[Array, "*batch"]
+    value_belief_entropy: Float[Array, "*batch"]
+    value_belief_variance: Float[Array, "*batch"]
+    q_belief_entropy: Float[Array, "*batch"]
+    q_belief_variance: Float[Array, "*batch"]
+    belief_head_is_binned: Float[Array, "*batch"]
     dirichlet_concentration_histogram_counts: Float[
         Array,
         "4 concentration_bin",
@@ -276,7 +285,7 @@ def make_compute_input_for_lossfn(
         terminal_edge_targets = config.training.losses.terminal_edge_targets
         terminal_parent_targets = config.training.losses.terminal_parent_targets
         if terminal_edge_targets or terminal_parent_targets:
-            outcome_index = _outcome_index(source.reward, beta_v_target.shape[-1])
+            outcome_index = _outcome_index(source.reward, config.env.resolved_num_outcomes())
             played_action_mask = jax.nn.one_hot(
                 source.played_action,
                 beta_q_target.shape[-2],
@@ -786,13 +795,31 @@ def _head_concentration_metrics(
     return metrics, histograms
 
 
+def _native_binned_loss(target, probs, kind, outcome, weight):
+    """NLL of the search's belief under the predicted one, per head entry.
+
+    A proven outcome is a point mass on the first (loss) or last (win) atom.
+    """
+    kind = jnp.asarray(kind)
+    valid = (kind == TARGET_BINNED) | (kind == TARGET_CATEGORICAL)
+    index = jnp.asarray(outcome, dtype=jnp.int32) * (probs.shape[-1] - 1)
+    exact = jax.nn.one_hot(index, probs.shape[-1], dtype=probs.dtype)
+    target = jnp.where((kind == TARGET_CATEGORICAL)[..., None], exact, target)
+    target = jax.lax.stop_gradient(jnp.where(valid[..., None], target, 0.0))
+    loss = -jnp.sum(target * jnp.log(jnp.maximum(probs, jnp.finfo(probs.dtype).tiny)), axis=-1)
+    return loss * jnp.where(valid, weight, 0.0)
+
+
 def _compute_dirichlet_losses(
     logits: jax.Array,
     alpha_v: jax.Array,
     alpha_q: jax.Array,
     data: Sample,
     config,
+    *,
+    bin_support: jax.Array | None = None,
 ) -> tuple[jax.Array, TrainMetrics]:
+    """Shared V/Q masking and reductions for Dirichlet or binned beliefs."""
     native_fields = _native_target_fields(data, data.beta_Q_target, data.beta_V_target)
     policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
     value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
@@ -807,14 +834,17 @@ def _compute_dirichlet_losses(
         config.training.regularization.dirichlet_concentration_clip
     )
     dirichlet_loss_mode = str(config.training.losses.dirichlet_loss_mode)
-    value_dir_kl = _native_dirichlet_loss(
+    def native_loss(beta, alpha, kind, outcome, weight):
+        if bin_support is not None:
+            return _native_binned_loss(beta, alpha, kind, outcome, weight)
+        return _native_dirichlet_loss(beta, alpha, kind, outcome, weight, categorical_reference_concentration, dirichlet_loss_mode)
+
+    value_dir_kl = native_loss(
         data.beta_V_target,
         alpha_v,
         native_fields["v_target_kind"],
         native_fields["v_target_outcome"],
         native_fields["v_target_weight"],
-        categorical_reference_concentration,
-        dirichlet_loss_mode,
     )
     value_dir_kl_loss = _native_masked_mean(
         value_dir_kl,
@@ -822,14 +852,12 @@ def _compute_dirichlet_losses(
         native_fields["v_target_kind"],
     )
 
-    q_dir_kl = _native_dirichlet_loss(
+    q_dir_kl = native_loss(
         data.beta_Q_target,
         alpha_q,
         native_fields["q_target_kind"],
         native_fields["q_target_outcome"],
         native_fields["q_target_weight"],
-        categorical_reference_concentration,
-        dirichlet_loss_mode,
     )
     q_row_mask = (
         value_loss_mask
@@ -883,14 +911,19 @@ def _compute_dirichlet_losses(
         raise ValueError(f"unknown Q pair reduction: {q_pair_reduction!r}")
 
     outcome_mask = _mask_or(data.outcome_mask, data.value_mask)
-    outcome_index = _outcome_index(data.value_tgt, alpha_v.shape[-1])
-    value_outcome = _dirichlet_mean_categorical_nll(alpha_v, outcome_index)
+    outcome_index = _outcome_index(data.value_tgt, config.env.resolved_num_outcomes())
+    def outcome_nll(alpha):
+        if bin_support is not None:
+            p = binned.mean(alpha, bin_support)
+            alpha = jnp.stack((1.0 - p, p), axis=-1)
+        return _dirichlet_mean_categorical_nll(alpha, outcome_index)
+    value_outcome = outcome_nll(alpha_v)
     value_outcome_mask = outcome_mask & (
         native_fields["v_target_kind"] != int(TARGET_CATEGORICAL)
     )
     value_outcome_loss = _masked_mean(value_outcome, value_outcome_mask)
     played_alpha_q = _gather_played_action(alpha_q, data.played_action)
-    q_outcome = _dirichlet_mean_categorical_nll(played_alpha_q, outcome_index)
+    q_outcome = outcome_nll(played_alpha_q)
     played_q_target_kind = _gather_played_action_field(
         native_fields["q_target_kind"],
         data.played_action,
@@ -903,10 +936,25 @@ def _compute_dirichlet_losses(
     count_dtype = alpha_v.dtype
     concentration_metrics = {}
     histograms = []
+    belief_metrics = {}
     for head, alpha, beta, kind, mask in (
         ("V", alpha_v, data.beta_V_target, native_fields["v_target_kind"], value_loss_mask),
         ("Q", alpha_q, data.beta_Q_target, native_fields["q_target_kind"], q_supervised_pair_mask),
     ):
+        if bin_support is not None:
+            entropy = -jnp.sum(alpha * jnp.log(jnp.maximum(alpha, jnp.finfo(alpha.dtype).tiny)), axis=-1)
+            mu = binned.mean(alpha, bin_support)
+            variance = jnp.sum(alpha * (bin_support - mu[..., None]) ** 2, axis=-1)
+            prefix = "value" if head == "V" else "q"
+            belief_metrics[f"{prefix}_belief_entropy"] = _masked_mean(entropy, mask)
+            belief_metrics[f"{prefix}_belief_variance"] = _masked_mean(variance, mask)
+            lower = head.lower()
+            categorical_count = jnp.sum((mask & (kind == TARGET_CATEGORICAL)).astype(count_dtype))
+            native_count = jnp.sum((mask & (kind != TARGET_PAD)).astype(count_dtype))
+            belief_metrics[f"{lower}_categorical_target_count"] = categorical_count
+            belief_metrics[f"{lower}_native_target_count"] = native_count
+            belief_metrics[f"{lower}_categorical_target_fraction"] = categorical_count / jnp.maximum(native_count, 1)
+            continue
         head_metrics, head_histograms = _head_concentration_metrics(
             head, alpha, beta, kind, mask, config, count_dtype,
         )
@@ -984,16 +1032,20 @@ def _compute_dirichlet_losses(
         policy_nll_loss=policy_loss,
         policy_kl_hat=policy_kl_hat,
         policy_target_entropy=policy_target_entropy,
-        value_dir_kl_loss=value_dir_kl_loss,
-        q_dir_kl_loss=q_dir_kl_loss,
+        value_dir_kl_loss=value_dir_kl_loss if bin_support is None else jnp.zeros_like(value_dir_kl_loss),
+        q_dir_kl_loss=q_dir_kl_loss if bin_support is None else jnp.zeros_like(q_dir_kl_loss),
+        value_binned_loss=value_dir_kl_loss if bin_support is not None else jnp.zeros_like(value_dir_kl_loss),
+        q_binned_loss=q_dir_kl_loss if bin_support is not None else jnp.zeros_like(q_dir_kl_loss),
+        belief_head_is_binned=jnp.asarray(bin_support is not None, dtype=count_dtype),
         value_outcome_loss=value_outcome_loss,
         q_outcome_loss=q_outcome_loss,
-        dirichlet_concentration_histogram_counts=jnp.stack(histograms, axis=0),
+        dirichlet_concentration_histogram_counts=jnp.stack(histograms, axis=0) if histograms else jnp.zeros((len(CONCENTRATION_HISTOGRAM_SERIES), CONCENTRATION_HISTOGRAM_NUM_BINS), dtype=count_dtype),
         dirichlet_head_is_legacy=jnp.asarray(
             str(config.model.dirichlet_head_parameterization) == "legacy",
             dtype=count_dtype,
         ),
         **concentration_metrics,
+        **belief_metrics,
         q_supervised_actions_per_row=q_supervised_actions_per_row,
         q_positive_evidence_action_count=q_positive_evidence_action_count,
         q_positive_policy_action_count=q_positive_policy_action_count,
@@ -1007,6 +1059,8 @@ def _compute_dirichlet_losses(
 def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
     def loss_fn(model: Any):
         output = model(data.obs, train=True)
+        if isinstance(output, binned.BinnedOutput):
+            return _compute_dirichlet_losses(output.logits, output.value_probs, output.action_probs, data, config, bin_support=output.support)
         if len(output) == 2:
             logits, value = output
             policy_loss, value_loss = _compute_losses(logits, value, data, config)

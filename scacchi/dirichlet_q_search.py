@@ -40,7 +40,7 @@ def terminal_outcome_from_reward(
     return outcome.astype(jnp.int8)
 
 
-def make_dirichlet_expand_fn(env: Any, evaluator: Any):
+def make_dirichlet_expand_fn(env: Any, evaluator: Any, *, num_outcomes: int | None = None):
     """Build the native environment-step plus leaf-evaluation function."""
 
     def expand_fn(_, rng_key: jax.Array, action: jax.Array, env_state: Any):
@@ -50,15 +50,16 @@ def make_dirichlet_expand_fn(env: Any, evaluator: Any):
         prediction = evaluator(child_state.observation)
         alpha_v = _required_output(prediction.alpha_v, "alpha_v")
         alpha_q = _required_output(prediction.alpha_q, "alpha_q")
+        outcome_count = alpha_v.shape[-1] if num_outcomes is None else num_outcomes
         reward = child_state.rewards[
             jnp.arange(child_state.rewards.shape[0]),
             parent_player,
         ]
         parent_terminal_outcome = terminal_outcome_from_reward(
             reward,
-            alpha_v.shape[-1],
+            outcome_count,
         )
-        child_terminal_outcome = align_categorical_outcome(parent_terminal_outcome, parent_player, child_state.current_player, alpha_v.shape[-1])
+        child_terminal_outcome = align_categorical_outcome(parent_terminal_outcome, parent_player, child_state.current_player, outcome_count)
         terminal_outcome = jnp.where(
             child_state.terminated,
             child_terminal_outcome,
