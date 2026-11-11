@@ -78,7 +78,24 @@ def test_kernel_inside_a_while_loop():
     np.testing.assert_allclose(jax.jit(lambda: run(fused_backup))(), jax.jit(lambda: run(_jax_backup))(), atol=6e-6)
 
 
-def test_backup_kernel_must_be_xla_or_cuda():
-    assert BinnedThompsonSearchConfig(backup_kernel="cuda").backup_kernel == "cuda"
-    with pytest.raises(ValueError, match="backup_kernel"):
-        BinnedThompsonSearchConfig(backup_kernel="triton")
+def test_search_kernel_values():
+    assert BinnedThompsonSearchConfig().search_kernel == "auto"
+    assert BinnedThompsonSearchConfig(search_kernel="cuda").search_kernel == "cuda"
+    with pytest.raises(ValueError, match="search_kernel"):
+        BinnedThompsonSearchConfig(search_kernel="triton")
+
+
+def test_auto_search_kernel(monkeypatch):
+    import scacchi.binned_search as binned_search
+    from scacchi.envs import make_env
+
+    hex7, c4 = make_env("hex", 7), make_env("connect_four", None)
+    monkeypatch.setattr(binned_search, "_kernels_available", lambda: True)
+    assert binned_search.resolve_search_kernel("auto", hex7, 9) == "fused"
+    assert binned_search.resolve_search_kernel("auto", c4, 9) == "cuda"
+    assert binned_search.resolve_search_kernel("auto", make_env("hex", 13), 9) == "xla"  # 169 moves
+    assert binned_search.resolve_search_kernel("xla", hex7, 9) == "xla"
+    with pytest.raises(ValueError, match="Hex only"):
+        binned_search.resolve_search_kernel("fused", c4, 9)
+    monkeypatch.setattr(binned_search, "_kernels_available", lambda: False)
+    assert binned_search.resolve_search_kernel("auto", hex7, 9) == "xla"

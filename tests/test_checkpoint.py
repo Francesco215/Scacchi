@@ -51,6 +51,20 @@ def test_legacy_flat_checkpoint_config_loads_for_solved_baselines() -> None:
     assert config.eval.batch_size == 64
 
 
+def test_nested_checkpoint_migrates_backup_kernel_to_search_kernel() -> None:
+    config = checkpoint._load_checkpoint_config(
+        {
+            "env": {"num_outcomes": 2},
+            "model": {"network": "aznet_binned"},
+            "selfplay": {"search": {"kind": "binned_thompson", "binned_thompson": {"backup_kernel": "fused"}}},
+            "eval": {"player_search": {"kind": "binned_thompson", "binned_thompson": {"backup_kernel": "xla"}}},
+        }
+    )
+
+    assert config.selfplay.search.binned_thompson.search_kernel == "fused"
+    assert config.eval.player_search.binned_thompson.search_kernel == "xla"
+
+
 def test_nested_checkpoint_migrates_legacy_search_blocks_to_total_simulations() -> None:
     config = checkpoint._load_checkpoint_config(
         {

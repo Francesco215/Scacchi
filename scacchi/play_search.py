@@ -821,9 +821,16 @@ def make_search_player(
     action_commitment: ActionCommitmentConfig,
     q_supervision_config: QSupervisionConfig | None = None,
 ):
+    evaluator = make_evaluator(model)
+    if search_cfg.kind == SearchKind.binned_thompson and search_cfg.binned_thompson.network_kernel != "xla":
+        from .native_binned.network import make_native_evaluator, supports
+
+        if not supports(model):
+            raise ValueError("network_kernel=cuda/fp8/int8 needs AZBinnedNet with 128 channels and 6 ResNet-v2 blocks")
+        evaluator = make_native_evaluator(model, search_cfg.binned_thompson.network_kernel)
     search = make_search(
         env,
-        make_evaluator(model),
+        evaluator,
         search_cfg,
         q_supervision_config,
     )

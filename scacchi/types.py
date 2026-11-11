@@ -365,18 +365,39 @@ class BinnedThompsonSearchConfig:
     max_depth: int | None = None
     root_policy_support: RootPolicySupport = RootPolicySupport.all_legal
     policy_target_temperature: float = 1.0
-    # "xla" runs the backup as JAX code; "cuda" runs the same backup through
-    # the opt-in kernel in scacchi.native_binned (CUDA GPUs, at most 128 moves).
-    backup_kernel: str = "xla"
+    # Which code runs the search. "fused": the whole search step (descent, Hex
+    # move, expansion, backup) as one CUDA kernel per simulation
+    # (scacchi.native_binned.search; Hex only). "cuda": the JAX search with the
+    # backup as one CUDA kernel (scacchi.native_binned; same trees as "fused").
+    # "xla": all JAX. "auto" picks fused on Hex, else cuda, when there is a CUDA
+    # GPU, nvcc and at most 128 moves; otherwise xla. The kernels need a CUDA
+    # GPU, at most 128 moves and at most 129 atoms.
+    search_kernel: str = "auto"
+    # Lane cohorts of the fused search. 2 runs one half's network next to the
+    # other half's tree step (faster on large batches). Trees then match
+    # search_kernel=cuda only if cuDNN gives each position the same bits at half
+    # the batch size, which depends on the convolution algorithm it picks.
+    fused_cohorts: int = 1
+    # "xla" evaluates the network with the flax module; "cuda" with the kernels in
+    # scacchi.native_binned.network (AZBinnedNet, 128 channels, 6 blocks): same
+    # precision, f32 sums in another order, so outputs match to bf16 rounding.
+    # "fp8" and "int8" are the same kernels with the residual convolutions on
+    # 8-bit inputs, e4m3 floats or integers (approximations, for search only;
+    # training stays bf16). int8 is both closer to the bf16 network and faster;
+    # see scacchi/native_binned/network.py.
+    network_kernel: str = "xla"
 
     def __post_init__(self) -> None:
         _require_ge("search.binned_thompson.num_simulations", self.num_simulations, 0)
+        _require_ge("search.binned_thompson.fused_cohorts", self.fused_cohorts, 1)
         if self.max_depth is None:
             self.max_depth = self.num_simulations
         _require_ge("search.binned_thompson.max_depth", self.max_depth, int(self.num_simulations > 0))
         _require_gt("search.binned_thompson.policy_target_temperature", self.policy_target_temperature, 0.0)
-        if self.backup_kernel not in {"xla", "cuda"}:
-            raise ValueError("search.binned_thompson.backup_kernel must be xla or cuda")
+        if self.network_kernel not in {"xla", "cuda", "fp8", "int8"}:
+            raise ValueError("search.binned_thompson.network_kernel must be xla, cuda, fp8 or int8")
+        if self.search_kernel not in {"auto", "fused", "cuda", "xla"}:
+            raise ValueError("search.binned_thompson.search_kernel must be auto, fused, cuda or xla")
 
 
 @dataclass
