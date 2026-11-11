@@ -8,6 +8,13 @@ one kernel. Same precision as the flax module (bf16 layers, f32 accumulation,
 f32 belief layers); the f32 sums are added in another order than cuDNN's, so
 results match the XLA network to bf16 rounding, not bitwise. A position's
 result does not depend on the batch it is evaluated in.
+
+``fp8=True`` runs the 12 residual convolutions on FP8 (e4m3) inputs with f32
+accumulation: weights get one scale per output channel (largest magnitude
+mapped to 448, e4m3's largest value) and the convolution inputs (after
+BatchNorm and ReLU) are rounded to e4m3 without a scale, saturating at 448.
+Stem, heads, the residual stream and every epilogue stay as above. This is an
+approximation of the bf16 network meant for search only; training keeps bf16.
 """
 
 from __future__ import annotations
@@ -24,7 +31,8 @@ BLOCKS = 6
 
 class PackedNetwork(NamedTuple):
     stem_w: jax.Array   # [128, 36] bf16
-    trunk_w: jax.Array  # [12, 128, 1152] bf16
+    trunk_w: jax.Array  # [12, 128, 1152] bf16, or e4m3 bytes (uint8) for fp8
+    wscale: jax.Array   # [12, 128] f32 weight scale per output channel (ones for bf16)
     vec: jax.Array      # [52, 128] f32
     head_cw: jax.Array  # [5, 128] bf16
     head_cv: jax.Array  # [4, 5] f32
@@ -65,12 +73,23 @@ def _conv3x3(kernel):
     return jnp.transpose(kernel, (3, 0, 1, 2)).reshape(kernel.shape[3], -1)
 
 
-def pack(model) -> PackedNetwork:
+E4M3_MAX = 448.0
+
+
+def _quantize_e4m3(kernels):
+    """[convs, 128, 1152] weights -> e4m3 bytes and per-output-channel scales."""
+    amax = jnp.max(jnp.abs(kernels), axis=-1)
+    scale = jnp.where(amax > 0, amax / E4M3_MAX, 1.0).astype(jnp.float32)
+    q = (kernels / scale[..., None]).astype(jnp.float8_e4m3fn)
+    return jax.lax.bitcast_convert_type(q, jnp.uint8), scale
+
+
+def pack(model, fp8: bool = False) -> PackedNetwork:
     rows = [_bf16(model.conv.bias[...])]
     trunk = []
     for block in model.blocks:
         rows += _bn(block.bn1) + [_bf16(block.conv1.bias[...])] + _bn(block.bn2) + [_bf16(block.conv2.bias[...])]
-        trunk += [_conv3x3(block.conv1.kernel[...]), _conv3x3(block.conv2.kernel[...])]
+        trunk += [block.conv1.kernel[...], block.conv2.kernel[...]]
     rows += _bn(model.bn)
     head_kernels = [model.policy_conv.kernel[...], model.value_conv.kernel[...], model.q_dir_conv.kernel[...]]
     head_cw = jnp.concatenate([k.reshape(k.shape[-2], k.shape[-1]).T for k in head_kernels], axis=0).astype(jnp.bfloat16)
@@ -79,9 +98,16 @@ def pack(model) -> PackedNetwork:
         jnp.concatenate([_bf16(model.policy_conv.bias[...]), _bf16(model.value_conv.bias[...]), _bf16(model.q_dir_conv.bias[...])]),
         *[jnp.concatenate([bn[i] for bn in head_bn]) for i in range(3)],
     ])
+    # HWIO [3, 3, cin, cout] -> [cout, (kh * 3 + kw) * cin + c], float32
+    trunk = jnp.stack([jnp.transpose(k, (3, 0, 1, 2)).reshape(k.shape[3], -1) for k in trunk]).astype(jnp.float32)
+    if fp8:
+        trunk_w, wscale = _quantize_e4m3(trunk)
+    else:
+        trunk_w, wscale = trunk.astype(jnp.bfloat16), jnp.ones(trunk.shape[:2], jnp.float32)
     return PackedNetwork(
         stem_w=_conv3x3(model.conv.kernel[...]),
-        trunk_w=jnp.stack(trunk),
+        trunk_w=trunk_w,
+        wscale=wscale,
         vec=jnp.stack(rows).astype(jnp.float32),
         head_cw=head_cw,
         head_cv=head_cv.astype(jnp.float32),
@@ -111,16 +137,17 @@ def apply(packed: PackedNetwork, observation: jax.Array, num_actions: int, atoms
         jax.ShapeDtypeStruct((batch, num_actions, atoms), jnp.float32),
         *[jax.ShapeDtypeStruct((rows, CH), jnp.bfloat16)] * 3,
     ]
-    out = jax.ffi.ffi_call(NETWORK_TARGET, results)(observation.astype(jnp.bool_), *packed)
+    fp8 = packed.trunk_w.dtype == jnp.uint8
+    out = jax.ffi.ffi_call(NETWORK_TARGET, results)(observation.astype(jnp.bool_), *packed, fp8=np.int64(fp8))
     return out[0], out[1], out[2]
 
 
-def make_native_evaluator(model):
+def make_native_evaluator(model, fp8: bool = False):
     """``play_search.make_evaluator`` for ``AZBinnedNet`` with the CUDA forward pass."""
     from .. import binned
     from ..play_search import EvaluatorOutput
 
-    packed = pack(model)
+    packed = pack(model, fp8=fp8)
     support = jnp.asarray(binned.support(model.bins))
     num_actions = packed.pol_w.shape[1]
     atoms = packed.vout_w.shape[1]

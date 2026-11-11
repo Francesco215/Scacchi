@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -50,6 +51,17 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
                : "r"(addr));
 }
 
+// FP8 (e4m3) inputs, f32 accumulation: k = 32 per instruction, so a 32-byte
+// k-slice holds the same bytes as bf16's k = 16 and the ldmatrix fragments are
+// laid out the same way (pairs of bytes read as b16).
+__device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+      "{%0, %1, %2, %3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
 __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
@@ -71,6 +83,8 @@ struct Epilogue {
   const __nv_bfloat16* residual;  // [rows, 128] or null: x = conv + bias + residual
   __nv_bfloat16* out_x;     // [rows, 128] or null: the residual stream after this conv
   __nv_bfloat16* out_z;     // [rows, 128]: relu(bn(.)), the next convolution's input
+  const float* wscale = nullptr;  // FP8 path: [128] weight scale per output channel
+  uint8_t* out_zq = nullptr;      // FP8 path: z as e4m3 bytes instead of out_z
 };
 
 struct ConvShape {
@@ -80,9 +94,16 @@ struct ConvShape {
 };
 
 // One CTA: rows [m0, m0 + BM) x all 128 output channels; BM = 32 MT, warp tile 16 MT x 32.
-template <int MT>
-__device__ __forceinline__ void conv3x3_tile(const __nv_bfloat16* __restrict__ in, const __nv_bfloat16* __restrict__ w,
+// FP8 = true: in and w are e4m3 bytes ([rows, 128] and [128, 1152]); the
+// shared-memory tiles hold 64 elements per 64-byte row instead of 32.
+template <int MT, bool FP8>
+__device__ __forceinline__ void conv3x3_tile(const void* __restrict__ in_, const void* __restrict__ w_,
                                              const ConvShape& s, const Epilogue& ep, int m0, char* smem) {
+  constexpr int E = FP8 ? 1 : 2;      // bytes per element
+  constexpr int BKE = 64 / E;         // elements per 64-byte tile row
+  constexpr int KIT = KDIM / BKE;     // 36 (bf16) or 18 (fp8) k-iterations
+  const char* in = reinterpret_cast<const char*>(in_);
+  const char* w = reinterpret_cast<const char*>(w_);
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -111,22 +132,23 @@ __device__ __forceinline__ void conv3x3_tile(const __nv_bfloat16* __restrict__ i
   const uint32_t smem0 = smem_u32(smem);
 
   auto load_stage = [&](int stage, int kk) {
-    const int tap = kk >> 2;
+    const int kel = kk * BKE;
+    const int tap = kel >> 7;
     const int dy = tap / 3 - 1, dx = tap % 3 - 1;
-    const int c0 = (kk & 3) * BK + lchunk * 8;
+    const int c0 = (kel & (CH - 1)) + lchunk * (16 / E);
     const uint32_t a_dst = smem0 + stage * STAGE_BYTES;
     const uint32_t b_dst = a_dst + BM * BK * 2;
 #pragma unroll
     for (int i = 0; i < LOADS; ++i) {
       const int y = a_y[i] + dy, x = a_x[i] + dx;
       const bool ok = a_ok[i] && y >= 0 && y < s.side && x >= 0 && x < s.side;
-      const __nv_bfloat16* src = in + (size_t)(ok ? a_base[i] + y * s.side + x : 0) * CH + c0;
+      const char* src = in + ((size_t)(ok ? a_base[i] + y * s.side + x : 0) * CH + c0) * E;
       cp_async16(a_dst + swz(lrow + 64 * i, lchunk), src, ok);
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int n = lrow + 64 * i;
-      const __nv_bfloat16* src = w + (size_t)n * KDIM + kk * BK + lchunk * 8;
+      const char* src = w + ((size_t)n * KDIM + kel + lchunk * (16 / E)) * E;
       cp_async16(b_dst + swz(n, lchunk), src, true);
     }
   };
@@ -145,11 +167,11 @@ __device__ __forceinline__ void conv3x3_tile(const __nv_bfloat16* __restrict__ i
     cp_async_commit();
   }
 
-  for (int kk = 0; kk < KITERS; ++kk) {
+  for (int kk = 0; kk < KIT; ++kk) {
     cp_async_wait<STAGES - 2>();
     __syncthreads();
     const int next = kk + STAGES - 1;
-    if (next < KITERS) load_stage(next % STAGES, next);
+    if (next < KIT) load_stage(next % STAGES, next);
     cp_async_commit();
 
     const uint32_t a_tile = smem0 + (kk % STAGES) * STAGE_BYTES;
@@ -173,7 +195,10 @@ __device__ __forceinline__ void conv3x3_tile(const __nv_bfloat16* __restrict__ i
 #pragma unroll
       for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) mma_bf16(acc[mt][nt], a[mt], b[nt >> 1][(nt & 1) * 2], b[nt >> 1][(nt & 1) * 2 + 1]);
+        for (int nt = 0; nt < 4; ++nt) {
+          if constexpr (FP8) mma_e4m3(acc[mt][nt], a[mt], b[nt >> 1][(nt & 1) * 2], b[nt >> 1][(nt & 1) * 2 + 1]);
+          else mma_bf16(acc[mt][nt], a[mt], b[nt >> 1][(nt & 1) * 2], b[nt >> 1][(nt & 1) * 2 + 1]);
+        }
     }
   }
   cp_async_wait<0>();
@@ -207,13 +232,14 @@ __device__ __forceinline__ void conv3x3_tile(const __nv_bfloat16* __restrict__ i
   for (int nt = 0; nt < 4; ++nt) {
     const int col = wn * 32 + nt * 8 + (lane & 3) * 2;
     const float b0 = ep.bias[col], b1 = ep.bias[col + 1];
+    const float s0 = ep.wscale ? ep.wscale[col] : 1.f, s1 = ep.wscale ? ep.wscale[col + 1] : 1.f;
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
 #pragma unroll
       for (int half = 0; half < 2; ++half) {
         const int r = wm * (16 * MT) + mt * 16 + (lane >> 2) + half * 8;
-        float v0 = __bfloat162float(__float2bfloat16_rn(acc[mt][nt][half * 2]));
-        float v1 = __bfloat162float(__float2bfloat16_rn(acc[mt][nt][half * 2 + 1]));
+        float v0 = __bfloat162float(__float2bfloat16_rn(acc[mt][nt][half * 2] * s0));
+        float v1 = __bfloat162float(__float2bfloat16_rn(acc[mt][nt][half * 2 + 1] * s1));
         v0 = __bfloat162float(__float2bfloat16_rn(v0 + b0));
         v1 = __bfloat162float(__float2bfloat16_rn(v1 + b1));
         __nv_bfloat162* t = reinterpret_cast<__nv_bfloat162*>(tile + r * TS + col);
@@ -252,15 +278,30 @@ __device__ __forceinline__ void conv3x3_tile(const __nv_bfloat16* __restrict__ i
     }
   }
   __syncthreads();
-  copy_out(ep.out_z);
+  if (ep.out_zq) {
+    for (int i = tid; i < BM * (CH / 8); i += THREADS) {
+      const int r = i >> 4, c = (i & 15) * 8;
+      if (r >= rows_here) continue;
+      const __nv_bfloat162* t = reinterpret_cast<const __nv_bfloat162*>(tile + r * TS + c);
+      uint32_t q[2] = {0u, 0u};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float2 f = __bfloat1622float2(t[j]);
+        const uint32_t pair = (uint32_t)__nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+        q[j >> 1] |= pair << (16 * (j & 1));
+      }
+      *reinterpret_cast<uint2*>(ep.out_zq + (size_t)(m0 + r) * CH + c) = make_uint2(q[0], q[1]);
+    }
+  } else {
+    copy_out(ep.out_z);
+  }
 }
 
-template <int MT>
-__global__ void __launch_bounds__(THREADS, 2) conv3x3_kernel(const __nv_bfloat16* __restrict__ in,
-                                                             const __nv_bfloat16* __restrict__ w, ConvShape s,
-                                                             Epilogue ep) {
+template <int MT, bool FP8 = false>
+__global__ void __launch_bounds__(THREADS, 2) conv3x3_kernel(const void* __restrict__ in, const void* __restrict__ w,
+                                                             ConvShape s, Epilogue ep) {
   extern __shared__ __align__(128) char smem[];
-  conv3x3_tile<MT>(in, w, s, ep, blockIdx.x * 32 * MT, smem);
+  conv3x3_tile<MT, FP8>(in, w, s, ep, blockIdx.x * 32 * MT, smem);
 }
 
 }  // namespace scacchi_net

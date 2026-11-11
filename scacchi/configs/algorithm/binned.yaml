@@ -22,7 +22,8 @@ selfplay:
       # backup_kernel=fused only: 2 overlaps half the lanes' network with the
       # other half's tree step; see scacchi/types.py for when trees stay identical.
       fused_cohorts: 1
-      # xla (flax) or cuda (scacchi/native_binned/network.cu, same precision).
+      # xla (flax), cuda (scacchi/native_binned/network.cu, same precision), or
+      # fp8 (same kernels, residual convolutions on e4m3; search only, training stays bf16).
       network_kernel: xla
   action_commitment:
     posterior_update: null
