@@ -15,6 +15,8 @@ selfplay:
       max_depth: 32
       root_policy_support: search_evidence
       policy_target_temperature: 1.0
+      # xla, or cuda for the same backup as one CUDA kernel (scacchi/native_binned).
+      backup_kernel: xla
   action_commitment:
     posterior_update: null
 
@@ -25,5 +27,6 @@ eval:
       num_simulations: 32
       max_depth: 32
       root_policy_support: search_evidence
+      backup_kernel: ${selfplay.search.binned_thompson.backup_kernel}
   player_action_commitment:
     posterior_update: null

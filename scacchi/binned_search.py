@@ -54,20 +54,26 @@ def only_repaired(compute, repaired, *operands):
     return jnp.where(repaired.reshape((lanes,) + (1,) * (result.ndim - 1)), result, 0)
 
 
-def update_posterior(key, context, *, points):
+def update_posterior(key, context, *, points, kernel: str = "xla"):
     """Node belief = law of ``sum_a pi(a) X_a`` over its current edge beliefs.
 
     ``pi`` is the probability that each move is best. There are no counts, no
     prior strength and no blend with the node's own value prediction.
+    ``kernel="cuda"`` computes the same backup with ``scacchi.native_binned``.
     """
     del key
     prepared = _repair_inputs(context)
     edges = binned.categorical_edges(prepared.effective_alpha, context.node.edge_categorical_outcome)
     repaired = context.active & (prepared.n_down > 0)
-    value = only_repaired(
-        lambda edges, invalid: binned.weighted_sum(edges, binned.best_policy(edges, invalid), points),
-        repaired, edges, context.node.invalid_actions,
-    )
+    if kernel == "cuda":
+        from .native_binned import fused_backup
+
+        value = fused_backup(edges, context.node.invalid_actions, points, repaired)
+    else:
+        value = only_repaired(
+            lambda edges, invalid: binned.weighted_sum(edges, binned.best_policy(edges, invalid), points),
+            repaired, edges, context.node.invalid_actions,
+        )
     value = jnp.where(repaired[..., None], value, context.node.value_alpha)
     return PosteriorUpdate(edge_alpha=prepared.edge_alpha, edge_payload=prepared.edge_payload, value_alpha=value)
 
@@ -79,7 +85,7 @@ def make_binned_search(env, evaluator, config, q_supervision_config):
 
     def search(state, key):
         prediction = evaluator(state.observation)
-        repair = functools.partial(update_posterior, points=prediction.support)
+        repair = functools.partial(update_posterior, points=prediction.support, kernel=config.backup_kernel)
         reward = state.rewards[jnp.arange(state.rewards.shape[0]), state.current_player]
         root = RootFnOutput(
             prior_logits=prediction.logits,

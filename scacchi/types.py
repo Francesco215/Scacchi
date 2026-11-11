@@ -365,6 +365,9 @@ class BinnedThompsonSearchConfig:
     max_depth: int | None = None
     root_policy_support: RootPolicySupport = RootPolicySupport.all_legal
     policy_target_temperature: float = 1.0
+    # "xla" runs the backup as JAX code; "cuda" runs the same backup through
+    # the opt-in kernel in scacchi.native_binned (CUDA GPUs, at most 128 moves).
+    backup_kernel: str = "xla"
 
     def __post_init__(self) -> None:
         _require_ge("search.binned_thompson.num_simulations", self.num_simulations, 0)
@@ -372,6 +375,8 @@ class BinnedThompsonSearchConfig:
             self.max_depth = self.num_simulations
         _require_ge("search.binned_thompson.max_depth", self.max_depth, int(self.num_simulations > 0))
         _require_gt("search.binned_thompson.policy_target_temperature", self.policy_target_temperature, 0.0)
+        if self.backup_kernel not in {"xla", "cuda"}:
+            raise ValueError("search.binned_thompson.backup_kernel must be xla or cuda")
 
 
 @dataclass
