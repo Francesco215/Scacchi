@@ -50,7 +50,7 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=4096)
     parser.add_argument("--plies", type=int, nargs="+", default=[0, 10, 25])
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--fp8", action="store_true")
+    parser.add_argument("--kernel", choices=["cuda", "fp8", "int8"], default="cuda")
     args = parser.parse_args()
 
     from scacchi.native_binned.network import make_native_evaluator, supports
@@ -66,7 +66,7 @@ def main() -> None:
 
     @nnx.jit
     def native(model, obs):
-        out = make_native_evaluator(model, fp8=args.fp8)(obs)
+        out = make_native_evaluator(model, args.kernel)(obs)
         return out.logits, out.alpha_v, out.alpha_q
 
     for plies in args.plies:

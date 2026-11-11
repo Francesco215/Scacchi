@@ -106,7 +106,7 @@ def main() -> None:
 
     @nnx.jit
     def kernel(model, obs):
-        out = make_native_evaluator(model, fp8=not args.no_quant)(obs)
+        out = make_native_evaluator(model, "cuda" if args.no_quant else "fp8")(obs)
         return out.logits, out.alpha_v, out.alpha_q
 
     for plies in args.plies:

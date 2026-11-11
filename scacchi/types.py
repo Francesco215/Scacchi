@@ -381,8 +381,10 @@ class BinnedThompsonSearchConfig:
     # "xla" evaluates the network with the flax module; "cuda" with the kernels in
     # scacchi.native_binned.network (AZBinnedNet, 128 channels, 6 blocks): same
     # precision, f32 sums in another order, so outputs match to bf16 rounding.
-    # "fp8" is the same kernels with the residual convolutions on e4m3 inputs
-    # (an approximation, for search only; training stays bf16).
+    # "fp8" and "int8" are the same kernels with the residual convolutions on
+    # 8-bit inputs, e4m3 floats or integers (approximations, for search only;
+    # training stays bf16). int8 is both closer to the bf16 network and faster;
+    # see scacchi/native_binned/network.py.
     network_kernel: str = "xla"
 
     def __post_init__(self) -> None:
@@ -392,8 +394,8 @@ class BinnedThompsonSearchConfig:
             self.max_depth = self.num_simulations
         _require_ge("search.binned_thompson.max_depth", self.max_depth, int(self.num_simulations > 0))
         _require_gt("search.binned_thompson.policy_target_temperature", self.policy_target_temperature, 0.0)
-        if self.network_kernel not in {"xla", "cuda", "fp8"}:
-            raise ValueError("search.binned_thompson.network_kernel must be xla, cuda or fp8")
+        if self.network_kernel not in {"xla", "cuda", "fp8", "int8"}:
+            raise ValueError("search.binned_thompson.network_kernel must be xla, cuda, fp8 or int8")
         if self.search_kernel not in {"auto", "fused", "cuda", "xla"}:
             raise ValueError("search.binned_thompson.search_kernel must be auto, fused, cuda or xla")
 

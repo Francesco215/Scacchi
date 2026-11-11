@@ -24,6 +24,7 @@
 #include <cuda_fp8.h>
 
 #include "conv_mma.cuh"
+#include "conv_int8.cuh"
 
 namespace ffi = xla::ffi;
 
@@ -57,7 +58,7 @@ __device__ __forceinline__ float bn_relu(float v, float mean, float mul, float b
 __global__ void __launch_bounds__(256) stem_kernel(const uint8_t* __restrict__ obs, const __nv_bfloat16* __restrict__ w,
                                                    const float* __restrict__ vec, int rows, int side, int cells,
                                                    __nv_bfloat16* __restrict__ x_out, __nv_bfloat16* __restrict__ z_out,
-                                                   uint8_t* __restrict__ zq_out) {
+                                                   uint8_t* __restrict__ zq_out, const float* __restrict__ qinv) {
   __shared__ __align__(16) float ws[36 * CH];
   for (int i = threadIdx.x; i < CH * 36; i += blockDim.x) {
     const int n = i / 36, k = i - n * 36;
@@ -93,10 +94,14 @@ __global__ void __launch_bounds__(256) stem_kernel(const uint8_t* __restrict__ o
   }
   *reinterpret_cast<uint4*>(x_out + (size_t)r * CH + n0) = *reinterpret_cast<const uint4*>(xo);
   if (zq_out) {
+    // z as 8-bit inputs of the first residual convolution: integers on its grid (qinv), or e4m3.
     uint32_t q[2] = {0u, 0u};
 #pragma unroll
-    for (int j = 0; j < 8; ++j)
-      q[j >> 2] |= (uint32_t)__nv_cvt_float_to_fp8(__bfloat162float(zo[j]), __NV_SATFINITE, __NV_E4M3) << (8 * (j & 3));
+    for (int j = 0; j < 8; ++j) {
+      const float z = __bfloat162float(zo[j]);
+      const uint32_t byte = qinv ? i8_quant(z, qinv[n0 + j]) : (uint32_t)__nv_cvt_float_to_fp8(z, __NV_SATFINITE, __NV_E4M3);
+      q[j >> 2] |= byte << (8 * (j & 3));
+    }
     *reinterpret_cast<uint2*>(zq_out + (size_t)r * CH + n0) = make_uint2(q[0], q[1]);
   } else {
     *reinterpret_cast<uint4*>(z_out + (size_t)r * CH + n0) = *reinterpret_cast<const uint4*>(zo);
@@ -258,8 +263,9 @@ __global__ void __launch_bounds__(256) heads_kernel(const __nv_bfloat16* __restr
 template <typename T>
 T* ptr(ffi::AnyBuffer& b) { return reinterpret_cast<T*>(b.untyped_data()); }
 
-ffi::Error Network(cudaStream_t stream, int64_t fp8, ffi::AnyBuffer obs, ffi::AnyBuffer stem_w, ffi::AnyBuffer trunk_w,
-                   ffi::AnyBuffer wscale,
+// kernel: 0 bf16, 1 FP8 (e4m3), 2 INT8 residual convolutions.
+ffi::Error Network(cudaStream_t stream, int64_t kernel, ffi::AnyBuffer obs, ffi::AnyBuffer stem_w, ffi::AnyBuffer trunk_w,
+                   ffi::AnyBuffer wscale, ffi::AnyBuffer qinv,
                    ffi::AnyBuffer vec, ffi::AnyBuffer head_cw, ffi::AnyBuffer head_cv, ffi::AnyBuffer pol_w,
                    ffi::AnyBuffer pol_b, ffi::AnyBuffer val_w, ffi::AnyBuffer val_b, ffi::AnyBuffer vout_w,
                    ffi::AnyBuffer vout_b, ffi::AnyBuffer q_w, ffi::AnyBuffer q_b, ffi::AnyBuffer qout_w,
@@ -287,10 +293,15 @@ ffi::Error Network(cudaStream_t stream, int64_t fp8, ffi::AnyBuffer obs, ffi::An
   __nv_bfloat16* Z2 = ptr<__nv_bfloat16>(*z2s);
   const float* V = ptr<const float>(vec);
   const char* W = ptr<const char>(trunk_w);
-  const size_t conv_bytes = (size_t)CH * KDIM * (fp8 ? 1 : 2);
+  const bool fp8 = kernel == 1, int8 = kernel == 2;
+  if (kernel < 0 || kernel > 2) return ffi::Error::InvalidArgument("kernel must be 0 (bf16), 1 (fp8) or 2 (int8)");
+  const size_t conv_bytes = (size_t)CH * KDIM * (kernel ? 1 : 2);
   const float* WS = ptr<const float>(wscale);
-  if (fp8 && (int)wscale.element_count() != CONVS * CH) return ffi::Error::InvalidArgument("wscale must be [12, 128]");
-  // FP8: the convolution inputs Z and Z2 are e4m3 bytes in the same scratch buffers.
+  const float* QI = ptr<const float>(qinv);
+  if (kernel && ((int)wscale.element_count() != CONVS * CH || (int)qinv.element_count() != CONVS * CH))
+    return ffi::Error::InvalidArgument("wscale and qinv must be [12, 128]");
+  if (int8 && !i8_supports(side)) return ffi::Error::InvalidArgument("the int8 network needs a board side from 3 to 15");
+  // FP8 and INT8: the convolution inputs Z and Z2 are bytes in the same scratch buffers.
   uint8_t* Zq = reinterpret_cast<uint8_t*>(Z);
   uint8_t* Z2q = reinterpret_cast<uint8_t*>(Z2);
 
@@ -300,13 +311,14 @@ ffi::Error Network(cudaStream_t stream, int64_t fp8, ffi::AnyBuffer obs, ffi::An
     if (e == cudaSuccess) e = cudaFuncSetAttribute(conv3x3_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, CONV_SMEM);
     if (e == cudaSuccess) e = cudaFuncSetAttribute(conv3x3_kernel<4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, CONV_SMEM);
     if (e == cudaSuccess) e = cudaFuncSetAttribute(conv3x3_kernel<2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, CONV_SMEM);
+    if (e == cudaSuccess) e = cudaFuncSetAttribute(conv3x3_int8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, I8_SMEM_PAIR);
     if (e == cudaSuccess) e = cudaFuncSetAttribute(heads_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, HEADS_SMEM);
     if (e == cudaSuccess) e = cudaFuncSetAttribute(heads_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, HEADS_SMEM);
     if (e != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(e));
     configured.store(true);
   }
   stem_kernel<<<(rows + 511) / 512, 256, 0, stream>>>(ptr<const uint8_t>(obs), ptr<const __nv_bfloat16>(stem_w), V, rows,
-                                                    side, cells, X, Z, fp8 ? Zq : nullptr);
+                                                    side, cells, X, Z, kernel ? Zq : nullptr, int8 ? QI : nullptr);
   // 128-row tiles when they fill at least two waves (2 CTAs per SM), else 64.
   int sms = 0, device = 0;
   cudaGetDevice(&device);
@@ -323,16 +335,25 @@ ffi::Error Network(cudaStream_t stream, int64_t fp8, ffi::AnyBuffer obs, ffi::An
       else conv3x3_kernel<2><<<grid, THREADS, CONV_SMEM, stream>>>(in, w, s, e);
     }
   };
+  // INT8: persistent CTAs over units of whole boards (conv_int8.cuh); qinv[j] is the grid of convolution j's input.
+  const I8Plan plan = int8 ? i8_plan(boards, side, sms) : I8Plan{};
+  auto conv8 = [&](const uint8_t* in, int j, const Epilogue& e) {
+    conv3x3_int8_kernel<<<plan.grid, I8_THREADS, plan.smem, stream>>>(
+        in, reinterpret_cast<const int8_t*>(W + (size_t)j * conv_bytes), s, e, e.out_zq ? QI + (j + 1) * CH : nullptr,
+        plan.boards_per_unit);
+  };
   for (int i = 0; i < BLOCKS; ++i) {
     Epilogue e1{V + b1_row(i) * CH, V + bn2_row(i) * CH, V + (bn2_row(i) + 1) * CH, V + (bn2_row(i) + 2) * CH,
                 nullptr, nullptr, Z2};
-    if (fp8) { e1.wscale = WS + (2 * i) * CH; e1.out_zq = Z2q; }
-    conv(Z, W + (size_t)(2 * i) * conv_bytes, e1);
+    if (kernel) { e1.wscale = WS + (2 * i) * CH; e1.out_zq = Z2q; }
+    if (int8) conv8(Zq, 2 * i, e1);
+    else conv(Z, W + (size_t)(2 * i) * conv_bytes, e1);
     const int next = i + 1 < BLOCKS ? bn1_row(i + 1) : FINAL_BN;
     Epilogue e2{V + b2_row(i) * CH, V + next * CH, V + (next + 1) * CH, V + (next + 2) * CH, X, X, Z};
     // The last convolution's z feeds the heads, which read bf16.
-    if (fp8) { e2.wscale = WS + (2 * i + 1) * CH; if (i + 1 < BLOCKS) e2.out_zq = Zq; }
-    conv(Z2, W + (size_t)(2 * i + 1) * conv_bytes, e2);
+    if (kernel) { e2.wscale = WS + (2 * i + 1) * CH; if (i + 1 < BLOCKS) e2.out_zq = Zq; }
+    if (int8) conv8(Z2q, 2 * i + 1, e2);
+    else conv(Z2, W + (size_t)(2 * i + 1) * conv_bytes, e2);
   }
   Heads h{ptr<const __nv_bfloat16>(head_cw), ptr<const float>(head_cv), ptr<const __nv_bfloat16>(pol_w),
           ptr<const float>(pol_b), ptr<const __nv_bfloat16>(val_w), ptr<const float>(val_b), ptr<const float>(vout_w),
@@ -356,11 +377,12 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ScacchiBinnedNetwork, Network,
     ffi::Ffi::Bind()
         .Ctx<ffi::PlatformStream<cudaStream_t>>()
-        .Attr<int64_t>("fp8")    // 1: trunk convolutions on e4m3 inputs
+        .Attr<int64_t>("kernel") // residual convolutions: 0 bf16, 1 FP8 (e4m3), 2 INT8
         .Arg<ffi::AnyBuffer>()   // obs      [B, N, N, 4] bool
         .Arg<ffi::AnyBuffer>()   // stem_w   [128, 36] bf16
-        .Arg<ffi::AnyBuffer>()   // trunk_w  [12, 128, 1152] bf16, or e4m3 bytes when fp8
-        .Arg<ffi::AnyBuffer>()   // wscale   [12, 128] f32 weight scale per output channel (fp8)
+        .Arg<ffi::AnyBuffer>()   // trunk_w  [12, 128, 1152] bf16, e4m3 bytes (fp8) or int8
+        .Arg<ffi::AnyBuffer>()   // wscale   [12, 128] f32 weight scale per output channel (fp8, int8)
+        .Arg<ffi::AnyBuffer>()   // qinv     [12, 128] f32 1 / input step of each convolution (int8)
         .Arg<ffi::AnyBuffer>()   // vec      [52, 128] f32
         .Arg<ffi::AnyBuffer>()   // head_cw  [5, 128] bf16
         .Arg<ffi::AnyBuffer>()   // head_cv  [4, 5] f32

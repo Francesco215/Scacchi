@@ -1,9 +1,11 @@
 """Evaluate the network alone on a batch of positions, for profiling.
 
-Benchmark only. Same evaluator as the search (``play_search.make_evaluator``),
-on observations of positions after ``--plies`` random moves. The timed calls
-sit between cudaProfilerStart/Stop, so nsys/ncu with a profiler-API capture
-range see only them.
+Benchmark only. Same evaluator as the search (``play_search.make_evaluator``,
+or the CUDA network of ``--kernel cuda|fp8|int8`` with its weights packed
+outside the timed call, as the search does once per self-play call), on
+observations of positions after ``--plies`` random moves. The timed calls sit
+between cudaProfilerStart/Stop, so nsys/ncu with a profiler-API capture range
+see only them.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ def main() -> None:
     parser.add_argument("--plies", type=int, default=8)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument("--kernel", choices=["xla", "cuda", "fp8", "int8"], default="xla")
     args = parser.parse_args()
 
     from scacchi.checkpoint import from_pretrained
@@ -54,22 +57,33 @@ def main() -> None:
     states = jax.jit(random_positions, static_argnums=(0, 1, 2))(env, args.batch, args.plies, jax.random.PRNGKey(3))
     observation = states.observation
 
-    @nnx.jit
-    def run(model, observation):
-        out = make_evaluator(model)(observation)
-        return out.alpha_v, out.alpha_q, out.logits
+    if args.kernel == "xla":
+        @nnx.jit
+        def evaluate(model, observation):
+            out = make_evaluator(model)(observation)
+            return out.alpha_v, out.alpha_q, out.logits
 
-    jax.block_until_ready(run(model, observation))
-    jax.block_until_ready(run(model, observation))
+        run = lambda: evaluate(model, observation)  # noqa: E731
+    else:
+        from scacchi import binned
+        from scacchi.native_binned import network
+
+        packed = jax.block_until_ready(jax.jit(lambda: network.pack(model, args.kernel))())
+        atoms = binned.support(model.bins).shape[0]
+        evaluate = jax.jit(lambda packed, observation: network.apply(packed, observation, env.num_actions, atoms))
+        run = lambda: evaluate(packed, observation)  # noqa: E731
+
+    jax.block_until_ready(run())
+    jax.block_until_ready(run())
     lib = cudart()
     times = []
     lib.cudaProfilerStart()
     for _ in range(args.repeats):
         started = time.perf_counter()
-        jax.block_until_ready(run(model, observation))
+        jax.block_until_ready(run())
         times.append(time.perf_counter() - started)
     lib.cudaProfilerStop()
-    print(json.dumps({"batch": args.batch, "median_ms": round(1e3 * statistics.median(times), 3), "min_ms": round(1e3 * min(times), 3)}))
+    print(json.dumps({"kernel": args.kernel, "batch": args.batch, "median_ms": round(1e3 * statistics.median(times), 3), "min_ms": round(1e3 * min(times), 3)}))
 
 
 if __name__ == "__main__":

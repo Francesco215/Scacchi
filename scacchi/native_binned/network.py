@@ -9,12 +9,26 @@ f32 belief layers); the f32 sums are added in another order than cuDNN's, so
 results match the XLA network to bf16 rounding, not bitwise. A position's
 result does not depend on the batch it is evaluated in.
 
-``fp8=True`` runs the 12 residual convolutions on FP8 (e4m3) inputs with f32
-accumulation: weights get one scale per output channel (largest magnitude
+``kernel="fp8"`` runs the 12 residual convolutions on FP8 (e4m3) inputs with
+f32 accumulation: weights get one scale per output channel (largest magnitude
 mapped to 448, e4m3's largest value) and the convolution inputs (after
 BatchNorm and ReLU) are rounded to e4m3 without a scale, saturating at 448.
-Stem, heads, the residual stream and every epilogue stay as above. This is an
-approximation of the bf16 network meant for search only; training keeps bf16.
+
+``kernel="int8"`` runs them on 8-bit integers with exact int32 sums
+(``conv_int8.cuh``; on an RTX 5090 the integer tensor-core instruction runs
+twice as often as the FP8 one). A convolution's inputs are >= 0 (after
+BatchNorm and ReLU) and are rounded to 0..255 with one step per channel; the
+weights are rounded to -127..127 with one step per output channel after the
+input steps are folded in. The input step of a channel comes from its
+BatchNorm: before the ReLU the layer's output has mean ``bias`` and standard
+deviation ``|scale|`` on the training distribution, so [0, bias +
+INT8_CLIP * |scale|] is mapped to 0..255 and larger values saturate. On the
+trained Hex 7 network this is 2 to 9 times closer to the bf16 network than FP8
+(``scripts/check_int8_network.py``).
+
+In both, stem, heads, the residual stream and every epilogue stay as above.
+They approximate the bf16 network and are meant for search only; training
+keeps bf16.
 """
 
 from __future__ import annotations
@@ -29,10 +43,16 @@ CH = 128
 BLOCKS = 6
 
 
+KERNELS = {"cuda": 0, "fp8": 1, "int8": 2}
+# Standard deviations of a BatchNorm output, above its mean, that the int8 grid of a convolution input covers.
+INT8_CLIP = 6.0
+
+
 class PackedNetwork(NamedTuple):
     stem_w: jax.Array   # [128, 36] bf16
-    trunk_w: jax.Array  # [12, 128, 1152] bf16, or e4m3 bytes (uint8) for fp8
+    trunk_w: jax.Array  # [12, 128, 1152] bf16, e4m3 bytes (uint8) for fp8, or int8
     wscale: jax.Array   # [12, 128] f32 weight scale per output channel (ones for bf16)
+    qinv: jax.Array     # [12, 128] f32 1 / input step of each convolution (int8; ones otherwise)
     vec: jax.Array      # [52, 128] f32
     head_cw: jax.Array  # [5, 128] bf16
     head_cv: jax.Array  # [4, 5] f32
@@ -84,12 +104,30 @@ def _quantize_e4m3(kernels):
     return jax.lax.bitcast_convert_type(q, jnp.uint8), scale
 
 
-def pack(model, fp8: bool = False) -> PackedNetwork:
+def int8_input_step(norm, clip: float = INT8_CLIP):
+    """Step of the 0..255 grid for relu(norm(.)), per channel."""
+    top = norm.bias[...].astype(jnp.float32) + clip * jnp.abs(norm.scale[...].astype(jnp.float32))
+    return jnp.maximum(top, 1e-6) / 255.0
+
+
+def _quantize_int8(kernels, steps):
+    """[convs, 128, 1152] weights and [convs, 128] input steps -> int8 weights and per-output-channel steps."""
+    folded = kernels * jnp.tile(steps, (1, 9))[:, None, :]  # column tap * 128 + c takes step[c]
+    wstep = (jnp.maximum(jnp.max(jnp.abs(folded), axis=-1), 1e-30) / 127.0).astype(jnp.float32)
+    q = jnp.clip(jnp.round(folded / wstep[..., None]), -127.0, 127.0).astype(jnp.int8)
+    return q, wstep
+
+
+def pack(model, kernel: str = "cuda") -> PackedNetwork:
+    if kernel not in KERNELS:
+        raise ValueError(f"kernel must be one of {sorted(KERNELS)}")
     rows = [_bf16(model.conv.bias[...])]
     trunk = []
+    steps = []
     for block in model.blocks:
         rows += _bn(block.bn1) + [_bf16(block.conv1.bias[...])] + _bn(block.bn2) + [_bf16(block.conv2.bias[...])]
         trunk += [block.conv1.kernel[...], block.conv2.kernel[...]]
+        steps += [int8_input_step(block.bn1), int8_input_step(block.bn2)]
     rows += _bn(model.bn)
     head_kernels = [model.policy_conv.kernel[...], model.value_conv.kernel[...], model.q_dir_conv.kernel[...]]
     head_cw = jnp.concatenate([k.reshape(k.shape[-2], k.shape[-1]).T for k in head_kernels], axis=0).astype(jnp.bfloat16)
@@ -100,14 +138,20 @@ def pack(model, fp8: bool = False) -> PackedNetwork:
     ])
     # HWIO [3, 3, cin, cout] -> [cout, (kh * 3 + kw) * cin + c], float32
     trunk = jnp.stack([jnp.transpose(k, (3, 0, 1, 2)).reshape(k.shape[3], -1) for k in trunk]).astype(jnp.float32)
-    if fp8:
+    qinv = jnp.ones(trunk.shape[:2], jnp.float32)
+    if kernel == "fp8":
         trunk_w, wscale = _quantize_e4m3(trunk)
+    elif kernel == "int8":
+        steps = jnp.stack(steps)
+        trunk_w, wscale = _quantize_int8(trunk, steps)
+        qinv = (1.0 / steps).astype(jnp.float32)
     else:
         trunk_w, wscale = trunk.astype(jnp.bfloat16), jnp.ones(trunk.shape[:2], jnp.float32)
     return PackedNetwork(
         stem_w=_conv3x3(model.conv.kernel[...]),
         trunk_w=trunk_w,
         wscale=wscale,
+        qinv=qinv,
         vec=jnp.stack(rows).astype(jnp.float32),
         head_cw=head_cw,
         head_cv=head_cv.astype(jnp.float32),
@@ -137,17 +181,17 @@ def apply(packed: PackedNetwork, observation: jax.Array, num_actions: int, atoms
         jax.ShapeDtypeStruct((batch, num_actions, atoms), jnp.float32),
         *[jax.ShapeDtypeStruct((rows, CH), jnp.bfloat16)] * 3,
     ]
-    fp8 = packed.trunk_w.dtype == jnp.uint8
-    out = jax.ffi.ffi_call(NETWORK_TARGET, results)(observation.astype(jnp.bool_), *packed, fp8=np.int64(fp8))
+    kernel = {jnp.dtype(jnp.bfloat16): 0, jnp.dtype(jnp.uint8): 1, jnp.dtype(jnp.int8): 2}[packed.trunk_w.dtype]
+    out = jax.ffi.ffi_call(NETWORK_TARGET, results)(observation.astype(jnp.bool_), *packed, kernel=np.int64(kernel))
     return out[0], out[1], out[2]
 
 
-def make_native_evaluator(model, fp8: bool = False):
-    """``play_search.make_evaluator`` for ``AZBinnedNet`` with the CUDA forward pass."""
+def make_native_evaluator(model, kernel: str = "cuda"):
+    """``play_search.make_evaluator`` for ``AZBinnedNet`` with the CUDA forward pass (cuda, fp8 or int8)."""
     from .. import binned
     from ..play_search import EvaluatorOutput
 
-    packed = pack(model, fp8=fp8)
+    packed = pack(model, kernel)
     support = jnp.asarray(binned.support(model.bins))
     num_actions = packed.pol_w.shape[1]
     atoms = packed.vout_w.shape[1]

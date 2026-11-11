@@ -24,7 +24,8 @@ selfplay:
       # other half's tree step; see scacchi/types.py for when trees stay identical.
       fused_cohorts: 1
       # xla (flax), cuda (scacchi/native_binned/network.cu, same precision), or
-      # fp8 (same kernels, residual convolutions on e4m3; search only, training stays bf16).
+      # fp8 / int8 (same kernels, residual convolutions on 8-bit floats / integers;
+      # search only, training stays bf16; int8 is the closer and faster of the two).
       network_kernel: xla
   action_commitment:
     posterior_update: null

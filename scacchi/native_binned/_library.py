@@ -29,7 +29,7 @@ SEARCH_TARGET = "scacchi_binned_search_step"
 NETWORK_TARGET = "scacchi_binned_network"
 HERE = Path(__file__).parent
 SOURCES = [HERE / "backup.cu", HERE / "search.cu", HERE / "network.cu"]
-HEADERS = [HERE / "backup_lane.cuh", HERE / "conv_mma.cuh"]
+HEADERS = [HERE / "backup_lane.cuh", HERE / "conv_mma.cuh", HERE / "conv_int8.cuh"]
 REPO = Path(__file__).resolve().parents[2]
 FLAGS = ["-std=c++17", "-O3", "--shared", "-Xcompiler", "-fPIC", "-lineinfo", "-Xptxas", "-v"]
 
