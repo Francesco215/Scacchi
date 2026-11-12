@@ -134,6 +134,8 @@ class TrainMetrics(NamedTuple):
     curiosity_predicted: Float[Array, "*batch"]
     curiosity_realised: Float[Array, "*batch"]
     curiosity_correlation: Float[Array, "*batch"]
+    curiosity_sigma: Float[Array, "*batch"]
+    curiosity_error: Float[Array, "*batch"]
 
 
 def _with_categorical_targets(
@@ -1069,10 +1071,12 @@ def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
         output = model(data.obs, train=True)
         if isinstance(output, binned.BinnedOutput):
             total, metrics = _compute_dirichlet_losses(output.logits, output.value_probs, output.action_probs, data, config, bin_support=output.support)
-            if output.log_next_bits is not None and data.next_bits_tgt is not None:
+            if output.next_bits is not None and data.next_bits_tgt is not None:
                 from .curiosity import next_bits_nll
 
-                curiosity = next_bits_nll(output.log_next_bits, data.played_action, data.next_bits_tgt, data.next_bits_mask)
+                curiosity = next_bits_nll(
+                    output.next_bits, output.next_bits_log_variance, data.played_action, data.next_bits_tgt, data.next_bits_mask
+                )
                 total = total + curiosity["nll"].astype(total.dtype)
                 metrics = metrics._replace(**{f"curiosity_{name}": jax.lax.stop_gradient(value).astype(metrics.policy_loss.dtype) for name, value in curiosity.items()})
             return total, metrics

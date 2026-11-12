@@ -35,7 +35,14 @@ def _muon_weight_dimension_numbers(params: Any) -> Any:
 def build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
     transforms: list[optax.GradientTransformation] = []
     if config.training.grad_clip_norm is not None:
-        transforms.append(optax.clip_by_global_norm(config.training.grad_clip_norm))
+        # The curiosity head is a reader of the features: its gradient must not
+        # eat into the norm budget of the parameters that shape the beliefs.
+        def belief_parameters(params: Any) -> Any:
+            return jax.tree_util.tree_map_with_path(
+                lambda path, _: not str(getattr(path[0], "key", getattr(path[0], "name", ""))).startswith("curiosity"), params
+            )
+
+        transforms.append(optax.masked(optax.clip_by_global_norm(config.training.grad_clip_norm), belief_parameters))
 
     learning_rate: float | optax.Schedule = config.training.learning_rate
     if config.training.lr_decay_after_iters is not None and config.training.lr_decay_factor != 1.0:

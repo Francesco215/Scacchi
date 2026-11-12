@@ -19,8 +19,10 @@ class BinnedOutput(NamedTuple):
     value_probs: jax.Array
     action_probs: jax.Array
     support: jax.Array
-    # Log of the bits expected at the position each move leads to (curiosity head).
-    log_next_bits: jax.Array | None = None
+    # Curiosity head: for each move, the bits expected at the position it leads
+    # to and the log-variance of that prediction.
+    next_bits: jax.Array | None = None
+    next_bits_log_variance: jax.Array | None = None
 
 
 def support(config: BinConfig) -> np.ndarray:

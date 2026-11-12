@@ -5,8 +5,8 @@ search concluded about the position, summed over the policy, V and supervised
 Q targets with the loss weights: the information the search added.
 
 A head predicts, for every move, the bits of the position that move leads to.
-It is trained by regression on what self-play then measured, one ply ahead:
-no reward is propagated through time. Self-play can tilt its move choice
+It is trained by regression on what self-play then measured, one ply ahead
+(a Gaussian NLL with a learned variance): no reward is propagated through time. Self-play can tilt its move choice
 towards moves whose next position is expected to carry more bits. The search
 target of a position does not depend on how the game reached it, so the tilt
 changes which positions are seen and leaves every target as it was.
@@ -85,22 +85,34 @@ def next_bits_targets(bits: jax.Array, valid: jax.Array, terminated: jax.Array) 
     return jnp.where(mask, following, 0.0), mask
 
 
-def next_bits_nll(log_predicted: jax.Array, played_action: jax.Array, target: jax.Array, mask: jax.Array) -> dict[str, jax.Array]:
-    """NLL of the measured next-position bits under an exponential law.
+def next_bits_nll(
+    predicted: jax.Array, log_variance: jax.Array, played_action: jax.Array, target: jax.Array, mask: jax.Array
+) -> dict[str, jax.Array]:
+    """NLL of the measured next-position bits under a Gaussian with a learned variance.
 
-    Bits are non-negative with an unknown scale; an exponential distribution
-    with mean ``mu`` has NLL ``log mu + x / mu``, minimised at ``mu = E[x]``.
-    The head outputs ``log mu`` for every move; only the played one has a target.
+    With ``l = log sigma^2`` the NLL is ``l + (x - mu)^2 * exp(-l)`` up to
+    constants: the mean has the gradient of a squared error weighted by the
+    predicted precision, and ``sigma`` learns the expected error of the mean.
+    Predicting the log-variance keeps it finite near ``sigma = 0``. The head
+    outputs ``mu`` and ``l`` for every move; only the played one has a target.
     """
-    log_mu = jnp.take_along_axis(log_predicted, played_action[..., None].astype(jnp.int32), axis=-1)[..., 0].astype(jnp.float32)
+    played = played_action[..., None].astype(jnp.int32)
+    mu = jnp.take_along_axis(predicted, played, axis=-1)[..., 0].astype(jnp.float32)
+    log_var = jnp.take_along_axis(log_variance, played, axis=-1)[..., 0].astype(jnp.float32)
     weight = mask.astype(jnp.float32)
     count = jnp.maximum(jnp.sum(weight), 1.0)
     mean = lambda x: jnp.sum(x * weight) / count
-    predicted = jnp.exp(log_mu)
-    nll = mean(log_mu + target * jnp.exp(-log_mu))
-    centred_p, centred_t = predicted - mean(predicted), target - mean(target)
+    nll = mean(log_var + jnp.square(target - mu) * jnp.exp(-log_var))
+    centred_p, centred_t = mu - mean(mu), target - mean(target)
     correlation = mean(centred_p * centred_t) / jnp.sqrt(jnp.maximum(mean(centred_p**2) * mean(centred_t**2), 1e-12))
-    return {"nll": nll, "predicted": mean(predicted), "realised": mean(target), "correlation": correlation}
+    return {
+        "nll": nll,
+        "predicted": mean(mu),
+        "realised": mean(target),
+        "correlation": correlation,
+        "sigma": mean(jnp.exp(0.5 * log_var)),
+        "error": jnp.sqrt(mean(jnp.square(target - mu))),
+    }
 
 
 def curious_action(key: jax.Array, policy: jax.Array, legal: jax.Array, next_bits: jax.Array, temperature: float) -> jax.Array:

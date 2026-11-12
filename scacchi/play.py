@@ -221,7 +221,7 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
         def curious_player(env_state, rng_key):
             search_key, action_key = jax.random.split(rng_key)
             output = player(env_state, search_key)
-            next_bits = jnp.exp(model(env_state.observation, train=False).log_next_bits)
+            next_bits = model(env_state.observation, train=False).next_bits
             action = curious_action(
                 action_key, output.posterior.prediction.policy, env_state.legal_action_mask, next_bits, curiosity_temperature
             )

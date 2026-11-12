@@ -194,6 +194,8 @@ def training_metrics(train_metrics: Any, *, seconds: float, hours: float, frames
                 "curiosity/predicted_bits": train_metrics.curiosity_predicted.mean().item(),
                 "curiosity/realised_bits": train_metrics.curiosity_realised.mean().item(),
                 "curiosity/correlation": train_metrics.curiosity_correlation.mean().item(),
+                "curiosity/predicted_sigma": train_metrics.curiosity_sigma.mean().item(),
+                "curiosity/rms_error": train_metrics.curiosity_error.mean().item(),
             }
         )
     is_binned = bool(np.all(np.asarray(jax.device_get(train_metrics.belief_head_is_binned))))

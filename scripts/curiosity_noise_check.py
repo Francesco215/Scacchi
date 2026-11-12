@@ -93,7 +93,7 @@ def main() -> None:
                 first = player(state, player_key)
                 second = search(state, second_key)
                 output = model(state.observation, train=False)
-                next_bits = jnp.exp(output.log_next_bits)
+                next_bits = output.next_bits
                 action = first.action
                 if temperature is not None:
                     action = curious_action(action_key, first.posterior.prediction.policy, state.legal_action_mask, next_bits, temperature)

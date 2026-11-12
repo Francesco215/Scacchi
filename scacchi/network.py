@@ -476,8 +476,8 @@ class AZBeliefNet(nnx.Module):
             rngs=rngs,
         )
 
-        # Predicts, per move, the log of the bits search will add at the next
-        # position (scacchi/curiosity.py). It reads the features without
+        # Predicts, per move, the bits search will add at the next position and
+        # the log-variance of that prediction (scacchi/curiosity.py). It reads the features without
         # shaping them, so the beliefs train exactly as they do without it.
         self.curiosity_conv = (
             nnx.Conv(num_channels, 2, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs) if curiosity_head else None
@@ -486,7 +486,7 @@ class AZBeliefNet(nnx.Module):
         self.curiosity_linear = (
             nnx.Linear(
                 height * width * 2,
-                num_actions,
+                num_actions * 2,
                 dtype=jnp.float32,
                 kernel_init=jax.nn.initializers.zeros,
                 bias_init=jax.nn.initializers.zeros,
@@ -541,17 +541,19 @@ class AZBeliefNet(nnx.Module):
         )
 
         if self.bins is not None:
-            log_next_bits = None
+            next_bits = next_bits_log_variance = None
             if self.curiosity_conv is not None:
                 features = self.curiosity_conv(jax.lax.stop_gradient(x))
                 features = jax.nn.relu(self.curiosity_bn(features, use_running_average=not train))
-                log_next_bits = self.curiosity_linear(features.reshape((features.shape[0], -1)).astype(jnp.float32))
+                curiosity = self.curiosity_linear(features.reshape((features.shape[0], -1)).astype(jnp.float32))
+                next_bits, next_bits_log_variance = curiosity[:, : self.num_actions], curiosity[:, self.num_actions :]
             return binned.BinnedOutput(
                 logits.astype(jnp.float32),
                 binned.from_logits(value_logits),
                 binned.from_logits(q_mean_logits),
                 jnp.asarray(binned.support(self.bins)),
-                log_next_bits,
+                next_bits,
+                next_bits_log_variance,
             )
 
         alpha_v = dirichlet_from_logits(
