@@ -360,6 +360,7 @@ class AZBeliefNet(nnx.Module):
         dirichlet_initial_concentration: float | None = None,
         dirichlet_head_parameterization: str = "log_concentration",
         bins: BinConfig | None = None,
+        curiosity_head: bool = False,
         rngs: nnx.Rngs,
     ):
         height, width, input_channels = observation_shape
@@ -475,6 +476,26 @@ class AZBeliefNet(nnx.Module):
             rngs=rngs,
         )
 
+        # Predicts, per move, the log of the bits search will add at the next
+        # position (scacchi/curiosity.py). It reads the features without
+        # shaping them, so the beliefs train exactly as they do without it.
+        self.curiosity_conv = (
+            nnx.Conv(num_channels, 2, kernel_size=(1, 1), padding="SAME", dtype=dtype, rngs=rngs) if curiosity_head else None
+        )
+        self.curiosity_bn = nnx.BatchNorm(2, momentum=0.9, dtype=dtype, rngs=rngs) if curiosity_head else None
+        self.curiosity_linear = (
+            nnx.Linear(
+                height * width * 2,
+                num_actions,
+                dtype=jnp.float32,
+                kernel_init=jax.nn.initializers.zeros,
+                bias_init=jax.nn.initializers.zeros,
+                rngs=rngs,
+            )
+            if curiosity_head
+            else None
+        )
+
     def _trunk(self, x: jax.Array, *, train: bool) -> jax.Array:
         x = x.astype(self.dtype)
         x = self.conv(x)
@@ -520,11 +541,17 @@ class AZBeliefNet(nnx.Module):
         )
 
         if self.bins is not None:
+            log_next_bits = None
+            if self.curiosity_conv is not None:
+                features = self.curiosity_conv(jax.lax.stop_gradient(x))
+                features = jax.nn.relu(self.curiosity_bn(features, use_running_average=not train))
+                log_next_bits = self.curiosity_linear(features.reshape((features.shape[0], -1)).astype(jnp.float32))
             return binned.BinnedOutput(
                 logits.astype(jnp.float32),
                 binned.from_logits(value_logits),
                 binned.from_logits(q_mean_logits),
                 jnp.asarray(binned.support(self.bins)),
+                log_next_bits,
             )
 
         alpha_v = dirichlet_from_logits(
@@ -861,6 +888,7 @@ def build_model(
             ),
             dirichlet_head_parameterization=head_parameterization,
             bins=config.model.bins if config.model.network == "aznet_binned" else None,
+            curiosity_head=config.model.curiosity_head,
             rngs=rngs,
         )
     if config.model.network == "boardlaw":

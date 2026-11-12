@@ -54,6 +54,9 @@ class Sample(NamedTuple):
     v_target_weight: Float[Array, "*batch"] | None = None
     v_target_outcome: Int[Array, "*batch"] | None = None
     v_target_distance: Int[Array, "*batch"] | None = None
+    # Curiosity head: bits measured at the position the played move led to.
+    next_bits_tgt: Float[Array, "*batch"] | None = None
+    next_bits_mask: Bool[Array, "*batch"] | None = None
 
 
 class TrainMetrics(NamedTuple):
@@ -126,6 +129,11 @@ class TrainMetrics(NamedTuple):
     data_pass_fraction: Float[Array, "*batch"]
     data_terminations_per_row: Float[Array, "*batch"]
     data_psk_termination_fraction: Float[Array, "*batch"]
+    data_bits: Float[Array, "*batch"]
+    curiosity_nll: Float[Array, "*batch"]
+    curiosity_predicted: Float[Array, "*batch"]
+    curiosity_realised: Float[Array, "*batch"]
+    curiosity_correlation: Float[Array, "*batch"]
 
 
 def _with_categorical_targets(
@@ -1060,7 +1068,14 @@ def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
     def loss_fn(model: Any):
         output = model(data.obs, train=True)
         if isinstance(output, binned.BinnedOutput):
-            return _compute_dirichlet_losses(output.logits, output.value_probs, output.action_probs, data, config, bin_support=output.support)
+            total, metrics = _compute_dirichlet_losses(output.logits, output.value_probs, output.action_probs, data, config, bin_support=output.support)
+            if output.log_next_bits is not None and data.next_bits_tgt is not None:
+                from .curiosity import next_bits_nll
+
+                curiosity = next_bits_nll(output.log_next_bits, data.played_action, data.next_bits_tgt, data.next_bits_mask)
+                total = total + curiosity["nll"].astype(total.dtype)
+                metrics = metrics._replace(**{f"curiosity_{name}": jax.lax.stop_gradient(value).astype(metrics.policy_loss.dtype) for name, value in curiosity.items()})
+            return total, metrics
         if len(output) == 2:
             logits, value = output
             policy_loss, value_loss = _compute_losses(logits, value, data, config)

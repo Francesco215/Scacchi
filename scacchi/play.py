@@ -201,14 +201,33 @@ def play(
 def make_selfplay(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
 
+    curiosity_temperature = config.selfplay.curiosity_temperature
+    if curiosity_temperature is not None and not config.model.curiosity_head:
+        raise ValueError("selfplay.curiosity_temperature needs model.curiosity_head=true.")
+
     def training_player(model: nnx.Module):
-        return make_search_player(
+        player = make_search_player(
             env,
             model,
             config.selfplay.search,
             config.selfplay.action_commitment,
             q_supervision_config=config.training.losses.q_supervision,
         )
+        if curiosity_temperature is None:
+            return player
+
+        from .curiosity import curious_action
+
+        def curious_player(env_state, rng_key):
+            search_key, action_key = jax.random.split(rng_key)
+            output = player(env_state, search_key)
+            next_bits = jnp.exp(model(env_state.observation, train=False).log_next_bits)
+            action = curious_action(
+                action_key, output.posterior.prediction.policy, env_state.legal_action_mask, next_bits, curiosity_temperature
+            )
+            return PlayerOutput(action=action, posterior=output.posterior)
+
+        return curious_player
 
     local_batch_size = parallel.local_batch_size(int(config.selfplay.batch_size))
     if local_batch_size == 0:

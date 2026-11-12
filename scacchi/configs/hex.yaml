@@ -16,10 +16,12 @@ model:
   dirichlet_head_parameterization: log_concentration
   dirichlet_initial_concentration: 3.1
   legacy_dirichlet_head_init: false
+  curiosity_head: false
   rezero_kernel_init: variance_scaling
 
 selfplay:
   batch_size: 4096
+  curiosity_temperature: null
   action_commitment:
     kind: posterior_sample
     posterior_update: numerical

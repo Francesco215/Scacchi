@@ -156,6 +156,9 @@ class ModelConfig:
     dirichlet_initial_concentration: float | None = None
     rezero_kernel_init: RezeroKernelInit = RezeroKernelInit.variance_scaling
     bins: BinConfig = field(default_factory=BinConfig)
+    # Binned network only: a head that predicts, per move, the bits search
+    # will add at the next position (scacchi/curiosity.py).
+    curiosity_head: bool = False
 
     def __post_init__(self) -> None:
         _require_gt(
@@ -442,9 +445,14 @@ class SelfplayConfig:
     action_commitment: ActionCommitmentConfig = field(
         default_factory=ActionCommitmentConfig
     )
+    # Bits. A self-play move is drawn in proportion to
+    # P(best) * exp(predicted next-position bits / curiosity_temperature);
+    # None plays by P(best) alone. Needs model.curiosity_head.
+    curiosity_temperature: float | None = None
 
     def __post_init__(self) -> None:
         _require_ge("selfplay.batch_size", self.batch_size, 1)
+        _require_gt("selfplay.curiosity_temperature", self.curiosity_temperature, 0.0)
 
 
 @dataclass

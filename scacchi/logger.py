@@ -186,6 +186,16 @@ def training_metrics(train_metrics: Any, *, seconds: float, hours: float, frames
         "train/hours": hours,
         "train/frames": frames,
     }
+    if float(train_metrics.curiosity_realised.mean()) > 0:  # a curiosity head is being trained
+        metrics.update(
+            {
+                "data/bits": train_metrics.data_bits.mean().item(),
+                "curiosity/nll": train_metrics.curiosity_nll.mean().item(),
+                "curiosity/predicted_bits": train_metrics.curiosity_predicted.mean().item(),
+                "curiosity/realised_bits": train_metrics.curiosity_realised.mean().item(),
+                "curiosity/correlation": train_metrics.curiosity_correlation.mean().item(),
+            }
+        )
     is_binned = bool(np.all(np.asarray(jax.device_get(train_metrics.belief_head_is_binned))))
     if is_binned:
         metrics.pop("train/value_dir_kl_loss")

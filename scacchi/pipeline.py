@@ -144,6 +144,27 @@ def _with_data_stats(
     )
 
 
+def _with_next_bits(model: nnx.Module, samples: Sample, terminated: jax.Array, config, chunks: int = 8) -> tuple[Sample, jax.Array]:
+    """Measure every fresh row's bits before training on it and attach, to each
+    row, the bits of the position its move led to (the curiosity head's target)."""
+    from .curiosity import next_bits_targets, row_bits
+
+    lanes, steps = samples.obs.shape[:2]
+    rows = jax.tree_util.tree_map(lambda x: x.reshape((lanes * steps,) + x.shape[2:]), samples)
+    bounds = [lanes * steps * index // chunks for index in range(chunks + 1)]
+    bits, valid = [], []
+    for start, stop in zip(bounds[:-1], bounds[1:]):
+        chunk = jax.tree_util.tree_map(lambda x: x[start:stop], rows)
+        chunk_bits, chunk_valid = row_bits(model(chunk.obs, train=False), chunk, config)
+        bits.append(chunk_bits)
+        valid.append(chunk_valid)
+    bits = jax.lax.stop_gradient(jnp.concatenate(bits)).reshape((lanes, steps))
+    valid = jnp.concatenate(valid).reshape((lanes, steps))
+    target, mask = next_bits_targets(bits, valid, terminated)
+    mean_bits = jnp.sum(bits * valid) / jnp.maximum(jnp.sum(valid), 1)
+    return samples._replace(next_bits_tgt=target, next_bits_mask=mask), mean_bits
+
+
 def make_training_iteration(env, config, parallel: BatchParallel | None = None):
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     selfplay = make_selfplay(env, config, parallel=parallel)
@@ -158,6 +179,9 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
         perm_key: jax.Array,
     ) -> TrainMetrics:
         samples = compute_input_for_lossfn(data)
+        data_bits = None
+        if config.model.curiosity_head:
+            samples, data_bits = _with_next_bits(model, samples, data.terminated, config)
         minibatches = make_minibatches(
             samples,
             perm_key,
@@ -166,7 +190,8 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
             parallel,
         )
         metrics = train_minibatches(model, optimizer, minibatches, config, parallel)
-        return _with_data_stats(metrics, data, num_actions)
+        metrics = _with_data_stats(metrics, data, num_actions)
+        return metrics if data_bits is None else metrics._replace(data_bits=data_bits.astype(metrics.policy_loss.dtype))
 
     def training_iteration(
         model: nnx.Module,
