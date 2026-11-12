@@ -115,7 +115,16 @@ def main() -> None:
                     bits = bits + jnp.sum((jnp.sum(terms, axis=-1) * weight * weights[h]).reshape(games, -1), axis=-1)
                 following = jax.vmap(auto_reset(env.step, env.init))(state, action, jax.random.split(reset_key, games))
                 played = jnp.take_along_axis(next_bits, action[:, None], axis=-1)[:, 0]
+                # How much the head can tell the candidate moves apart, and what a tilt gains from it.
+                policy = first.posterior.prediction.policy
+                support = legal & (policy > 0)
+                plain_mean = jnp.sum(policy * jnp.where(support, next_bits, 0.0), axis=-1)
+                spread = jnp.sqrt(jnp.sum(policy * jnp.where(support, jnp.square(next_bits - plain_mean[:, None]), 0.0), axis=-1))
+                tilted = jax.nn.softmax(jnp.where(support, jnp.log(jnp.maximum(policy, 1e-30)) + next_bits / args.temperature, -jnp.inf), axis=-1)
                 record = {
+                    "spread": spread,
+                    "tilt_gain": jnp.sum(tilted * jnp.where(support, next_bits, 0.0), axis=-1) - plain_mean,
+                    "moves": jnp.sum(support, axis=-1).astype(jnp.float32),
                     "use": dot(pulls[0], pulls[1]),
                     "norm": 0.5 * (dot(pulls[0], pulls[0]) + dot(pulls[1], pulls[1])),
                     "bits": bits / math.log(2.0),
@@ -138,6 +147,9 @@ def main() -> None:
         result = {"rows": int(keep.sum()), "signal_share": float(use.sum() / norm.sum()), "bits": float(bits.mean()), "wrong_way": float((use < 0).mean())}
         known = np.isfinite(expected)
         result["predicted_bits"] = float(expected[known].mean())
+        result["spread_across_moves"] = float(flat["spread"][keep].mean())
+        result["tilt_gain"] = float(flat["tilt_gain"][keep].mean())
+        result["candidate_moves"] = float(flat["moves"][keep].mean())
         result["prediction_correlation"] = float(np.corrcoef(expected[known], bits[known])[0, 1])
         for name, by in (("by_predicted", expected), ("by_measured", bits)):
             rows = known if name == "by_predicted" else np.ones_like(known)
@@ -158,6 +170,7 @@ def main() -> None:
         report[label] = summarise(records)
         r = report[label]
         print(f"{label:8s} rows={r['rows']} bits={r['bits']:.2f} signal_share={r['signal_share']:.2f} wrong_way={r['wrong_way']:.2f} corr(predicted, measured)={r['prediction_correlation']:.2f}")
+        print(f"   candidate moves={r['candidate_moves']:.1f} spread of predicted bits across them={r['spread_across_moves']:.3f} expected gain of the tilt={r['tilt_gain']:.3f}")
         print("   by predicted bits:", " ".join(f"{x:.2f}:{s:.2f}" for x, s in zip(r["by_predicted"]["x"], r["by_predicted"]["signal_share"])))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(report, indent=1))

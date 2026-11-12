@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument("--noise", action="append", default=[], help="label=noise_check.json")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    runs = {label: [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()] for label, path in (item.split("=", 1) for item in args.runs)}
+    runs = {label: [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()] for label, path in (item.rsplit("=", 1) for item in args.runs)}
     colors = dict(zip(runs, ["black", "tab:blue", "tab:red", "tab:green", "tab:orange"]))
     figure, axes = plt.subplots(2, 3, figsize=(17, 9.5))
     for axis, (title, key) in zip(axes.flat, CURVES):
@@ -52,7 +52,7 @@ def main() -> None:
         axis.grid(alpha=0.2)
     axis = axes.flat[5]
     for item in args.noise:
-        label, path = item.split("=", 1)
+        label, path = item.rsplit("=", 1)
         report = json.loads(Path(path).read_text())
         for name, style in (("plain", "--"), ("curious", "-")):
             part = report[name]["by_predicted"]
