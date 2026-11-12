@@ -77,10 +77,11 @@ def _run_loop(config: Config, model: nnx.Module, optimizer: nnx.Optimizer, train
             with parallel.mesh_context():
                 train_result = jax.block_until_ready(training_iteration(model, optimizer, train_key))
             seconds = time.perf_counter() - started
-            frames_this_iteration = config.selfplay.batch_size * config.selfplay.max_num_steps
+            frames_this_iteration = getattr(training_iteration, "frames", lambda: config.selfplay.batch_size * config.selfplay.max_num_steps)()
             frames += frames_this_iteration
             hours += seconds / 3600
             metrics.update(training_metrics(train_result, seconds=seconds, hours=hours, frames=frames, frames_this_iteration=frames_this_iteration))
+            metrics.update(getattr(training_iteration, "extras", dict)())
             logger.log(iteration, metrics, prefix="")
             maybe_save(
                 checkpoint_manager,

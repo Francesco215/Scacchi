@@ -538,10 +538,61 @@ class TrainingRegularizationConfig:
 
 
 @dataclass
+class PoolConfig:
+    """Replay pool of high-loss positions (scacchi/pool.py); off by default."""
+
+    enabled: bool = False
+    # What decides which rows leave: bits | log_bits | gain | youth | uniform (scacchi/pool.py).
+    evict_by: str = "bits"
+    # Eviction probability is proportional to exp(-score / temperature);
+    # 0 evicts the lowest-scoring rows deterministically.
+    temperature: float = 1.0
+    # How pool rows are drawn into a batch: uniform, or a score, with
+    # probability proportional to exp(score / sample_temperature).
+    # Target age, in gradient updates, at which the 'useful' score halves a row's bits.
+    half_life_updates: float = 400.0
+    sample_by: str = "uniform"
+    sample_temperature: float = 1.0
+    # Share of every training batch that comes from this iteration's self-play.
+    fresh_fraction: float = 0.125
+    # Pool rows per fresh row of one round.
+    size_multiple: int = 64
+    # One self-play batch is fed to the pool in this many equal slices, each
+    # followed by its own gradient steps and pool turnover.
+    rounds_per_selfplay: int = 1
+    # Games per self-play call of the fill phase, which trains on fresh rows
+    # only until the pool is full (0: no fill phase).
+    fill_games: int = 0
+    # Self-play lanes start from pool positions drawn by bits (with
+    # research_temperature) instead of the opening; a finished game restarts
+    # from the opening. Meant for short self-play windows.
+    start_from_pool: bool = False
+    # Pool positions searched again in every self-play search call (0: targets
+    # are only recycled), and which rows: bits (most bits first) | age | uniform.
+    research_lanes: int = 0
+    research_by: str = "bits"
+    # With research_by=bits: rows are drawn with probability proportional to
+    # exp(bits / research_temperature); 0 takes the rows with the most bits.
+    research_temperature: float = 0.0
+
+    def __post_init__(self) -> None:
+        _require_ge("training.pool.temperature", self.temperature, 0.0)
+        _require_gt("training.pool.sample_temperature", self.sample_temperature, 0.0)
+        _require_gt("training.pool.fresh_fraction", self.fresh_fraction, 0.0)
+        _require_ge("training.pool.size_multiple", self.size_multiple, 1)
+        _require_ge("training.pool.rounds_per_selfplay", self.rounds_per_selfplay, 1)
+        _require_ge("training.pool.research_lanes", self.research_lanes, 0)
+        _require_ge("training.pool.fill_games", self.fill_games, 0)
+        _require_ge("training.pool.research_temperature", self.research_temperature, 0.0)
+
+
+@dataclass
 class TrainingConfig:
     batch_size: int = 4096
     max_updates_per_iter: int | None = None
     learning_rate: float = 0.001
+    # Muon step for the residual-block kernels; learning_rate drives the rest.
+    muon_learning_rate: float = 0.005
     lr_decay_after_iters: int | None = None
     lr_decay_factor: float = 1.0
     grad_clip_norm: float | None = None
@@ -549,11 +600,13 @@ class TrainingConfig:
     regularization: TrainingRegularizationConfig = field(
         default_factory=TrainingRegularizationConfig
     )
+    pool: PoolConfig = field(default_factory=PoolConfig)
 
     def __post_init__(self) -> None:
         _require_ge("training.batch_size", self.batch_size, 1)
         _require_ge("training.max_updates_per_iter", self.max_updates_per_iter, 1)
         _require_gt("training.learning_rate", self.learning_rate, 0.0)
+        _require_gt("training.muon_learning_rate", self.muon_learning_rate, 0.0)
         _require_ge("training.lr_decay_after_iters", self.lr_decay_after_iters, 1)
         _require_gt("training.lr_decay_factor", self.lr_decay_factor, 0.0)
         _require_gt("training.grad_clip_norm", self.grad_clip_norm, 0.0)
