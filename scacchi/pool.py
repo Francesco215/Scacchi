@@ -374,6 +374,15 @@ def select_for_research(
     return jnp.where(live, indices, indices[0]), live
 
 
+def write_live(old: jax.Array, indices: jax.Array, live: jax.Array, new: jax.Array) -> jax.Array:
+    """``old`` with ``new`` written at the live ``indices``.
+
+    A lane that is not live repeats another lane's index; its write goes out
+    of range and is dropped, so it cannot compete with the live lane's.
+    """
+    return old.at[jnp.where(live, indices, old.shape[0])].set(new.astype(old.dtype), mode="drop")
+
+
 def apply_research(
     model, pool: Pool, indices: jax.Array, live: jax.Array, posterior, now: jax.Array, compute_input_for_lossfn, config, updates_per_round: int
 ):
@@ -429,9 +438,7 @@ def apply_research(
         ratios[f"research/agreement_by_age/{name}"] = (jnp.sum(agree * inside), jnp.sum(norm * inside))
         ratios[f"research/wrong_way_by_age/{name}"] = (jnp.sum((agree < 0) * inside), jnp.sum(inside))
 
-    def write(old, new):
-        mask = live.reshape((-1,) + (1,) * (new.ndim - 1))
-        return old.at[indices].set(jnp.where(mask, new.astype(old.dtype), old[indices]))
+    write = lambda old, new: write_live(old, indices, live, new)
 
     pool = pool._replace(
         samples=jax.tree_util.tree_map(write, pool.samples, renewed),
@@ -652,6 +659,11 @@ def make_pool_training_iteration(selfplay, compute_input_for_lossfn, with_data_s
             raise ValueError(
                 f"fill_games * steps ({int(settings.fill_games) * steps}) must be a multiple of {num_updates * batch_size} "
                 "(one round of gradient steps on fresh rows only)."
+            )
+        if num_updates * batch_size > pool_size:
+            raise ValueError(
+                f"a fill round adds {num_updates * batch_size} rows but the pool holds {pool_size}: "
+                "training.pool.size_multiple must be at least 1 / fresh_fraction when fill_games > 0."
             )
         fill_iteration = build_phase(int(settings.fill_games), 1.0, fill_rounds, 0)
 

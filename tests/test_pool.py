@@ -8,6 +8,7 @@ from scacchi import binned
 from scacchi.dirichlet_mctx.native_targets import TARGET_BINNED, TARGET_CATEGORICAL
 from scacchi.loss import Sample, _compute_dirichlet_losses
 from scacchi.pool import (
+    write_live,
     empty_pool,
     eviction_mask,
     insert_and_evict,
@@ -252,3 +253,13 @@ def test_research_selection_with_temperature_draws_by_softmax_of_bits():
     pool = empty_pool(template, 4)._replace(bits=bits, valid=jnp.ones(4, jnp.bool_))
     picks = jax.vmap(lambda key: select_for_research(key, pool, jnp.asarray(0), 1, "bits", 1.5)[0][0])(jax.random.split(jax.random.PRNGKey(3), 40000))
     np.testing.assert_allclose(np.bincount(np.asarray(picks), minlength=4) / 40000, jax.nn.softmax(bits / 1.5), atol=0.01)
+
+
+def test_research_writes_from_padded_lanes_are_dropped():
+    # Lanes 1 and 2 are padding that repeats lane 0's row; only lane 0 writes.
+    old = jnp.arange(5.0)
+    indices, live = jnp.array([3, 3, 3]), jnp.array([True, False, False])
+    out = write_live(old, indices, live, jnp.array([10.0, 20.0, 30.0]))
+    np.testing.assert_array_equal(np.asarray(out), [0.0, 1.0, 2.0, 10.0, 4.0])
+    rows = write_live(jnp.zeros((5, 2)), indices, live, jnp.ones((3, 2)) * jnp.array([[1.0], [2.0], [3.0]]))
+    np.testing.assert_array_equal(np.asarray(rows[3]), [1.0, 1.0])
