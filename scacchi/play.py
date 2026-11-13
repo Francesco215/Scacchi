@@ -30,6 +30,8 @@ class TrainingSamples(NamedTuple):
     played_action: Int[Array, "batch time"]
     legal_action_mask: Bool[Array, "batch time action"]
     psk_terminated: Bool[Array, "batch time"] | None = None
+    # The position each row was searched from; kept only on request.
+    state: Any | None = None
 
 
 class EvalMetrics(NamedTuple):
@@ -97,7 +99,10 @@ def _selfplay_step_frame(
     key: jax.Array,
     *,
     batch_size: int,
-) -> tuple[Any, TrainingSamples]:
+    extra_states: Any | None = None,
+    keep_state: bool = False,
+) -> tuple[Any, tuple[TrainingSamples, PosteriorTargets | None]]:
+    """One self-play move; ``extra_states`` are searched in the same call but not played."""
     player_key, reset_key = jax.random.split(key, 2)
 
     # ``pgx.experimental.auto_reset`` returns a freshly initialized position
@@ -113,10 +118,21 @@ def _selfplay_step_frame(
     )
     observation = env_state.observation
     legal_action_mask = env_state.legal_action_mask
-    player_output = player(env_state, player_key)
+    searched_state = env_state
+    if extra_states is not None:
+        searched_state = jax.tree_util.tree_map(lambda a, b: jnp.concatenate((a, b), axis=0), env_state, extra_states)
+    player_output = player(searched_state, player_key)
     if player_output.posterior is None:
         raise ValueError("self-play player must return posterior targets")
+    extra_posterior = None
+    if extra_states is not None:
+        extra_posterior = jax.tree_util.tree_map(lambda x: x[batch_size:], player_output.posterior)
+        player_output = PlayerOutput(
+            action=player_output.action[:batch_size],
+            posterior=jax.tree_util.tree_map(lambda x: x[:batch_size], player_output.posterior),
+        )
 
+    searched_from = env_state
     actor = env_state.current_player
     reset_keys = jax.random.split(reset_key, batch_size)
     env_state = jax.vmap(auto_reset(env.step, env.init))(env_state, player_output.action, reset_keys)
@@ -138,8 +154,9 @@ def _selfplay_step_frame(
         posterior=player_output.posterior,
         played_action=player_output.action,
         psk_terminated=psk_terminated,
+        state=searched_from if keep_state else None,
     )
-    return env_state, frame
+    return env_state, (frame, extra_posterior)
 
 
 def play_training(
@@ -150,29 +167,41 @@ def play_training(
     batch_size: int,
     max_num_steps: int,
     parallel: BatchParallel | None = None,
-) -> TrainingSamples:
+    extra_states: Any | None = None,
+    keep_states: bool = False,
+    initial_states: Any | None = None,
+) -> TrainingSamples | tuple[TrainingSamples, PosteriorTargets]:
+    """Self-play rollouts. With ``extra_states`` (leaves ``[step, lane, ...]``)
+    every search call also searches that step's positions, and their targets
+    are returned as a second value with the same leading axes."""
     parallel = DISABLED_BATCH_PARALLEL if parallel is None else parallel
     rollout_rng, init_key = jax.random.split(rng_key)
     init_keys = jax.random.split(init_key, batch_size)
-    env_state = jax.vmap(env.init)(init_keys)
+    # Lanes start from the given positions; a finished game restarts from the opening.
+    env_state = jax.vmap(env.init)(init_keys) if initial_states is None else initial_states
     env_state = constrain_batch_axis(env_state, parallel, batch_axis=0)
 
-    def step_fn(env_state: Any, key: jax.Array) -> tuple[Any, TrainingSamples]:
+    def step_fn(env_state: Any, inputs) -> tuple[Any, tuple[TrainingSamples, PosteriorTargets | None]]:
+        key, extra = inputs
         return _selfplay_step_frame(
             env,
             player,
             env_state,
             key,
             batch_size=batch_size,
+            extra_states=extra,
+            keep_state=keep_states,
         )
 
     step_keys = jax.random.split(rollout_rng, max_num_steps)
-    env_state, data = jax.lax.scan(step_fn, env_state, step_keys)
+    env_state, (data, extra_posteriors) = jax.lax.scan(step_fn, env_state, (step_keys, extra_states))
     data = jax.tree_util.tree_map( #exchanges the batch axis with the step axis
         lambda leaf: leaf.swapaxes(0, 1) if isinstance(leaf, jax.Array) else leaf,
         data,
     )
-    return data
+    if extra_states is None:
+        return data
+    return data, extra_posteriors
 
 
 def play(
@@ -242,5 +271,38 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
     def selfplay(model: nnx.Module, rng_key: jax.Array) -> TrainingSamples:
         device_rng_keys = jax.random.split(rng_key, parallel.device_count)
         return local_selfplay(model, device_rng_keys)
+
+    return selfplay
+
+
+def make_research_selfplay(env, config, games: int | None = None):
+    """Single-device self-play that also searches given positions.
+
+    ``selfplay(model, key, extra_states)`` returns the usual samples, with the
+    position of every row, and the search targets of ``extra_states`` (None
+    when there are no extra states). ``games`` overrides selfplay.batch_size.
+    """
+    games = int(config.selfplay.batch_size) if games is None else int(games)
+
+    @nnx.jit
+    def selfplay(model: nnx.Module, rng_key: jax.Array, extra_states: Any, initial_states: Any = None):
+        player = make_search_player(
+            env,
+            model,
+            config.selfplay.search,
+            config.selfplay.action_commitment,
+            q_supervision_config=config.training.losses.q_supervision,
+        )
+        result = play_training(
+            env,
+            player,
+            rng_key,
+            batch_size=games,
+            max_num_steps=int(config.selfplay.max_num_steps),
+            extra_states=extra_states,
+            keep_states=True,
+            initial_states=initial_states,
+        )
+        return (result, None) if extra_states is None else result
 
     return selfplay

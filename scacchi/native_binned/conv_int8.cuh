@@ -27,7 +27,10 @@
 //     3 of 9) skips that tap's mma: the products it drops are all with the
 //     zero padding.
 //   - Only the weights stream through cp.async: one tap of the unit's 64
-//     channels (8 KiB) per stage, two stages.
+//     channels (8 KiB) per stage, two stages. The last tap leaves stage 1
+//     free, and the epilogue's per-channel constants are fetched into it
+//     during that tap. Keeping them out of the rest of shared memory lets 4
+//     boards of 64 cells (Hex 8, 256 rows) fit two CTAs on an SM.
 //   - CTAs are persistent: gridDim.x of them (two per SM) each take units
 //     blockIdx.x, blockIdx.x + gridDim.x, ... .
 //   - The epilogue stages its rows through shared memory so every global load
@@ -56,11 +59,17 @@ constexpr int I8_SMEM_PAIR = 50176;        // most shared memory per CTA with tw
 constexpr int I8_CONSTS = 6;  // per-channel epilogue constants: bias, wscale, bn mean, mul, beta, qinv
 
 // Shared memory for units of up to `cap` rows: the rows, a row of zeros, two
-// weight stages, the table of rows by rank (16 bits each) and the epilogue
-// constants of the CTA's 64 channels. Two CTAs fit an SM up to 50176 bytes each.
+// weight stages and the table of rows by rank (16 bits each). The epilogue
+// constants of the unit's 64 channels live in weight stage 1 during the
+// epilogue. Two CTAs fit an SM up to 50176 bytes each.
 __host__ __device__ constexpr int i8_smem(int cap) {
-  return (cap + 1) * CH + 2 * I8_WSTAGE + I8_ROWS * 2 + I8_CONSTS * I8_NH * 4;
+  return (cap + 1) * CH + 2 * I8_WSTAGE + I8_ROWS * 2;
 }
+static_assert(I8_CONSTS * I8_NH * 4 <= I8_WSTAGE, "the epilogue constants fit one weight stage");
+// The epilogue's scratch rows ((cap + 1) * I8_XPITCH bytes from offset 0) end
+// before weight stage 1 starts ((cap + 1) * CH + I8_WSTAGE), so the constants
+// there survive it.
+static_assert((I8_ROWS + 1) * (I8_XPITCH - CH) <= I8_WSTAGE, "the epilogue scratch stays below weight stage 1");
 
 // The rows of a unit in fragment order: interior cells, then top + top-left
 // corner, left + bottom-left, bottom + bottom-right, right + top-right. Each
@@ -128,6 +137,11 @@ __host__ __device__ inline int i8_taps(const I8Layout& l, int f) {
   return mask;
 }
 
+__device__ __forceinline__ void cp_async8(uint32_t dst, const void* src, bool valid) {
+  const int bytes = valid ? 8 : 0;  // zero fill when invalid
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(dst), "l"(src), "r"(bytes));
+}
+
 __device__ __forceinline__ float i8_bf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
 __device__ __forceinline__ void mma_u8s8(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -192,11 +206,13 @@ __global__ void __launch_bounds__(I8_THREADS, 2) conv3x3_int8_kernel(
   const int units = 2 * ((boards + G - 1) / G);
   uint16_t* table = reinterpret_cast<uint16_t*>(smem + (cap + 1) * CH + 2 * I8_WSTAGE);  // [I8_ROWS]: row by rank
   int table_boards = 0;
-  // Epilogue constants of channels n0 .. n0 + 63 as [kind][wn][lane & 3][nt][2]: a thread's pair of
-  // one kind and nt is one 8-byte load, and a warp reads 64 consecutive bytes. (With shared memory
-  // this large the SM has almost no L1 cache left, so global loads of them would each wait on L2.)
-  float* cst = reinterpret_cast<float*>(table + I8_ROWS);
-  int cst_n0 = -1;
+  // Epilogue constants of the unit's channels n0 .. n0 + 63 as [kind][wn][lane & 3][nt][2], in weight
+  // stage 1: a thread's pair of one kind and nt is one 8-byte load, and a warp reads 64 consecutive
+  // bytes. (With shared memory this large the SM has almost no L1 cache left, so global loads of them
+  // in the epilogue would each wait on L2.) They are fetched during the last tap, which uses stage 0.
+  static_assert(TAPS % 2 == 1, "the last tap's weights are in stage 0");
+  const float* cst = reinterpret_cast<const float*>(smem + (cap + 1) * CH + I8_WSTAGE);
+  const uint32_t cst_u32 = w_u32 + I8_WSTAGE;
   // This thread's ldmatrix row in each of the warp's 4 fragments as row | y << 12 | x << 16
   // (y = 15 for no row: every tap is off the board), and the fragments' taps.
   int ent[4], taps[4];
@@ -204,18 +220,6 @@ __global__ void __launch_bounds__(I8_THREADS, 2) conv3x3_int8_kernel(
   for (int u = blockIdx.x; u < units; u += gridDim.x) {
     const int b0 = (u >> 1) * G, nb = min(G, boards - b0);
     const int n0 = (u & 1) * I8_NH;
-    if (n0 != cst_n0) {
-      if (cst_n0 >= 0) __syncthreads();
-      for (int i = tid; i < I8_CONSTS * I8_NH; i += I8_THREADS) {
-        const int kind = i >> 6, e = i & 63;
-        const int col = (e >> 5) * 32 + ((e >> 1) & 3) * 8 + ((e >> 3) & 3) * 2 + (e & 1);
-        const float* src = kind == 0 ? ep.bias : kind == 1 ? ep.wscale : kind == 2 ? ep.bn_mean : kind == 3 ? ep.bn_mul
-                         : kind == 4 ? ep.bn_beta : qinv;
-        cst[i] = (kind < 5 || ep.out_zq) ? src[n0 + col] : 0.f;
-      }
-      __syncthreads();
-      cst_n0 = n0;
-    }
     {
       const int rows = nb * cells;
       const size_t g0 = (size_t)b0 * cells * CH + n0;  // the unit's first element in [rows, 128] arrays
@@ -272,6 +276,15 @@ __global__ void __launch_bounds__(I8_THREADS, 2) conv3x3_int8_kernel(
         if (tap + 1 < TAPS) {
           load_weights(tap + 1);
           cp_async_commit();
+        } else if (tid < I8_CONSTS * I8_NH / 2) {
+          // Stage 1 is free: the epilogue constants, one pair of consecutive channels a thread.
+          const int i = 2 * tid, kind = i >> 6, e = i & 63;
+          const int col = (e >> 5) * 32 + ((e >> 1) & 3) * 8 + ((e >> 3) & 3) * 2;
+          const float* src = kind == 0 ? ep.bias : kind == 1 ? ep.wscale : kind == 2 ? ep.bn_mean : kind == 3 ? ep.bn_mul
+                           : kind == 4 ? ep.bn_beta : qinv;
+          const bool ok = kind < 5 || ep.out_zq;
+          cp_async8(cst_u32 + i * 4, ok ? src + n0 + col : ep.bias, ok);
+          cp_async_commit();
         }
         const int dy = tap / 3 - 1, dx = tap % 3 - 1;
         uint32_t arow[4];
@@ -308,7 +321,8 @@ __global__ void __launch_bounds__(I8_THREADS, 2) conv3x3_int8_kernel(
           }
         }
       }
-      __syncthreads();  // shared memory becomes the epilogue's scratch
+      cp_async_wait<0>();
+      __syncthreads();  // shared memory becomes the epilogue's scratch; the constants are in
 
       // Epilogue as in conv_mma.cuh: v = bf16(bf16(sum * wscale) + bias)
       // [+ residual in bf16], then z = relu(bf16(bn(v))). Scratch rows are the

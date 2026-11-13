@@ -48,7 +48,7 @@ def build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
 
     transforms.append(
         optax.contrib.muon(
-            5e-3,
+            config.training.muon_learning_rate,
             adam_learning_rate=learning_rate,
             muon_weight_dimension_numbers=_muon_weight_dimension_numbers,
             consistent_rms=0.2,
@@ -167,6 +167,19 @@ def make_training_iteration(env, config, parallel: BatchParallel | None = None):
         )
         metrics = train_minibatches(model, optimizer, minibatches, config, parallel)
         return _with_data_stats(metrics, data, num_actions)
+
+    if config.training.pool.enabled:
+        from .pool import make_pool_training_iteration
+
+        if parallel.device_count != 1:
+            raise NotImplementedError("training.pool runs on a single device.")
+        return make_pool_training_iteration(
+            selfplay,
+            compute_input_for_lossfn,
+            lambda metrics, data: _with_data_stats(metrics, data, num_actions),
+            config,
+            env=env,
+        )
 
     def training_iteration(
         model: nnx.Module,

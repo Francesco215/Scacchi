@@ -13,6 +13,7 @@
 // network to bf16 rounding, not bit for bit. Each position's result does not
 // depend on the batch it is evaluated in.
 
+#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -108,6 +109,9 @@ __global__ void __launch_bounds__(256) stem_kernel(const uint8_t* __restrict__ o
   }
   }
 }
+
+constexpr int STEM_CTAS_PER_SM = 4;
+constexpr int HEADS_MIN_CTAS_PER_SM = 4;
 
 // ---- heads ----------------------------------------------------------------------
 struct Heads {
@@ -314,15 +318,19 @@ ffi::Error Network(cudaStream_t stream, int64_t kernel, ffi::AnyBuffer obs, ffi:
     if (e == cudaSuccess) e = cudaFuncSetAttribute(conv3x3_int8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, I8_SMEM_PAIR);
     if (e == cudaSuccess) e = cudaFuncSetAttribute(heads_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, HEADS_SMEM);
     if (e == cudaSuccess) e = cudaFuncSetAttribute(heads_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, HEADS_SMEM);
+    if (e == cudaSuccess) e = cudaFuncSetAttribute(heads_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, HEADS_SMEM);
     if (e != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(e));
     configured.store(true);
   }
-  stem_kernel<<<(rows + 511) / 512, 256, 0, stream>>>(ptr<const uint8_t>(obs), ptr<const __nv_bfloat16>(stem_w), V, rows,
-                                                    side, cells, X, Z, kernel ? Zq : nullptr, int8 ? QI : nullptr);
-  // 128-row tiles when they fill at least two waves (2 CTAs per SM), else 64.
   int sms = 0, device = 0;
   cudaGetDevice(&device);
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  // A CTA takes 16 rows per pass. Enough CTAs to fill the SMs (STEM_CTAS_PER_SM each), not more: every
+  // CTA first copies the 36 x 128 stem weights. (One CTA per 512 rows left most SMs idle below ~2000 boards.)
+  const int stem_grid = std::max(1, std::min((rows + 15) / 16, STEM_CTAS_PER_SM * sms));
+  stem_kernel<<<stem_grid, 256, 0, stream>>>(ptr<const uint8_t>(obs), ptr<const __nv_bfloat16>(stem_w), V, rows,
+                                             side, cells, X, Z, kernel ? Zq : nullptr, int8 ? QI : nullptr);
+  // 128-row tiles when they fill at least two waves (2 CTAs per SM), else 64.
   const bool tall = (rows + 127) / 128 >= 4 * sms;
   const int bm = tall ? 128 : 64;
   const int grid = (rows + bm - 1) / bm;
@@ -359,9 +367,14 @@ ffi::Error Network(cudaStream_t stream, int64_t kernel, ffi::AnyBuffer obs, ffi:
           ptr<const float>(pol_b), ptr<const __nv_bfloat16>(val_w), ptr<const float>(val_b), ptr<const float>(vout_w),
           ptr<const float>(vout_b), ptr<const __nv_bfloat16>(q_w), ptr<const float>(q_b), ptr<const float>(qout_w),
           ptr<const float>(qout_b)};
-  auto heads_smem = [&](int hb) { return sizeof(float) * (hb * cells * HEAD_CH + 2 * hb * CH + hb * A * K); };
-  if (heads_smem(8) <= HEADS_SMEM) {
+  // The last region holds the Q logits, and the 1x1 head weights ([128][5]) before them.
+  auto heads_smem = [&](int hb) { return sizeof(float) * (hb * cells * HEAD_CH + 2 * hb * CH + std::max(hb * A * K, HEAD_CH * CH)); };
+  if (heads_smem(8) <= HEADS_SMEM && (boards + 7) / 8 >= HEADS_MIN_CTAS_PER_SM * sms) {
     heads_kernel<8><<<(boards + 7) / 8, 256, heads_smem(8), stream>>>(Z, h, boards, cells, A, K, ptr<float>(*logits),
+                                                                      ptr<float>(*vprobs), ptr<float>(*qprobs));
+  } else if (heads_smem(4) <= HEADS_SMEM) {
+    // Fewer boards: 4 per CTA, so that more SMs get work (each CTA reads all head weights once).
+    heads_kernel<4><<<(boards + 3) / 4, 256, heads_smem(4), stream>>>(Z, h, boards, cells, A, K, ptr<float>(*logits),
                                                                       ptr<float>(*vprobs), ptr<float>(*qprobs));
   } else {
     return ffi::Error::InvalidArgument("heads do not fit in shared memory");

@@ -46,6 +46,7 @@ training:
   batch_size: 1024
   max_updates_per_iter: null
   learning_rate: 1e-3
+  muon_learning_rate: 5e-3
   lr_decay_after_iters: null
   lr_decay_factor: 1.0
   grad_clip_norm: 1.0
@@ -53,8 +54,8 @@ training:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 0.2
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
     q_supervision:
       action_set: positive_search_evidence_or_solved
       reduction: mean_over_selected_state_action_pairs
@@ -66,6 +67,24 @@ training:
   regularization:
     # Exact-outcome reference concentration; this does not clip the head.
     dirichlet_concentration_clip: 16.0
+  # Experimental replay pool of high-loss positions; see scacchi/pool.py.
+  pool:
+    enabled: false
+    evict_by: bits
+    temperature: 1.0
+    half_life_updates: 400.0
+    sample_by: uniform
+    sample_temperature: 1.0
+    fresh_fraction: 0.125
+    size_multiple: 64
+    rounds_per_selfplay: 1
+    fill_games: 0
+    start_from_pool: false
+    research_lanes: 0
+    research_by: bits
+    # stored | fresh: fresh keeps no targets in the pool and trains on re-searched rows only (scacchi/pool.py).
+    targets: stored
+    research_temperature: 0.0
 
 eval:
   interval: 1
