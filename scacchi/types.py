@@ -574,8 +574,15 @@ class PoolConfig:
     # With research_by=bits: rows are drawn with probability proportional to
     # exp(bits / research_temperature); 0 takes the rows with the most bits.
     research_temperature: float = 0.0
+    # stored: pool rows keep their search targets and batches draw from them
+    # (sample_by); research_lanes refreshes some. fresh: the pool keeps positions,
+    # game fields, bits and age only, and its share of every batch is the rows
+    # re-searched in this iteration's self-play (needs research_lanes > 0).
+    targets: str = "stored"
 
     def __post_init__(self) -> None:
+        if self.targets not in {"stored", "fresh"}:
+            raise ValueError("training.pool.targets must be stored or fresh")
         _require_ge("training.pool.temperature", self.temperature, 0.0)
         _require_gt("training.pool.sample_temperature", self.sample_temperature, 0.0)
         _require_gt("training.pool.fresh_fraction", self.fresh_fraction, 0.0)

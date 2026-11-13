@@ -26,6 +26,12 @@ current network (same call, not stepped), and each such row gets the new
 target, its bits against it, and age zero. Comparing the old and the new target
 of a row measures, for free, how much an old target is still worth.
 
+With ``targets: fresh`` the pool stores no search targets at all: a row keeps
+its position, what came from its game, its bits and its age. The pool's share
+of every batch is the rows searched again in this iteration's self-play, with
+their new targets, next to the fresh self-play rows; nothing is trained on a
+target computed by an older network.
+
 Binned beliefs on a single device only; the pool is not checkpointed.
 """
 
@@ -196,9 +202,9 @@ AGE_BUCKETS = ((0, 200), (200, 800), (800, 3200), (3200, None))
 
 def empty_pool(fresh: Sample, size: int, extra: Any = None) -> Pool:
     blank = lambda tree: jax.tree_util.tree_map(lambda x: jnp.zeros((size,) + x.shape[1:], x.dtype), tree)
-    zeros = jnp.zeros((size,), jnp.float32)
+    zeros = lambda dtype: jnp.zeros((size,), dtype)  # one array each: turnover may donate them
     return Pool(
-        blank(fresh), zeros, zeros, jnp.zeros((size,), jnp.bool_), jnp.zeros((size,), jnp.int32), jnp.zeros((size,), jnp.int32), blank(extra)
+        blank(fresh), zeros(jnp.float32), zeros(jnp.float32), zeros(jnp.bool_), zeros(jnp.int32), zeros(jnp.int32), blank(extra)
     )
 
 
@@ -383,6 +389,43 @@ def write_live(old: jax.Array, indices: jax.Array, live: jax.Array, new: jax.Arr
     return old.at[jnp.where(live, indices, old.shape[0])].set(new.astype(old.dtype), mode="drop")
 
 
+# What a row keeps from its game, in a pool that stores no search targets.
+GAME_FIELDS = ("obs", "value_tgt", "played_action", "policy_mask", "value_mask", "outcome_mask", "policy_loss_mask", "value_loss_mask")
+
+
+def game_fields(samples: Sample) -> dict[str, jax.Array]:
+    return {name: getattr(samples, name) for name in GAME_FIELDS if getattr(samples, name) is not None}
+
+
+def renewed_rows(game: dict, extra: dict, posterior, compute_input_for_lossfn, config) -> Sample:
+    """Training rows from new search targets of stored positions.
+
+    ``game`` and ``extra`` are the rows' stored fields (see ``game_fields``)
+    and payload. A row keeps what came from its game (outcome, masks, the
+    played move's terminal result) and takes everything search produced.
+    """
+    from .play import TrainingSamples
+
+    timed = lambda tree: jax.tree_util.tree_map(lambda x: x[:, None], tree)
+    source = TrainingSamples(
+        obs=game["obs"][:, None],
+        reward=extra["reward"][:, None],
+        terminated=extra["terminated"][:, None],
+        discount=jnp.where(extra["terminated"], 0.0, -1.0)[:, None],
+        posterior=timed(posterior),
+        played_action=game["played_action"][:, None],
+        legal_action_mask=game["policy_mask"][:, None],
+    )
+    renewed = jax.tree_util.tree_map(lambda x: x[:, 0], compute_input_for_lossfn(source))
+    kept = {name: game.get(name) for name in ("value_tgt", "value_mask", "outcome_mask")}
+    mode = config.training.losses.loss_mask_mode
+    if mode == "value":  # these masks follow the game, not the search
+        kept.update(policy_loss_mask=game.get("policy_loss_mask"), value_loss_mask=game.get("value_loss_mask"))
+    elif mode != "search":
+        raise NotImplementedError("re-searching pool rows supports loss_mask_mode value or search.")
+    return renewed._replace(**kept)
+
+
 def apply_research(
     model, pool: Pool, indices: jax.Array, live: jax.Array, posterior, now: jax.Array, compute_input_for_lossfn, config, updates_per_round: int
 ):
@@ -392,28 +435,9 @@ def apply_research(
     The row keeps what came from its game (outcome, masks, the played move's
     terminal result) and takes everything search produced.
     """
-    from .play import TrainingSamples
-
     stored = jax.tree_util.tree_map(lambda x: x[indices], pool.samples)
     extra = jax.tree_util.tree_map(lambda x: x[indices], pool.extra)
-    timed = lambda tree: jax.tree_util.tree_map(lambda x: x[:, None], tree)
-    source = TrainingSamples(
-        obs=stored.obs[:, None],
-        reward=extra["reward"][:, None],
-        terminated=extra["terminated"][:, None],
-        discount=jnp.where(extra["terminated"], 0.0, -1.0)[:, None],
-        posterior=timed(posterior),
-        played_action=stored.played_action[:, None],
-        legal_action_mask=stored.policy_mask[:, None],
-    )
-    renewed = jax.tree_util.tree_map(lambda x: x[:, 0], compute_input_for_lossfn(source))
-    kept = {"value_tgt": stored.value_tgt, "value_mask": stored.value_mask, "outcome_mask": stored.outcome_mask}
-    mode = config.training.losses.loss_mask_mode
-    if mode == "value":  # these masks follow the game, not the search
-        kept.update(policy_loss_mask=stored.policy_loss_mask, value_loss_mask=stored.value_loss_mask)
-    elif mode != "search":
-        raise NotImplementedError("training.pool.research_lanes supports loss_mask_mode value or search.")
-    renewed = renewed._replace(**kept)
+    renewed = renewed_rows(stored._asdict(), extra, posterior, compute_input_for_lossfn, config)
 
     output = model(stored.obs, train=False)
     old_rows, new_rows = row_losses(output, stored, config), row_losses(output, renewed, config)
@@ -463,6 +487,8 @@ def make_pool_training_iteration(selfplay, compute_input_for_lossfn, with_data_s
     then starts full of positions the network has just been trained on.
     """
     settings = config.training.pool
+    if settings.targets == "fresh":
+        return make_fresh_target_iteration(compute_input_for_lossfn, with_data_stats, config, env)
     batch_size = config.training.batch_size
     steps = int(config.selfplay.max_num_steps)
     for kind in (settings.evict_by, settings.sample_by):
@@ -676,4 +702,184 @@ def make_pool_training_iteration(selfplay, compute_input_for_lossfn, with_data_s
 
     training_iteration.extras = lambda: state["extras"]
     training_iteration.frames = lambda: state["frames"]
+    return training_iteration
+
+
+def _restrict(rows: RowLoss, keep: jax.Array) -> RowLoss:
+    """``rows`` with every row outside ``keep`` masked out (for subset metrics)."""
+    return rows._replace(
+        valid=rows.valid & keep,
+        policy_mask=rows.policy_mask & keep,
+        value_mask=rows.value_mask & keep,
+        outcome_mask=rows.outcome_mask & keep,
+        q_pairs=jnp.where(keep, rows.q_pairs, 0.0),
+        q_nll_sum=jnp.where(keep, rows.q_nll_sum, 0.0),
+    )
+
+
+def make_fresh_target_iteration(compute_input_for_lossfn, with_data_stats, config, env):
+    """``training.pool.targets: fresh``: a pool of positions, trained on only with new targets.
+
+    Each iteration picks ``research_lanes * steps`` pool rows (by
+    ``research_by``), searches them in every self-play search call next to the
+    ``selfplay.batch_size`` games, and trains on the fresh self-play rows and
+    those re-searched rows together, shuffled into batches of
+    ``training.batch_size``. A re-searched row then gets its bits against the
+    new target (measured in its batch, before the update) and age zero; the
+    fresh rows join the pool and as many rows leave it (``evict_by``). The
+    pool's share of a batch is ``research_lanes / (games + research_lanes)``,
+    so ``fresh_fraction`` and ``sample_by`` play no part.
+
+    The first iteration has no pool yet and trains on its fresh rows alone.
+    ``rounds_per_selfplay`` only counts age: an iteration adds that many rounds.
+    """
+    from .play import make_research_selfplay
+
+    settings = config.training.pool
+    batch_size = int(config.training.batch_size)
+    steps = int(config.selfplay.max_num_steps)
+    games, lanes = int(config.selfplay.batch_size), int(settings.research_lanes)
+    rounds = int(settings.rounds_per_selfplay)
+    if env is None or lanes < 1 or settings.research_by not in RESEARCH_BY:
+        raise ValueError(f"training.pool.targets=fresh needs the env, research_lanes > 0 and research_by in {RESEARCH_BY}")
+    if settings.fill_games or settings.start_from_pool:
+        raise ValueError("training.pool.targets=fresh supports neither fill_games nor start_from_pool.")
+    if settings.evict_by not in SCORES + ("uniform",):
+        raise ValueError(f"unknown pool score {settings.evict_by!r}; expected one of {SCORES} or 'uniform'")
+    fresh_count, research_count = games * steps, lanes * steps
+    total = fresh_count + research_count
+    if fresh_count % batch_size or total % batch_size:
+        raise ValueError(
+            f"self-play rows ({fresh_count}) and self-play plus re-searched rows ({total}) must be multiples of "
+            f"training.batch_size ({batch_size})."
+        )
+    pool_size = settings.size_multiple * fresh_count // rounds
+    if research_count > pool_size:
+        raise ValueError(f"research_lanes * steps ({research_count}) exceeds the pool ({pool_size} rows).")
+    updates_per_round = total / batch_size / rounds
+    half_life = settings.half_life_updates / updates_per_round  # in rounds
+    evict_by = "bits" if settings.evict_by == "uniform" else settings.evict_by
+    temperature = 1e9 if settings.evict_by == "uniform" else float(settings.temperature)
+    play = make_research_selfplay(env, config, games)
+    state: dict[str, Any] = {"pool": None, "round": 0, "updates": 0, "searches": 0, "extras": {}}
+
+    @jax.jit
+    def pick(pool: Pool, key, now):
+        indices, live = select_for_research(key, pool, now, research_count, settings.research_by, float(settings.research_temperature))
+        states = jax.tree_util.tree_map(lambda x: x[indices].reshape((steps, lanes) + x.shape[1:]), pool.extra["state"])
+        return indices, live, states
+
+    @jax.jit
+    def prepare(data, posterior, pool: Pool | None, indices, live, key):
+        """Fresh rows and their payload; then all rows to train on, shuffled, and which come from the pool."""
+        samples = compute_input_for_lossfn(data)
+        flat = lambda tree: jax.tree_util.tree_map(lambda x: x.reshape((fresh_count,) + x.shape[2:]), tree)
+        samples = flat(samples)
+        payload = flat({"state": data.state, "reward": data.reward, "terminated": data.terminated})
+        rows, from_pool = samples, jnp.zeros((fresh_count,), jnp.bool_)
+        if posterior is not None:
+            posterior = jax.tree_util.tree_map(lambda x: x.reshape((research_count,) + x.shape[2:]), posterior)
+            take = lambda tree: jax.tree_util.tree_map(lambda x: x[indices], tree)
+            renewed = renewed_rows(take(pool.samples), take(pool.extra), posterior, compute_input_for_lossfn, config)
+            # A padded lane (fewer valid pool rows than lanes) repeats another row: it carries no loss.
+            masks = ("value_mask", "outcome_mask", "policy_loss_mask", "value_loss_mask", "search_loss_mask")
+            renewed = renewed._replace(**{name: getattr(renewed, name) & live for name in masks if getattr(renewed, name) is not None})
+            rows = jax.tree_util.tree_map(lambda a, b: jnp.concatenate((a, b), axis=0), samples, renewed)
+            from_pool = jnp.concatenate((from_pool, jnp.ones((research_count,), jnp.bool_)))
+        order = jax.random.permutation(key, from_pool.shape[0])
+        shuffled = jax.tree_util.tree_map(lambda x: x[order], rows)
+        return shuffled, from_pool[order], order, samples, payload
+
+    @nnx.jit
+    def train(model, optimizer, rows: Sample, from_pool):
+        batches = jax.tree_util.tree_map(lambda x: x.reshape((-1, batch_size) + x.shape[1:]), rows)
+        flags = from_pool.reshape(-1, batch_size)
+
+        @nnx.scan(in_axes=(nnx.Carry, 0, 0), out_axes=(nnx.Carry, 0))
+        def step(carry, batch, flag):
+            model, optimizer = carry
+            metrics, losses = train_with_row_losses(model, optimizer, batch, config)
+            fresh, replay = _restrict(losses, ~flag), _restrict(losses, flag)
+            # (sum, count) pairs, so that each subset is averaged over its own rows
+            sums = {
+                f"{prefix}/{name}": (jnp.sum(value * mask), jnp.sum(mask))
+                for prefix, part in (("fresh", fresh), ("replay", replay))
+                for name, value, mask in (
+                    ("bits", part.bits, part.valid),
+                    ("policy_kl_hat", part.policy_ce - part.policy_entropy, part.policy_mask),
+                    ("policy_target_entropy", part.policy_entropy, part.policy_mask),
+                    ("value_binned_loss", part.value_nll, part.value_mask),
+                    ("value_outcome_loss", part.outcome_nll, part.outcome_mask),
+                )
+            }
+            sums["fresh/q_binned_loss"] = (jnp.sum(fresh.q_nll_sum), jnp.sum(fresh.q_pairs))
+            sums["replay/q_binned_loss"] = (jnp.sum(replay.q_nll_sum), jnp.sum(replay.q_pairs))
+            return (model, optimizer), (metrics, sums, losses.bits, losses.valid)
+
+        _, (metrics, sums, bits, valid) = step((model, optimizer), batches, flags)
+        sums = {name: (jnp.sum(total), jnp.sum(count.astype(jnp.float32))) for name, (total, count) in sums.items()}
+        return metrics, sums, bits.reshape(-1), valid.reshape(-1)
+
+    def _turnover(pool: Pool, game, payload, order, bits, valid, indices, live, key, now):
+        # Undo the shuffle: row j of the concatenation sat at position order^-1[j].
+        bits = jnp.zeros_like(bits).at[order].set(bits)
+        valid = jnp.zeros_like(valid).at[order].set(valid)
+        stats = {}
+        if indices is not None:
+            new_bits, new_valid = bits[fresh_count:], valid[fresh_count:]
+            seen = (live & new_valid).astype(jnp.float32)
+            stats = {
+                "research/bits_before": (jnp.sum(pool.bits[indices] * seen), jnp.sum(seen)),
+                "research/bits_after": (jnp.sum(new_bits * seen), jnp.sum(seen)),
+                "research/age_updates": (jnp.sum((now - pool.born[indices]) * updates_per_round * seen), jnp.sum(seen)),
+                "research/rows": (jnp.sum(seen), jnp.ones(())),
+            }
+            write = lambda old, new: write_live(old, indices, live & new_valid, new)
+            pool = pool._replace(
+                bits=write(pool.bits, new_bits),
+                gain=write(pool.gain, new_bits),
+                born=write(pool.born, jnp.full(indices.shape, now, jnp.int32)),
+                visits=write(pool.visits, pool.visits[indices] + 1),
+            )
+        pool, turnover_stats = insert_and_evict(
+            pool, game, bits[:fresh_count], valid[:fresh_count], key, now, temperature, evict_by, half_life, payload
+        )
+        return pool, turnover_stats, stats
+
+    turnover = jax.jit(_turnover, donate_argnums=(0,))
+
+    def training_iteration(model, optimizer, rng_key):
+        selfplay_key, pick_key, order_key, evict_key = jax.random.split(rng_key, 4)
+        now = jnp.asarray(state["round"], jnp.int32)
+        pool = state["pool"]
+        indices = live = posterior = None
+        if pool is None:  # nothing to search again yet
+            data, _ = play(model, selfplay_key, None)
+        else:
+            indices, live, states = pick(pool, pick_key, now)
+            data, posterior = play(model, selfplay_key, states)
+        rows, from_pool, order, samples, payload = prepare(data, posterior, pool, indices, live, order_key)
+        metrics, sums, bits, valid = train(model, optimizer, rows, from_pool)
+        game = game_fields(samples)
+        if pool is None:
+            pool = empty_pool(game, pool_size, payload)
+        state["pool"], turnover_stats, research_stats = turnover(pool, game, payload, order, bits, valid, indices, live, evict_key, now)
+        updates = int(from_pool.shape[0]) // batch_size
+        state["round"] += rounds
+        state["updates"] += updates
+        state["searches"] += fresh_count + (research_count if indices is not None else 0)
+        extras = {name: float(value) for name, value in turnover_stats.items()}
+        for name, (total_, count) in {**sums, **research_stats}.items():
+            if float(count) > 0:
+                extras[name] = float(total_) / float(count)
+        extras["pool/age_updates"] = extras["pool/age_iters"] * updates_per_round
+        extras["train/updates"] = state["updates"]
+        extras["train/gradient_rows"] = state["updates"] * batch_size
+        extras["train/searches"] = state["searches"]
+        state["extras"] = extras
+        return with_data_stats(metrics, data)
+
+    training_iteration.extras = lambda: state["extras"]
+    training_iteration.frames = lambda: fresh_count
+    training_iteration.pool = lambda: state["pool"]
     return training_iteration

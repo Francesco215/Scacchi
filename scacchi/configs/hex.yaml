@@ -82,6 +82,8 @@ training:
     start_from_pool: false
     research_lanes: 0
     research_by: bits
+    # stored | fresh: fresh keeps no targets in the pool and trains on re-searched rows only (scacchi/pool.py).
+    targets: stored
     research_temperature: 0.0
 
 eval:

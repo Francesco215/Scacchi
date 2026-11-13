@@ -263,3 +263,49 @@ def test_research_writes_from_padded_lanes_are_dropped():
     np.testing.assert_array_equal(np.asarray(out), [0.0, 1.0, 2.0, 10.0, 4.0])
     rows = write_live(jnp.zeros((5, 2)), indices, live, jnp.ones((3, 2)) * jnp.array([[1.0], [2.0], [3.0]]))
     np.testing.assert_array_equal(np.asarray(rows[3]), [1.0, 1.0])
+
+
+def test_fresh_targets_train_on_rows_searched_in_the_same_iteration():
+    """targets=fresh: the pool keeps no search targets; re-searched rows are trained on at once."""
+    from flax import nnx
+
+    from scacchi.envs import make_env
+    from scacchi.network import build_model
+    from scacchi.pipeline import build_optimizer, make_training_iteration
+    from scacchi.pool import GAME_FIELDS
+
+    games, lanes, steps = 8, 4, 8
+    with initialize_config_module(config_module="scacchi.configs", version_base=None):
+        config = load_config(compose("hex4", overrides=[
+            "+algorithm=binned", "logging.wandb.enabled=false", f"selfplay.batch_size={games}", f"selfplay.max_num_steps={steps}",
+            "selfplay.search.binned_thompson.num_simulations=4", "training.batch_size=32", "model.num_channels=16", "model.num_layers=1",
+            "training.losses.value_outcome_weight=0", "training.losses.q_outcome_weight=0", "training.losses.loss_mask_mode=search",
+            "training.pool.enabled=true", "training.pool.targets=fresh", f"training.pool.research_lanes={lanes}",
+            "training.pool.evict_by=youth", "training.pool.temperature=0", "training.pool.size_multiple=4",
+        ]))
+    env = make_env(config.env.id, config.env.board_size)
+    model = build_model(config, num_actions=env.num_actions, observation_shape=env.observation_shape, rngs=nnx.Rngs(0))
+    optimizer = build_optimizer(model, config)
+    iteration = make_training_iteration(env, config)
+    fresh, searched = games * steps, lanes * steps
+
+    first = iteration(model, optimizer, jax.random.PRNGKey(0))
+    assert first.policy_loss.shape[0] == fresh // 32  # no pool yet: fresh rows alone
+    assert "replay/bits" not in iteration.extras()
+
+    second = iteration(model, optimizer, jax.random.PRNGKey(1))
+    extras = iteration.extras()
+    assert second.policy_loss.shape[0] == (fresh + searched) // 32  # fresh and re-searched rows, in the same iteration
+    assert extras["research/rows"] == searched
+    assert np.isfinite(extras["replay/bits"]) and np.isfinite(extras["fresh/bits"])
+    assert extras["train/searches"] == 2 * fresh + searched
+
+    pool = iteration.pool()
+    assert set(pool.samples) <= set(GAME_FIELDS)  # positions and game fields: no policy, V or Q targets
+    assert set(pool.extra) == {"state", "reward", "terminated"}
+    # The rows searched in the second iteration were stamped with its round; fresh rows came after.
+    assert int(jnp.sum(pool.valid)) == 2 * fresh and int(jnp.sum(pool.visits == 1)) == searched
+
+    iteration(model, optimizer, jax.random.PRNGKey(2))
+    extras = iteration.extras()
+    assert extras["research/rows"] == searched and extras["pool/valid_fraction"] > 0
