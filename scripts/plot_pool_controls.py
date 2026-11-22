@@ -5,7 +5,8 @@ outcome losses off, 1,024 self-play games per iteration. The pool runs add 256
 re-search lanes, which count as searched positions.
 
   Hex 8   tnj90uci  pool          4lzxy4zi  no pool
-  Hex 10  hbwhn2fy  pool          z2l7fxid  no pool (stopped at 25 minutes)
+  Hex 10  hbwhn2fy  pool          z2l7fxid  no pool (stopped at iteration 287, resumed from its
+                                  iteration-250 checkpoint as pxwf6251)
 
 Hex 8 also shows q9wqllha (no pool, 4,096 games per iteration, XLA network) on
 the positions axis only: it is the run the pool was first compared with, and
@@ -46,7 +47,7 @@ PANELS = [
     ]),
     ("Hex 10", "vs 10_reference", {"positions": (2e6, 1e8), "minutes": (2, 70)}, [
         ("hbwhn2fy", "pool, 1,024 games + 256 re-search lanes", H / "h10/pool_int8_h10.jsonl", POOL, True),
-        ("z2l7fxid", "no pool, 1,024 games", H / "h10/nopool_int8_h10_1024.jsonl", CTRL, True),
+        ("z2l7fxid", "no pool, 1,024 games", H / "h10/nopool_int8_h10_1024.merged.jsonl", CTRL, True),
     ]),
 ]
 LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5)
@@ -107,8 +108,6 @@ def main(out: str) -> None:
                 ax.errorbar(x, y, yerr=err, fmt="o", ms=2.6, color=color, alpha=0.35, elinewidth=0.7, capsize=0, zorder=2)
                 sx, sy = smooth(x, y)
                 ax.plot(sx, sy, color=color, lw=2, zorder=3, label=f"{label}  ({run})")
-                if run == "z2l7fxid":
-                    ax.annotate("stopped", xy=(sx[-1], sy[-1]), xytext=(4, -10), textcoords="offset points", fontsize=8, color=INK2)
                 crossings.setdefault((board, run, label), {})[key] = [first_crossing(sx, sy, lv) for lv in LEVELS]
             ax.set_xlim(*limits[key])
             if key == "positions":
