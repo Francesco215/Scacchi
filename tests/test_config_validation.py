@@ -617,6 +617,17 @@ def test_mean_dirichlet_loss_mode_warns_that_it_is_comparison_only():
     assert config.training.losses.dirichlet_loss_mode == "mean"
 
 
+@pytest.mark.parametrize("name", ["value_outcome_weight", "q_outcome_weight"])
+def test_nonzero_outcome_weight_is_rejected(name):
+    with pytest.raises(ValueError, match="debug-only"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "training": {"losses": {name: 0.2}},
+            }
+        )
+
+
 def test_num_search_blocks_is_not_a_public_config_field():
     with pytest.raises(ConfigKeyError, match="num_blocks"):
         _config(

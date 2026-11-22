@@ -53,8 +53,8 @@ training:
     policy_weight: 1.0
     value_dir_kl_weight: 1.0
     q_dir_kl_weight: 1.0
-    value_outcome_weight: 1.0
-    q_outcome_weight: 0.2
+    value_outcome_weight: 0.0
+    q_outcome_weight: 0.0
     q_supervision:
       action_set: positive_search_evidence_or_solved
       reduction: mean_over_selected_state_action_pairs
