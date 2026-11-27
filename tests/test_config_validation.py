@@ -628,6 +628,17 @@ def test_nonzero_outcome_weight_is_rejected(name):
         )
 
 
+@pytest.mark.parametrize("mode", ["value", "pgx"])
+def test_non_search_loss_mask_mode_is_rejected(mode):
+    with pytest.raises(ValueError, match="loss_mask_mode must be 'search'"):
+        _config(
+            {
+                "model": {"network": "boardlaw_dirichlet"},
+                "training": {"losses": {"loss_mask_mode": mode}},
+            }
+        )
+
+
 def test_num_search_blocks_is_not_a_public_config_field():
     with pytest.raises(ConfigKeyError, match="num_blocks"):
         _config(

@@ -504,6 +504,18 @@ class TrainingLossConfig:
                 f"value_outcome_weight={self.value_outcome_weight}, q_outcome_weight={self.q_outcome_weight}."
             )
 
+        # Only the search mask matches the objective in math.md: the Dirichlet
+        # search targets do not depend on the game outcome. ``value`` keeps
+        # only frames of finished games (dropping valid search targets and
+        # biasing toward short games) and averages over frames with no search
+        # target; ``pgx`` replicates the pgx AlphaZero surrogate loss.
+        if self.loss_mask_mode != LossMaskMode.search:
+            raise ValueError(
+                "training.losses.loss_mask_mode must be 'search' (the 'value' and 'pgx' masks are "
+                "debug-only and inconsistent with the objective in math.md); got "
+                f"loss_mask_mode={self.loss_mask_mode!r}."
+            )
+
     def active_dirichlet_weights(self) -> list[str]:
         weights = (
             ("value_dir_kl_weight", self.value_dir_kl_weight),
