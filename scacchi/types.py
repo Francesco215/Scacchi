@@ -13,6 +13,9 @@ class Network(StrEnum):
     aznet = "aznet"
     aznet_dirichlet = "aznet_dirichlet"
     aznet_binned = "aznet_binned"
+    aznet_kata_conv = "aznet_kata_conv"
+    aznet_kata_transformer = "aznet_kata_transformer"
+    aznet_inkling = "aznet_inkling"
     boardlaw = "boardlaw"
     boardlaw_dirichlet = "boardlaw_dirichlet"
 
@@ -157,6 +160,17 @@ class ModelConfig:
     rezero_kernel_init: RezeroKernelInit = RezeroKernelInit.variance_scaling
     bins: BinConfig = field(default_factory=BinConfig)
     fp8_training: bool = False
+    canonicalize_hex_color: bool = True
+    transformer_mid_channels: int | None = None
+    transformer_ffn_channels: int | None = None
+    transformer_heads: int = 4
+    transformer_inner_blocks: int = 2
+    transformer_qk_norm: bool = True
+    transformer_infer_chunk_size: int = 512
+    inkling_kv_heads: int = 2
+    inkling_passes: int = 1
+    inkling_gate_rank: int = 32
+    inkling_layers_per_block: int = 2
 
     def __post_init__(self) -> None:
         _require_gt(
@@ -573,6 +587,7 @@ class TrainingConfig:
     lr_decay_after_iters: int | None = None
     lr_decay_factor: float = 1.0
     grad_clip_norm: float | None = None
+    muon_weight_decay: float = 0.0
     symmetry_rot180: bool = False
     symmetry_epochs: int = 1
     lazy_minibatches: bool = False
@@ -589,6 +604,7 @@ class TrainingConfig:
         _require_ge("training.lr_decay_after_iters", self.lr_decay_after_iters, 1)
         _require_gt("training.lr_decay_factor", self.lr_decay_factor, 0.0)
         _require_gt("training.grad_clip_norm", self.grad_clip_norm, 0.0)
+        _require_ge("training.muon_weight_decay", self.muon_weight_decay, 0.0)
         _require_ge("training.symmetry_epochs", self.symmetry_epochs, 1)
 
 
@@ -653,7 +669,13 @@ class TrainConfig:
 
     def __post_init__(self) -> None:
         dirichlet_networks = {Network.aznet_dirichlet, Network.boardlaw_dirichlet}
-        belief_networks = dirichlet_networks | {Network.aznet_binned}
+        binned_networks = {
+            Network.aznet_binned,
+            Network.aznet_kata_conv,
+            Network.aznet_kata_transformer,
+            Network.aznet_inkling,
+        }
+        belief_networks = dirichlet_networks | binned_networks
         num_outcomes = self.env.resolved_num_outcomes()
         active_weights = self.training.losses.active_dirichlet_weights()
         if self.model.network not in belief_networks and active_weights:
@@ -669,9 +691,9 @@ class TrainConfig:
             ("eval.player_search", self.eval.player_search),
         ):
             if search.kind == SearchKind.binned_thompson:
-                if self.model.network != Network.aznet_binned:
-                    raise ValueError(f"{name}.kind=binned_thompson requires model.network=aznet_binned")
-            if self.model.network == Network.aznet_binned:
+                if self.model.network not in binned_networks:
+                    raise ValueError(f"{name}.kind=binned_thompson requires a binned network")
+            if self.model.network in binned_networks:
                 if num_outcomes != 2:
                     raise ValueError("binned win-probability heads require env.num_outcomes=2")
                 if search.kind not in {SearchKind.binned_thompson, SearchKind.policy}:

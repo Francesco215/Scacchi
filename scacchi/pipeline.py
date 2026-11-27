@@ -52,6 +52,7 @@ def build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
     transforms.append(
         optax.contrib.muon(
             5e-3,
+            weight_decay=float(getattr(config.training, "muon_weight_decay", 0.0)),
             adam_learning_rate=learning_rate,
             muon_weight_dimension_numbers=_muon_weight_dimension_numbers,
             consistent_rms=0.2,
@@ -237,7 +238,7 @@ def _train_minibatches_fast(
 
     last_only = (
         bool(getattr(config.training, "last_step_diagnostics_only", False))
-        and isinstance(model, AZBinnedNet)
+        and getattr(model, "bins", None) is not None
         and num_updates > 1
     )
     if not last_only:
