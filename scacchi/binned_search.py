@@ -111,6 +111,7 @@ def make_binned_search(env, evaluator, config, q_supervision_config):
         resolve_search_kernel("fused", env, 9)  # fail at construction, not at the first trace
 
     from .native_binned.inkling import PackedInkling
+    from .native_binned.kata_tf import PackedKataTf
 
     use_fast = (
         bool(getattr(config, "fast_search", False))
@@ -118,7 +119,7 @@ def make_binned_search(env, evaluator, config, q_supervision_config):
         and (
             getattr(evaluator, "kernel", None) == "int8"
             or (
-                isinstance(getattr(evaluator, "packed", None), PackedInkling)
+                isinstance(getattr(evaluator, "packed", None), (PackedInkling, PackedKataTf))
                 and getattr(evaluator, "kernel", None) in ("int8", "cuda")
             )
         )

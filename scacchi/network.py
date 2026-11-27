@@ -830,8 +830,15 @@ class KataPolicyQHead(nnx.Module):
             self.pass_q = None
 
     def __call__(self, x: jax.Array, *, is_white: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
-        outp = self.conv1p(x)
-        outg = jax.nn.silu(self.norm_g(self.conv1g(x)))
+        # Fuse 1x1 conv1p and conv1g into a single matmul (reads x once; preserves param names).
+        p_ch = int(self.conv1p.kernel[...].shape[-1])
+        w_pg = jnp.concatenate(
+            [self.conv1p.kernel[...][0, 0], self.conv1g.kernel[...][0, 0]],
+            axis=-1,
+        ).astype(x.dtype)
+        pg = jnp.matmul(x, w_pg, preferred_element_type=x.dtype)
+        outp, outg_raw = pg[..., :p_ch], pg[..., p_ch:]
+        outg = jax.nn.silu(self.norm_g(outg_raw))
         pooled_g = _global_pool_mean_max(outg)
         g_bias = self.linear_g(pooled_g)[:, None, None, :]
         h = jax.nn.silu(self.norm_p(outp + g_bias))
@@ -1119,9 +1126,16 @@ class KataRoPEAttention(nnx.Module):
     def __call__(self, x: jax.Array, s_x: jax.Array, s_y: jax.Array) -> jax.Array:
         b, s, c = x.shape
         xn = self.norm(x)
-        q = self.q_proj(xn).reshape((b, s, self.num_heads, self.head_dim))
-        k = self.k_proj(xn).reshape((b, s, self.num_heads, self.head_dim))
-        v = self.v_proj(xn).reshape((b, s, self.num_heads, self.head_dim))
+        # Fuse Q, K, V projections into a single matmul while keeping separate params for Muon.
+        w_qkv = jnp.concatenate(
+            [self.q_proj.kernel[...], self.k_proj.kernel[...], self.v_proj.kernel[...]],
+            axis=-1,
+        ).astype(xn.dtype)
+        qkv = jnp.matmul(xn, w_qkv, preferred_element_type=xn.dtype)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        q = q.reshape((b, s, self.num_heads, self.head_dim))
+        k = k.reshape((b, s, self.num_heads, self.head_dim))
+        v = v.reshape((b, s, self.num_heads, self.head_dim))
         if self.qk_norm:
             assert self.q_norm is not None and self.k_norm is not None
             q = self.q_norm(q)
@@ -1173,7 +1187,14 @@ class KataSwiGLU(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         xn = self.norm(x)
-        return self.w_down(jax.nn.silu(self.w_gate(xn)) * self.w_up(xn))
+        # Fuse W_gate and W_up into a single matmul while keeping separate params for Muon.
+        w_gu = jnp.concatenate(
+            [self.w_gate.kernel[...], self.w_up.kernel[...]],
+            axis=-1,
+        ).astype(xn.dtype)
+        gu = jnp.matmul(xn, w_gu, preferred_element_type=xn.dtype)
+        g, u = jnp.split(gu, 2, axis=-1)
+        return self.w_down(jax.nn.silu(g) * u)
 
 
 class KataNestedBottleneckTransformerBlock(nnx.Module):
@@ -1411,10 +1432,25 @@ def _read_depth_nostack(queries: jax.Array, norm_sources: tuple[jax.Array, ...])
         [B, S, Q, C] weighted combinations in the source dtype.
     """
     dtype = norm_sources[0].dtype
-    scale = queries.shape[-1] ** -0.5
-    q = queries.astype(dtype)
+    scale = jnp.asarray(queries.shape[-1] ** -0.5, dtype=jnp.float32)
     if len(norm_sources) == 1:
-        return jnp.broadcast_to(norm_sources[0][:, :, None, :], norm_sources[0].shape[:2] + (queries.shape[0], queries.shape[1]))
+        return jnp.broadcast_to(
+            norm_sources[0][:, :, None, :],
+            norm_sources[0].shape[:2] + (queries.shape[0], queries.shape[1]),
+        )
+    if queries.shape[0] == 1:
+        # Avoid launching N tiny Q=1 cuBLAS GEMMs; elementwise reduction fuses cleanly in XLA.
+        q0 = queries[0]  # [C] f32
+        logits = jnp.stack(
+            [jnp.sum(src.astype(jnp.float32) * q0, axis=-1) * scale for src in norm_sources],
+            axis=-1,
+        )  # [B, S, N]
+        weights = jax.nn.softmax(logits, axis=-1).astype(dtype)
+        out = weights[..., 0:1] * norm_sources[0]
+        for idx in range(1, len(norm_sources)):
+            out = out + weights[..., idx : idx + 1] * norm_sources[idx]
+        return out[:, :, None, :]
+    q = queries.astype(dtype)
     logits_list = [
         jnp.einsum("bsc,qc->bsq", src, q, preferred_element_type=jnp.float32) * scale
         for src in norm_sources
@@ -1622,6 +1658,17 @@ class InklingDenseLayer(nnx.Module):
         t0, t1 = t[..., :half], t[..., half:]
         return jnp.concatenate([t0 * cos - t1 * sin, t0 * sin + t1 * cos], axis=-1)
 
+    def _apply_kernel(self, kernel: jax.Array, x: jax.Array, *, train: bool) -> jax.Array:
+        w = kernel.astype(x.dtype)
+        if self.fp8_training and train and x.dtype == jnp.bfloat16:
+            return _fp8_linear(x, w)
+        return jax.lax.dot_general(
+            x,
+            w,
+            dimension_numbers=(((x.ndim - 1,), (0,)), ((), ())),
+            preferred_element_type=x.dtype,
+        )
+
     def _apply_linear(self, linear: nnx.Linear, x: jax.Array, *, train: bool) -> jax.Array:
         if self.fp8_training and train and x.dtype == jnp.bfloat16:
             return _fp8_linear(x, linear.kernel[...].astype(jnp.bfloat16))
@@ -1684,21 +1731,49 @@ class InklingDenseLayer(nnx.Module):
             q_in = self.attn_norm(q_in)
             k_in = v_in = q_in
 
-        q = self._apply_linear(self.q_proj, q_in, train=train).reshape((b, s, self.num_heads, self.head_dim))
-        q = _clip_heads(q * self.q_scale[...].astype(self.dtype), self.qk_clip)
-        k = self.k_conv(self._apply_linear(self.k_proj, k_in, train=train)).reshape((b, s, self.kv_heads, self.head_dim))
-        k = _clip_heads(k, self.qk_clip)
-        v = _unit_rms(self.v_conv(self._apply_linear(self.v_proj, v_in, train=train)).reshape((b, s, self.kv_heads, self.head_dim)))
+        n_q = self.num_heads * self.head_dim
+        n_kv = self.kv_heads * self.head_dim
+        if not self.full:
+            # Fuse [q_proj | out_gate | k_proj | v_proj] into 1 GEMM (same parameter tree, 1/4 launches).
+            w_qkvg = jnp.concatenate(
+                [
+                    self.q_proj.kernel[...],
+                    self.out_gate.kernel[...],
+                    self.k_proj.kernel[...],
+                    self.v_proj.kernel[...],
+                ],
+                axis=-1,
+            )
+            qkvg = self._apply_kernel(w_qkvg, q_in, train=train)
+            q_raw = qkvg[..., :n_q]
+            og_raw = qkvg[..., n_q : 2 * n_q]
+            k_raw = qkvg[..., 2 * n_q : 2 * n_q + n_kv]
+            v_raw = qkvg[..., 2 * n_q + n_kv :]
+        else:
+            w_qog = jnp.concatenate([self.q_proj.kernel[...], self.out_gate.kernel[...]], axis=-1)
+            qog = self._apply_kernel(w_qog, q_in, train=train)
+            q_raw = qog[..., :n_q]
+            og_raw = qog[..., n_q:]
+            k_raw = self._apply_linear(self.k_proj, k_in, train=train)
+            v_raw = self._apply_linear(self.v_proj, v_in, train=train)
 
-        # Apply matching 2D RoPE per KV-head group (so grouped Q and K share identical frequencies).
+        q = _clip_heads(
+            q_raw.reshape((b, s, self.num_heads, self.head_dim)) * self.q_scale[...].astype(self.dtype),
+            self.qk_clip,
+        )
+        k = _clip_heads(self.k_conv(k_raw).reshape((b, s, self.kv_heads, self.head_dim)), self.qk_clip)
+        v = _unit_rms(self.v_conv(v_raw).reshape((b, s, self.kv_heads, self.head_dim)))
+
+        # Apply matching 2D RoPE per KV-head group via broadcast (zero jnp.repeat copy).
         freqs_kv = self.rope_freqs[...]  # [kv_heads, D/2, 2]
         angle_kv = s_x[:, None, None] * freqs_kv[None, :, :, 0] + s_y[:, None, None] * freqs_kv[None, :, :, 1]
         cos_kv = jnp.cos(angle_kv)[None, :, :, :].astype(self.dtype)
         sin_kv = jnp.sin(angle_kv)[None, :, :, :].astype(self.dtype)
         groups = self.num_heads // self.kv_heads
-        cos_q = jnp.repeat(cos_kv, groups, axis=2)
-        sin_q = jnp.repeat(sin_kv, groups, axis=2)
-        q = self._apply_rope_2d(q, cos_q, sin_q)
+        q_grp = q.reshape((b, s, self.kv_heads, groups, self.head_dim))
+        q = self._apply_rope_2d(q_grp, cos_kv[:, :, :, None, :], sin_kv[:, :, :, None, :]).reshape(
+            (b, s, self.num_heads, self.head_dim)
+        )
         k = self._apply_rope_2d(k, cos_kv, sin_kv)
 
         # Append 2 learned zero-value attention sink KV tokens (keeps S_kv even for cuDNN FlashAttn).
@@ -1717,8 +1792,8 @@ class InklingDenseLayer(nnx.Module):
         )
         attn_out = jax.nn.dot_product_attention(
             q, k_aug, v_aug, implementation="cudnn" if use_cudnn else None
-        ).reshape((b, s, self.num_heads * self.head_dim))
-        attn_out = attn_out * jax.nn.sigmoid(self._apply_linear(self.out_gate, q_in, train=train))
+        ).reshape((b, s, n_q))
+        attn_out = attn_out * jax.nn.sigmoid(og_raw)
         branch = self.after_attn(self._apply_linear(self.out_proj, attn_out, train=train))
 
         if self.seals_bank:
@@ -1733,9 +1808,11 @@ class InklingDenseLayer(nnx.Module):
             xm = self.mlp_gate(xm, msg_mlp)
         xm = self.mlp_norm(xm)
 
-        # Dense Inkling-2 Capped-SwiGLU: (4*tanh(g/4))*sigmoid(g)*(25*tanh(u/25))
-        gt = self._apply_linear(self.w_gate, xm, train=train)
-        up = self._apply_linear(self.w_up, xm, train=train)
+        # Fuse [w_gate | w_up] into 1 GEMM + Dense Inkling-2 Capped-SwiGLU.
+        ffn = self.w_gate.kernel[...].shape[-1]
+        w_gu = jnp.concatenate([self.w_gate.kernel[...], self.w_up.kernel[...]], axis=-1)
+        gu = self._apply_kernel(w_gu, xm, train=train)
+        gt, up = gu[..., :ffn], gu[..., ffn:]
         c4 = jnp.asarray(4.0, dtype=self.dtype)
         c25 = jnp.asarray(25.0, dtype=self.dtype)
         gated = (c4 * jnp.tanh(gt * jnp.asarray(0.25, dtype=self.dtype))) * jax.nn.sigmoid(gt) * (

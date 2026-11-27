@@ -67,9 +67,15 @@ __host__ __device__ constexpr int gemm_smem_bytes() {
   return pipe > epi ? pipe : epi;
 }
 
+__device__ __forceinline__ float tanh_approx_f32(float x) {
+  float y;
+  asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
 __device__ __forceinline__ float capped_swiglu_f32(float g, float u) {
-  const float sig = 1.0f / (1.0f + __expf(-g));
-  return (4.0f * tanhf(g * 0.25f)) * sig * (25.0f * tanhf(u * 0.04f));
+  const float sig = fmaf(0.5f, tanh_approx_f32(0.5f * g), 0.5f);
+  return (4.0f * tanh_approx_f32(g * 0.25f)) * sig * (25.0f * tanh_approx_f32(u * 0.04f));
 }
 
 __device__ __forceinline__ uint8_t gemm_quant_u8_s8(float v, float inv_scale) {

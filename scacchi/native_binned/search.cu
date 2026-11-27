@@ -1368,6 +1368,7 @@ ffi::Error Step(cudaStream_t stream, int64_t max_depth, int64_t flags,
       data<const float>(qweights), data<const int32_t>(sim), reinterpret_cast<uint8_t*>(r_obs->untyped_data())};
   switch (g.K) {
     case 9:  return launch<9>(stream, t, in, g, (int)flags);
+    case 15: return launch<15>(stream, t, in, g, (int)flags);
     case 65: return launch<65>(stream, t, in, g, (int)flags);
     default: return launch<0>(stream, t, in, g, (int)flags);
   }
@@ -1460,6 +1461,7 @@ ffi::Error FastStep(
 
   switch (g.K) {
     case 9:  return launch_fast<9>(stream, t, in, out, g, cfg, (int)flags);
+    case 15: return launch_fast<15>(stream, t, in, out, g, cfg, (int)flags);
     case 65: return launch_fast<65>(stream, t, in, out, g, cfg, (int)flags);
     default: return launch_fast<0>(stream, t, in, out, g, cfg, (int)flags);
   }

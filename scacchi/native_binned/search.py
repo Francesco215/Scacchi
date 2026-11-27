@@ -12,6 +12,7 @@ from ..dirichlet_mctx.base import RootFnOutput
 from ..dirichlet_mctx.tree import SearchSummary, Tree, instantiate_tree_from_root
 from . import _fast_quadrature, _quadrature
 from .inkling import PackedInkling, apply_inkling_compact
+from .kata_tf import PackedKataTf, apply_kata_tf_compact
 from .network import PackedNetwork, PositionCache, apply_compact
 
 PEND = 8
@@ -302,6 +303,11 @@ def fused_fast_search(
             return apply_inkling_compact(
                 packed, obs_c, d_active, miss_k, cache_obj, actions, atoms,
                 layers_per_block=layers_per_block, use_cache=use_cache,
+            )
+        if isinstance(packed, PackedKataTf):
+            return apply_kata_tf_compact(
+                packed, obs_c, d_active, miss_k, cache_obj, actions, atoms,
+                use_cache=use_cache,
             )
         return apply_compact(
             packed, obs_c, d_active, miss_k, cache_obj, actions, atoms,

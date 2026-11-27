@@ -332,6 +332,7 @@ def _play_training_fast_hex(
     from . import binned
     from .dirichlet_mctx.native_targets import TARGET_BINNED
     from .native_binned.inkling import pack_inkling, supports_inkling
+    from .native_binned.kata_tf import pack_kata_tf, supports_kata_tf
     from .native_binned.network import empty_position_cache, pack, supports
     from .native_binned.search import empty_fast_tree_carry, fused_fast_search
     from .play_search import make_action_committer, targets_from_summary
@@ -351,9 +352,15 @@ def _play_training_fast_hex(
         if nk not in ("int8", "cuda"):
             raise ValueError("fast_search for AZInklingBinnedNet requires network_kernel in ('int8', 'cuda')")
         packed, layers_per_block = pack_inkling(model, nk)
+    elif supports_kata_tf(model):
+        if nk != "int8":
+            raise ValueError("fast_search for flat AZKataTransformerBinnedNet requires network_kernel='int8'")
+        packed = pack_kata_tf(model, "int8")
+        layers_per_block = 1
     else:
         raise ValueError(
-            "fast_search requires AZBinnedNet (128ch, 6 ResNet-v2 blocks) "
+            "fast_search requires AZBinnedNet (128ch, 6 ResNet-v2 blocks), "
+            "flat AZKataTransformerBinnedNet (192ch, H=6, D=32), "
             "or unlooped AZInklingBinnedNet (192ch, H=6, KV=2, D=32)"
         )
     points = jnp.asarray(binned.support(model.bins), dtype=jnp.float32)
@@ -551,10 +558,15 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             env_state = jax.vmap(env.init)(jax.random.split(init_key, local_batch_size))
         if use_fast_hex:
             from .native_binned.inkling import supports_inkling
+            from .native_binned.kata_tf import supports_kata_tf
             from .native_binned.network import supports as supports_resnet
 
             nk = config.selfplay.search.binned_thompson.network_kernel
-            if (supports_resnet(model) and nk == "int8") or (supports_inkling(model) and nk in ("int8", "cuda")):
+            if (
+                (supports_resnet(model) and nk == "int8")
+                or (supports_inkling(model) and nk in ("int8", "cuda"))
+                or (supports_kata_tf(model) and nk == "int8")
+            ):
                 return _play_training_fast_hex(
                     env,
                     model,

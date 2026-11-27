@@ -597,47 +597,86 @@ __device__ __forceinline__ float backup_lane(
 
   // ---- stage 5: lattice -> atoms, normalise -----------------------------------
   if (lane == 0) cur[OFF + TOP] = lump;
-  for (int s = 0; s < 5; ++s) {
-    const int c = lane + 32 * s;
-    if (c < LAT) {
-      const float fine = (float)c * 0.0078125f;
-      int cnt = 0;
-#pragma unroll UK
-      for (int k = 0; k < K; ++k) cnt += (S.pts[k] <= fine);
-      const int u = min(max(cnt, 1), K - 1);
-      const float den = S.pts[u] - S.pts[u - 1];
-      S.up[c] = u;
-      S.fr[c] = fminf(fmaxf((fine - S.pts[u - 1]) / den, 0.f), 1.f);
-    }
-  }
   __syncwarp();
   float rk[5];
   float tsum = 0.f;
+  bool fast_uniform = false;
+  if constexpr (FAST && KT > 0 && (TOP % (KT - 1) == 0)) {
+    constexpr float inv_km1 = 1.0f / (float)(KT - 1);
+    fast_uniform = (fabsf(S.pts[0]) < 1e-6f) &&
+                   (fabsf(S.pts[1] - inv_km1) < 1e-6f) &&
+                   (fabsf(S.pts[KT / 2] - 0.5f) < 1e-6f) &&
+                   (fabsf(S.pts[KT - 1] - 1.0f) < 1e-6f);
+  }
+  if (fast_uniform) {
+    // Closed-form tent projection when (K - 1) | 128 (e.g. K=9 -> STEP=16):
+    // zero divisions, zero binary searches, zero S.up/S.fr smem traffic!
+    constexpr int STEP = (KT > 1) ? (TOP / (KT - 1)) : TOP;
+    constexpr float INV_STEP = 1.0f / (float)STEP;
 #pragma unroll
-  for (int s = 0; s < 5; ++s) {
-    const int k = lane + 32 * s;
-    float r = 0.f;
-    if (k < K) {
-      int lo = 0, hi = LAT;
-      while (lo < hi) {
-        const int mid = (lo + hi) >> 1;
-        if (S.up[mid] >= k) hi = mid; else lo = mid + 1;
+    for (int s = 0; s < 5; ++s) {
+      const int k = lane + 32 * s;
+      float r = 0.f;
+      if (k < K) {
+        const int center = k * STEP;
+        r = cur[OFF + center];
+        if (k > 0) {
+#pragma unroll
+          for (int d = 1; d < STEP; ++d) {
+            r = fmaf(cur[OFF + center - d], (float)(STEP - d) * INV_STEP, r);
+          }
+        }
+        if (k < K - 1) {
+#pragma unroll
+          for (int d = 1; d < STEP; ++d) {
+            r = fmaf(cur[OFF + center + d], (float)(STEP - d) * INV_STEP, r);
+          }
+        }
+        tsum += r;
       }
-      int end = lo, top = LAT;
-      while (end < top) {
-        const int mid = (end + top) >> 1;
-        if (S.up[mid] > k + 1) top = mid; else end = mid + 1;
-      }
-#pragma unroll 4
-      for (int c = lo; c < end; ++c) {
-        const float pcell = cur[OFF + c];
-        const float f = S.fr[c];
-        r = fmaf(pcell, S.up[c] == k ? f : 1.f - f, r);
-      }
-      r *= scale;
-      tsum += r;
+      rk[s] = r;
     }
-    rk[s] = r;
+  } else {
+    for (int s = 0; s < 5; ++s) {
+      const int c = lane + 32 * s;
+      if (c < LAT) {
+        const float fine = (float)c * 0.0078125f;
+        int cnt = 0;
+#pragma unroll UK
+        for (int k = 0; k < K; ++k) cnt += (S.pts[k] <= fine);
+        const int u = min(max(cnt, 1), K - 1);
+        const float den = S.pts[u] - S.pts[u - 1];
+        S.up[c] = u;
+        S.fr[c] = fminf(fmaxf((fine - S.pts[u - 1]) / den, 0.f), 1.f);
+      }
+    }
+    __syncwarp();
+#pragma unroll
+    for (int s = 0; s < 5; ++s) {
+      const int k = lane + 32 * s;
+      float r = 0.f;
+      if (k < K) {
+        int lo = 0, hi = LAT;
+        while (lo < hi) {
+          const int mid = (lo + hi) >> 1;
+          if (S.up[mid] >= k) hi = mid; else lo = mid + 1;
+        }
+        int end = lo, top = LAT;
+        while (end < top) {
+          const int mid = (end + top) >> 1;
+          if (S.up[mid] > k + 1) top = mid; else end = mid + 1;
+        }
+#pragma unroll 4
+        for (int c = lo; c < end; ++c) {
+          const float pcell = cur[OFF + c];
+          const float f = S.fr[c];
+          r = fmaf(pcell, S.up[c] == k ? f : 1.f - f, r);
+        }
+        r *= scale;
+        tsum += r;
+      }
+      rk[s] = r;
+    }
   }
   tsum = warp_sum(tsum);
   const float denom = fmaxf(tsum, TINY);

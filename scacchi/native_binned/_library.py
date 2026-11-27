@@ -19,8 +19,16 @@ NETWORK_TARGET = "scacchi_binned_network"
 NETWORK_COMPACT_TARGET = "scacchi_binned_network_compact"
 INKLING_NETWORK_TARGET = "scacchi_inkling_network"
 INKLING_COMPACT_TARGET = "scacchi_inkling_network_compact"
+KATA_TF_NETWORK_TARGET = "scacchi_kata_tf_network"
+KATA_TF_COMPACT_TARGET = "scacchi_kata_tf_network_compact"
 HERE = Path(__file__).parent
-SOURCES = [HERE / "backup.cu", HERE / "search.cu", HERE / "network.cu", HERE / "inkling_network.cu"]
+SOURCES = [
+    HERE / "backup.cu",
+    HERE / "search.cu",
+    HERE / "network.cu",
+    HERE / "inkling_network.cu",
+    HERE / "kata_tf_network.cu",
+]
 HEADERS = [
     HERE / "backup_lane.cuh",
     HERE / "cache_key.cuh",
@@ -28,6 +36,7 @@ HEADERS = [
     HERE / "conv_int8.cuh",
     HERE / "conv_board_int8.cuh",
     HERE / "inkling_mma.cuh",
+    HERE / "kata_tf_board_int8.cuh",
 ]
 REPO = Path(__file__).resolve().parents[2]
 FLAGS = ["-std=c++17", "-O3", "--shared", "-Xcompiler", "-fPIC", "-lineinfo", "-Xptxas", "-v"]
@@ -181,3 +190,21 @@ def register_inkling_compact() -> str:
     library = load_library()
     jax.ffi.register_ffi_target(INKLING_COMPACT_TARGET, jax.ffi.pycapsule(library.ScacchiInklingNetworkCompact), platform="CUDA", api_version=1)
     return INKLING_COMPACT_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_kata_tf_network() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(KATA_TF_NETWORK_TARGET, jax.ffi.pycapsule(library.ScacchiKataTfNetwork), platform="CUDA", api_version=1)
+    return KATA_TF_NETWORK_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_kata_tf_compact() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(KATA_TF_COMPACT_TARGET, jax.ffi.pycapsule(library.ScacchiKataTfNetworkCompact), platform="CUDA", api_version=1)
+    return KATA_TF_COMPACT_TARGET
