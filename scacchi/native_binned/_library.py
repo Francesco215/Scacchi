@@ -1,9 +1,11 @@
-"""Build and register the fused binned-backup CUDA kernel as an XLA FFI target.
+"""Build and register the binned CUDA kernels as XLA FFI targets.
 
 Opt-in and local, like ``native_hex``: nothing here runs at import time. The
-first call to :func:`load_library` compiles ``backup.cu`` with nvcc into
-``outputs/native_binned/<fingerprint>/`` (kept between processes) and
-:func:`register` hands the handler to JAX for the CUDA platform.
+first call to :func:`load_library` compiles ``backup.cu`` (the batched backup)
+and ``search.cu`` (the fused search step) with nvcc into one library under
+``outputs/native_binned/<fingerprint>/`` (kept between processes), and
+:func:`register` / :func:`register_search` hand the handlers to JAX for the
+CUDA platform.
 
 nvcc is looked for in ``$NVCC``, ``$CUDA_HOME/bin``, ``PATH`` and the
 ``nvidia-cuda-nvcc`` wheel that ships with the JAX CUDA install. The FFI
@@ -23,7 +25,11 @@ import subprocess
 import sys
 
 TARGET = "scacchi_binned_backup"
-SOURCE = Path(__file__).parent / "backup.cu"
+SEARCH_TARGET = "scacchi_binned_search_step"
+NETWORK_TARGET = "scacchi_binned_network"
+HERE = Path(__file__).parent
+SOURCES = [HERE / "backup.cu", HERE / "search.cu", HERE / "network.cu"]
+HEADERS = [HERE / "backup_lane.cuh", HERE / "conv_mma.cuh", HERE / "conv_int8.cuh"]
 REPO = Path(__file__).resolve().parents[2]
 FLAGS = ["-std=c++17", "-O3", "--shared", "-Xcompiler", "-fPIC", "-lineinfo", "-Xptxas", "-v"]
 
@@ -67,7 +73,8 @@ def compute_capability() -> str:
 def fingerprint(nvcc: Path, arch: str) -> str:
     version = subprocess.run([str(nvcc), "--version"], capture_output=True, text=True, check=True).stdout
     digest = hashlib.sha256()
-    for part in (SOURCE.read_bytes(), version.encode(), arch.encode(), " ".join(FLAGS).encode(), os.environ.get("NVCC_EXTRA", "").encode()):
+    sources = [path.read_bytes() for path in (*SOURCES, *HEADERS)]
+    for part in (*sources, version.encode(), arch.encode(), " ".join(FLAGS).encode(), os.environ.get("NVCC_EXTRA", "").encode()):
         digest.update(part)
     return digest.hexdigest()[:16]
 
@@ -87,7 +94,7 @@ def build() -> Path:
         str(nvcc), *FLAGS, f"-gencode=arch=compute_{arch},code=sm_{arch}",
         f"-I{jax.ffi.include_dir()}", f"-I{cuda_include(nvcc)}",
         *shlex.split(os.environ.get("NVCC_EXTRA", "")),
-        str(SOURCE), "-o", str(temporary),
+        *(str(source) for source in SOURCES), "-o", str(temporary),
     ]
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True)
@@ -112,3 +119,23 @@ def register() -> str:
     library = load_library()
     jax.ffi.register_ffi_target(TARGET, jax.ffi.pycapsule(library.ScacchiBinnedBackup), platform="CUDA", api_version=1)
     return TARGET
+
+
+@lru_cache(maxsize=1)
+def register_search() -> str:
+    """Register the fused search-step handler for the CUDA platform (once per process)."""
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(SEARCH_TARGET, jax.ffi.pycapsule(library.ScacchiBinnedSearchStep), platform="CUDA", api_version=1)
+    return SEARCH_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_network() -> str:
+    """Register the network handler for the CUDA platform (once per process)."""
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(NETWORK_TARGET, jax.ffi.pycapsule(library.ScacchiBinnedNetwork), platform="CUDA", api_version=1)
+    return NETWORK_TARGET

@@ -265,6 +265,9 @@ def _load_checkpoint_config(raw: dict[str, Any]) -> Config:
                         },
                         "numerical": numerical,
                     }
+            binned_thompson = search.get("binned_thompson")
+            if isinstance(binned_thompson, dict) and "backup_kernel" in binned_thompson:
+                binned_thompson["search_kernel"] = binned_thompson.pop("backup_kernel")
             gumbel = search.get("gumbel")
             if isinstance(gumbel, dict):
                 for stale in (
