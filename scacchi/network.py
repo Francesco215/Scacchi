@@ -239,21 +239,93 @@ class BlockV1(nnx.Module):
         return jax.nn.relu(x + residual)
 
 
+_FP8_E4M3_MAX = 448.0
+
+
+@jax.custom_vjp
+def _fp8_conv3x3(x: jax.Array, kernel: jax.Array) -> jax.Array:
+    """Dynamically-scaled FP8 (e4m3fn) 3x3 SAME convolution with scaled FP8 backward."""
+    y, _ = _fp8_conv3x3_fwd(x, kernel)
+    return y
+
+
+def _fp8_quantize_e4m3(t: jax.Array) -> tuple[jax.Array, jax.Array]:
+    tf = t.astype(jnp.float32)
+    amax = jnp.max(jnp.abs(tf))
+    scale = jnp.where(amax > 0.0, amax / _FP8_E4M3_MAX, 1.0)
+    q = jnp.clip(tf / scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX).astype(jnp.float8_e4m3fn)
+    return q, scale
+
+
+def _fp8_conv3x3_fwd(x: jax.Array, kernel: jax.Array):
+    x_q, x_scale = _fp8_quantize_e4m3(x)
+    w_q, w_scale = _fp8_quantize_e4m3(kernel)
+    y_f32 = jax.lax.conv_general_dilated(
+        x_q,
+        w_q,
+        window_strides=(1, 1),
+        padding="SAME",
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+        preferred_element_type=jnp.float32,
+    )
+    y = (y_f32 * (x_scale * w_scale)).astype(jnp.bfloat16)
+    return y, (x_q, x_scale, w_q, w_scale)
+
+
+def _fp8_conv3x3_bwd(res, dy: jax.Array):
+    x_q, x_scale, w_q, w_scale = res
+    dy_q, dy_scale = _fp8_quantize_e4m3(dy)
+    w_q_rev = jnp.swapaxes(w_q[::-1, ::-1, :, :], 2, 3)
+    dx_f32 = jax.lax.conv_general_dilated(
+        dy_q,
+        w_q_rev,
+        window_strides=(1, 1),
+        padding="SAME",
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+        preferred_element_type=jnp.float32,
+    )
+    dx = (dx_f32 * (dy_scale * w_scale)).astype(jnp.bfloat16)
+    # Weight gradient from saved 1-byte x_q and dy_q via bf16 tensor cores (cuDNN optimal wgrad).
+    x_bf16 = x_q.astype(jnp.bfloat16)
+    dy_bf16 = dy_q.astype(jnp.bfloat16)
+    _, vjp_w = jax.vjp(
+        lambda w_: jax.lax.conv_general_dilated(
+            x_bf16, w_, window_strides=(1, 1), padding="SAME", dimension_numbers=("NHWC", "HWIO", "NHWC")
+        ),
+        jnp.zeros(w_q.shape, dtype=jnp.bfloat16),
+    )
+    (dw_bf16,) = vjp_w(dy_bf16)
+    dw = (dw_bf16.astype(jnp.float32) * (x_scale * dy_scale)).astype(jnp.bfloat16)
+    return dx, dw
+
+
+_fp8_conv3x3.defvjp(_fp8_conv3x3_fwd, _fp8_conv3x3_bwd)
+
+
 class BlockV2(nnx.Module):
-    def __init__(self, num_channels: int, *, dtype=jnp.float32, rngs: nnx.Rngs):
+    def __init__(self, num_channels: int, *, dtype=jnp.float32, fp8_training: bool = False, rngs: nnx.Rngs):
+        self.fp8_training = fp8_training
         self.bn1 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
         self.conv1 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
         self.bn2 = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
         self.conv2 = nnx.Conv(num_channels, num_channels, kernel_size=(3, 3), padding="SAME", dtype=dtype, rngs=rngs)
 
+    def _apply_conv(self, conv: nnx.Conv, x: jax.Array, *, train: bool) -> jax.Array:
+        if self.fp8_training and train and x.dtype == jnp.bfloat16:
+            y = _fp8_conv3x3(x, conv.kernel[...].astype(jnp.bfloat16))
+            if conv.bias is not None:
+                y = y + conv.bias[...].astype(x.dtype)
+            return y
+        return conv(x)
+
     def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
         residual = x
         x = self.bn1(x, use_running_average=not train)
         x = jax.nn.relu(x)
-        x = self.conv1(x)
+        x = self._apply_conv(self.conv1, x, train=train)
         x = self.bn2(x, use_running_average=not train)
         x = jax.nn.relu(x)
-        x = self.conv2(x)
+        x = self._apply_conv(self.conv2, x, train=train)
         return x + residual
 
 
@@ -282,8 +354,12 @@ class AZNet(nnx.Module):
         if not resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
-        block_cls = BlockV2 if resnet_v2 else BlockV1
-        self.blocks = nnx.List([block_cls(num_channels, dtype=dtype, rngs=rngs) for _ in range(num_blocks)])
+        if resnet_v2:
+            self.blocks = nnx.List(
+                [BlockV2(num_channels, dtype=dtype, fp8_training=fp8_training, rngs=rngs) for _ in range(num_blocks)]
+            )
+        else:
+            self.blocks = nnx.List([BlockV1(num_channels, dtype=dtype, rngs=rngs) for _ in range(num_blocks)])
 
         if resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
@@ -360,6 +436,7 @@ class AZBeliefNet(nnx.Module):
         dirichlet_initial_concentration: float | None = None,
         dirichlet_head_parameterization: str = "log_concentration",
         bins: BinConfig | None = None,
+        fp8_training: bool = False,
         rngs: nnx.Rngs,
     ):
         height, width, input_channels = observation_shape
@@ -370,6 +447,7 @@ class AZBeliefNet(nnx.Module):
         self.resnet_v2 = resnet_v2
         self.dtype = dtype
         self.bins = bins
+        self.fp8_training = fp8_training
         output_size = num_outcomes if bins is None else bins.count
         self.dirichlet_head_parameterization = str(
             dirichlet_head_parameterization
@@ -402,8 +480,12 @@ class AZBeliefNet(nnx.Module):
         if not resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
 
-        block_cls = BlockV2 if resnet_v2 else BlockV1
-        self.blocks = nnx.List([block_cls(num_channels, dtype=dtype, rngs=rngs) for _ in range(num_blocks)])
+        if resnet_v2:
+            self.blocks = nnx.List(
+                [BlockV2(num_channels, dtype=dtype, fp8_training=fp8_training, rngs=rngs) for _ in range(num_blocks)]
+            )
+        else:
+            self.blocks = nnx.List([BlockV1(num_channels, dtype=dtype, rngs=rngs) for _ in range(num_blocks)])
 
         if resnet_v2:
             self.bn = nnx.BatchNorm(num_channels, momentum=0.9, dtype=dtype, rngs=rngs)
@@ -861,6 +943,7 @@ def build_model(
             ),
             dirichlet_head_parameterization=head_parameterization,
             bins=config.model.bins if config.model.network == "aznet_binned" else None,
+            fp8_training=bool(getattr(config.model, "fp8_training", False)),
             rngs=rngs,
         )
     if config.model.network == "boardlaw":

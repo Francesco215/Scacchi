@@ -18,7 +18,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault(
     "XLA_FLAGS",
     "--xla_gpu_enable_command_buffer=+WHILE,+CONDITIONAL,+CONVOLUTION "
-    "--xla_gpu_graph_min_graph_size=1",
+    "--xla_gpu_graph_min_graph_size=1 "
+    "--xla_gpu_command_buffer_scheduling_mode=CONCURRENT",
 )
 
 from flax import nnx

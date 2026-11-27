@@ -27,6 +27,13 @@ selfplay:
       # fp8 / int8 (same kernels, residual convolutions on 8-bit floats / integers;
       # search only, training stays bf16; int8 is the closer and faster of the two).
       network_kernel: xla
+      fast_search: false
+      subtree_reuse: true
+      position_cache: true
+      early_stop_prob: 0.96
+      min_stop_nodes: 10
+      playout_cap_prob: 1.0
+      fast_simulations: 8
   action_commitment:
     posterior_update: null
 
@@ -40,5 +47,9 @@ eval:
       search_kernel: ${selfplay.search.binned_thompson.search_kernel}
       fused_cohorts: 1
       network_kernel: ${selfplay.search.binned_thompson.network_kernel}
+      fast_search: ${selfplay.search.binned_thompson.fast_search}
+      position_cache: ${selfplay.search.binned_thompson.position_cache}
+      early_stop_prob: ${selfplay.search.binned_thompson.early_stop_prob}
+      min_stop_nodes: ${selfplay.search.binned_thompson.min_stop_nodes}
   player_action_commitment:
     posterior_update: null

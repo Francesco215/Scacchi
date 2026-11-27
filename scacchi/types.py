@@ -156,6 +156,7 @@ class ModelConfig:
     dirichlet_initial_concentration: float | None = None
     rezero_kernel_init: RezeroKernelInit = RezeroKernelInit.variance_scaling
     bins: BinConfig = field(default_factory=BinConfig)
+    fp8_training: bool = False
 
     def __post_init__(self) -> None:
         _require_gt(
@@ -386,16 +387,29 @@ class BinnedThompsonSearchConfig:
     # training stays bf16). int8 is both closer to the bf16 network and faster;
     # see scacchi/native_binned/network.py.
     network_kernel: str = "xla"
+    fast_search: bool = False
+    subtree_reuse: bool = True
+    position_cache: bool = True
+    early_stop_prob: float = 0.96
+    min_stop_nodes: int = 10
+    playout_cap_prob: float = 1.0
+    fast_simulations: int = 8
 
     def __post_init__(self) -> None:
         _require_ge("search.binned_thompson.num_simulations", self.num_simulations, 0)
         _require_ge("search.binned_thompson.fused_cohorts", self.fused_cohorts, 1)
+        _require_ge("search.binned_thompson.min_stop_nodes", self.min_stop_nodes, 1)
+        _require_ge("search.binned_thompson.fast_simulations", self.fast_simulations, 0)
         if self.max_depth is None:
             self.max_depth = self.num_simulations
         _require_ge("search.binned_thompson.max_depth", self.max_depth, int(self.num_simulations > 0))
         _require_gt("search.binned_thompson.policy_target_temperature", self.policy_target_temperature, 0.0)
-        if self.network_kernel not in {"xla", "cuda", "fp8", "int8"}:
-            raise ValueError("search.binned_thompson.network_kernel must be xla, cuda, fp8 or int8")
+        if not (0.0 <= float(self.early_stop_prob) <= 1.0):
+            raise ValueError("search.binned_thompson.early_stop_prob must be in [0, 1]")
+        if not (0.0 < float(self.playout_cap_prob) <= 1.0):
+            raise ValueError("search.binned_thompson.playout_cap_prob must be in (0, 1]")
+        if self.network_kernel not in {"xla", "cuda", "fp8", "int8", "int8_14"}:
+            raise ValueError("search.binned_thompson.network_kernel must be xla, cuda, fp8, int8 or int8_14")
         if self.search_kernel not in {"auto", "fused", "cuda", "xla"}:
             raise ValueError("search.binned_thompson.search_kernel must be auto, fused, cuda or xla")
 
@@ -438,6 +452,7 @@ class ActionCommitmentConfig:
 class SelfplayConfig:
     batch_size: int = 1024
     max_num_steps: int = 256
+    persistent_envs: bool = False
     search: SearchConfig = field(default_factory=SearchConfig)
     action_commitment: ActionCommitmentConfig = field(
         default_factory=ActionCommitmentConfig
@@ -558,6 +573,10 @@ class TrainingConfig:
     lr_decay_after_iters: int | None = None
     lr_decay_factor: float = 1.0
     grad_clip_norm: float | None = None
+    symmetry_rot180: bool = False
+    symmetry_epochs: int = 1
+    lazy_minibatches: bool = False
+    last_step_diagnostics_only: bool = False
     losses: TrainingLossConfig = field(default_factory=TrainingLossConfig)
     regularization: TrainingRegularizationConfig = field(
         default_factory=TrainingRegularizationConfig
@@ -570,12 +589,14 @@ class TrainingConfig:
         _require_ge("training.lr_decay_after_iters", self.lr_decay_after_iters, 1)
         _require_gt("training.lr_decay_factor", self.lr_decay_factor, 0.0)
         _require_gt("training.grad_clip_norm", self.grad_clip_norm, 0.0)
+        _require_ge("training.symmetry_epochs", self.symmetry_epochs, 1)
 
 
 @dataclass
 class EvalConfig:
     interval: int = 5
     batch_size: int = 16
+    stratified_hex: bool = False
     player_search: SearchConfig = field(default_factory=SearchConfig)
     baseline_search: SearchConfig = field(default_factory=SearchConfig)
     player_action_commitment: ActionCommitmentConfig = field(

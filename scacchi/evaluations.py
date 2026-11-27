@@ -146,6 +146,7 @@ def make_mcts_evaluate(
             rng_key,
             batch_size=eval_batch_size,
             parallel=parallel,
+            stratified_hex=bool(getattr(config.eval, "stratified_hex", False)),
         )
         return assert_batch_axis_sharded(
             metrics.returns,
