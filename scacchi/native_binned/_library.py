@@ -1,16 +1,4 @@
-"""Build and register the binned CUDA kernels as XLA FFI targets.
-
-Opt-in and local, like ``native_hex``: nothing here runs at import time. The
-first call to :func:`load_library` compiles ``backup.cu`` (the batched backup)
-and ``search.cu`` (the fused search step) with nvcc into one library under
-``outputs/native_binned/<fingerprint>/`` (kept between processes), and
-:func:`register` / :func:`register_search` hand the handlers to JAX for the
-CUDA platform.
-
-nvcc is looked for in ``$NVCC``, ``$CUDA_HOME/bin``, ``PATH`` and the
-``nvidia-cuda-nvcc`` wheel that ships with the JAX CUDA install. The FFI
-headers come from ``jax.ffi.include_dir()``.
-"""
+"""Build and register the binned CUDA kernels as XLA FFI targets."""
 
 from __future__ import annotations
 
@@ -26,10 +14,30 @@ import sys
 
 TARGET = "scacchi_binned_backup"
 SEARCH_TARGET = "scacchi_binned_search_step"
+FAST_SEARCH_TARGET = "scacchi_binned_search_fast_step"
 NETWORK_TARGET = "scacchi_binned_network"
+NETWORK_COMPACT_TARGET = "scacchi_binned_network_compact"
+INKLING_NETWORK_TARGET = "scacchi_inkling_network"
+INKLING_COMPACT_TARGET = "scacchi_inkling_network_compact"
+KATA_TF_NETWORK_TARGET = "scacchi_kata_tf_network"
+KATA_TF_COMPACT_TARGET = "scacchi_kata_tf_network_compact"
 HERE = Path(__file__).parent
-SOURCES = [HERE / "backup.cu", HERE / "search.cu", HERE / "network.cu"]
-HEADERS = [HERE / "backup_lane.cuh", HERE / "conv_mma.cuh", HERE / "conv_int8.cuh"]
+SOURCES = [
+    HERE / "backup.cu",
+    HERE / "search.cu",
+    HERE / "network.cu",
+    HERE / "inkling_network.cu",
+    HERE / "kata_tf_network.cu",
+]
+HEADERS = [
+    HERE / "backup_lane.cuh",
+    HERE / "cache_key.cuh",
+    HERE / "conv_mma.cuh",
+    HERE / "conv_int8.cuh",
+    HERE / "conv_board_int8.cuh",
+    HERE / "inkling_mma.cuh",
+    HERE / "kata_tf_board_int8.cuh",
+]
 REPO = Path(__file__).resolve().parents[2]
 FLAGS = ["-std=c++17", "-O3", "--shared", "-Xcompiler", "-fPIC", "-lineinfo", "-Xptxas", "-v"]
 
@@ -40,13 +48,13 @@ def find_nvcc() -> Path:
         candidates.append(str(Path(os.environ["CUDA_HOME"]) / "bin" / "nvcc"))
     candidates.append(shutil.which("nvcc"))
     try:
-        import nvidia.cu13 as wheel  # nvidia-cuda-nvcc wheel layout
+        import nvidia.cu13 as wheel
 
         candidates.append(str(Path(next(iter(wheel.__path__))) / "bin" / "nvcc"))
     except ImportError:
         pass
     for site in sys.path:
-        for wheel in ("cu13", "cuda_nvcc"):  # CUDA 13 and CUDA 12 wheel layouts
+        for wheel in ("cu13", "cuda_nvcc"):
             candidates.append(str(Path(site) / "nvidia" / wheel / "bin" / "nvcc"))
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
@@ -66,7 +74,7 @@ def cuda_include(nvcc: Path) -> Path:
 def compute_capability() -> str:
     import jax
 
-    capability = jax.devices()[0].compute_capability  # e.g. "12.0"
+    capability = jax.devices()[0].compute_capability
     return capability.replace(".", "")
 
 
@@ -112,8 +120,17 @@ def load_library() -> ctypes.CDLL:
 
 
 @lru_cache(maxsize=1)
+def device_sm_count() -> int:
+    """Actual SM count of the active CUDA device (fixes hardcoded SM-count scratch checks)."""
+    lib = load_library()
+    fn = lib.ScacchiDeviceSMCount
+    fn.restype = ctypes.c_int
+    sms = int(fn())
+    return sms if sms > 0 else 1
+
+
+@lru_cache(maxsize=1)
 def register() -> str:
-    """Register the FFI handler for the CUDA platform (once per process)."""
     import jax
 
     library = load_library()
@@ -123,7 +140,6 @@ def register() -> str:
 
 @lru_cache(maxsize=1)
 def register_search() -> str:
-    """Register the fused search-step handler for the CUDA platform (once per process)."""
     import jax
 
     library = load_library()
@@ -132,10 +148,63 @@ def register_search() -> str:
 
 
 @lru_cache(maxsize=1)
+def register_fast_search() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(FAST_SEARCH_TARGET, jax.ffi.pycapsule(library.ScacchiBinnedSearchFastStep), platform="CUDA", api_version=1)
+    return FAST_SEARCH_TARGET
+
+
+@lru_cache(maxsize=1)
 def register_network() -> str:
-    """Register the network handler for the CUDA platform (once per process)."""
     import jax
 
     library = load_library()
     jax.ffi.register_ffi_target(NETWORK_TARGET, jax.ffi.pycapsule(library.ScacchiBinnedNetwork), platform="CUDA", api_version=1)
     return NETWORK_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_network_compact() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(NETWORK_COMPACT_TARGET, jax.ffi.pycapsule(library.ScacchiBinnedNetworkCompact), platform="CUDA", api_version=1)
+    return NETWORK_COMPACT_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_inkling_network() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(INKLING_NETWORK_TARGET, jax.ffi.pycapsule(library.ScacchiInklingNetwork), platform="CUDA", api_version=1)
+    return INKLING_NETWORK_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_inkling_compact() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(INKLING_COMPACT_TARGET, jax.ffi.pycapsule(library.ScacchiInklingNetworkCompact), platform="CUDA", api_version=1)
+    return INKLING_COMPACT_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_kata_tf_network() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(KATA_TF_NETWORK_TARGET, jax.ffi.pycapsule(library.ScacchiKataTfNetwork), platform="CUDA", api_version=1)
+    return KATA_TF_NETWORK_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_kata_tf_compact() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(KATA_TF_COMPACT_TARGET, jax.ffi.pycapsule(library.ScacchiKataTfNetworkCompact), platform="CUDA", api_version=1)
+    return KATA_TF_COMPACT_TARGET

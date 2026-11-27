@@ -1,0 +1,62 @@
+# Hex 10 with flat KataGo Transformer (aznet_kata_transformer, 4L C=192 FFN=512 H=6 D=32)
+# + 2-half 2-CTA/SM INT8 + FP8-FlashAttention megakernel, fast_search (subtree reuse, 512K PositionCache,
+# EVPI stopping, Q=9 backup), batched Muon + weight decay, and rot180 symmetry.
+# Usage: python -m scacchi.train --config-name hex10_katatf_fast
+
+defaults:
+  - hex10
+  - algorithm: binned
+  - _self_
+
+run:
+  max_num_iters: 150
+
+model:
+  network: aznet_kata_transformer
+  num_channels: 192
+  num_layers: 4
+  compute_dtype: bfloat16
+  fp8_training: false
+  canonicalize_hex_color: true
+  transformer_heads: 6
+  transformer_ffn_channels: 512
+  transformer_inner_blocks: 1
+  transformer_qk_norm: true
+
+selfplay:
+  batch_size: 2048
+  max_num_steps: 16
+  persistent_envs: true
+  search:
+    binned_thompson:
+      network_kernel: int8
+      search_kernel: fused
+      fast_search: true
+      subtree_reuse: true
+      position_cache: true
+      early_stop_prob: 0.96
+      early_stop_evpi: 0.005
+      min_stop_nodes: 10
+
+training:
+  batch_size: 1024
+  muon_weight_decay: 0.02
+  lazy_minibatches: true
+  last_step_diagnostics_only: true
+  symmetry_rot180: true
+  symmetry_epochs: 2
+
+eval:
+  interval: 10
+  batch_size: 512
+  stratified_hex: true
+
+checkpointing:
+  max_to_keep: 1
+  save_interval_steps: 50
+  directory: checkpoints/hex10_katatf_fast_seed0
+
+logging:
+  jsonl_path: outputs/hex10_katatf_fast/history.jsonl
+  wandb:
+    enabled: true

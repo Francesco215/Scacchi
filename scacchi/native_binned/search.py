@@ -1,29 +1,69 @@
-"""Binned Thompson search on Hex with one fused CUDA kernel per simulation.
-
-``fused_search`` returns the same tree as ``dirichlet_mctx.search.search`` with
-``binned_search.action_selection`` and ``binned_search.update_posterior``
-(``kernel="cuda"``): same keys, same draws, same arithmetic. Between two
-kernel calls the network evaluates the leaves (XLA, unchanged); each call
-writes the evaluated leaves into the tree, repairs every lane's path to the
-root, then descends the next simulation and plays its Hex move, every lane on
-its own (``search.cu``).
-
-Hex only (pgx ``hex``; at most 127 cells), binary outcomes, CUDA GPUs.
-"""
+"""Binned Thompson search on Hex: bitwise-reference fused step and stateful fast megakernel."""
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from ..dirichlet_mctx.base import RootFnOutput
-from ..dirichlet_mctx.tree import Tree, instantiate_tree_from_root
-from . import _quadrature
+from ..dirichlet_mctx.tree import SearchSummary, Tree, instantiate_tree_from_root
+from . import _fast_quadrature, _quadrature
+from .inkling import PackedInkling, apply_inkling_compact
+from .kata_tf import PackedKataTf, apply_kata_tf_compact
+from .network import PackedNetwork, PositionCache, apply_compact
 
 PEND = 8
 FINISH = 1
 DESCEND = 2
+F_SUBTREE_INIT = 4
+F_ROOT_FINISH = 8
+F_READOUT = 16
+
+
+class FastTreeCarry(NamedTuple):
+    """Persistent per-lane tree state carried across consecutive moves of a rollout."""
+
+    parents: jax.Array       # [B, N] i32
+    children: jax.Array      # [B, N, A] i32
+    to_play: jax.Array       # [B, N] i32
+    node_out: jax.Array      # [B, N] i8
+    node_pay: jax.Array      # [B, N] i32
+    edge_out: jax.Array      # [B, N, A] i8
+    edge_pay: jax.Array      # [B, N, A] i32
+    vprior: jax.Array        # [B, N, K] f32
+    valpha: jax.Array        # [B, N, K] f32
+    ealpha: jax.Array        # [B, N, A, K] f32
+    invalid: jax.Array       # [B, N, A] bool
+    boards: jax.Array        # [B, N, C] i8
+    steps: jax.Array         # [B, N] i32
+    pending: jax.Array       # [B, 8] i32
+    prev_actions: jax.Array  # [B] i32 (-1 before first move)
+    was_reset: jax.Array     # [B] bool (True before first move or after game termination)
+
+
+def empty_fast_tree_carry(batch: int, num_simulations: int, num_actions: int, atoms: int, cells: int) -> FastTreeCarry:
+    nodes = num_simulations + 1
+    return FastTreeCarry(
+        parents=jnp.full((batch, nodes), -1, jnp.int32),
+        children=jnp.full((batch, nodes, num_actions), -1, jnp.int32),
+        to_play=jnp.zeros((batch, nodes), jnp.int32),
+        node_out=jnp.full((batch, nodes), -1, jnp.int8),
+        node_pay=jnp.zeros((batch, nodes), jnp.int32),
+        edge_out=jnp.full((batch, nodes, num_actions), -1, jnp.int8),
+        edge_pay=jnp.zeros((batch, nodes, num_actions), jnp.int32),
+        vprior=jnp.zeros((batch, nodes, atoms), jnp.float32),
+        valpha=jnp.zeros((batch, nodes, atoms), jnp.float32),
+        ealpha=jnp.zeros((batch, nodes, num_actions, atoms), jnp.float32),
+        invalid=jnp.ones((batch, nodes, num_actions), jnp.bool_),
+        boards=jnp.zeros((batch, nodes, cells), jnp.int8),
+        steps=jnp.zeros((batch, nodes), jnp.int32),
+        pending=jnp.zeros((batch, PEND), jnp.int32),
+        prev_actions=jnp.full((batch,), -1, jnp.int32),
+        was_reset=jnp.ones((batch,), jnp.bool_),
+    )
 
 
 def _key_data(keys: jax.Array) -> jax.Array:
@@ -67,22 +107,7 @@ def _cohort(tree: Tree, lanes: slice) -> Tree:
 
 def fused_search(evaluator, state, root: RootFnOutput, rng_key: jax.Array, *, points, num_simulations: int,
                  max_depth: int | None = None, cohorts: int = 1) -> Tree:
-    """The binned search tree after ``num_simulations`` simulations from ``state``.
-
-    ``state`` is the batched pgx Hex state at the root and ``root`` its network
-    evaluation (``embedding`` is not used). ``evaluator(observation)`` must
-    return ``alpha_v`` [B, K] and ``alpha_q`` [B, A, K] like
-    ``play_search.make_evaluator``.
-
-    With ``cohorts=2`` the lanes are split in two halves that are one phase
-    apart: while the network evaluates one half's leaves, the kernel finishes
-    and descends the other half, and XLA can run the two at the same time
-    (with ``--xla_gpu_command_buffer_scheduling_mode=CONCURRENT``). The tree of
-    a lane is then the same as with ``cohorts=1`` as long as the network gives
-    a position the same bits at half the batch size. cuDNN picks its
-    convolution algorithm per shape: at 4096 lanes this held on Hex 7 and 9
-    but not on Hex 8 and 11 (outputs differ by ~1e-6), nor at 512 lanes.
-    """
+    """Bitwise-identical reference fused search step."""
     if max_depth is None:
         max_depth = num_simulations
     tree = instantiate_tree_from_root(root.replace(embedding=()), num_simulations, ~state.legal_action_mask)
@@ -105,8 +130,6 @@ def fused_search(evaluator, state, root: RootFnOutput, rng_key: jax.Array, *, po
     def evaluate(observation, carry, after=None):
         active = carry[3][:, 2] != 0
         if after is not None:
-            # One network at a time: this cohort's evaluation waits for the
-            # previous one, so the step kernel beside it has the other half.
             observation, active, _ = jax.lax.optimization_barrier((observation, active, after))
 
         def run(_):
@@ -126,16 +149,12 @@ def fused_search(evaluator, state, root: RootFnOutput, rng_key: jax.Array, *, po
     def lane_keys(simulate_key, c):
         return jax.random.split(simulate_key, batch)[parts[c]]
 
-    # Same key chain as dirichlet_mctx.search.search: four keys per simulation,
-    # the second split into one key per lane for the descent.
     carries = [(_cohort(tree, part), boards[part], steps[part], pending[part]) for part in parts]
     key, simulate_key, _, _ = jax.random.split(rng_key, 4)
     observations = []
     for c in range(cohorts):
         carries[c], obs = step(c, carries[c], (no_value, no_q), lane_keys(simulate_key, c), 0, DESCEND)
         observations.append(obs)
-    # Software pipeline: cohort c is finished and descended while the network
-    # evaluates cohort c + 1, which is one phase behind.
     net0 = evaluate(observations[0], carries[0])
 
     def body(index, loop):
@@ -165,3 +184,177 @@ def fused_search(evaluator, state, root: RootFnOutput, rng_key: jax.Array, *, po
     if cohorts == 1:
         return carries[0][0]
     return jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *(carry[0] for carry in carries))
+
+
+def fused_fast_search(
+    packed: PackedNetwork | PackedInkling,
+    state,
+    rng_key: jax.Array,
+    *,
+    points,
+    num_simulations: int,
+    max_depth: int | None = None,
+    tree_carry: FastTreeCarry | None = None,
+    cache: PositionCache,
+    lane_caps: jax.Array | None = None,
+    subtree_reuse: bool = True,
+    use_cache: bool = True,
+    early_stop_prob: float = 0.96,
+    early_stop_evpi: float = 0.0,
+    min_stop_nodes: int = 10,
+    support_search_evidence: bool = True,
+    policy_target_temperature: float = 1.0,
+    layers_per_block: int = 2,
+) -> tuple[SearchSummary, jax.Array, jax.Array, FastTreeCarry, PositionCache]:
+    """Full megakernel search step: subtree reuse + dynamic compaction + board-resident INT8 + fused readout."""
+    from ..dirichlet_q_search import terminal_outcome_from_reward
+    from ._library import FAST_SEARCH_TARGET, register_fast_search
+
+    register_fast_search()
+    if max_depth is None:
+        max_depth = num_simulations
+
+    batch = state.current_player.shape[0]
+    cells = state._x.board.shape[-1]
+    size = int(round(cells ** 0.5))
+    actions = cells + 1
+    atoms = int(points.shape[-1])
+    nodes = num_simulations + 1
+
+    if tree_carry is None or not subtree_reuse:
+        tree_carry = empty_fast_tree_carry(batch, num_simulations, actions, atoms, cells)
+
+    if lane_caps is None:
+        lane_caps = jnp.full((batch,), nodes, jnp.int32)
+    else:
+        lane_caps = lane_caps.astype(jnp.int32)
+
+    quad_nodes, quad_weights = _fast_quadrature(actions)
+    reward = state.rewards[jnp.arange(batch), state.current_player]
+    root_term_out = jnp.where(state.terminated, terminal_outcome_from_reward(reward, 2), jnp.int8(-1))
+    root_boards = state._x.board.astype(jnp.int8)
+    root_steps = state._x.step_count.astype(jnp.int32)
+    root_to_play = state.current_player.astype(jnp.int32)
+    root_invalid = ~state.legal_action_mask
+    root_obs = state.observation.astype(jnp.bool_)
+    order = state._player_order.astype(jnp.int32)
+    reset_mask = tree_carry.was_reset if subtree_reuse else jnp.ones((batch,), jnp.bool_)
+    prev_actions = tree_carry.prev_actions if subtree_reuse else jnp.full((batch,), -1, jnp.int32)
+
+    tree_arrays = (
+        tree_carry.parents, tree_carry.children, tree_carry.to_play, tree_carry.node_out,
+        tree_carry.node_pay, tree_carry.edge_out, tree_carry.edge_pay, tree_carry.vprior,
+        tree_carry.valpha, tree_carry.ealpha, tree_carry.invalid, tree_carry.boards,
+        tree_carry.steps, tree_carry.pending,
+    )
+    tree_specs = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in tree_arrays]
+    extra_specs = [
+        jax.ShapeDtypeStruct((batch, size, size, 4), jnp.bool_),   # obs_compact
+        jax.ShapeDtypeStruct((1,), jnp.int32),                     # d_num_active
+        jax.ShapeDtypeStruct((batch, 10), jnp.uint32),             # miss_keys (40B/entry = CacheKey)
+        jax.ShapeDtypeStruct((batch, actions), jnp.float32),       # out_policy
+        jax.ShapeDtypeStruct((batch, actions, atoms), jnp.float32),# out_qalpha
+        jax.ShapeDtypeStruct((batch, atoms), jnp.float32),         # out_valpha
+        jax.ShapeDtypeStruct((batch, actions), jnp.float32),       # out_visits
+        jax.ShapeDtypeStruct((batch, actions), jnp.int8),          # out_q_cat_out
+        jax.ShapeDtypeStruct((batch, actions), jnp.int32),         # out_q_cat_dist
+        jax.ShapeDtypeStruct((batch,), jnp.int8),                  # out_v_cat_out
+        jax.ShapeDtypeStruct((batch,), jnp.int32),                 # out_v_cat_dist
+        jax.ShapeDtypeStruct((batch,), jnp.int32),                 # out_search_action
+        jax.ShapeDtypeStruct(cache.locks.shape, cache.locks.dtype),# r_cache_locks (alias arg 31 -> out 26)
+    ]
+    aliases = {i: i for i in range(14)}
+    aliases[31] = 26
+    call = jax.ffi.ffi_call(
+        FAST_SEARCH_TARGET,
+        [*tree_specs, *extra_specs],
+        input_output_aliases=aliases,
+    )
+
+    no_v = jnp.zeros((batch, atoms), jnp.float32)
+    no_q = jnp.zeros((batch, actions, atoms), jnp.float32)
+    no_keys = jnp.zeros((batch, 2), jnp.uint32)
+    pts_arr = jnp.asarray(points, jnp.float32)
+    qn_arr = jnp.asarray(quad_nodes, jnp.float32)
+    qw_arr = jnp.asarray(quad_weights, jnp.float32)
+
+    def invoke(ta, net_v, net_q, keys_u32, cache_obj: PositionCache, flags: int):
+        next_wave = cache_obj.wave + jnp.uint32(1) if (flags & (F_SUBTREE_INIT | DESCEND)) else cache_obj.wave
+        out = call(
+            *ta,
+            net_v, net_q, keys_u32, order, pts_arr, qn_arr, qw_arr,
+            prev_actions, reset_mask, root_boards, root_steps, root_to_play, root_term_out,
+            root_invalid, root_obs, lane_caps,
+            cache_obj.keys, cache_obj.locks, cache_obj.v, cache_obj.q, next_wave,
+            max_depth=np.int64(max_depth),
+            flags=np.int64(flags),
+            min_stop_nodes=np.int64(min_stop_nodes),
+            use_cache=np.int64(1 if use_cache else 0),
+            support_search_evidence=np.int64(1 if support_search_evidence else 0),
+            early_stop_prob=float(early_stop_prob),
+            early_stop_evpi=float(early_stop_evpi),
+            policy_temp=float(policy_target_temperature),
+        )
+        next_cache = cache_obj._replace(locks=out[26], wave=next_wave)
+        return tuple(out[:14]), out[14], out[15], out[16], out[17:26], next_cache
+
+    def eval_compact(obs_c, d_active, miss_k, cache_obj: PositionCache, *, small_hint: bool):
+        if isinstance(packed, PackedInkling):
+            return apply_inkling_compact(
+                packed, obs_c, d_active, miss_k, cache_obj, actions, atoms,
+                layers_per_block=layers_per_block, use_cache=use_cache,
+            )
+        if isinstance(packed, PackedKataTf):
+            return apply_kata_tf_compact(
+                packed, obs_c, d_active, miss_k, cache_obj, actions, atoms,
+                use_cache=use_cache,
+            )
+        return apply_compact(
+            packed, obs_c, d_active, miss_k, cache_obj, actions, atoms,
+            use_cache=use_cache, small_hint=small_hint,
+        )
+
+    search_key, tie_key = jax.random.split(rng_key)
+    tie_keys_u32 = _key_data(jax.random.split(tie_key, batch))
+
+    # 1. Subtree reuse / cold root compaction + compact root network eval (only reset lanes!)
+    ta, obs_c, d_active, miss_k, _, cache = invoke(tree_arrays, no_v, no_q, no_keys, cache, F_SUBTREE_INIT)
+    net_v, net_q, cache = eval_compact(obs_c, d_active, miss_k, cache, small_hint=subtree_reuse)
+
+    if num_simulations == 0:
+        ta, _, _, _, ro, cache = invoke(ta, net_v, net_q, tie_keys_u32, cache, F_ROOT_FINISH | F_READOUT)
+    else:
+        key, sim0_key = jax.random.split(search_key)
+        sim0_u32 = _key_data(jax.random.split(sim0_key, batch))
+        ta, obs_c, d_active, miss_k, _, cache = invoke(ta, net_v, net_q, sim0_u32, cache, F_ROOT_FINISH | DESCEND)
+        net_v, net_q, cache = eval_compact(obs_c, d_active, miss_k, cache, small_hint=False)
+
+        def loop_body(_, carry):
+            key, ta, net_v, net_q, cache_c = carry
+            key, sim_key = jax.random.split(key)
+            sim_u32 = _key_data(jax.random.split(sim_key, batch))
+            ta, obs_c, d_active, miss_k, _, cache_c = invoke(ta, net_v, net_q, sim_u32, cache_c, FINISH | DESCEND)
+            net_v, net_q, cache_c = eval_compact(obs_c, d_active, miss_k, cache_c, small_hint=False)
+            return key, ta, net_v, net_q, cache_c
+
+        if num_simulations > 1:
+            _, ta, net_v, net_q, cache = jax.lax.fori_loop(1, num_simulations, loop_body, (key, ta, net_v, net_q, cache))
+
+        ta, _, _, _, ro, cache = invoke(ta, net_v, net_q, tie_keys_u32, cache, FINISH | F_READOUT)
+
+    policy, qalpha, valpha, visits, q_cat_out, q_cat_dist, v_cat_out, v_cat_dist, search_action = ro
+    summary = SearchSummary(
+        visit_counts=visits,
+        alpha=qalpha,
+        value_alpha=valpha,
+        q_categorical_outcome=q_cat_out,
+        q_categorical_distance=q_cat_dist,
+        v_categorical_outcome=v_cat_out,
+        v_categorical_distance=v_cat_dist,
+    )
+    next_carry = FastTreeCarry(
+        *ta,
+        prev_actions=tree_carry.prev_actions,
+        was_reset=tree_carry.was_reset,
+    )
+    return summary, policy, search_action, next_carry, cache

@@ -259,7 +259,18 @@ def make_compute_input_for_lossfn(
             )
             return values[::-1]
 
-        value_tgt = jax.vmap(trajectory_value_targets)(source.reward, source.discount)
+        loss_mask_mode = config.training.losses.loss_mask_mode
+        need_value_tgt = (
+            not getattr(config.training, "last_step_diagnostics_only", False)
+            or config.training.losses.policy_target_mode == "winner_action"
+            or config.training.losses.value_outcome_weight != 0.0
+            or config.training.losses.q_outcome_weight != 0.0
+        )
+        value_tgt = (
+            jax.vmap(trajectory_value_targets)(source.reward, source.discount)
+            if need_value_tgt
+            else jnp.zeros_like(source.reward)
+        )
         policy_tgt = jnp.asarray(policy)
         policy_loss_mask = legal_policy_mask & search_loss_mask
         value_loss_mask = search_loss_mask
@@ -339,6 +350,12 @@ def make_compute_input_for_lossfn(
                 "loss native_targets after terminal_parent_targets",
                 native_targets,
             )
+
+        if getattr(config.training, "lazy_minibatches", False):
+            policy_tgt = policy_tgt.astype(jnp.bfloat16)
+            beta_q_target = beta_q_target.astype(jnp.bfloat16)
+            beta_v_target = beta_v_target.astype(jnp.bfloat16)
+            q_pair_weight = q_pair_weight.astype(jnp.bfloat16)
 
         sample = Sample(
             obs=source.obs,
@@ -824,9 +841,12 @@ def _compute_dirichlet_losses(
     policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
     value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
     search_loss_mask = _mask_or(data.search_loss_mask, policy_loss_mask)
-    policy_loss = optax.softmax_cross_entropy(logits, data.policy_tgt, where=data.policy_mask)
+    policy_tgt_f32 = data.policy_tgt.astype(logits.dtype)
+    beta_v_f32 = data.beta_V_target.astype(alpha_v.dtype)
+    beta_q_f32 = data.beta_Q_target.astype(alpha_q.dtype)
+    policy_loss = optax.softmax_cross_entropy(logits, policy_tgt_f32, where=data.policy_mask)
     policy_loss = _masked_mean(policy_loss, policy_loss_mask)
-    policy_target_entropy = _categorical_entropy_from_probs(data.policy_tgt, data.policy_mask)
+    policy_target_entropy = _categorical_entropy_from_probs(policy_tgt_f32, data.policy_mask)
     policy_target_entropy = _masked_mean(policy_target_entropy, policy_loss_mask)
     policy_kl_hat = jax.lax.stop_gradient(policy_loss - policy_target_entropy)
 
@@ -840,7 +860,7 @@ def _compute_dirichlet_losses(
         return _native_dirichlet_loss(beta, alpha, kind, outcome, weight, categorical_reference_concentration, dirichlet_loss_mode)
 
     value_dir_kl = native_loss(
-        data.beta_V_target,
+        beta_v_f32,
         alpha_v,
         native_fields["v_target_kind"],
         native_fields["v_target_outcome"],
@@ -853,7 +873,7 @@ def _compute_dirichlet_losses(
     )
 
     q_dir_kl = native_loss(
-        data.beta_Q_target,
+        beta_q_f32,
         alpha_q,
         native_fields["q_target_kind"],
         native_fields["q_target_outcome"],
@@ -938,8 +958,8 @@ def _compute_dirichlet_losses(
     histograms = []
     belief_metrics = {}
     for head, alpha, beta, kind, mask in (
-        ("V", alpha_v, data.beta_V_target, native_fields["v_target_kind"], value_loss_mask),
-        ("Q", alpha_q, data.beta_Q_target, native_fields["q_target_kind"], q_supervised_pair_mask),
+        ("V", alpha_v, beta_v_f32, native_fields["v_target_kind"], value_loss_mask),
+        ("Q", alpha_q, beta_q_f32, native_fields["q_target_kind"], q_supervised_pair_mask),
     ):
         if bin_support is not None:
             entropy = -jnp.sum(alpha * jnp.log(jnp.maximum(alpha, jnp.finfo(alpha.dtype).tiny)), axis=-1)
@@ -1081,3 +1101,63 @@ def train(model: Any, optimizer: nnx.Optimizer, data: Sample, config):
     )(model)
     optimizer.update(model, grads)
     return metrics
+
+
+def train_binned_fast(
+    model: Any,
+    optimizer: nnx.Optimizer,
+    data: Sample,
+    config,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Lightweight gradient step for AZBinnedNet without per-step diagnostic reductions."""
+
+    def loss_fn(model: Any):
+        output = model(data.obs, train=True)
+        logits, alpha_v, alpha_q = output.logits, output.value_probs, output.action_probs
+        policy_loss_mask = _mask_or(data.policy_loss_mask, data.value_mask)
+        value_loss_mask = _mask_or(data.value_loss_mask, data.value_mask)
+        search_loss_mask = _mask_or(data.search_loss_mask, policy_loss_mask)
+
+        policy_loss = optax.softmax_cross_entropy(
+            logits, data.policy_tgt.astype(logits.dtype), where=data.policy_mask
+        )
+        policy_loss = _masked_mean(policy_loss, policy_loss_mask)
+
+        v_kind = data.v_target_kind
+        v_loss = _native_binned_loss(
+            data.beta_V_target.astype(alpha_v.dtype),
+            alpha_v,
+            v_kind,
+            data.v_target_outcome,
+            data.v_target_weight,
+        )
+        v_loss = _native_masked_mean(v_loss, value_loss_mask, v_kind)
+
+        q_kind = data.q_target_kind
+        q_loss_raw = _native_binned_loss(
+            data.beta_Q_target.astype(alpha_q.dtype),
+            alpha_q,
+            q_kind,
+            data.q_target_outcome,
+            data.q_target_weight,
+        )
+        q_row_mask = value_loss_mask if config.training.losses.loss_mask_mode == "value" else search_loss_mask
+        q_pair_mask = data.q_supervised_pair_mask & data.policy_mask & q_row_mask[..., None]
+        if config.training.losses.q_supervision.reduction == "mean_over_selected_state_action_pairs":
+            q_loss = _native_masked_mean(q_loss_raw, q_pair_mask, q_kind)
+        else:
+            q_dir_kl_mask = _native_loss_mask(q_loss_raw, q_pair_mask, q_kind)
+            weights = jnp.where(q_dir_kl_mask, data.q_pair_weight.astype(q_loss_raw.dtype), 0.0)
+            safe_q = jnp.where(q_dir_kl_mask, jnp.nan_to_num(q_loss_raw), 0.0)
+            q_loss = jnp.sum(weights * safe_q) / jnp.maximum(jnp.sum(weights), jnp.finfo(q_loss_raw.dtype).eps)
+
+        total = (
+            _weighted_loss_term(config.training.losses.policy_weight, policy_loss)
+            + _weighted_loss_term(config.training.losses.value_dir_kl_weight, v_loss)
+            + _weighted_loss_term(config.training.losses.q_dir_kl_weight, q_loss)
+        )
+        return total, (policy_loss, v_loss, q_loss)
+
+    (_, losses), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    optimizer.update(model, grads)
+    return losses

@@ -823,11 +823,23 @@ def make_search_player(
 ):
     evaluator = make_evaluator(model)
     if search_cfg.kind == SearchKind.binned_thompson and search_cfg.binned_thompson.network_kernel != "xla":
+        from .native_binned.inkling import make_inkling_evaluator, supports_inkling
+        from .native_binned.kata_tf import make_kata_tf_evaluator, supports_kata_tf
         from .native_binned.network import make_native_evaluator, supports
 
-        if not supports(model):
-            raise ValueError("network_kernel=cuda/fp8/int8 needs AZBinnedNet with 128 channels and 6 ResNet-v2 blocks")
-        evaluator = make_native_evaluator(model, search_cfg.binned_thompson.network_kernel)
+        nk = search_cfg.binned_thompson.network_kernel
+        if supports(model):
+            evaluator = make_native_evaluator(model, nk)
+        elif supports_inkling(model) and nk in ("cuda", "int8"):
+            evaluator = make_inkling_evaluator(model, nk)
+        elif supports_kata_tf(model) and nk == "int8":
+            evaluator = make_kata_tf_evaluator(model, nk)
+        else:
+            raise ValueError(
+                "network_kernel=cuda/fp8/int8 needs AZBinnedNet (128ch, 6 blocks), "
+                "flat AZKataTransformerBinnedNet (192ch, H=6, D=32; int8), "
+                "or unlooped AZInklingBinnedNet (192ch, H=6, KV=2, D=32; cuda/int8)"
+            )
     search = make_search(
         env,
         evaluator,

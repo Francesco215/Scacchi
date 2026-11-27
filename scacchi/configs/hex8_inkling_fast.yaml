@@ -1,0 +1,63 @@
+# Hex 8 with unlooped Inkling-2 Mini (aznet_inkling) + custom Tensor Core INT8 CUDA kernel,
+# fast_search (subtree reuse, 512K bf16 wave-tagged PositionCache, EVPI stopping, Q=9 backup),
+# batched Muon + weight decay, and rot180 symmetry.
+# Usage: python -m scacchi.train --config-name hex8_inkling_fast
+
+defaults:
+  - hex8
+  - algorithm: binned
+  - _self_
+
+run:
+  max_num_iters: 100
+
+model:
+  network: aznet_inkling
+  num_channels: 192
+  num_layers: 4
+  compute_dtype: bfloat16
+  fp8_training: false
+  canonicalize_hex_color: true
+  transformer_heads: 6
+  transformer_ffn_channels: 512
+  inkling_kv_heads: 2
+  inkling_passes: 1
+  inkling_layers_per_block: 2
+
+selfplay:
+  batch_size: 2048
+  max_num_steps: 16
+  persistent_envs: true
+  search:
+    binned_thompson:
+      network_kernel: int8
+      search_kernel: fused
+      fast_search: true
+      subtree_reuse: true
+      position_cache: true
+      early_stop_prob: 0.96
+      early_stop_evpi: 0.005
+      min_stop_nodes: 10
+
+training:
+  batch_size: 1024
+  muon_weight_decay: 0.02
+  lazy_minibatches: true
+  last_step_diagnostics_only: true
+  symmetry_rot180: true
+  symmetry_epochs: 2
+
+eval:
+  interval: 10
+  batch_size: 512
+  stratified_hex: true
+
+checkpointing:
+  max_to_keep: 1
+  save_interval_steps: 50
+  directory: checkpoints/hex8_inkling_fast_seed0
+
+logging:
+  jsonl_path: outputs/hex8_inkling_fast/history.jsonl
+  wandb:
+    enabled: true

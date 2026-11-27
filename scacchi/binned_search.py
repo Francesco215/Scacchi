@@ -104,12 +104,61 @@ def resolve_search_kernel(kernel: str, env, atoms: int) -> str:
 
 def make_binned_search(env, evaluator, config, q_supervision_config):
     from .play_search import _normalize_policy_on_support, _root_policy_support, targets_from_summary
+    from .types import RootPolicySupport
 
     expand = make_dirichlet_expand_fn(env, evaluator, num_outcomes=2)
     if config.search_kernel == "fused":
         resolve_search_kernel("fused", env, 9)  # fail at construction, not at the first trace
 
+    from .native_binned.inkling import PackedInkling
+    from .native_binned.kata_tf import PackedKataTf
+
+    use_fast = (
+        bool(getattr(config, "fast_search", False))
+        and getattr(env, "id", None) == "hex"
+        and (
+            getattr(evaluator, "kernel", None) == "int8"
+            or (
+                isinstance(getattr(evaluator, "packed", None), (PackedInkling, PackedKataTf))
+                and getattr(evaluator, "kernel", None) in ("int8", "cuda")
+            )
+        )
+        and hasattr(evaluator, "packed")
+        and hasattr(evaluator, "support")
+        and env.num_actions <= 128
+        and _kernels_available()
+    )
+
     def search(state, key):
+        if use_fast:
+            from .native_binned.network import empty_position_cache
+            from .native_binned.search import fused_fast_search
+
+            support_pts = evaluator.support
+            atoms = int(support_pts.shape[-1])
+            cache = empty_position_cache(env.num_actions, atoms, enabled=config.position_cache)
+            summary, policy, action, _, _ = fused_fast_search(
+                evaluator.packed,
+                state,
+                key,
+                points=support_pts,
+                num_simulations=config.num_simulations,
+                max_depth=config.max_depth,
+                tree_carry=None,
+                cache=cache,
+                subtree_reuse=False,
+                use_cache=config.position_cache,
+                early_stop_prob=config.early_stop_prob,
+                early_stop_evpi=float(getattr(config, "early_stop_evpi", 0.0)),
+                min_stop_nodes=config.min_stop_nodes,
+                support_search_evidence=(config.root_policy_support == RootPolicySupport.search_evidence),
+                policy_target_temperature=config.policy_target_temperature,
+                layers_per_block=int(getattr(evaluator, "layers_per_block", 2)),
+            )
+            return targets_from_summary(
+                summary, policy, action, state.legal_action_mask, q_supervision_config, unresolved_kind=TARGET_BINNED
+            )
+
         prediction = evaluator(state.observation)
         kernel = resolve_search_kernel(config.search_kernel, env, prediction.support.shape[-1])
         fused = kernel == "fused"

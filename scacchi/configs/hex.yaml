@@ -59,7 +59,7 @@ training:
       action_set: positive_search_evidence_or_solved
       reduction: mean_over_selected_state_action_pairs
     dirichlet_loss_mode: full
-    loss_mask_mode: value
+    loss_mask_mode: search
     terminal_edge_targets: true
     terminal_parent_targets: true
     policy_target_mode: search

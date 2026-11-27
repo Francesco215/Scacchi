@@ -194,12 +194,13 @@ inline I8Plan i8_plan(int boards, int side, int sms) {
 // inverse steps qinv[128]; without out_zq the output is bf16 (out_z).
 __global__ void __launch_bounds__(I8_THREADS, 2) conv3x3_int8_kernel(
     const uint8_t* __restrict__ in, const int8_t* __restrict__ w, ConvShape sh, Epilogue ep,
-    const float* __restrict__ qinv, int G) {
+    const float* __restrict__ qinv, int G, const int32_t* __restrict__ d_boards = nullptr) {
   extern __shared__ __align__(128) char smem[];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int wm = warp >> 1, wn = warp & 1;
   const int S = sh.side, cells = sh.cells;
-  const int boards = sh.rows / cells;
+  const int boards = d_boards ? *d_boards : (sh.rows / cells);
+  if (boards <= 0) return;
   const int cap = G * cells;  // slot `cap` is the row of zeros
   const uint32_t z_u32 = smem_u32(smem);
   const uint32_t w_u32 = z_u32 + (cap + 1) * CH;
