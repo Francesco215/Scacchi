@@ -405,6 +405,7 @@ class BinnedThompsonSearchConfig:
     subtree_reuse: bool = True
     position_cache: bool = True
     early_stop_prob: float = 0.96
+    early_stop_evpi: float = 0.0
     min_stop_nodes: int = 10
     playout_cap_prob: float = 1.0
     fast_simulations: int = 8
@@ -420,6 +421,8 @@ class BinnedThompsonSearchConfig:
         _require_gt("search.binned_thompson.policy_target_temperature", self.policy_target_temperature, 0.0)
         if not (0.0 <= float(self.early_stop_prob) <= 1.0):
             raise ValueError("search.binned_thompson.early_stop_prob must be in [0, 1]")
+        if not (0.0 <= float(self.early_stop_evpi) <= 1.0):
+            raise ValueError("search.binned_thompson.early_stop_evpi must be in [0, 1]")
         if not (0.0 < float(self.playout_cap_prob) <= 1.0):
             raise ValueError("search.binned_thompson.playout_cap_prob must be in (0, 1]")
         if self.network_kernel not in {"xla", "cuda", "fp8", "int8", "int8_14"}:
@@ -449,6 +452,9 @@ class ActionCommitmentConfig:
     # None reuses the updater selected by Dirichlet Thompson search.
     posterior_update: PosteriorUpdateKind | None = None
     posterior_sample_temperature: float = 1.0
+    # Optional ply-annealed sampling temperature (applied when step_count >= posterior_sample_temp_ply).
+    posterior_sample_temp_late: float | None = None
+    posterior_sample_temp_ply: int = 6
 
     def __post_init__(self) -> None:
         if (
@@ -460,6 +466,16 @@ class ActionCommitmentConfig:
                 "finite and > 0; got "
                 f"{self.posterior_sample_temperature}."
             )
+        if self.posterior_sample_temp_late is not None:
+            if (
+                not math.isfinite(self.posterior_sample_temp_late)
+                or self.posterior_sample_temp_late <= 0.0
+            ):
+                raise ValueError(
+                    "action_commitment.posterior_sample_temp_late must be "
+                    f"finite and > 0; got {self.posterior_sample_temp_late}."
+                )
+        _require_ge("action_commitment.posterior_sample_temp_ply", self.posterior_sample_temp_ply, 0)
 
 
 @dataclass

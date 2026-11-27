@@ -33,12 +33,159 @@ def _muon_weight_dimension_numbers(params: Any) -> Any:
     return jax.tree_util.tree_map_with_path(dimension_numbers, params)
 
 
+def _batched_scale_by_muon(
+    *,
+    weight_dimension_numbers: Any,
+    ns_steps: int = 5,
+    beta: float = 0.95,
+    eps: float = 1e-8,
+    nesterov: bool = True,
+) -> optax.GradientTransformation:
+    """Drop-in replacement for optax.contrib.scale_by_muon with shape-grouped vmap Newton-Schulz.
+
+    Produces the exact same MuonState and orthogonalized updates (checkpoint-compatible with
+    optax.contrib.muon), while collapsing 12-32 sequential NS loops into 1-4 batched GPU calls.
+    """
+    from optax._src import numerics as _optax_numerics
+    from optax.contrib import _muon
+    from optax.transforms import _masking as _optax_masking
+
+    base_tx = _muon.scale_by_muon(
+        ns_steps=ns_steps,
+        beta=beta,
+        eps=eps,
+        nesterov=nesterov,
+        weight_dimension_numbers=weight_dimension_numbers,
+    )
+
+    def update_fn(updates, state, params=None):
+        del params
+        resolved = (
+            weight_dimension_numbers(updates)
+            if callable(weight_dimension_numbers)
+            else weight_dimension_numbers
+        )
+        mu = optax.tree.update_moment(updates, state.mu, beta, 1)
+        count_inc = _optax_numerics.safe_increment(state.count)
+        if nesterov:
+            mu_hat = jax.tree.map(
+                lambda m, g: beta * m + (1 - beta) * g,
+                optax.tree.bias_correction(mu, beta, _optax_numerics.safe_increment(count_inc)),
+                optax.tree.bias_correction(updates, beta, count_inc),
+            )
+        else:
+            mu_hat = optax.tree.bias_correction(mu, beta, count_inc)
+
+        leaves, treedef = jax.tree_util.tree_flatten(
+            mu_hat,
+            is_leaf=lambda x: isinstance(x, _optax_masking.MaskedNode),
+        )
+        dim_leaves, _ = jax.tree_util.tree_flatten(
+            resolved,
+            is_leaf=lambda x: x is None or _muon._is_weight_dim_nums(x) or isinstance(x, _optax_masking.MaskedNode),
+        )
+        assert len(leaves) == len(dim_leaves), f"muon tree mismatch: {len(leaves)} vs {len(dim_leaves)}"
+        out_leaves: list[Any] = list(leaves)
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for idx, (leaf, dn) in enumerate(zip(leaves, dim_leaves)):
+            if isinstance(leaf, _optax_masking.MaskedNode) or dn is None or isinstance(dn, _optax_masking.MaskedNode):
+                continue
+            key = (leaf.shape, leaf.dtype, dn.reduction_axis, dn.output_axis)
+            groups.setdefault(key, []).append(idx)
+
+        for idxs in groups.values():
+            dn = dim_leaves[idxs[0]]
+            if len(idxs) == 1:
+                i = idxs[0]
+                out_leaves[i] = _muon.orthogonalize_via_newton_schulz(
+                    leaves[i], state.ns_coeffs, ns_steps, "frobenius", eps, dn
+                )
+            else:
+                stacked = jnp.stack([leaves[i] for i in idxs], axis=0)
+                ortho = jax.vmap(
+                    lambda x: _muon.orthogonalize_via_newton_schulz(
+                        x, state.ns_coeffs, ns_steps, "frobenius", eps, dn
+                    )
+                )(stacked)
+                for k, i in enumerate(idxs):
+                    out_leaves[i] = ortho[k]
+
+        out_updates = jax.tree_util.tree_unflatten(treedef, out_leaves)
+        return out_updates, _muon.MuonState(count=count_inc, mu=mu, ns_coeffs=state.ns_coeffs)
+
+    return optax.GradientTransformation(base_tx.init, update_fn)
+
+
+def _batched_muon(
+    learning_rate: float | optax.Schedule,
+    *,
+    weight_decay: float,
+    adam_learning_rate: float | optax.Schedule,
+    muon_weight_dimension_numbers: Any,
+    consistent_rms: float = 0.2,
+) -> optax.GradientTransformation:
+    """optax.contrib.muon with shape-batched Newton-Schulz (exact state & math parity)."""
+    from optax.contrib import _muon
+    from optax.transforms import _masking as _optax_masking
+
+    def param_labels(params):
+        dim_nums = (
+            muon_weight_dimension_numbers(params)
+            if callable(muon_weight_dimension_numbers)
+            else muon_weight_dimension_numbers
+        )
+        return jax.tree.map(
+            lambda dim_num, x: jax.tree.map(lambda _: "muon" if dim_num is not None else "adam", x),
+            dim_nums,
+            params,
+            is_leaf=lambda x: x is None or _muon._is_weight_dim_nums(x),
+        )
+
+    def muon_dim_nums_fn(params):
+        dim_nums = (
+            muon_weight_dimension_numbers(params)
+            if callable(muon_weight_dimension_numbers)
+            else muon_weight_dimension_numbers
+        )
+        mask = jax.tree.map(lambda label: label == "muon", param_labels(params))
+        is_leaf = lambda x: (
+            x is None or _muon._is_weight_dim_nums(x) or isinstance(x, _optax_masking.MaskedNode)
+        )
+        return jax.tree.map(
+            lambda dn, submask: jax.tree.map(lambda m: dn if m else _optax_masking.MaskedNode(), submask),
+            dim_nums,
+            mask,
+            is_leaf=is_leaf,
+        )
+
+    return optax.partition(
+        transforms={
+            "muon": optax.chain(
+                _batched_scale_by_muon(weight_dimension_numbers=muon_dim_nums_fn),
+                _muon.scale_by_shape(
+                    weight_dimension_numbers=muon_dim_nums_fn,
+                    consistent_rms=consistent_rms,
+                ),
+                optax.add_decayed_weights(weight_decay),
+                optax.scale_by_learning_rate(learning_rate),
+            ),
+            "adam": optax.adamw(
+                learning_rate=adam_learning_rate,
+                weight_decay=0.0,
+                nesterov=True,
+            ),
+        },
+        param_labels=param_labels,
+    )
+
+
 def build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
     transforms: list[optax.GradientTransformation] = []
     if config.training.grad_clip_norm is not None:
         transforms.append(optax.clip_by_global_norm(config.training.grad_clip_norm))
 
     learning_rate: float | optax.Schedule = config.training.learning_rate
+    muon_lr: float | optax.Schedule = 5e-3
     if config.training.lr_decay_after_iters is not None and config.training.lr_decay_factor != 1.0:
         rows_per_iteration = max(1, config.selfplay.batch_size * config.selfplay.max_num_steps)
         updates_per_iteration = max(1, rows_per_iteration // config.training.batch_size)
@@ -48,10 +195,11 @@ def build_optimizer(model: nnx.Module, config: Config) -> nnx.Optimizer:
             updates_per_iteration = min(updates_per_iteration, config.training.max_updates_per_iter)
         boundary = config.training.lr_decay_after_iters * updates_per_iteration
         learning_rate = optax.piecewise_constant_schedule(config.training.learning_rate, {boundary: config.training.lr_decay_factor})
+        muon_lr = optax.piecewise_constant_schedule(5e-3, {boundary: config.training.lr_decay_factor})
 
     transforms.append(
-        optax.contrib.muon(
-            5e-3,
+        _batched_muon(
+            muon_lr,
             weight_decay=float(getattr(config.training, "muon_weight_decay", 0.0)),
             adam_learning_rate=learning_rate,
             muon_weight_dimension_numbers=_muon_weight_dimension_numbers,

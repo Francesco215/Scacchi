@@ -110,10 +110,18 @@ def make_binned_search(env, evaluator, config, q_supervision_config):
     if config.search_kernel == "fused":
         resolve_search_kernel("fused", env, 9)  # fail at construction, not at the first trace
 
+    from .native_binned.inkling import PackedInkling
+
     use_fast = (
         bool(getattr(config, "fast_search", False))
         and getattr(env, "id", None) == "hex"
-        and getattr(evaluator, "kernel", None) == "int8"
+        and (
+            getattr(evaluator, "kernel", None) == "int8"
+            or (
+                isinstance(getattr(evaluator, "packed", None), PackedInkling)
+                and getattr(evaluator, "kernel", None) in ("int8", "cuda")
+            )
+        )
         and hasattr(evaluator, "packed")
         and hasattr(evaluator, "support")
         and env.num_actions <= 128
@@ -140,9 +148,11 @@ def make_binned_search(env, evaluator, config, q_supervision_config):
                 subtree_reuse=False,
                 use_cache=config.position_cache,
                 early_stop_prob=config.early_stop_prob,
+                early_stop_evpi=float(getattr(config, "early_stop_evpi", 0.0)),
                 min_stop_nodes=config.min_stop_nodes,
                 support_search_evidence=(config.root_policy_support == RootPolicySupport.search_evidence),
                 policy_target_temperature=config.policy_target_temperature,
+                layers_per_block=int(getattr(evaluator, "layers_per_block", 2)),
             )
             return targets_from_summary(
                 summary, policy, action, state.legal_action_mask, q_supervision_config, unresolved_kind=TARGET_BINNED

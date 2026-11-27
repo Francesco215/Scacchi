@@ -328,22 +328,34 @@ def _play_training_fast_hex(
     max_num_steps: int,
     config: Any,
 ) -> tuple[Any, TrainingSamples]:
-    """Stateful Hex self-play rollout with subtree reuse, GPU position cache, and compact INT8 net."""
+    """Stateful Hex self-play rollout with subtree reuse, GPU position cache, and compact native net."""
     from . import binned
     from .dirichlet_mctx.native_targets import TARGET_BINNED
+    from .native_binned.inkling import pack_inkling, supports_inkling
     from .native_binned.network import empty_position_cache, pack, supports
     from .native_binned.search import empty_fast_tree_carry, fused_fast_search
     from .play_search import make_action_committer, targets_from_summary
     from .types import RootPolicySupport
 
-    if not supports(model):
-        raise ValueError("fast_search requires AZBinnedNet with 128 channels and 6 ResNet-v2 blocks")
-
     bt_cfg = config.selfplay.search.binned_thompson
     q_sup_cfg = config.training.losses.q_supervision
     action_committer = make_action_committer(config.selfplay.action_commitment, None)
 
-    packed = pack(model, "int8")
+    nk = bt_cfg.network_kernel
+    if supports(model):
+        if nk != "int8":
+            raise ValueError("fast_search for AZBinnedNet requires network_kernel='int8'")
+        packed = pack(model, "int8")
+        layers_per_block = 2
+    elif supports_inkling(model):
+        if nk not in ("int8", "cuda"):
+            raise ValueError("fast_search for AZInklingBinnedNet requires network_kernel in ('int8', 'cuda')")
+        packed, layers_per_block = pack_inkling(model, nk)
+    else:
+        raise ValueError(
+            "fast_search requires AZBinnedNet (128ch, 6 ResNet-v2 blocks) "
+            "or unlooped AZInklingBinnedNet (192ch, H=6, KV=2, D=32)"
+        )
     points = jnp.asarray(binned.support(model.bins), dtype=jnp.float32)
     atoms = int(model.bins.count)
     num_actions = int(env.num_actions)
@@ -386,9 +398,11 @@ def _play_training_fast_hex(
             subtree_reuse=bt_cfg.subtree_reuse,
             use_cache=bt_cfg.position_cache,
             early_stop_prob=bt_cfg.early_stop_prob,
+            early_stop_evpi=float(getattr(bt_cfg, "early_stop_evpi", 0.0)),
             min_stop_nodes=bt_cfg.min_stop_nodes,
             support_search_evidence=(bt_cfg.root_policy_support == RootPolicySupport.search_evidence),
             policy_target_temperature=bt_cfg.policy_target_temperature,
+            layers_per_block=layers_per_block,
         )
         posterior = targets_from_summary(
             summary, policy, search_action, legal_action_mask, q_sup_cfg, unresolved_kind=TARGET_BINNED
@@ -398,7 +412,23 @@ def _play_training_fast_hex(
             new_mask = full_mask if base_mask is None else (base_mask & full_mask)
             posterior = posterior._replace(metadata=posterior.metadata._replace(mask=new_mask))
 
-        played_action = action_committer(posterior, legal_action_mask, action_key)
+        ac_cfg = config.selfplay.action_commitment
+        if (
+            getattr(ac_cfg, "posterior_sample_temp_late", None) is not None
+            and str(ac_cfg.kind) == "posterior_sample"
+        ):
+            t_early = float(ac_cfg.posterior_sample_temperature)
+            t_late = float(ac_cfg.posterior_sample_temp_late)
+            t_ply = int(getattr(ac_cfg, "posterior_sample_temp_ply", 6))
+            step_cnt = st._x.step_count
+            temp_vec = jnp.where(step_cnt < t_ply, t_early, t_late).astype(jnp.float32)[:, None]
+            positive_legal = legal_action_mask & (posterior.prediction.policy > 0.0)
+            eligible = jnp.where(jnp.any(positive_legal, axis=-1, keepdims=True), positive_legal, legal_action_mask)
+            logits = jnp.log(jnp.clip(posterior.prediction.policy, 1e-8, 1.0)) / temp_vec
+            logits = jnp.where(eligible, logits, jnp.finfo(logits.dtype).min)
+            played_action = jax.random.categorical(action_key, logits).astype(jnp.int32)
+        else:
+            played_action = action_committer(posterior, legal_action_mask, action_key)
         actor = st.current_player
         reset_keys = jax.random.split(reset_key, batch_size)
         st_next = step_env(st, played_action, reset_keys)
@@ -458,7 +488,7 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
     use_fast_hex = (
         config.selfplay.search.kind == SearchKind.binned_thompson
         and bool(getattr(config.selfplay.search.binned_thompson, "fast_search", False))
-        and config.selfplay.search.binned_thompson.network_kernel == "int8"
+        and config.selfplay.search.binned_thompson.network_kernel in ("int8", "cuda")
         and getattr(env, "id", None) == "hex"
         and int(env.num_actions) <= 128
         and _kernels_available()
@@ -520,15 +550,20 @@ def make_selfplay(env, config, parallel: BatchParallel | None = None):
             rng_key, init_key = jax.random.split(rng_key)
             env_state = jax.vmap(env.init)(jax.random.split(init_key, local_batch_size))
         if use_fast_hex:
-            return _play_training_fast_hex(
-                env,
-                model,
-                env_state,
-                rng_key,
-                batch_size=local_batch_size,
-                max_num_steps=max_num_steps,
-                config=config,
-            )
+            from .native_binned.inkling import supports_inkling
+            from .native_binned.network import supports as supports_resnet
+
+            nk = config.selfplay.search.binned_thompson.network_kernel
+            if (supports_resnet(model) and nk == "int8") or (supports_inkling(model) and nk in ("int8", "cuda")):
+                return _play_training_fast_hex(
+                    env,
+                    model,
+                    env_state,
+                    rng_key,
+                    batch_size=local_batch_size,
+                    max_num_steps=max_num_steps,
+                    config=config,
+                )
         player = training_player(model)
         step_keys = jax.random.split(rng_key, max_num_steps)
         next_state, data = jax.lax.scan(

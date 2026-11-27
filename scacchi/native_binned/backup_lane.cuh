@@ -366,7 +366,7 @@ template <int KT, bool FAST = false>
 __device__ __forceinline__ float backup_lane(
     const Smem& S, const uint8_t* inv, const float* __restrict__ points,
     const float* __restrict__ nodes, const float* __restrict__ qweights,
-    float* o, const Dims& d, int lane) {
+    float* o, const Dims& d, int lane, float* out_evpi = nullptr) {
   const int K = KT > 0 ? KT : d.K;
   const int A = d.A, KS = d.KS;
   constexpr int UK = KT > 0 ? (KT > 16 ? 8 : KT) : 4;
@@ -374,6 +374,34 @@ __device__ __forceinline__ float backup_lane(
   PROF_MARK(0);
 
   const int nv = compute_policy_lane<KT, FAST>(S, inv, points, nodes, qweights, d, lane);
+  if constexpr (FAST) {
+    if (out_evpi) {
+      // Exact EVPI = E[max_a X_a] - max_a E[X_a], using S.bp + S.h (exact CDFs still intact in FAST mode).
+      float term = 0.f;
+      if (nv > 0) {
+        for (int i = lane; i < K - 1; i += 32) {
+          float cdf_prod = 1.f;
+          for (int v = 0; v < nv; ++v) {
+            const int a = S.vlist[v];
+            cdf_prod *= fminf(1.f, S.bp[a * KS + i] + S.h[a * KS + i]);
+          }
+          term -= (S.pts[i + 1] - S.pts[i]) * cdf_prod;
+        }
+      }
+      const float exp_max = nv > 0 ? (S.pts[K - 1] + warp_sum(term)) : 0.f;
+      float best_mean = -1e30f;
+      for (int v = lane; v < nv; v += 32) {
+        const float* hr = S.h + S.vlist[v] * KS;
+        float mu = 0.f;
+#pragma unroll UK
+        for (int k = 0; k < K; ++k) mu = fmaf(hr[k], S.pts[k], mu);
+        best_mean = fmaxf(best_mean, mu);
+      }
+#pragma unroll
+      for (int dd = 16; dd > 0; dd >>= 1) best_mean = fmaxf(best_mean, __shfl_xor_sync(FULL, best_mean, dd));
+      *out_evpi = nv > 0 ? fmaxf(0.f, exp_max - best_mean) : 0.f;
+    }
+  }
   PROF_MARK(3);
 
   // ---- stage 3: rank by decreasing weight, ties by action index -------------

@@ -10,7 +10,7 @@ import numpy as np
 
 CH = 128
 BLOCKS = 6
-CACHE_SLOTS = 65536
+CACHE_SLOTS = 524288
 
 KERNELS = {"cuda": 0, "fp8": 1, "int8": 2, "int8_14": 3}
 INT8_CLIP = 6.0
@@ -38,9 +38,10 @@ class PackedNetwork(NamedTuple):
 
 class PositionCache(NamedTuple):
     keys: jax.Array   # [CACHE_SLOTS, 10] uint32 (40 bytes/entry = CacheKey)
-    locks: jax.Array  # [CACHE_SLOTS] uint32
-    v: jax.Array      # [CACHE_SLOTS, K] float32
-    q: jax.Array      # [CACHE_SLOTS, A, K] float32
+    locks: jax.Array  # [CACHE_SLOTS] uint32 (0 empty, 1 writing, >=2 valid = 2 + wave_id)
+    v: jax.Array      # [CACHE_SLOTS, K] bfloat16
+    q: jax.Array      # [CACHE_SLOTS, A, K] bfloat16
+    wave: jax.Array   # [1] uint32 monotonically incremented per wave
 
 
 def empty_position_cache(num_actions: int, atoms: int, enabled: bool = True) -> PositionCache:
@@ -48,8 +49,9 @@ def empty_position_cache(num_actions: int, atoms: int, enabled: bool = True) -> 
     return PositionCache(
         keys=jnp.zeros((slots, 10), jnp.uint32),
         locks=jnp.zeros((slots,), jnp.uint32),
-        v=jnp.zeros((slots, atoms), jnp.float32),
-        q=jnp.zeros((slots, num_actions, atoms), jnp.float32),
+        v=jnp.zeros((slots, atoms), jnp.bfloat16),
+        q=jnp.zeros((slots, num_actions, atoms), jnp.bfloat16),
+        wave=jnp.zeros((1,), jnp.uint32),
     )
 
 
@@ -148,14 +150,14 @@ def pack(model, kernel: str = "cuda") -> PackedNetwork:
 
 def apply(packed: PackedNetwork, observation: jax.Array, num_actions: int, atoms: int, *, kernel_override: int | None = None):
     """Logits [B, A] f32, value beliefs [B, K] and Q beliefs [B, A, K] (softmax)."""
-    from ._library import NETWORK_TARGET, register_network
+    from ._library import NETWORK_TARGET, device_sm_count, register_network
 
     register_network()
     batch, side = observation.shape[0], observation.shape[1]
     kernel = kernel_override if kernel_override is not None else {
         jnp.dtype(jnp.bfloat16): 0, jnp.dtype(jnp.uint8): 1, jnp.dtype(jnp.int8): 2
     }[packed.trunk_w.dtype]
-    scratch_rows = 1 if (kernel == 2 and 3 <= side <= 11 and batch < 170) else (batch * side * side)
+    scratch_rows = 1 if (kernel == 2 and 3 <= side <= 11 and batch < device_sm_count()) else (batch * side * side)
     results = [
         jax.ShapeDtypeStruct((batch, num_actions), jnp.float32),
         jax.ShapeDtypeStruct((batch, atoms), jnp.float32),
@@ -179,11 +181,11 @@ def apply_compact(
     small_hint: bool = False,
 ) -> tuple[jax.Array, jax.Array, PositionCache]:
     """Evaluate only `*d_boards` compacted boards with INT8 + GPU position cache."""
-    from ._library import NETWORK_COMPACT_TARGET, register_network_compact
+    from ._library import NETWORK_COMPACT_TARGET, device_sm_count, register_network_compact
 
     register_network_compact()
     batch, side = obs_compact.shape[0], obs_compact.shape[1]
-    scratch_rows = 1 if (small_hint or batch < 170) else (batch * side * side)
+    scratch_rows = 1 if (small_hint or batch < device_sm_count()) else (batch * side * side)
     results = [
         jax.ShapeDtypeStruct((batch, atoms), jnp.float32),
         jax.ShapeDtypeStruct((batch, num_actions, atoms), jnp.float32),
@@ -205,10 +207,11 @@ def apply_compact(
         cache.locks,
         cache.v,
         cache.q,
+        cache.wave,
         use_cache=np.int64(1 if use_cache else 0),
         small_hint=np.int64(1 if small_hint else 0),
     )
-    return out[0], out[1], PositionCache(keys=out[2], locks=out[3], v=out[4], q=out[5])
+    return out[0], out[1], PositionCache(keys=out[2], locks=out[3], v=out[4], q=out[5], wave=cache.wave)
 
 
 def make_native_evaluator(model, kernel: str = "cuda"):

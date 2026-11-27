@@ -11,6 +11,7 @@ import numpy as np
 from ..dirichlet_mctx.base import RootFnOutput
 from ..dirichlet_mctx.tree import SearchSummary, Tree, instantiate_tree_from_root
 from . import _fast_quadrature, _quadrature
+from .inkling import PackedInkling, apply_inkling_compact
 from .network import PackedNetwork, PositionCache, apply_compact
 
 PEND = 8
@@ -185,7 +186,7 @@ def fused_search(evaluator, state, root: RootFnOutput, rng_key: jax.Array, *, po
 
 
 def fused_fast_search(
-    packed: PackedNetwork,
+    packed: PackedNetwork | PackedInkling,
     state,
     rng_key: jax.Array,
     *,
@@ -198,9 +199,11 @@ def fused_fast_search(
     subtree_reuse: bool = True,
     use_cache: bool = True,
     early_stop_prob: float = 0.96,
+    early_stop_evpi: float = 0.0,
     min_stop_nodes: int = 10,
     support_search_evidence: bool = True,
     policy_target_temperature: float = 1.0,
+    layers_per_block: int = 2,
 ) -> tuple[SearchSummary, jax.Array, jax.Array, FastTreeCarry, PositionCache]:
     """Full megakernel search step: subtree reuse + dynamic compaction + board-resident INT8 + fused readout."""
     from ..dirichlet_q_search import terminal_outcome_from_reward
@@ -257,11 +260,14 @@ def fused_fast_search(
         jax.ShapeDtypeStruct((batch,), jnp.int8),                  # out_v_cat_out
         jax.ShapeDtypeStruct((batch,), jnp.int32),                 # out_v_cat_dist
         jax.ShapeDtypeStruct((batch,), jnp.int32),                 # out_search_action
+        jax.ShapeDtypeStruct(cache.locks.shape, cache.locks.dtype),# r_cache_locks (alias arg 31 -> out 26)
     ]
+    aliases = {i: i for i in range(14)}
+    aliases[31] = 26
     call = jax.ffi.ffi_call(
         FAST_SEARCH_TARGET,
         [*tree_specs, *extra_specs],
-        input_output_aliases={i: i for i in range(14)},
+        input_output_aliases=aliases,
     )
 
     no_v = jnp.zeros((batch, atoms), jnp.float32)
@@ -272,58 +278,63 @@ def fused_fast_search(
     qw_arr = jnp.asarray(quad_weights, jnp.float32)
 
     def invoke(ta, net_v, net_q, keys_u32, cache_obj: PositionCache, flags: int):
+        next_wave = cache_obj.wave + jnp.uint32(1) if (flags & (F_SUBTREE_INIT | DESCEND)) else cache_obj.wave
         out = call(
             *ta,
             net_v, net_q, keys_u32, order, pts_arr, qn_arr, qw_arr,
             prev_actions, reset_mask, root_boards, root_steps, root_to_play, root_term_out,
             root_invalid, root_obs, lane_caps,
-            cache_obj.keys, cache_obj.locks, cache_obj.v, cache_obj.q,
+            cache_obj.keys, cache_obj.locks, cache_obj.v, cache_obj.q, next_wave,
             max_depth=np.int64(max_depth),
             flags=np.int64(flags),
             min_stop_nodes=np.int64(min_stop_nodes),
             use_cache=np.int64(1 if use_cache else 0),
             support_search_evidence=np.int64(1 if support_search_evidence else 0),
             early_stop_prob=float(early_stop_prob),
+            early_stop_evpi=float(early_stop_evpi),
             policy_temp=float(policy_target_temperature),
         )
-        return tuple(out[:14]), out[14], out[15], out[16], out[17:]
+        next_cache = cache_obj._replace(locks=out[26], wave=next_wave)
+        return tuple(out[:14]), out[14], out[15], out[16], out[17:26], next_cache
+
+    def eval_compact(obs_c, d_active, miss_k, cache_obj: PositionCache, *, small_hint: bool):
+        if isinstance(packed, PackedInkling):
+            return apply_inkling_compact(
+                packed, obs_c, d_active, miss_k, cache_obj, actions, atoms,
+                layers_per_block=layers_per_block, use_cache=use_cache,
+            )
+        return apply_compact(
+            packed, obs_c, d_active, miss_k, cache_obj, actions, atoms,
+            use_cache=use_cache, small_hint=small_hint,
+        )
 
     search_key, tie_key = jax.random.split(rng_key)
     tie_keys_u32 = _key_data(jax.random.split(tie_key, batch))
 
     # 1. Subtree reuse / cold root compaction + compact root network eval (only reset lanes!)
-    ta, obs_c, d_active, miss_k, _ = invoke(tree_arrays, no_v, no_q, no_keys, cache, F_SUBTREE_INIT)
-    net_v, net_q, cache = apply_compact(
-        packed, obs_c, d_active, miss_k, cache, actions, atoms,
-        use_cache=use_cache, small_hint=subtree_reuse,
-    )
+    ta, obs_c, d_active, miss_k, _, cache = invoke(tree_arrays, no_v, no_q, no_keys, cache, F_SUBTREE_INIT)
+    net_v, net_q, cache = eval_compact(obs_c, d_active, miss_k, cache, small_hint=subtree_reuse)
 
     if num_simulations == 0:
-        ta, _, _, _, ro = invoke(ta, net_v, net_q, tie_keys_u32, cache, F_ROOT_FINISH | F_READOUT)
+        ta, _, _, _, ro, cache = invoke(ta, net_v, net_q, tie_keys_u32, cache, F_ROOT_FINISH | F_READOUT)
     else:
         key, sim0_key = jax.random.split(search_key)
         sim0_u32 = _key_data(jax.random.split(sim0_key, batch))
-        ta, obs_c, d_active, miss_k, _ = invoke(ta, net_v, net_q, sim0_u32, cache, F_ROOT_FINISH | DESCEND)
-        net_v, net_q, cache = apply_compact(
-            packed, obs_c, d_active, miss_k, cache, actions, atoms,
-            use_cache=use_cache, small_hint=False,
-        )
+        ta, obs_c, d_active, miss_k, _, cache = invoke(ta, net_v, net_q, sim0_u32, cache, F_ROOT_FINISH | DESCEND)
+        net_v, net_q, cache = eval_compact(obs_c, d_active, miss_k, cache, small_hint=False)
 
         def loop_body(_, carry):
             key, ta, net_v, net_q, cache_c = carry
             key, sim_key = jax.random.split(key)
             sim_u32 = _key_data(jax.random.split(sim_key, batch))
-            ta, obs_c, d_active, miss_k, _ = invoke(ta, net_v, net_q, sim_u32, cache_c, FINISH | DESCEND)
-            net_v, net_q, cache_c = apply_compact(
-                packed, obs_c, d_active, miss_k, cache_c, actions, atoms,
-                use_cache=use_cache, small_hint=False,
-            )
+            ta, obs_c, d_active, miss_k, _, cache_c = invoke(ta, net_v, net_q, sim_u32, cache_c, FINISH | DESCEND)
+            net_v, net_q, cache_c = eval_compact(obs_c, d_active, miss_k, cache_c, small_hint=False)
             return key, ta, net_v, net_q, cache_c
 
         if num_simulations > 1:
             _, ta, net_v, net_q, cache = jax.lax.fori_loop(1, num_simulations, loop_body, (key, ta, net_v, net_q, cache))
 
-        ta, _, _, _, ro = invoke(ta, net_v, net_q, tie_keys_u32, cache, FINISH | F_READOUT)
+        ta, _, _, _, ro, cache = invoke(ta, net_v, net_q, tie_keys_u32, cache, FINISH | F_READOUT)
 
     policy, qalpha, valpha, visits, q_cat_out, q_cat_dist, v_cat_out, v_cat_dist, search_action = ro
     summary = SearchSummary(

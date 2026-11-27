@@ -40,14 +40,6 @@ struct NetHeads {
   const float* qout_b;          // [A K]
 };
 
-struct CacheWrite {
-  const CacheKey* miss_keys;   // [max_boards]: key of compacted slot b, meta bit 31 == 1 if valid
-  CacheKey* table_keys;        // [CACHE_SLOTS]
-  uint32_t* table_locks;       // [CACHE_SLOTS]: 0 empty/unlocked, 1 locked, 2 ready
-  float* table_v;              // [CACHE_SLOTS][K]
-  float* table_q;              // [CACHE_SLOTS][A * K]
-};
-
 template <int FRAGS>
 __host__ __device__ inline I8Layout board_layout(int side, int boards) {
   const int e = side - 2;
@@ -491,28 +483,28 @@ __global__ void __launch_bounds__(B_THREADS, LAUNCH_BOUNDS_BLOCKS) board_net_int
     }
     __syncthreads();
 
-    // Optional lock-free writeback to the GPU position cache (write-only phase:
-    // no reader executes concurrently with this kernel).
+    // Optional lock-free writeback to the GPU position cache (wave-tagged overwrite!).
     if (cw.miss_keys) {
+      const uint32_t tag = 2u + *cw.cache_wave;
       for (int bb = 0; bb < nb; ++bb) {
         const CacheKey mk = cw.miss_keys[b0 + bb];
         if (!(mk.meta & 0x80000000u)) continue;
         const uint32_t slot = hash_cache_key(mk);
         __shared__ int won_slot;
         if (tid == 0) {
-          won_slot = (atomicCAS(cw.table_locks + slot, 0u, 1u) == 0u) ? (int)slot : -1;
+          won_slot = cache_try_acquire(cw.table_locks, slot, tag) ? (int)slot : -1;
           if (won_slot >= 0) cw.table_keys[slot] = mk;
         }
         __syncthreads();
         if (won_slot >= 0) {
           const float* vp = vprobs + (size_t)(b0 + bb) * K;
           const float* qp = qprobs + (size_t)(b0 + bb) * AK;
-          for (int k = tid; k < K; k += B_THREADS) cw.table_v[(size_t)slot * K + k] = vp[k];
-          for (int i = tid; i < AK; i += B_THREADS) cw.table_q[(size_t)slot * AK + i] = qp[i];
+          for (int k = tid; k < K; k += B_THREADS) cw.table_v[(size_t)slot * K + k] = __float2bfloat16_rn(vp[k]);
+          for (int i = tid; i < AK; i += B_THREADS) cw.table_q[(size_t)slot * AK + i] = __float2bfloat16_rn(qp[i]);
           __syncthreads();
           if (tid == 0) {
             __threadfence();
-            cw.table_locks[slot] = 2u;
+            atomicExch(cw.table_locks + slot, tag);
           }
         }
         __syncthreads();

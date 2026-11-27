@@ -545,6 +545,7 @@ struct FastConfig {
   int use_cache;
   int support_search_evidence;
   float early_stop_prob;
+  float early_stop_evpi;
   float policy_temp;
 };
 
@@ -566,9 +567,10 @@ struct FastInputs {
   const uint8_t* root_obs;      // [B, C * 4]
   const int32_t* lane_caps;     // [B] node capacity per lane (<= N)
   const CacheKey* cache_keys;   // [CACHE_SLOTS]
-  const uint32_t* cache_locks;  // [CACHE_SLOTS]
-  const float* cache_v;         // [CACHE_SLOTS, K]
-  const float* cache_q;         // [CACHE_SLOTS, A * K]
+  uint32_t* cache_locks;        // [CACHE_SLOTS] (mutated on hit to pin wave tag!)
+  const __nv_bfloat16* cache_v; // [CACHE_SLOTS, K]
+  const __nv_bfloat16* cache_q; // [CACHE_SLOTS, A * K]
+  const uint32_t* cache_wave;   // [1] current wave id
 };
 
 struct FastOutputs {
@@ -593,10 +595,11 @@ __device__ __forceinline__ int probe_or_enqueue(
   if (cfg.use_cache) {
     const uint32_t h = hash_cache_key(mk);
     int hit = 0;
-    if (lane == 0 && in.cache_locks[h] == 2u) {
+    if (lane == 0 && in.cache_locks[h] >= 2u) {
       const CacheKey tk = in.cache_keys[h];
       hit = (tk.my_lo == mk.my_lo && tk.my_hi == mk.my_hi &&
              tk.op_lo == mk.op_lo && tk.op_hi == mk.op_hi && tk.meta == mk.meta);
+      if (hit) in.cache_locks[h] = 2u + *in.cache_wave;
     }
     if (__shfl_sync(FULL, hit, 0)) {
       return -2 - (int)h;
@@ -758,14 +761,24 @@ __device__ void fast_root_finish(
   int32_t* pend = t.pending + (size_t)b * PEND;
   const int src = pend[5];
   if (src == -1) return;
-  const float* v = (src >= 0) ? (in.net_value + (size_t)src * K) : (in.cache_v + (size_t)(-2 - src) * K);
-  const float* q = (src >= 0) ? (in.net_q + (size_t)src * A * K) : (in.cache_q + (size_t)(-2 - src) * A * K);
-  for (int k = lane; k < K; k += 32) {
-    t.vprior[bN * K + k] = v[k];
-    t.valpha[bN * K + k] = v[k];
-  }
-  for (int i = lane; i < A * K; i += 32) {
-    t.ealpha[bN * A * K + i] = q[i];
+  if (src >= 0) {
+    const float* v = in.net_value + (size_t)src * K;
+    const float* q = in.net_q + (size_t)src * A * K;
+    for (int k = lane; k < K; k += 32) {
+      t.vprior[bN * K + k] = v[k];
+      t.valpha[bN * K + k] = v[k];
+    }
+    for (int i = lane; i < A * K; i += 32) t.ealpha[bN * A * K + i] = q[i];
+  } else {
+    const size_t slot = (size_t)(-2 - src);
+    const __nv_bfloat16* v = in.cache_v + slot * K;
+    const __nv_bfloat16* q = in.cache_q + slot * A * K;
+    for (int k = lane; k < K; k += 32) {
+      const float vf = __bfloat162float(v[k]);
+      t.vprior[bN * K + k] = vf;
+      t.valpha[bN * K + k] = vf;
+    }
+    for (int i = lane; i < A * K; i += 32) t.ealpha[bN * A * K + i] = __bfloat162float(q[i]);
   }
   if (lane == 0) pend[5] = -1;
   __syncwarp();
@@ -890,13 +903,18 @@ __device__ void fast_repair_node(
     return;
   }
 
-  // Unresolved node: run fast weighted-sum backup!
+  // Unresolved node: run fast weighted-sum backup (+ optional exact EVPI at root)!
   if (n_down > 0 && t.node_out[bN + n] == NOUT) {
+    float evpi = 1.f;
+    const bool want_evpi = (n == 0 && cfg.early_stop_evpi > 0.f);
     const float max_pi = backup_lane<KT, true>(
-        S, t.invalid + e, S.pts, S.tq, S.wq, t.valpha + (bN + n) * K, g.d, lane);
-    if (n == 0 && cfg.early_stop_prob > 0.f) {
+        S, t.invalid + e, S.pts, S.tq, S.wq, t.valpha + (bN + n) * K, g.d, lane,
+        want_evpi ? &evpi : nullptr);
+    if (n == 0 && (cfg.early_stop_prob > 0.f || cfg.early_stop_evpi > 0.f)) {
       int32_t* pend = t.pending + (size_t)b * PEND;
-      if (pend[6] >= cfg.min_stop_nodes && max_pi >= cfg.early_stop_prob) {
+      const bool stop_pi = (cfg.early_stop_prob > 0.f) && (max_pi >= cfg.early_stop_prob);
+      const bool stop_evpi = want_evpi && (evpi <= cfg.early_stop_evpi);
+      if (pend[6] >= cfg.min_stop_nodes && (stop_pi || stop_evpi)) {
         if (lane == 0) pend[7] = 1;
       }
     }
@@ -943,15 +961,28 @@ __device__ void fast_finish(
       pend[6] = fresh + 1;
     }
     if (!publish_terminal) {
-      const float* v = (src >= 0) ? (in.net_value + (size_t)src * K) : (in.cache_v + (size_t)(-2 - src) * K);
-      const float* q = (src >= 0) ? (in.net_q + (size_t)src * A * K) : (in.cache_q + (size_t)(-2 - src) * A * K);
-      for (int k = lane; k < K; k += 32) {
-        t.vprior[(bN + fresh) * K + k] = v[k];
-        t.valpha[(bN + fresh) * K + k] = v[k];
+      if (src >= 0) {
+        const float* v = in.net_value + (size_t)src * K;
+        const float* q = in.net_q + (size_t)src * A * K;
+        for (int k = lane; k < K; k += 32) {
+          t.vprior[(bN + fresh) * K + k] = v[k];
+          t.valpha[(bN + fresh) * K + k] = v[k];
+        }
+        float* dst = t.ealpha + (bN + fresh) * A * K;
+        for (int i = lane; i < A * K; i += 32) dst[i] = q[i];
+      } else {
+        const size_t slot = (size_t)(-2 - src);
+        const __nv_bfloat16* v = in.cache_v + slot * K;
+        const __nv_bfloat16* q = in.cache_q + slot * A * K;
+        for (int k = lane; k < K; k += 32) {
+          const float vf = __bfloat162float(v[k]);
+          t.vprior[(bN + fresh) * K + k] = vf;
+          t.valpha[(bN + fresh) * K + k] = vf;
+        }
+        float* dst = t.ealpha + (bN + fresh) * A * K;
+        for (int i = lane; i < A * K; i += 32) dst[i] = __bfloat162float(q[i]);
       }
-      float* dst = t.ealpha + (bN + fresh) * A * K;
-      for (int i = lane; i < A * K; i += 32) dst[i] = q[i];
-      leaf_value = v;
+      leaf_value = t.vprior + (bN + fresh) * K;
     }
     const int8_t* cb = t.board + (bN + fresh) * C;
     uint8_t* inv = t.invalid + (bN + fresh) * A;
@@ -1345,7 +1376,7 @@ ffi::Error Step(cudaStream_t stream, int64_t max_depth, int64_t flags,
 ffi::Error FastStep(
     cudaStream_t stream,
     int64_t max_depth, int64_t flags, int64_t min_stop_nodes, int64_t use_cache, int64_t support_search_evidence,
-    double early_stop_prob, double policy_temp,
+    double early_stop_prob, double early_stop_evpi, double policy_temp,
     ffi::AnyBuffer parents, ffi::AnyBuffer children, ffi::AnyBuffer to_play, ffi::AnyBuffer node_out,
     ffi::AnyBuffer node_pay, ffi::AnyBuffer edge_out, ffi::AnyBuffer edge_pay, ffi::AnyBuffer vprior,
     ffi::AnyBuffer valpha, ffi::AnyBuffer ealpha, ffi::AnyBuffer invalid, ffi::AnyBuffer board,
@@ -1356,6 +1387,7 @@ ffi::Error FastStep(
     ffi::AnyBuffer root_steps, ffi::AnyBuffer root_to_play, ffi::AnyBuffer root_term_out,
     ffi::AnyBuffer root_invalid, ffi::AnyBuffer root_obs, ffi::AnyBuffer lane_caps,
     ffi::AnyBuffer cache_keys, ffi::AnyBuffer cache_locks, ffi::AnyBuffer cache_v, ffi::AnyBuffer cache_q,
+    ffi::AnyBuffer cache_wave,
     ffi::Result<ffi::AnyBuffer> r_parents, ffi::Result<ffi::AnyBuffer> r_children,
     ffi::Result<ffi::AnyBuffer> r_to_play, ffi::Result<ffi::AnyBuffer> r_node_out,
     ffi::Result<ffi::AnyBuffer> r_node_pay, ffi::Result<ffi::AnyBuffer> r_edge_out,
@@ -1369,7 +1401,8 @@ ffi::Error FastStep(
     ffi::Result<ffi::AnyBuffer> r_out_valpha, ffi::Result<ffi::AnyBuffer> r_out_visits,
     ffi::Result<ffi::AnyBuffer> r_out_q_cat_out, ffi::Result<ffi::AnyBuffer> r_out_q_cat_dist,
     ffi::Result<ffi::AnyBuffer> r_out_v_cat_out, ffi::Result<ffi::AnyBuffer> r_out_v_cat_dist,
-    ffi::Result<ffi::AnyBuffer> r_out_search_action) {
+    ffi::Result<ffi::AnyBuffer> r_out_search_action,
+    ffi::Result<ffi::AnyBuffer> r_cache_locks) {
   auto ed = ealpha.dimensions();
   if (ed.size() != 4) return ffi::Error::InvalidArgument("edge_alpha must be [B, N, A, K]");
   Geometry g;
@@ -1404,7 +1437,10 @@ ffi::Error FastStep(
       data<const int8_t>(root_term_out), data<const uint8_t>(root_invalid), data<const uint8_t>(root_obs),
       data<const int32_t>(lane_caps),
       reinterpret_cast<const CacheKey*>(cache_keys.untyped_data()),
-      data<const uint32_t>(cache_locks), data<const float>(cache_v), data<const float>(cache_q)};
+      reinterpret_cast<uint32_t*>(r_cache_locks->untyped_data()),
+      reinterpret_cast<const __nv_bfloat16*>(cache_v.untyped_data()),
+      reinterpret_cast<const __nv_bfloat16*>(cache_q.untyped_data()),
+      data<const uint32_t>(cache_wave)};
   FastOutputs out{
       reinterpret_cast<uint8_t*>(r_obs_compact->untyped_data()),
       reinterpret_cast<int32_t*>(r_num_active->untyped_data()),
@@ -1420,7 +1456,7 @@ ffi::Error FastStep(
       reinterpret_cast<int32_t*>(r_out_search_action->untyped_data())};
   FastConfig cfg{
       (int)max_depth, (int)min_stop_nodes, (int)use_cache, (int)support_search_evidence,
-      (float)early_stop_prob, (float)policy_temp};
+      (float)early_stop_prob, (float)early_stop_evpi, (float)policy_temp};
 
   switch (g.K) {
     case 9:  return launch_fast<9>(stream, t, in, out, g, cfg, (int)flags);
@@ -1459,19 +1495,21 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("use_cache")
         .Attr<int64_t>("support_search_evidence")
         .Attr<double>("early_stop_prob")
+        .Attr<double>("early_stop_evpi")
         .Attr<double>("policy_temp")
         // 14 in-place tree buffers (0..13)
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
-        // 20 read-only operands (14..33)
+        // 21 operands (14..34): 16 search inputs + cache_{keys,locks,v,q,wave}
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>().Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
         // 14 aliased tree results (0..13)
         .Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>()
@@ -1482,5 +1520,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         // 9 readout outputs (17..25): policy, qalpha, valpha, visits, q_out, q_dist, v_out, v_dist, action
         .Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>().Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        // 1 aliased cache_locks output (26, aliases arg 31)
         .Ret<ffi::AnyBuffer>(),
     {ffi::Traits::kCmdBufferCompatible});

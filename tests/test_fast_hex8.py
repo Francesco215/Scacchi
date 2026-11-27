@@ -143,4 +143,4 @@ def test_fused_fast_search_subtree_reuse_and_cache():
     )
     assert bool(jnp.all(jnp.isfinite(pol1)))
     assert bool(jnp.all(jnp.isfinite(summary1.value_alpha)))
-    assert int(jnp.sum(cache.locks == 2)) > 0
+    assert int(jnp.sum(cache.locks >= 2)) > 0

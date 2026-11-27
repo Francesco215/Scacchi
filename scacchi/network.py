@@ -250,11 +250,56 @@ def _fp8_conv3x3(x: jax.Array, kernel: jax.Array) -> jax.Array:
 
 
 def _fp8_quantize_e4m3(t: jax.Array) -> tuple[jax.Array, jax.Array]:
-    tf = t.astype(jnp.float32)
-    amax = jnp.max(jnp.abs(tf))
+    # Compute amax directly in input dtype (avoids 2x memory bandwidth f32 cast on 33MB activations).
+    amax = jnp.max(jnp.abs(t)).astype(jnp.float32)
     scale = jnp.where(amax > 0.0, amax / _FP8_E4M3_MAX, 1.0)
-    q = jnp.clip(tf / scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX).astype(jnp.float8_e4m3fn)
+    inv_scale = jnp.where(amax > 0.0, _FP8_E4M3_MAX / amax, 1.0).astype(t.dtype)
+    q = jnp.clip(t * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX).astype(jnp.float8_e4m3fn)
     return q, scale
+
+
+@jax.custom_vjp
+def _fp8_linear(x: jax.Array, kernel: jax.Array) -> jax.Array:
+    """Dynamically-scaled FP8 (e4m3fn) dense linear matmul (fwd, dx, and dw all on FP8 Tensor Cores)."""
+    y, _ = _fp8_linear_fwd(x, kernel)
+    return y
+
+
+def _fp8_linear_fwd(x: jax.Array, kernel: jax.Array):
+    x_q, x_scale = _fp8_quantize_e4m3(x)
+    w_q, w_scale = _fp8_quantize_e4m3(kernel)
+    y_f32 = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((x_q.ndim - 1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    y = (y_f32 * (x_scale * w_scale)).astype(x.dtype)
+    return y, (x_q, x_scale, w_q, w_scale)
+
+
+def _fp8_linear_bwd(res, dy: jax.Array):
+    x_q, x_scale, w_q, w_scale = res
+    dy_q, dy_scale = _fp8_quantize_e4m3(dy)
+    dx_f32 = jax.lax.dot_general(
+        dy_q,
+        w_q,
+        dimension_numbers=(((dy_q.ndim - 1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    dx = (dx_f32 * (dy_scale * w_scale)).astype(dy.dtype)
+    batch_axes = tuple(range(x_q.ndim - 1))
+    dw_f32 = jax.lax.dot_general(
+        x_q,
+        dy_q,
+        dimension_numbers=((batch_axes, batch_axes), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    dw = (dw_f32 * (x_scale * dy_scale)).astype(dy.dtype)
+    return dx, dw
+
+
+_fp8_linear.defvjp(_fp8_linear_fwd, _fp8_linear_bwd)
 
 
 def _fp8_conv3x3_fwd(x: jax.Array, kernel: jax.Array):
@@ -1235,6 +1280,7 @@ class AZKataTransformerBinnedNet(nnx.Module):
         infer_chunk_size: int = 512,
         bins: BinConfig,
         dtype=jnp.bfloat16,
+        fp8_training: bool = False,
         canonicalize_hex_color: bool = True,
         rngs: nnx.Rngs,
     ):
@@ -1247,6 +1293,7 @@ class AZKataTransformerBinnedNet(nnx.Module):
         self.infer_chunk_size = int(infer_chunk_size)
         self.bins = bins
         self.dtype = dtype
+        self.fp8_training = bool(fp8_training)
         self.canonicalize_hex_color = bool(canonicalize_hex_color)
         use_canon = (
             self.canonicalize_hex_color
@@ -1296,8 +1343,9 @@ class AZKataTransformerBinnedNet(nnx.Module):
         )
 
     def _forward_chunk(
-        self, x: jax.Array, s_x: jax.Array, s_y: jax.Array
+        self, x: jax.Array, s_x: jax.Array, s_y: jax.Array, *, train: bool = False
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        del train
         x_in, is_white = _canonicalize_hex_obs(
             x, enabled=self.canonicalize_hex_color, num_actions=self.num_actions
         )
@@ -1323,13 +1371,13 @@ class AZKataTransformerBinnedNet(nnx.Module):
             n_chunks = batch // chunk
             x_chunks = x.reshape((n_chunks, chunk) + x.shape[1:])
             logits_c, v_c, q_c = jax.lax.map(
-                lambda xc: self._forward_chunk(xc, s_x, s_y), x_chunks
+                lambda xc: self._forward_chunk(xc, s_x, s_y, train=False), x_chunks
             )
             logits = logits_c.reshape((batch, self.num_actions))
             v_logits = v_c.reshape((batch, self.bins.count))
             q_logits = q_c.reshape((batch, self.num_actions, self.bins.count))
         else:
-            logits, v_logits, q_logits = self._forward_chunk(x, s_x, s_y)
+            logits, v_logits, q_logits = self._forward_chunk(x, s_x, s_y, train=train)
 
         return binned.BinnedOutput(
             logits.astype(jnp.float32),
@@ -1474,6 +1522,7 @@ class InklingDenseLayer(nnx.Module):
         in_core: bool = False,
         full: bool = False,
         dtype=jnp.bfloat16,
+        fp8_training: bool = False,
         rngs: nnx.Rngs,
     ):
         if width % num_heads != 0:
@@ -1495,6 +1544,7 @@ class InklingDenseLayer(nnx.Module):
         self.head_dim = int(head_dim)
         self.qk_clip = 2.0 * math.sqrt(head_dim)
         self.dtype = dtype
+        self.fp8_training = bool(fp8_training)
 
         if self.index > 0:
             self.attn_read_q = nnx.Param(jnp.zeros((3 if self.full else 1, width), dtype=jnp.float32))
@@ -1572,6 +1622,11 @@ class InklingDenseLayer(nnx.Module):
         t0, t1 = t[..., :half], t[..., half:]
         return jnp.concatenate([t0 * cos - t1 * sin, t0 * sin + t1 * cos], axis=-1)
 
+    def _apply_linear(self, linear: nnx.Linear, x: jax.Array, *, train: bool) -> jax.Array:
+        if self.fp8_training and train and x.dtype == jnp.bfloat16:
+            return _fp8_linear(x, linear.kernel[...].astype(jnp.bfloat16))
+        return linear(x)
+
     def __call__(
         self,
         partial: jax.Array,
@@ -1579,6 +1634,8 @@ class InklingDenseLayer(nnx.Module):
         prev_core_norm: tuple[jax.Array, ...] | None,
         s_x: jax.Array,
         s_y: jax.Array,
+        *,
+        train: bool = False,
     ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
         b, s, c = partial.shape
         partial_norm = _unit_rms(partial)
@@ -1627,11 +1684,11 @@ class InklingDenseLayer(nnx.Module):
             q_in = self.attn_norm(q_in)
             k_in = v_in = q_in
 
-        q = self.q_proj(q_in).reshape((b, s, self.num_heads, self.head_dim))
+        q = self._apply_linear(self.q_proj, q_in, train=train).reshape((b, s, self.num_heads, self.head_dim))
         q = _clip_heads(q * self.q_scale[...].astype(self.dtype), self.qk_clip)
-        k = self.k_conv(self.k_proj(k_in)).reshape((b, s, self.kv_heads, self.head_dim))
+        k = self.k_conv(self._apply_linear(self.k_proj, k_in, train=train)).reshape((b, s, self.kv_heads, self.head_dim))
         k = _clip_heads(k, self.qk_clip)
-        v = _unit_rms(self.v_conv(self.v_proj(v_in)).reshape((b, s, self.kv_heads, self.head_dim)))
+        v = _unit_rms(self.v_conv(self._apply_linear(self.v_proj, v_in, train=train)).reshape((b, s, self.kv_heads, self.head_dim)))
 
         # Apply matching 2D RoPE per KV-head group (so grouped Q and K share identical frequencies).
         freqs_kv = self.rope_freqs[...]  # [kv_heads, D/2, 2]
@@ -1661,8 +1718,8 @@ class InklingDenseLayer(nnx.Module):
         attn_out = jax.nn.dot_product_attention(
             q, k_aug, v_aug, implementation="cudnn" if use_cudnn else None
         ).reshape((b, s, self.num_heads * self.head_dim))
-        attn_out = attn_out * jax.nn.sigmoid(self.out_gate(q_in))
-        branch = self.after_attn(self.out_proj(attn_out))
+        attn_out = attn_out * jax.nn.sigmoid(self._apply_linear(self.out_gate, q_in, train=train))
+        branch = self.after_attn(self._apply_linear(self.out_proj, attn_out, train=train))
 
         if self.seals_bank:
             bank_norm = bank_norm + (partial_norm,)
@@ -1677,14 +1734,14 @@ class InklingDenseLayer(nnx.Module):
         xm = self.mlp_norm(xm)
 
         # Dense Inkling-2 Capped-SwiGLU: (4*tanh(g/4))*sigmoid(g)*(25*tanh(u/25))
-        gt = self.w_gate(xm)
-        up = self.w_up(xm)
+        gt = self._apply_linear(self.w_gate, xm, train=train)
+        up = self._apply_linear(self.w_up, xm, train=train)
         c4 = jnp.asarray(4.0, dtype=self.dtype)
         c25 = jnp.asarray(25.0, dtype=self.dtype)
         gated = (c4 * jnp.tanh(gt * jnp.asarray(0.25, dtype=self.dtype))) * jax.nn.sigmoid(gt) * (
             c25 * jnp.tanh(up * jnp.asarray(0.04, dtype=self.dtype))
         )
-        return partial + self.after_mlp(self.w_down(gated)), bank_norm
+        return partial + self.after_mlp(self._apply_linear(self.w_down, gated, train=train)), bank_norm
 
 
 class AZInklingBinnedNet(nnx.Module):
@@ -1712,6 +1769,7 @@ class AZInklingBinnedNet(nnx.Module):
         infer_chunk_size: int = 512,
         bins: BinConfig,
         dtype=jnp.bfloat16,
+        fp8_training: bool = False,
         canonicalize_hex_color: bool = True,
         rngs: nnx.Rngs,
     ):
@@ -1726,6 +1784,7 @@ class AZInklingBinnedNet(nnx.Module):
         self.infer_chunk_size = int(infer_chunk_size)
         self.bins = bins
         self.dtype = dtype
+        self.fp8_training = bool(fp8_training)
         self.canonicalize_hex_color = bool(canonicalize_hex_color)
         use_canon = (
             self.canonicalize_hex_color
@@ -1769,6 +1828,7 @@ class AZInklingBinnedNet(nnx.Module):
                     in_core=in_core,
                     full=is_full,
                     dtype=dtype,
+                    fp8_training=fp8_training,
                     rngs=rngs,
                 )
             )
@@ -1783,7 +1843,7 @@ class AZInklingBinnedNet(nnx.Module):
         )
 
     def _forward_chunk(
-        self, x: jax.Array, s_x: jax.Array, s_y: jax.Array
+        self, x: jax.Array, s_x: jax.Array, s_y: jax.Array, *, train: bool
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         x_in, is_white = _canonicalize_hex_obs(
             x, enabled=self.canonicalize_hex_color, num_actions=self.num_actions
@@ -1795,23 +1855,23 @@ class AZInklingBinnedNet(nnx.Module):
         bank_norm: tuple[jax.Array, ...] = ()
         if self.passes == 1:
             for layer in self.blocks:
-                seq, bank_norm = layer(seq, bank_norm, None, s_x, s_y)
+                seq, bank_norm = layer(seq, bank_norm, None, s_x, s_y, train=train)
         else:
             size = self.layers_per_block
             for layer in self.blocks[:size]:
-                seq, bank_norm = layer(seq, bank_norm, None, s_x, s_y)
+                seq, bank_norm = layer(seq, bank_norm, None, s_x, s_y, train=train)
             prelude = (seq, bank_norm)
 
             prev_core_norm: tuple[jax.Array, ...] | None = None
             for _ in range(self.passes):
                 seq, bank_norm = prelude
                 for layer in self.blocks[size : 3 * size]:
-                    seq, bank_norm = layer(seq, bank_norm, prev_core_norm, s_x, s_y)
+                    seq, bank_norm = layer(seq, bank_norm, prev_core_norm, s_x, s_y, train=train)
                 # Two completed core block summaries (unit-RMS normalized), kept in the autodiff graph.
                 prev_core_norm = (bank_norm[-1], _unit_rms(seq))
 
             for layer in self.blocks[3 * size :]:
-                seq, bank_norm = layer(seq, bank_norm, None, s_x, s_y)
+                seq, bank_norm = layer(seq, bank_norm, None, s_x, s_y, train=train)
 
         seq = _read_depth_nostack(self.final_read_q[...], bank_norm + (_unit_rms(seq),))[:, :, 0]
         h_out = jax.nn.silu(self.final_norm(seq)).reshape((b, hh, ww, c))
@@ -1831,13 +1891,13 @@ class AZInklingBinnedNet(nnx.Module):
             n_chunks = batch // chunk
             x_chunks = x.reshape((n_chunks, chunk) + x.shape[1:])
             logits_c, v_c, q_c = jax.lax.map(
-                lambda xc: self._forward_chunk(xc, s_x, s_y), x_chunks
+                lambda xc: self._forward_chunk(xc, s_x, s_y, train=False), x_chunks
             )
             logits = logits_c.reshape((batch, self.num_actions))
             v_logits = v_c.reshape((batch, self.bins.count))
             q_logits = q_c.reshape((batch, self.num_actions, self.bins.count))
         else:
-            logits, v_logits, q_logits = self._forward_chunk(x, s_x, s_y)
+            logits, v_logits, q_logits = self._forward_chunk(x, s_x, s_y, train=train)
 
         return binned.BinnedOutput(
             logits.astype(jnp.float32),
@@ -2171,6 +2231,7 @@ def build_model(
             infer_chunk_size=int(getattr(config.model, "transformer_infer_chunk_size", 512)),
             bins=config.model.bins,
             dtype=compute_dtype,
+            fp8_training=bool(getattr(config.model, "fp8_training", False)),
             canonicalize_hex_color=bool(getattr(config.model, "canonicalize_hex_color", True)),
             rngs=rngs,
         )
@@ -2189,6 +2250,7 @@ def build_model(
             infer_chunk_size=int(getattr(config.model, "transformer_infer_chunk_size", 512)),
             bins=config.model.bins,
             dtype=compute_dtype,
+            fp8_training=bool(getattr(config.model, "fp8_training", False)),
             canonicalize_hex_color=bool(getattr(config.model, "canonicalize_hex_color", True)),
             rngs=rngs,
         )

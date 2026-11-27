@@ -17,9 +17,18 @@ SEARCH_TARGET = "scacchi_binned_search_step"
 FAST_SEARCH_TARGET = "scacchi_binned_search_fast_step"
 NETWORK_TARGET = "scacchi_binned_network"
 NETWORK_COMPACT_TARGET = "scacchi_binned_network_compact"
+INKLING_NETWORK_TARGET = "scacchi_inkling_network"
+INKLING_COMPACT_TARGET = "scacchi_inkling_network_compact"
 HERE = Path(__file__).parent
-SOURCES = [HERE / "backup.cu", HERE / "search.cu", HERE / "network.cu"]
-HEADERS = [HERE / "backup_lane.cuh", HERE / "cache_key.cuh", HERE / "conv_mma.cuh", HERE / "conv_int8.cuh", HERE / "conv_board_int8.cuh"]
+SOURCES = [HERE / "backup.cu", HERE / "search.cu", HERE / "network.cu", HERE / "inkling_network.cu"]
+HEADERS = [
+    HERE / "backup_lane.cuh",
+    HERE / "cache_key.cuh",
+    HERE / "conv_mma.cuh",
+    HERE / "conv_int8.cuh",
+    HERE / "conv_board_int8.cuh",
+    HERE / "inkling_mma.cuh",
+]
 REPO = Path(__file__).resolve().parents[2]
 FLAGS = ["-std=c++17", "-O3", "--shared", "-Xcompiler", "-fPIC", "-lineinfo", "-Xptxas", "-v"]
 
@@ -102,6 +111,16 @@ def load_library() -> ctypes.CDLL:
 
 
 @lru_cache(maxsize=1)
+def device_sm_count() -> int:
+    """Actual SM count of the active CUDA device (fixes hardcoded SM-count scratch checks)."""
+    lib = load_library()
+    fn = lib.ScacchiDeviceSMCount
+    fn.restype = ctypes.c_int
+    sms = int(fn())
+    return sms if sms > 0 else 1
+
+
+@lru_cache(maxsize=1)
 def register() -> str:
     import jax
 
@@ -144,3 +163,21 @@ def register_network_compact() -> str:
     library = load_library()
     jax.ffi.register_ffi_target(NETWORK_COMPACT_TARGET, jax.ffi.pycapsule(library.ScacchiBinnedNetworkCompact), platform="CUDA", api_version=1)
     return NETWORK_COMPACT_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_inkling_network() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(INKLING_NETWORK_TARGET, jax.ffi.pycapsule(library.ScacchiInklingNetwork), platform="CUDA", api_version=1)
+    return INKLING_NETWORK_TARGET
+
+
+@lru_cache(maxsize=1)
+def register_inkling_compact() -> str:
+    import jax
+
+    library = load_library()
+    jax.ffi.register_ffi_target(INKLING_COMPACT_TARGET, jax.ffi.pycapsule(library.ScacchiInklingNetworkCompact), platform="CUDA", api_version=1)
+    return INKLING_COMPACT_TARGET

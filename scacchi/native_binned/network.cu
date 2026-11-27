@@ -132,7 +132,7 @@ __global__ void __launch_bounds__(256) heads_kernel(const __nv_bfloat16* __restr
                                                     int A, int K, float* __restrict__ logits, float* __restrict__ vprobs,
                                                     float* __restrict__ qprobs,
                                                     const int32_t* __restrict__ d_boards = nullptr,
-                                                    CacheWrite cw = {nullptr, nullptr, nullptr, nullptr, nullptr}) {
+                                                    CacheWrite cw = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}) {
   const int actual_boards = d_boards ? *d_boards : boards;
   const int b0 = blockIdx.x * HB;
   if (b0 >= actual_boards) return;
@@ -259,25 +259,26 @@ __global__ void __launch_bounds__(256) heads_kernel(const __nv_bfloat16* __restr
   }
   if (cw.miss_keys) {
     __syncthreads();
+    const uint32_t tag = 2u + *cw.cache_wave;
     for (int bb = 0; bb < nb; ++bb) {
       const CacheKey mk = cw.miss_keys[b0 + bb];
       if (!(mk.meta & 0x80000000u)) continue;
       const uint32_t slot = hash_cache_key(mk);
       __shared__ int won_slot;
       if (tid == 0) {
-        won_slot = (atomicCAS(cw.table_locks + slot, 0u, 1u) == 0u) ? (int)slot : -1;
+        won_slot = cache_try_acquire(cw.table_locks, slot, tag) ? (int)slot : -1;
         if (won_slot >= 0) cw.table_keys[slot] = mk;
       }
       __syncthreads();
       if (won_slot >= 0) {
         const float* vp = vprobs + (size_t)(b0 + bb) * K;
         const float* qp = qprobs + (size_t)(b0 + bb) * AK;
-        for (int k = tid; k < K; k += 256) cw.table_v[(size_t)slot * K + k] = vp[k];
-        for (int i = tid; i < AK; i += 256) cw.table_q[(size_t)slot * AK + i] = qp[i];
+        for (int k = tid; k < K; k += 256) cw.table_v[(size_t)slot * K + k] = __float2bfloat16_rn(vp[k]);
+        for (int i = tid; i < AK; i += 256) cw.table_q[(size_t)slot * AK + i] = __float2bfloat16_rn(qp[i]);
         __syncthreads();
         if (tid == 0) {
           __threadfence();
-          cw.table_locks[slot] = 2u;
+          atomicExch(cw.table_locks + slot, tag);
         }
       }
       __syncthreads();
@@ -386,7 +387,7 @@ ffi::Error Network(cudaStream_t stream, int64_t kernel, ffi::AnyBuffer obs, ffi:
                 ptr<const float>(pol_b), ptr<const __nv_bfloat16>(val_w), ptr<const float>(val_b),
                 ptr<const float>(vout_w), ptr<const float>(vout_b), ptr<const __nv_bfloat16>(q_w),
                 ptr<const float>(q_b), ptr<const float>(qout_w), ptr<const float>(qout_b)};
-    CacheWrite no_cache{nullptr, nullptr, nullptr, nullptr, nullptr};
+    CacheWrite no_cache{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     return launch_board_resident_int8(
         stream, sms, ptr<const uint8_t>(obs), nullptr, boards, side, cells, A, K,
         ptr<const __nv_bfloat16>(stem_w), ptr<const int8_t>(trunk_w), ptr<const float>(wscale),
@@ -471,6 +472,7 @@ ffi::Error NetworkCompact(
     ffi::AnyBuffer vout_b, ffi::AnyBuffer q_w, ffi::AnyBuffer q_b, ffi::AnyBuffer qout_w,
     ffi::AnyBuffer qout_b,
     ffi::AnyBuffer cache_keys, ffi::AnyBuffer cache_locks, ffi::AnyBuffer cache_v, ffi::AnyBuffer cache_q,
+    ffi::AnyBuffer cache_wave,
     ffi::Result<ffi::AnyBuffer> vprobs, ffi::Result<ffi::AnyBuffer> qprobs,
     ffi::Result<ffi::AnyBuffer> r_cache_keys, ffi::Result<ffi::AnyBuffer> r_cache_locks,
     ffi::Result<ffi::AnyBuffer> r_cache_v, ffi::Result<ffi::AnyBuffer> r_cache_q,
@@ -489,13 +491,14 @@ ffi::Error NetworkCompact(
   ffi::Error cfg_err = configure_kernels_for_device(device);
   if (cfg_err.failure()) return cfg_err;
 
-  CacheWrite cw{nullptr, nullptr, nullptr, nullptr, nullptr};
+  CacheWrite cw{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
   if (use_cache) {
     cw.miss_keys = reinterpret_cast<const CacheKey*>(miss_keys.untyped_data());
     cw.table_keys = reinterpret_cast<CacheKey*>(r_cache_keys->untyped_data());
     cw.table_locks = reinterpret_cast<uint32_t*>(r_cache_locks->untyped_data());
-    cw.table_v = ptr<float>(*r_cache_v);
-    cw.table_q = ptr<float>(*r_cache_q);
+    cw.table_v = ptr<__nv_bfloat16>(*r_cache_v);
+    cw.table_q = ptr<__nv_bfloat16>(*r_cache_q);
+    cw.cache_wave = ptr<const uint32_t>(cache_wave);
   }
   const int32_t* d_cnt = ptr<const int32_t>(d_boards);
 
@@ -621,8 +624,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()   // qout_b
         .Arg<ffi::AnyBuffer>()   // cache_keys  [CACHE_SLOTS, 10] u32
         .Arg<ffi::AnyBuffer>()   // cache_locks [CACHE_SLOTS] u32
-        .Arg<ffi::AnyBuffer>()   // cache_v     [CACHE_SLOTS, K] f32
-        .Arg<ffi::AnyBuffer>()   // cache_q     [CACHE_SLOTS, A, K] f32
+        .Arg<ffi::AnyBuffer>()   // cache_v     [CACHE_SLOTS, K] bf16
+        .Arg<ffi::AnyBuffer>()   // cache_q     [CACHE_SLOTS, A, K] bf16
+        .Arg<ffi::AnyBuffer>()   // cache_wave  [1] u32
         .Ret<ffi::AnyBuffer>()   // vprobs      [B, K] f32
         .Ret<ffi::AnyBuffer>()   // qprobs      [B, A, K] f32
         .Ret<ffi::AnyBuffer>()   // r_cache_keys
@@ -633,3 +637,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>()   // scratch z
         .Ret<ffi::AnyBuffer>(),  // scratch z2
     {ffi::Traits::kCmdBufferCompatible});
+
+extern "C" int ScacchiDeviceSMCount() {
+  int device = 0, sms = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) return 0;
+  if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) return 0;
+  return sms;
+}

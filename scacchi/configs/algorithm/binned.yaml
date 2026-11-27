@@ -31,6 +31,7 @@ selfplay:
       subtree_reuse: true
       position_cache: true
       early_stop_prob: 0.96
+      early_stop_evpi: 0.0
       min_stop_nodes: 10
       playout_cap_prob: 1.0
       fast_simulations: 8
@@ -50,6 +51,7 @@ eval:
       fast_search: ${selfplay.search.binned_thompson.fast_search}
       position_cache: ${selfplay.search.binned_thompson.position_cache}
       early_stop_prob: ${selfplay.search.binned_thompson.early_stop_prob}
+      early_stop_evpi: ${selfplay.search.binned_thompson.early_stop_evpi}
       min_stop_nodes: ${selfplay.search.binned_thompson.min_stop_nodes}
   player_action_commitment:
     posterior_update: null
